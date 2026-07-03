@@ -1,9 +1,8 @@
 import numpy as np
 import warp as wp
-from ..assembly.femelm import FEMElm, fe_N, fe_detJxW
-from ..assembly.operators import ConstrainedOperator, csr_spmv, _kernel_cache
+from ..assembly.operators import ConstrainedOperator, _kernel_cache
 from ..assembly.dirichlet import _BCOperator
-from ..physics.poisson import make_load_kernel, gauss_points
+from ..physics.poisson import make_load_kernel
 
 
 def make_gp_interp_kernel(nbf: int, nqp: int):

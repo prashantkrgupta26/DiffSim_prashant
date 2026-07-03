@@ -47,7 +47,7 @@ class NonlinearSolver:
             eta = self.linear_rtol or min(0.1, np.sqrt(hist[-1] / fprev) if it > 1 else 0.1)
             op = _NpOp(self._jac_action(u, Fu), len(u), self.device)
             du, info = self.linear_solver(op, -Fu, tol=eta, maxiter=1000)
-            lam, fnew, Fnew = 1.0, None, None
+            lam = 1.0
             while True:
                 Fnew = self.F(u + lam * du)
                 fnew = np.linalg.norm(Fnew)
@@ -57,7 +57,9 @@ class NonlinearSolver:
                 if lam < 1e-4:
                     break
             u = u + lam * du
-            fprev, Fu = hist[-1], Fnew
+            Fu = self.F(u)          # always consistent with the accepted step
+            fnew = np.linalg.norm(Fu)
+            fprev = hist[-1]
             hist.append(fnew)
         converged = hist[-1] < max(self.rtol * f0, self.atol)
         return u, {"iters": self.max_it, "fnorm_history": hist, "converged": converged}
