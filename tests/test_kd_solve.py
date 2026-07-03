@@ -52,3 +52,19 @@ def test_kd_mms_order(dim, levels, expected, device):
         errs.append(l2_error(dm, u, U))
     order = np.log2(errs[-2] / errs[-1])
     assert abs(order - expected) < 0.15, (dim, errs)
+
+@pytest.mark.parametrize("device", [None], indirect=True)
+def test_periodic_poisson_3d(device):
+    # u periodic in x, Dirichlet in y,z: u = sin(2 pi x) sin(pi y) sin(pi z)
+    U = lambda x: np.sin(2 * np.pi * x[:, 0]) * np.sin(np.pi * x[:, 1]) * np.sin(np.pi * x[:, 2])
+    F = lambda x: (4 + 1 + 1) * np.pi**2 * U(x)
+    errs = []
+    for lvl in [3, 4]:
+        t = build_uniform(lvl, dim=3, periodic=(True, False, False))
+        m, c, dm = _dm(t, 1, device)
+        u = DirichletPoisson(dm).solve(g_fn=U, f_fn=F, tol=1e-13)
+        errs.append(l2_error(dm, u, U))
+    assert abs(np.log2(errs[0] / errs[1]) - 2.0) < 0.2, errs
+    # seam continuity: wrap nodes are single DOFs, so this holds by construction;
+    # assert it anyway via icoords uniqueness
+    assert len(np.unique(m.node_icoords, axis=0)) == len(m.node_icoords)
