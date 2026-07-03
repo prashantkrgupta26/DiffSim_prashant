@@ -8,13 +8,21 @@ helpers a proper sub-package.  pyproject.toml pythonpath=["."] ensures the
 project root is on sys.path, so 'from tests.helpers...' resolves cleanly
 without touching conftest.py or sys.path at runtime.
 """
+import json
+import pathlib
 import numpy as np
 import pytest
 from diffsim.octree.build import build_uniform, refine_elements
 from diffsim.octree.balance import balance2to1
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
+from diffsim.mesh.basis import basis_tables
+from diffsim.assembly.operators import DeviceMesh
+from diffsim.assembly.dirichlet import DirichletPoisson
+from diffsim.physics.poisson import l2_error
 from tests.helpers.field_eval import trace_conformity_max_jump
+
+BASE = pathlib.Path(__file__).parent / "baselines" / "m05_baselines.json"
 
 pytestmark = pytest.mark.tier2
 
@@ -221,3 +229,52 @@ def test_chain_closure_deterministic():
     assert np.allclose(u, lin(m.node_coords), atol=1e-12), (
         "linear reproduction failed after chain resolution"
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 13: p2 quadratic patch + adaptive order-3 MMS + M0.5 baselines
+# ---------------------------------------------------------------------------
+
+@pytest.mark.tier3
+def test_p2_quadratic_patch_adaptive(device):
+    """-lap(u) = f with quadratic u must be exact for p2 through h-hanging faces."""
+    t = build_uniform(2, dim=3)
+    mask = np.zeros(len(t), bool)
+    mask[[0, 9]] = True
+    t = balance2to1(refine_elements(t, mask))
+    m = build_mesh(t, 2)
+    c = build_constraints(m)
+    dm = DeviceMesh.from_mesh(m, c, basis_tables(2, dim=3), device)
+    # U = x0^2 + x1^2 + x2^2  =>  lap(U) = 6  =>  -lap(U) = -6  =>  f = -6
+    U = lambda x: x[:, 0]**2 + x[:, 1]**2 + x[:, 2]**2
+    F = lambda x: np.full(len(x), -6.0)
+    u = DirichletPoisson(dm).solve(g_fn=U, f_fn=F, tol=1e-13)
+    assert l2_error(dm, u, U) < 1e-10
+
+
+@pytest.mark.tier3
+def test_p2_adaptive_mms_order3(device):
+    """p2 on adaptive meshes (hanging faces) must achieve L2 order ≈ 3."""
+    U_fn = lambda x: np.prod(np.sin(np.pi * x), axis=1)
+    F_fn = lambda x: 3 * np.pi**2 * U_fn(x)
+    errs = []
+    for lvl in [1, 2, 3]:
+        t = build_uniform(lvl, dim=3)
+        mask = np.zeros(len(t), bool)
+        mask[0] = True
+        t = balance2to1(refine_elements(t, mask))
+        m = build_mesh(t, 2)
+        c = build_constraints(m)
+        dm = DeviceMesh.from_mesh(m, c, basis_tables(2, dim=3), device)
+        u = DirichletPoisson(dm).solve(g_fn=U_fn, f_fn=F_fn, tol=1e-13)
+        errs.append(l2_error(dm, u, U_fn))
+    assert abs(np.log2(errs[-2] / errs[-1]) - 3.0) < 0.25, errs
+    # regression lock: create baseline on first run, compare thereafter
+    results = {"p2_adaptive_mms": errs}
+    if BASE.exists():
+        ref = json.loads(BASE.read_text())
+        assert np.allclose(errs, ref["p2_adaptive_mms"], rtol=1e-6), (errs, ref)
+    else:
+        BASE.parent.mkdir(parents=True, exist_ok=True)
+        BASE.write_text(json.dumps(results, indent=2) + "\n")
+        pytest.skip("baseline created; re-run to compare")
