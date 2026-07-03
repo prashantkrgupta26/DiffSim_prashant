@@ -78,7 +78,21 @@ def build_constraints(mesh: Mesh) -> Constraints:
         cols.append(int(free_of[n]))
         vals.append(1.0)
 
-    # Interpolation rows for hanging nodes
+    # --- Interpolation rows for hanging nodes with transitive chain resolution ---
+    #
+    # In mixed (p1+p2) meshes a p-hanging node's owner (the same-level p1
+    # element) can itself have h-hanging corner nodes if a coarser diagonal
+    # neighbour touches that corner (2:1 balance allows this off-face).  The
+    # chain is always short (≤ 2 for p1/p2 with one-knob + 2:1 balance), but
+    # rather than assert the chain is length-1 we resolve it to free nodes by
+    # fixed-point substitution.  This is mathematically exact: substituting an
+    # h-hanging corner's own interpolation row preserves partition-of-unity
+    # (weight sums compose to 1) and polynomial reproduction (pointwise
+    # exactness at each level).
+    #
+    # Step 1: build raw rows — targets may still be hanging.
+    raw: dict[int, dict[int, float]] = {}   # hanging node -> {all_node: weight}
+
     for n in np.where(hanging)[0]:
         e = int(owner[n])
         pv, r = elem_conn_row[e]
@@ -94,6 +108,7 @@ def build_constraints(mesh: Mesh) -> Constraints:
                     d_ic[ax] += G2
         xi = 2.0 * d_ic / size2[e] - 1.0
         w1 = [lagrange_1d(pv, xi[d])[0] for d in range(dim)]
+        row: dict[int, float] = {}
         for a in range(len(offs)):
             w = 1.0
             for d in range(dim):
@@ -101,8 +116,40 @@ def build_constraints(mesh: Mesh) -> Constraints:
             if abs(w) < 1e-14:
                 continue
             tgt = int(mesh.conn_of[pv][r, a])
+            row[tgt] = row.get(tgt, 0.0) + w
+        raw[int(n)] = row
+
+    # Step 2: resolve chains — substitute any hanging target with its own raw
+    # row (weight-multiplied) until all targets are free nodes.  Terminates in
+    # at most ceil(log2(max_chain_length)) ≈ 3 passes for real meshes.
+    MAX_ITERS = 10
+    for _it in range(MAX_ITERS):
+        changed = False
+        new_raw: dict[int, dict[int, float]] = {}
+        for n, row in raw.items():
+            new_row: dict[int, float] = {}
+            for tgt, w in row.items():
+                if hanging[tgt]:
+                    # tgt is itself hanging — substitute its raw row
+                    for tgt2, w2 in raw[tgt].items():
+                        new_row[tgt2] = new_row.get(tgt2, 0.0) + w * w2
+                    changed = True
+                else:
+                    new_row[tgt] = new_row.get(tgt, 0.0) + w
+            new_raw[n] = new_row
+        raw = new_raw
+        if not changed:
+            break
+    else:
+        raise RuntimeError(
+            f"constraint chain resolution did not converge in {MAX_ITERS} iterations"
+        )
+
+    # Step 3: emit resolved rows into the sparse T matrix
+    for n, row in raw.items():
+        for tgt, w in row.items():
             assert not hanging[tgt], (
-                "owner nodes must be free (one-knob + 2:1 balance)"
+                f"node {tgt} still hanging after chain resolution (node {n})"
             )
             rows.append(int(n))
             cols.append(int(free_of[tgt]))

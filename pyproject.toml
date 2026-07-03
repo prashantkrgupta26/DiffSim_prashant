@@ -15,6 +15,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 markers = [
   "tier1: sanity & determinism (octree infrastructure)",
   "tier2: connectivity & patch tests",
