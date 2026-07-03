@@ -301,6 +301,7 @@ Framework-written: Krylov loops (CG, BiCGStab, GMRES — small, tape-visible, FP
 | Heat / Mass-SUPG | θ or c (1) | SUPG + backflow | 1 / Dirichlet, Neumann (n̄·n), Robin | linear | SBM thermal flows |
 | CahnHilliard | φ, μ (2) | — (mixed form) | wetting (stretch) | Newton (CH-solve) | CPC/JCP CHNS |
 | PNP | φₑ, c₁…c_N (N+1) | SUPG on NP | 1 / Dirichlet, no-flux, Robin (Stern) | Newton, monolithic PNP block | JCP NS-PNP; weak-BC CMAME |
+| PNP-ρs (binary symmetric) | ρ=c⁺−c⁻, s=c⁺+c⁻, φₑ | SUPG | as PNP; EDL-model BCs (Table-4 mechanisms) | s linear; (ρ,φ) coupled 2-field block (charge-relaxation implicit) | §15 (ECI hero); EKaos analysis |
 | Elasticity | u (d) | — | 0.5 / Dirichlet, Neumann | linear (Newton later) | Neural-SBM CAD |
 | ThinShell (modifier) | — | — | two-sided Γ̃⁺/Γ̃⁻ | — | ThinShell |
 | AMThermal | T (1) | SUPG if advective | activation masks / Robin (h_infill, h_out), plate Dirichlet | linear | FEAD AM |
@@ -453,7 +454,83 @@ Across any face, either h changes (2:1, equal p) or p changes (equal level), nev
 2. **p2-only:** same battery with the bar raised: *quadratic* patch test at machine precision through p2 hanging constraints (the owner trace is quadratic, so exactness is required), plus order-3 MMS on adaptive meshes.
 3. **Mixed p1/p2:** linear patch at machine precision on arbitrary mixes (both knobs exercised in one mesh, never on one face); trace-conformity fuzz across p-faces; error measured on Ω, not Ω̃ (the draft's warning); and the purpose-built acceptance test — SBM Neumann (heated-cylinder Nusselt) with a p2 band vs p1-everywhere, demonstrating restored second-order flux convergence, with a band-thickness layer sweep showing rate insensitivity once quadrature coverage is met.
 
-## 14. Risks & Mitigations
+## 14. Run I/O, Observables & In-Situ Statistics
+
+At hero-run scale, "dump fields and post-process" is not viable; the science is computed in situ. Three streams, all epoch-aware, all provenance-stamped:
+
+### 14.1 The three streams
+
+1. **Checkpoints (restart contract):** full state — all fields + BDF history + tree keys/levels + Δt-controller state + **statistics accumulators** (restart-safe running averages) + config hash + git SHA. Async writes (device→host copy, background thread; never stall the GPU); ring buffer (last K=3); wall-clock cadence. Verification: restart reproduces the trajectory to determinism-mode tolerance. Checkpoints double as adjoint checkpoints.
+2. **Field snapshots (visualization):** deliberately decimated — FP32, selected fields, optional 1–2-level coarsening, subvolumes/slices; VTKHDF/VTU per the `results_%05d` convention; hours-cadence. Never the primary science record.
+3. **In-situ statistics (the science):** GPU-computed reductions, KB–MB storage, per the Observables contract below.
+
+Run-directory schema: `run/{config.txt, provenance.json (git SHA, config hash, hardware), checkpoints/, snapshots/, stats/}` — every artifact traces to a commit.
+
+### 14.2 The Observables contract (per-brick, doubles as the QoI interface)
+
+Each brick declares its observables: `(name, type, reduction kernel, cadence class, accumulation semantics)` with types **scalar time series | profile | surface map | spectrum | histogram/PDF**. The same declaration serves two masters: the statistics pipeline (forward runs) and the **QoI interface for adjoints** — any declared observable is a differentiable objective candidate (dC_d/dθ, dNu/dκ, d⟨I⟩/d(geometry) use the identical reduction kernels, tape-visible).
+
+Shared infrastructure (L5 `StatisticsPipeline`): running-moment accumulators (Welford — numerically stable), stationarity detector (the MF6 temporal switch) gating accumulation windows, plane/bin reductions on the tree, uniform-band FFT (cuFFT) + shell integration, histogram/joint-PDF kernels, conservative-flux evaluation (penalty-included, weak-BC Eq.-37 form; SBM true-boundary 3-case extrapolation for immersed surfaces), and **conservation sentinels** (mass/charge/energy budgets — simultaneously the Tier-MP precision canaries).
+
+Standard observables per brick (defaults; extensible via config):
+
+| Brick | Time series | Profiles/maps/spectra | Sentinels |
+|---|---|---|---|
+| NS | C_d, C_l (SBM true-boundary), St (lift PSD), KE, enstrophy, dissipation | wake/centerline profiles; surface C_p, C_f maps | ‖∇·u‖, momentum budget |
+| Heat/Mass | global Nu/Sh (conservative flux), power balance | local Nu/Sh maps; plane-averaged θ, c | energy/species balance |
+| CHNS | per-phase mass, energy functional (monotone decay), rise velocity/centroid | interface area; droplet/filament census (erosion–dilation morphology reused as analysis); size distributions; Hausdorff/Chamfer vs experiment | mass drift, energy monotonicity |
+| PNP/ECI | I(t) both boundaries, ⟨I⟩/I_lim, I-PSD | §15 menu (profiles in y and y⁺, closure terms, shell spectra, joint PDFs, autocorrelations) | species mass, total charge |
+| AMThermal | layer times, melt/interlayer temps; **digital-twin live stream at print cadence** | per-voxel thermal history (peak T, cooling rates — microstructure inputs); surface T maps | energy balance |
+| Elasticity | compliance, reaction forces | von Mises / stress maps | equilibrium residual |
+| ThinShell | integrated loads | pressure/traction-jump maps (two-sided Γ̃⁺/Γ̃⁻) | blockage (zero-flux) |
+
+Cadence classes: every-step scalars (append-only CSV/Parquet); windowed accumulators (profiles, spectra, PDFs — gated by stationarity); decimated maps. All reduction kernels follow the Integrands purity contract (§3.2) so observables are auto-adjointable.
+
+## 15. Hero Application: 3D Electroconvective DNS (NS-PNP at small ε)
+
+The flagship physics target (FASTEST S3/MF6): 3D DNS of electroconvective instability near an ideal cation-selective membrane, periodic cuboid, pushing the Debye parameter ε toward 1e-6.
+
+### 15.1 Formulation decision
+
+**One stiff mechanism governs the design: charge relaxation, τ_c = ε².** Any splitting that lags φ against the ion concentrations inherits Δt ≲ ε² (fatal at 1e-6). Therefore: **φ never leaves the block containing the charge variable.** Adopted structure (per BDF2 step, block-iterated with sweep-difference convergence, selective freezing, Aitken extrapolation — the NS-P-NP framework's Algorithm 1; adaptive Δt with history-safe rollback per its Algorithm 2):
+
+1. **Stokes predictor** (inertia dropped — Re≪1, Sc~10³; full NS available as option) with lagged body force −(κ/2ε²)ρ∇φ — SPD.
+2. **PP-solve** — SPD. 3. **VU-solve** — SPD.
+4. **Salt** s = c⁺+c⁻: linear advection–diffusion, ∇·(ρ∇φ) lagged (mild; ρ≈0 outside the ESC).
+5. **Charge–potential (ρ, φ)**: coupled 2-field linear (Picard) or small-Newton block — ρ-equation with implicit ∇·(s∇φ), Poisson −2ε²∇²φ = ρ. The only non-SPD, non-scalar solve; 2 dof/node. Field-split preconditioning designed via the h-scaling Jacobian analysis (NSPNP documentation, Eqs. 15–21); feeds MF3.
+
+Monolithic (c⁺,c⁻,φ) Newton (the JCP-proven path) remains available behind the same interface as the robustness fallback. Fixed small sweep counts (~3, per EKaos) expected sufficient for design order.
+
+**EDL modeled, ESC resolved.** For ideal membranes the equilibrium EDL is dynamically passive (statistics insensitive to c_M); the ESC drives the instability and is itself unstable — it must be resolved as dynamic. EDL model = Table-4 BC mechanisms (Dirichlet c± = exp(∓ζ); Robin/Grahame surface charge) via the weak-BC machinery. Claims restricted to ideal selectivity. **Non-dissipative integration is a correctness requirement** (dissipative integrators bias near-membrane variance by up to 79% while looking plausible — Comsol appendix); spectra-level validation is an acceptance gate; θ=½ option available for the stiff block.
+
+**Validation ladder:** (1) reproduce Druzgalski 3D ε=1e-3 statistics with resolved EDL; (2) show modeled-EDL BCs reproduce (1); (3) descend in ε with the Wang–Mani ε^0.8 collapse as the running check.
+
+### 15.2 Resolution and capacity (Wang–Mani scaling: Δx_tang ≈ 3ε^0.8L, uniform along the membrane; N_tang ≈ 2ε^−0.8; wall-normal graded)
+
+| ε | Tangential level | 3D nodes (2πL box) | Platform |
+|---|---|---|---|
+| 1e-3 | 2^9 | ~5–10 M | any (validation tier; published 3D record) |
+| 1e-4 | 2^12 | ~1×10⁸ | **4×H100 today — record-setting by ~10×** |
+| 1e-5 | 2^15 | ~4×10⁹ (πL box: ~1×10⁹) | 4×B300 / 2–4 NVLink nodes |
+| 1e-6 | 2^17 | ~5×10¹⁰ | **rack scale (GB300 NVL72, ~20 TB HBM)** |
+| 1e-6 (2D) | 2^17 × graded | ~3–5×10⁷ | single GPU — immediate science |
+
+Timestep must resolve eddy turnover ~ ε^1.2 over O(0.1–1) statistical horizons → 10⁶–10⁷ steps at the small-ε tiers: weeks-scale campaigns; the §14 in-situ design is a prerequisite, not a convenience. The modeled-EDL + incomplete-octree formulation is what makes ε=1e-6 3D *conceivable* (brute-force resolved-EDL is "costlier than aircraft DNS" — Wang–Mani); closing the DNS↔experiment ε gap is the headline claim (Annual Review Future Issues #2–3).
+
+### 15.3 ECI observables (instantiates §14.2)
+
+Every step: I(t) at membrane and reservoir (conservative penalty-included flux), running ⟨I⟩/I_lim, KE, ⟨u·f_e⟩, dissipation, species mass + total charge, max|u|/CFL/Δt, sweep/Krylov counts. Windowed (stationarity-gated): plane-averaged profiles vs y and y⁺ = y/(ε^0.8L) of ⟨ρ⟩, ⟨s⟩, ⟨φ⟩, ⟨E_y⟩, variances, energy deposition/dissipation, and the closure terms ⟨v′c′⟩, ⟨c′∂_yφ′⟩ (the ROM/neural-closure training deliverables); 2D tangential shell-integrated spectra at y⁺ ≈ 1, 10, 80 (the wall band is uniform by construction — direct cuFFT, no interpolation); temporal PSD of I(t) (the 1961-to-now experimental observable); membrane current maps, histograms, joint PDFs (i vs c⁻, ∂_yφ, v); tangential two-point autocorrelations (domain-adequacy certificate). Layer-edge extraction (EDL/ESC/mixing/diffusion per Druzgalski definitions) computed from accumulated profiles.
+
+## 16. Code Standards: Readability × Performance
+
+Both are hard requirements; the tension is resolved structurally, not by compromise.
+
+1. **Kernel documentation contract.** Every kernel/integrand carries a header docblock: (i) the equation it implements, cited to this spec's section and/or the source paper's equation number; (ii) a symbol glossary mapping code names to math symbols (Hughes nomenclature, §3); (iii) nondimensionalization/units of every field touched; (iv) memory-layout and indexing notes (SoA, node-major blocks, x-fastest ordering); (v) invariants and preconditions (e.g., "assumes 2:1 balance", "conn has no duplicates"). Inline comments at *block* level (one per loop/phase explaining the math step), not per-line narration.
+2. **Fast path + clear path, tested equal.** Any optimization that obscures (sum-factorization, shared-memory staging, warp shuffles, precision tricks) requires a naive reference twin kept in-tree; CI asserts equivalence (the S3-style consistency tests generalize). The reference is the documentation; the fast path is the product. Students read the twin, profile the product.
+3. **Performance annotations.** Every non-obvious optimization documents *why it exists and what it bought* (measured, with the profile date/hardware) — optimizations without receipts are reverted on sight. Profile before optimizing; the §9.3 roofline model defines "optimized"; no cleverness without a measured win.
+4. Style baseline: Google-style per talylite docs/style.md (§3.1); pure integrands (§3.2); tolerance policy (§9.2).
+
+## 17. Risks & Mitigations
 
 | Risk | Mitigation |
 |---|---|
