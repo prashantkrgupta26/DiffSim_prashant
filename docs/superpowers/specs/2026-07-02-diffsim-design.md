@@ -85,7 +85,8 @@ Five layers, strict downward dependencies. Physics and geometry are data-driven 
 │ L2  DISCRETIZATION     ElementKernels (p1/p2 tensorized, typed   │
 │     per (p, precision) bin) · SurrogateBoundary · Assembler      │
 │     (matrix-free + assembled CSR) · LinearSolvers (Warp Krylov,  │
-│     AMGX, cuDSS; IR/GMRES-IR wrappers) · PrecisionManager ·      │
+│     AMGX, cuDSS; IR/GMRES-IR wrappers) · NonlinearSolver         │
+│     (SNES-like Newton–Krylov) · PrecisionManager ·               │
 │     Adaptivity (indicators, refine/coarsen, transfer)            │
 ├─────────────────────────────────────────────────────────────────┤
 │ L1  FOUNDATION         Octree (Morton, 2:1, k-ring neighbors,    │
@@ -236,7 +237,18 @@ Same pipeline, different epoch triggers. Rigid motion: re-carve when displacemen
 - **LerayProjection (default):** VP-solve (Oseen-linearized predictor; advecting velocity â = 2uⁿ − uⁿ⁻¹; skew-symmetric form s=½ default for unconditional energy stability) → PP-solve (variable-coefficient incremental pressure Poisson with VMS fine-scale RHS term) → VU-solve (per-component mass-matrix L² projection, reusing one assembled mass matrix). All linear; PP/VU SPD.
 - **MonolithicSemiImplicit:** one coupled (u,p) linear solve per step with the exact-adjoint linearized VMS. Contrast case for MF3 conditioning analysis and splitting-error checks.
 
-Stabilization: elementwise-constant tauM/tauC (no ∇τ, no residual-derivative terms — deliberate, keeps integrands differentiable). Nonlinear bricks (CH, PNP) use Newton with AD-or-analytic Jacobians inside the block coupler.
+Stabilization: elementwise-constant tauM/tauC (no ∇τ, no residual-derivative terms — deliberate, keeps integrands differentiable). Nonlinear bricks (CH, PNP) use the NonlinearSolver (§5.1.1) inside the block coupler.
+
+#### 5.1.1 NonlinearSolver (SNES-like Newton–Krylov)
+
+A first-class, brick-agnostic Newton solver mirroring PETSc SNES, wrapping any `LinearSolver` for the inner solve:
+
+- **Structure per iteration:** residual F(u) from `Integrands_be`; Jacobian J from `Integrands_Ae` (analytic, the existing convention) or by AD of the residual integrands (Tier-1 forward-mode on the pure integrands — consistent linearization for free, including closure input-derivatives per §6.3); solve J δu = −F via any inner `LinearSolver` (Warp Krylov, AMGX, cuDSS); update with line search.
+- **Variants:** full Newton with assembled J; **JFNK** (Jacobian-free Newton–Krylov: J·v by AD directional derivative of the residual — the matrix-free Track-MF citizen, preconditioned by the low-order-refined proxy of §5.4); modified Newton (frozen J across iterations/steps, the cheap default for mildly nonlinear bricks).
+- **Line search:** backtracking (`bt`) and critical-point (`cp`) to start, matching SNES defaults; none (`basic`) for well-behaved problems.
+- **Inexact Newton:** Eisenstat–Walker forcing terms for the inner tolerance (loose early, tight late) — composes with IR/GMRES-IR (the inner solve's precision policy is the bin policy; Newton residual norms always FP64).
+- **Nomenclature:** `NonlinearEquation` base (as in TalyFEM) and `setNonLinearSolver(eq, octDA, ndof, mfree)` construction; options via the same `solver_options_*` config blocks with SNES-style keys (`snes_rtol`, `snes_atol`, `snes_max_it`, `snes_linesearch_type`) under per-solver prefixes (`"ch_"`, `"pnp_"`), exactly the Proteus convention.
+- **Adjoint:** unchanged Tier-2 story — implicit-function adjoint at convergence (one transposed-Jacobian solve at the converged state); Newton iterations are never unrolled. The convergence tolerance bounds the adjoint consistency error, so `snes_rtol` participates in the gradient-precision budget (D1/MF4).
 
 ### 5.2 Two-tier adjoints
 
@@ -245,7 +257,7 @@ Rule: **tape what's element-local, invert what's global.**
 - **Tier 1 (automatic):** all integrands, geometry evaluations, closures, transfer kernels — pure Warp functions, adjoint by `wp.Tape` (prototype) / Enzyme on the same contract (CUDA).
 - **Tier 2 (custom VJPs — exactly four):**
   1. *Linear solve* x = A⁻¹b → Aᵀ-solve. SPD blocks: Aᵀ = A, same setup/preconditioner reused. Oseen: adjoint operator **assembled directly** via the exact-adjoint identity M*ₐ,ₛ = −Mₐ,₁₋ₛ (swap s → 1−s in the same integrand); own AMGX setup, amortized over the backward sweep (linearization point frozen per step).
-  2. *Newton solve* (CH/PNP): implicit-function adjoint at convergence — one transposed-Jacobian solve.
+  2. *Newton solve* (NonlinearSolver, §5.1.1): implicit-function adjoint at convergence — one transposed-Jacobian solve.
   3. *Newton closest-point projection*: IFT at the converged point.
   4. *Block-iterative coupler*: reverse-sweep vs coupled-IFT at convergence — both implemented; prototype benchmarks the crossover (expected: IFT wins when block iterations > 2).
 
@@ -361,7 +373,7 @@ Adopt the cuFEM verification plan wholesale: tiers 1–9, same test IDs (O1–O9
 
 | Milestone | Deliverable | Gates | Feeds |
 |---|---|---|---|
-| M0 | Octree foundation: Morton build, carve, 2:1, hanging constraints, p1/p2 tensorized assembly, CG/BiCGStab | Tiers 1–3; patch tests | S1/MF1 substrate |
+| M0 | Octree foundation: Morton build, carve, 2:1, hanging constraints, p1/p2 tensorized assembly, CG/BiCGStab, NonlinearSolver (Newton–Krylov, validated on Bratu) | Tiers 1–3; patch tests | S1/MF1 substrate |
 | M1 | Differentiable octree-SBM Poisson → NS (both steppers, BDF1/BDF2), static 3D, all four geometry backends; shape + viscosity gradients | Tiers 4–7 + AD; cylinder/sphere/cavity; gradients vs FD | S1, D1 spike |
 | M2 | Heat + Mass bricks, block coupler, neural closures in-the-loop (viscosity retrain demo) | Nu/Sh benchmarks; dNu/dκ | S2 |
 | M3 | Mixed precision: (p, precision) binning, IR/GMRES-IR, tensor-core p2 path | Tier MP; cliff reproduction; parity | MF1, MF2 kernels, MF3 evidence |
