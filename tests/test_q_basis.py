@@ -41,3 +41,28 @@ def test_M2_local_stiffness_matrix():
         ev = np.linalg.eigvalsh(Ke)
         assert abs(ev[0]) < 1e-13 and ev[1] > 1e-8                # nullspace = constants only
         assert np.allclose(Ke @ np.ones(tb.nbf), 0.0, atol=1e-13)
+
+def test_lagrange_1d_exact_values():
+    from diffsim.mesh.basis import lagrange_1d
+    xi = 0.6
+    N1, dN1 = lagrange_1d(1, xi)
+    assert np.allclose(N1, [0.2, 0.8], atol=1e-15)
+    assert np.allclose(dN1, [-0.5, 0.5], atol=1e-15)
+    N2, dN2 = lagrange_1d(2, xi)
+    assert np.allclose(N2, [0.5 * 0.6 * (0.6 - 1.0), 1.0 - 0.36, 0.5 * 0.6 * 1.6], atol=1e-15)
+    assert np.allclose(dN2, [0.6 - 0.5, -1.2, 0.6 + 0.5], atol=1e-15)
+
+def test_dN_axis_identity():
+    # dN[q,a,d] must be the derivative along axis d of the tensor basis:
+    # verify against a manually assembled entry at one qp for p=2
+    from diffsim.mesh.basis import basis_tables, gauss_1d, lagrange_1d
+    tb = basis_tables(2)
+    pts, _ = gauss_1d(2)
+    qi, qj, qk = 2, 0, 1            # arbitrary distinct 1D qp indices
+    q = qi + 3 * qj + 9 * qk
+    i, j, k = 1, 2, 0               # arbitrary distinct 1D node indices
+    a = i + 3 * j + 9 * k
+    Nx, dNx = lagrange_1d(2, pts[qi]); Ny, dNy = lagrange_1d(2, pts[qj]); Nz, dNz = lagrange_1d(2, pts[qk])
+    assert np.isclose(tb.dN[q, a, 0], dNx[i] * Ny[j] * Nz[k], atol=1e-15)
+    assert np.isclose(tb.dN[q, a, 1], Nx[i] * dNy[j] * Nz[k], atol=1e-15)
+    assert np.isclose(tb.dN[q, a, 2], Nx[i] * Ny[j] * dNz[k], atol=1e-15)
