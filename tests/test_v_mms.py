@@ -34,8 +34,9 @@ def test_V2_convergence_orders(device):
     if BASE.exists():
         ref = json.loads(BASE.read_text())
         for k, v in results.items():
-            assert np.allclose(v, ref[k], rtol=1e-8), (k, v, ref[k])
+            # rtol sized for cross-machine reduction-order noise (review: Task 13)
+            assert np.allclose(v, ref[k], rtol=1e-6), (k, v, ref[k])
     else:
         BASE.parent.mkdir(parents=True, exist_ok=True)
-        BASE.write_text(json.dumps(results, indent=2))
+        BASE.write_text(json.dumps(results, indent=2) + "\n")
         pytest.skip("baseline created; re-run to compare")
