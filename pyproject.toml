@@ -1,0 +1,22 @@
+[project]
+name = "diffsim"
+version = "0.0.1"
+requires-python = ">=3.10"
+dependencies = ["warp-lang>=1.7", "numpy>=1.26", "scipy>=1.11"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+  "tier1: sanity & determinism (octree infrastructure)",
+  "tier2: connectivity & patch tests",
+  "tier3: operator & assembly correctness",
+]
