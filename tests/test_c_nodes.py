@@ -29,3 +29,27 @@ def test_C4_C6_incomplete_octree_no_orphans():
     referenced = np.unique(m.conn.ravel())
     assert len(referenced) == len(m.node_coords)          # C6: no orphan nodes
     assert np.all(referenced == np.arange(len(m.node_coords)))
+
+def test_hanging_constraints_partition_of_unity():
+    from diffsim.mesh.constraints import build_constraints
+    t = build_uniform(1)
+    mask = np.zeros(8, bool); mask[0] = True
+    t = refine_elements(t, mask)                        # one coarse-fine interface set
+    for p in (1, 2):
+        m = build_mesh(t, p=p)
+        c = build_constraints(m)
+        assert c.hanging.sum() > 0
+        # rows sum to 1 (constant field reproduced through constraints)
+        rowsum = np.asarray(c.T.sum(axis=1)).ravel()
+        assert np.allclose(rowsum, 1.0, atol=1e-13)
+        # a linear field is reproduced exactly by constrained interpolation
+        f = lambda x: 1.0 + 2.0 * x[:, 0] - 3.0 * x[:, 1] + 0.5 * x[:, 2]
+        u_free = f(m.node_coords[c.free_nodes])
+        u_all = c.T @ u_free
+        assert np.allclose(u_all, f(m.node_coords), atol=1e-12)
+
+def test_uniform_mesh_has_no_hanging():
+    from diffsim.mesh.constraints import build_constraints
+    m = build_mesh(build_uniform(2), p=1)
+    c = build_constraints(m)
+    assert c.hanging.sum() == 0 and c.T.shape == (len(m.node_coords),) * 2
