@@ -22,3 +22,19 @@ def fe_dN(dNtab: wp.array3d(dtype=wp.float64), fe: FEMElm, a: wp.int32, k: wp.in
 def fe_detJxW(wtab: wp.array(dtype=wp.float64), fe: FEMElm) -> wp.float64:
     half = fe.he * wp.float64(0.5)
     return wtab[fe.q] * half * half * half
+
+
+# --- Scaled accessors: precomputed dscale and jac supplied by the kernel factory ---
+
+@wp.func
+def fe_dN_s(dNtab: wp.array3d(dtype=wp.float64), fe: FEMElm, a: wp.int32,
+            k: wp.int32, dscale: wp.float64) -> wp.float64:
+    """Physical derivative: reference dN times dscale = 2/he."""
+    return dNtab[fe.q, a, k] * dscale
+
+
+@wp.func
+def fe_detJxW_s(wtab: wp.array(dtype=wp.float64), fe: FEMElm,
+                jac: wp.float64) -> wp.float64:
+    """Quadrature weight times jac = (he/2)^dim (dim folded in by caller)."""
+    return wtab[fe.q] * jac

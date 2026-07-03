@@ -79,7 +79,7 @@ class DirichletPoisson:
         xq = gauss_points(dm.mesh, dm.tables)
         fq = wp.array(f_fn(xq), dtype=wp.float64, device=d)
         F_full = wp.zeros(dm.n_nodes, dtype=wp.float64, device=d)
-        lk = make_load_kernel(dm.tables.nbf, dm.tables.nqp)
+        lk = make_load_kernel(dm.tables.nbf, dm.tables.nqp, dm.tables.dim)
         wp.launch(lk, dim=len(dm.mesh.tree),
                   inputs=[dm.conn, dm.h, dm.N, dm.w, fq, F_full], device=d)
         F_free = wp.zeros(n_free, dtype=wp.float64, device=d)

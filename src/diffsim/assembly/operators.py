@@ -1,7 +1,10 @@
 import numpy as np
 import scipy.sparse as sp
 import warp as wp
-from .femelm import FEMElm, fe_N, fe_dN, fe_detJxW
+from .femelm import FEMElm, fe_N, fe_dN, fe_detJxW, fe_dN_s, fe_detJxW_s
+
+# Dim-keyed float64 vector types for gradient accumulation.
+_VEC = {2: wp.vec2d, 3: wp.vec3d, 4: wp.vec4d}
 
 
 def _csr_to_device(A: sp.csr_matrix, device):
@@ -33,10 +36,20 @@ def csr_spmv(
 _kernel_cache: dict = {}
 
 
-def make_poisson_matvec(nbf: int, nqp: int):
-    key = ("poisson_mv", nbf, nqp)
+def make_poisson_matvec(nbf: int, nqp: int, dim: int = 3):
+    """Poisson matvec kernel: y += A x for Poisson stiffness.
+
+    Cache key includes dim so kernels for different space dimensions are
+    compiled and stored independently.
+    Primary approach: accumulate gradient into a VEC() (wp.vec{dim}d),
+    then dot with per-row gradients. dim is a Python compile-time constant
+    closed over from the factory; jac = (he/2)^dim via a power loop.
+    """
+    key = ("poisson_mv", nbf, nqp, dim)
     if key in _kernel_cache:
         return _kernel_cache[key]
+
+    VEC = _VEC[dim]
 
     @wp.kernel
     def poisson_mv(
@@ -52,31 +65,38 @@ def make_poisson_matvec(nbf: int, nqp: int):
         fe = FEMElm()
         fe.e = e
         fe.he = h[e]
+        half = fe.he * wp.float64(0.5)
+        # jac = (he/2)^dim  — power loop; dim is compile-time constant
+        jac = wp.float64(1.0)
+        for _ in range(dim):
+            jac = jac * half
+        dscale = wp.float64(2.0) / fe.he
         for q in range(nqp):
             fe.q = q
-            dJxW = fe_detJxW(wtab, fe)
-            gx = wp.float64(0.0)
-            gy = wp.float64(0.0)
-            gz = wp.float64(0.0)
+            dJxW = fe_detJxW_s(wtab, fe, jac)
+            # Build gradient g = sum_b dN_b * x_b  using VEC for dim-generic storage.
+            g = VEC()
             for b in range(nbf):
                 xb = x[conn[e, b]]
-                gx += fe_dN(dNtab, fe, b, wp.int32(0)) * xb
-                gy += fe_dN(dNtab, fe, b, wp.int32(1)) * xb
-                gz += fe_dN(dNtab, fe, b, wp.int32(2)) * xb
+                for d in range(dim):
+                    g[d] = g[d] + fe_dN_s(dNtab, fe, b, d, dscale) * xb
+            # Accumulate: y_a += (grad N_a) . g * dJxW
             for a in range(nbf):
-                val = (
-                    fe_dN(dNtab, fe, a, wp.int32(0)) * gx
-                    + fe_dN(dNtab, fe, a, wp.int32(1)) * gy
-                    + fe_dN(dNtab, fe, a, wp.int32(2)) * gz
-                ) * dJxW
-                wp.atomic_add(y, conn[e, a], val)
+                val = wp.float64(0.0)
+                for d in range(dim):
+                    val = val + fe_dN_s(dNtab, fe, a, d, dscale) * g[d]
+                wp.atomic_add(y, conn[e, a], val * dJxW)
 
     _kernel_cache[key] = poisson_mv
     return poisson_mv
 
 
-def make_volume_kernel(nqp: int):
-    key = ("volume", nqp)
+def make_volume_kernel(nqp: int, dim: int = 3):
+    """Volume integration kernel: accumulates element volumes into out[0].
+
+    jac = (he/2)^dim computed via power loop (dim compile-time constant).
+    """
+    key = ("volume", nqp, dim)
     if key in _kernel_cache:
         return _kernel_cache[key]
 
@@ -89,8 +109,11 @@ def make_volume_kernel(nqp: int):
         e = wp.tid()
         acc = wp.float64(0.0)
         half = h[e] * wp.float64(0.5)
+        jac = wp.float64(1.0)
+        for _ in range(dim):
+            jac = jac * half
         for q in range(nqp):
-            acc += wtab[q] * half * half * half
+            acc += wtab[q] * jac
         wp.atomic_add(out, 0, acc)
 
     _kernel_cache[key] = volume_k
@@ -103,6 +126,7 @@ class DeviceMesh:
         self.constraints = constraints
         self.tables = tables
         self.device = device
+        self.dim = mesh.dim          # space dimension (2, 3, or 4)
         self.conn = wp.array(
             np.ascontiguousarray(mesh.conn),
             dtype=wp.int32,
@@ -141,7 +165,7 @@ class DeviceMesh:
 
 def integrate_volume(dm: DeviceMesh) -> float:
     out = wp.zeros(1, dtype=wp.float64, device=dm.device)
-    kernel = make_volume_kernel(dm.tables.nqp)
+    kernel = make_volume_kernel(dm.tables.nqp, dm.dim)
     wp.launch(kernel, dim=len(dm.mesh.tree),
               inputs=[dm.h, dm.w, out], device=dm.device)
     return float(out.numpy()[0])
@@ -152,7 +176,7 @@ class ConstrainedOperator:
 
     def __init__(self, dm: DeviceMesh):
         self.dm = dm
-        self.kernel = make_poisson_matvec(dm.tables.nbf, dm.tables.nqp)
+        self.kernel = make_poisson_matvec(dm.tables.nbf, dm.tables.nqp, dm.dim)
         d = dm.device
         self.x_full = wp.zeros(dm.n_nodes, dtype=wp.float64, device=d)
         self.y_full = wp.zeros(dm.n_nodes, dtype=wp.float64, device=d)
@@ -180,8 +204,12 @@ class ConstrainedOperator:
         return yd.numpy()
 
 
-def make_poisson_element_matrices(nbf: int, nqp: int):
-    key = ("poisson_Ke", nbf, nqp)
+def make_poisson_element_matrices(nbf: int, nqp: int, dim: int = 3):
+    """Assemble per-element stiffness matrices Ke[e, a, b].
+
+    dim-generic: gradient loop runs range(dim), jac = (he/2)^dim.
+    """
+    key = ("poisson_Ke", nbf, nqp, dim)
     if key in _kernel_cache:
         return _kernel_cache[key]
 
@@ -191,15 +219,20 @@ def make_poisson_element_matrices(nbf: int, nqp: int):
                    Ke: wp.array3d(dtype=wp.float64)):        # [Ne, nbf, nbf]
         e = wp.tid()
         fe = FEMElm(); fe.e = e; fe.he = h[e]
+        half = fe.he * wp.float64(0.5)
+        jac = wp.float64(1.0)
+        for _ in range(dim):
+            jac = jac * half
+        dscale = wp.float64(2.0) / fe.he
         for q in range(nqp):
             fe.q = q
-            dJxW = fe_detJxW(wtab, fe)
+            dJxW = fe_detJxW_s(wtab, fe, jac)
             for a in range(nbf):
                 for b in range(nbf):
-                    v = (fe_dN(dNtab, fe, a, 0) * fe_dN(dNtab, fe, b, 0) +
-                         fe_dN(dNtab, fe, a, 1) * fe_dN(dNtab, fe, b, 1) +
-                         fe_dN(dNtab, fe, a, 2) * fe_dN(dNtab, fe, b, 2)) * dJxW
-                    Ke[e, a, b] = Ke[e, a, b] + v
+                    v = wp.float64(0.0)
+                    for d in range(dim):
+                        v = v + fe_dN_s(dNtab, fe, a, d, dscale) * fe_dN_s(dNtab, fe, b, d, dscale)
+                    Ke[e, a, b] = Ke[e, a, b] + v * dJxW
 
     _kernel_cache[key] = poisson_Ke
     return poisson_Ke
@@ -208,7 +241,7 @@ def make_poisson_element_matrices(nbf: int, nqp: int):
 def assemble_csr(dm):
     ne, nbf, nqp = len(dm.mesh.tree), dm.tables.nbf, dm.tables.nqp
     Ke = wp.zeros((ne, nbf, nbf), dtype=wp.float64, device=dm.device)
-    k = make_poisson_element_matrices(nbf, nqp)
+    k = make_poisson_element_matrices(nbf, nqp, dm.dim)
     wp.launch(k, dim=ne, inputs=[dm.h, dm.dN, dm.w, Ke], device=dm.device)
     Keh = Ke.numpy()
     conn = dm.mesh.conn

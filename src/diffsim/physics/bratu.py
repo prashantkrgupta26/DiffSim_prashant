@@ -35,7 +35,7 @@ class BratuProblem:
         self.n_free = dm.n_free
         self.nqp, self.nbf = dm.tables.nqp, dm.tables.nbf
         self._interp = make_gp_interp_kernel(self.nbf, self.nqp)
-        self._load = make_load_kernel(self.nbf, self.nqp)
+        self._load = make_load_kernel(self.nbf, self.nqp, dm.dim)
 
     def _to_dev(self, v):
         return wp.array(np.asarray(v, np.float64), dtype=wp.float64, device=self.dm.device)
