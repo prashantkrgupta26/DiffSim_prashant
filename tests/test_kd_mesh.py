@@ -67,3 +67,22 @@ def test_kd_basis_tables(dim, p):
     Ke = np.einsum("qak,qbk,q->ab", tb.dN * (2 / h), tb.dN * (2 / h), tb.w * (h / 2) ** dim)
     ev = np.linalg.eigvalsh(Ke)
     assert abs(ev[0]) < 1e-12 and ev[1] > 1e-9                      # constants-only nullspace
+
+def test_periodic_seam_hanging_constraints():
+    from diffsim.octree.build import refine_elements
+    from diffsim.octree.balance import balance2to1
+    from diffsim.mesh.constraints import build_constraints
+    # refine the LEFT-column element of a 2D x-periodic tree so seam-adjacent
+    # hanging nodes have owners across the wrap (exercises the d_ic < 0 branch)
+    t = build_uniform(1, dim=2, periodic=(True, False))
+    a = t.anchors()
+    mask = (a[:, 0] == 0) & (a[:, 1] == 0)
+    t = balance2to1(refine_elements(t, mask))
+    m = build_mesh(t, p=1)
+    c = build_constraints(m)
+    assert c.hanging.sum() > 0
+    assert np.allclose(np.asarray(c.T.sum(axis=1)).ravel(), 1.0, atol=1e-13)
+    # x-periodic-compatible linear field (constant in x): exact reproduction
+    f = lambda x: 1.0 + 3.0 * x[:, 1]
+    u_all = c.T @ f(m.node_coords[c.free_nodes])
+    assert np.allclose(u_all, f(m.node_coords), atol=1e-12)
