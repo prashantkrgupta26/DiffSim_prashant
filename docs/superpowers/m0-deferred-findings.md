@@ -23,3 +23,10 @@ deferred, non-blocking; address opportunistically in M1 tasks that touch them.
 - Unused kernel args (Ntab in poisson_mv, fe.e) — spec-mandated Integrands scaffolding, keep.
 - Type annotations missing on build.py/gauss_1d/lagrange_1d; assorted dead test helpers/comments.
 - cg tol semantics at bnorm~0 (atol floor governs — intentional; document).
+
+## M0.5 deferred findings (final whole-branch review, 2026-07-03 — carry to M1)
+
+1. **Dead code removal:** `fe_dN` / `fe_detJxW` in `src/diffsim/assembly/femelm.py` are superseded by `fe_dN_s`/`fe_detJxW_s` and have zero callers (survive only via `assembly/__init__.py` re-export and an unused import in `operators.py`). Remove in M1.
+2. **p_elem guard:** `assert set(np.unique(p_elem)) <= {1, 2}` in `src/diffsim/mesh/nodes.py` is user-facing input validation — convert to `ValueError` (parity with the one-knob validator; bare asserts vanish under `python -O`).
+3. **Uniform-mesh-only docstrings:** `integrate_volume` (operators.py) and `BratuProblem` (bratu.py) lack an explicit "uniform mesh only" docstring line; also note the deliberate back-compat property asymmetry (`dm.tables` no-assert vs `conn/h/N/dN/w` assert) in the DeviceMesh class docstring. A mixed-mesh BratuProblem constructs silently and fails only at first `dm.conn` access.
+4. **(Informational)** m05 baseline mismatch error message is a raw `(errs, ref)` tuple — fine for debugging, could be formatted.
