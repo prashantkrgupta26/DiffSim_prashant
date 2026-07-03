@@ -121,37 +121,41 @@ def make_volume_kernel(nqp: int, dim: int = 3):
 
 
 class DeviceMesh:
-    def __init__(self, mesh, constraints, tables, device):
+    """Device-side mesh with per-polynomial-degree (per-bin) arrays.
+
+    Accepts ``tables_by_p`` as either a single ``Tables`` object (uniform
+    back-compat, wrapped internally as ``{mesh.p: tables}``) or a
+    ``dict[int, Tables]`` for mixed-p meshes.
+    """
+
+    def __init__(self, mesh, constraints, tables_by_p, device):
+        if not isinstance(tables_by_p, dict):
+            tables_by_p = {mesh.p: tables_by_p}
         self.mesh = mesh
         self.constraints = constraints
-        self.tables = tables
         self.device = device
-        self.dim = mesh.dim          # space dimension (2, 3, or 4)
-        self.conn = wp.array(
-            np.ascontiguousarray(mesh.conn),
-            dtype=wp.int32,
-            device=device,
-        )
-        self.h = wp.array(
-            np.ascontiguousarray(mesh.tree.h().astype(np.float64)),
-            dtype=wp.float64,
-            device=device,
-        )
-        self.N = wp.array(
-            np.ascontiguousarray(tables.N.astype(np.float64)),
-            dtype=wp.float64,
-            device=device,
-        )
-        self.dN = wp.array(
-            np.ascontiguousarray(tables.dN.astype(np.float64)),
-            dtype=wp.float64,
-            device=device,
-        )
-        self.w = wp.array(
-            np.ascontiguousarray(tables.w.astype(np.float64)),
-            dtype=wp.float64,
-            device=device,
-        )
+        self.dim = mesh.dim
+        self.tables_by_p = tables_by_p
+
+        h_all = mesh.tree.h()
+        self.bins: dict = {}
+        for pv, eids in mesh.bins.items():
+            tb = tables_by_p[pv]
+            self.bins[pv] = dict(
+                eids=eids,
+                conn=wp.array(np.ascontiguousarray(mesh.conn_of[pv]),
+                              dtype=wp.int32, device=device),
+                h=wp.array(np.ascontiguousarray(h_all[eids].astype(np.float64)),
+                           dtype=wp.float64, device=device),
+                N=wp.array(np.ascontiguousarray(tb.N.astype(np.float64)),
+                           dtype=wp.float64, device=device),
+                dN=wp.array(np.ascontiguousarray(tb.dN.astype(np.float64)),
+                            dtype=wp.float64, device=device),
+                w=wp.array(np.ascontiguousarray(tb.w.astype(np.float64)),
+                           dtype=wp.float64, device=device),
+                nbf=tb.nbf, nqp=tb.nqp,
+            )
+
         T = constraints.T.tocsr()
         self.T_dev = _csr_to_device(T, device)
         self.Tt_dev = _csr_to_device(T.T.tocsr(), device)
@@ -161,6 +165,24 @@ class DeviceMesh:
     @classmethod
     def from_mesh(cls, m, c, t, d):
         return cls(m, c, t, d)
+
+    # ------------------------------------------------------------------
+    # Uniform-mesh back-compat accessors (M0 tests use dm.conn, dm.h, …)
+    # conn/h/N/dN/w assert single-bin; tables returns max-p Tables (no assert).
+    # ------------------------------------------------------------------
+    def _only_bin(self):
+        assert len(self.bins) == 1, (
+            f"Back-compat property requires a single-bin mesh; "
+            f"got bins={list(self.bins.keys())}"
+        )
+        return next(iter(self.bins.values()))
+
+    conn   = property(lambda s: s._only_bin()["conn"])
+    h      = property(lambda s: s._only_bin()["h"])
+    N      = property(lambda s: s._only_bin()["N"])
+    dN     = property(lambda s: s._only_bin()["dN"])
+    w      = property(lambda s: s._only_bin()["w"])
+    tables = property(lambda s: s.tables_by_p[max(s.tables_by_p)])
 
 
 def integrate_volume(dm: DeviceMesh) -> float:
@@ -172,11 +194,19 @@ def integrate_volume(dm: DeviceMesh) -> float:
 
 
 class ConstrainedOperator:
-    """y_free = T^T (A (T x_free)), where A is the Poisson stiffness action (no BCs)."""
+    """y_free = T^T (A (T x_free)), where A is the Poisson stiffness action (no BCs).
+
+    Supports mixed-p meshes: one kernel launch per bin, all accumulating into
+    the same y_full via atomic_add (safe on both CPU and CUDA).
+    """
 
     def __init__(self, dm: DeviceMesh):
         self.dm = dm
-        self.kernel = make_poisson_matvec(dm.tables.nbf, dm.tables.nqp, dm.dim)
+        # Pre-compile one kernel per (nbf, nqp, dim) combination.
+        self._kernels = {
+            pv: make_poisson_matvec(b["nbf"], b["nqp"], dm.dim)
+            for pv, b in dm.bins.items()
+        }
         d = dm.device
         self.x_full = wp.zeros(dm.n_nodes, dtype=wp.float64, device=d)
         self.y_full = wp.zeros(dm.n_nodes, dtype=wp.float64, device=d)
@@ -186,12 +216,13 @@ class ConstrainedOperator:
         # x_full = T @ x_free
         wp.launch(csr_spmv, dim=dm.n_nodes,
                   inputs=[*dm.T_dev, x_free, self.x_full], device=d)
-        # y_full = A @ x_full
+        # y_full = A @ x_full  (zero once, then per-bin accumulate)
         self.y_full.zero_()
-        wp.launch(self.kernel, dim=len(dm.mesh.tree),
-                  inputs=[dm.conn, dm.h, dm.N, dm.dN, dm.w,
-                          self.x_full, self.y_full],
-                  device=d)
+        for pv, b in dm.bins.items():
+            wp.launch(self._kernels[pv], dim=len(b["eids"]),
+                      inputs=[b["conn"], b["h"], b["N"], b["dN"], b["w"],
+                              self.x_full, self.y_full],
+                      device=d)
         # y_free = T^T @ y_full
         wp.launch(csr_spmv, dim=dm.n_free,
                   inputs=[*dm.Tt_dev, self.y_full, y_free], device=d)
@@ -239,15 +270,30 @@ def make_poisson_element_matrices(nbf: int, nqp: int, dim: int = 3):
 
 
 def assemble_csr(dm):
-    ne, nbf, nqp = len(dm.mesh.tree), dm.tables.nbf, dm.tables.nqp
-    Ke = wp.zeros((ne, nbf, nbf), dtype=wp.float64, device=dm.device)
-    k = make_poisson_element_matrices(nbf, nqp, dm.dim)
-    wp.launch(k, dim=ne, inputs=[dm.h, dm.dN, dm.w, Ke], device=dm.device)
-    Keh = Ke.numpy()
-    conn = dm.mesh.conn
-    rows = np.repeat(conn, nbf, axis=1).ravel()
-    cols = np.tile(conn, (1, nbf)).ravel()
-    K = sp.coo_matrix((Keh.ravel(), (rows, cols)),
+    """Assemble global constrained stiffness matrix T^T K T.
+
+    Loops over per-degree bins: each bin gets its own Ke kernel launch and
+    its own COO triplets.  All bin COOs are concatenated before the single
+    ``coo_matrix -> tocsr`` call so shared interface nodes are summed once.
+    """
+    all_rows, all_cols, all_vals = [], [], []
+    for pv, b in dm.bins.items():
+        ne_bin = len(b["eids"])
+        nbf = b["nbf"]
+        nqp = b["nqp"]
+        Ke = wp.zeros((ne_bin, nbf, nbf), dtype=wp.float64, device=dm.device)
+        k = make_poisson_element_matrices(nbf, nqp, dm.dim)
+        wp.launch(k, dim=ne_bin, inputs=[b["h"], b["dN"], b["w"], Ke],
+                  device=dm.device)
+        Keh = Ke.numpy()
+        conn = dm.mesh.conn_of[pv]                      # int32 [ne_bin, nbf]
+        all_rows.append(np.repeat(conn, nbf, axis=1).ravel())
+        all_cols.append(np.tile(conn, (1, nbf)).ravel())
+        all_vals.append(Keh.ravel())
+    rows = np.concatenate(all_rows)
+    cols = np.concatenate(all_cols)
+    vals = np.concatenate(all_vals)
+    K = sp.coo_matrix((vals, (rows, cols)),
                       shape=(dm.n_nodes, dm.n_nodes)).tocsr()
     T = dm.constraints.T.tocsr()
     return (T.T @ K @ T).tocsr()

@@ -82,3 +82,42 @@ def test_mixed_with_h_transitions_combined():
     f = lambda x: 1.0 - x[:, 0] + 4 * x[:, 1] + 2 * x[:, 2]
     u_all = c.T @ f(m.node_coords[c.free_nodes])
     assert np.allclose(u_all, f(m.node_coords), atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Task 11: mixed-p assembly — per-bin kernel dispatch
+# ---------------------------------------------------------------------------
+
+import warp as wp  # noqa: E402 (already imported at session init in conftest)
+from diffsim.mesh.basis import basis_tables
+from diffsim.assembly.operators import DeviceMesh, ConstrainedOperator, assemble_csr
+from diffsim.assembly.dirichlet import DirichletPoisson
+from diffsim.physics.poisson import l2_error
+
+
+def _mixed_dm(device, dim=3):
+    t, p = _mixed_tree_and_p(dim)
+    m = build_mesh(t, p)
+    c = build_constraints(m)
+    tb = {1: basis_tables(1, dim=dim), 2: basis_tables(2, dim=dim)}
+    return m, c, DeviceMesh.from_mesh(m, c, tb, device)
+
+
+@pytest.mark.tier3
+def test_mixed_matvec_vs_assembled(device):
+    m, c, dm = _mixed_dm(device)
+    A = assemble_csr(dm)
+    op = ConstrainedOperator(dm)
+    rng = np.random.default_rng(9)
+    for _ in range(10):
+        x = rng.standard_normal(dm.n_free)
+        diff = np.abs(A @ x - op.matvec_numpy(x)).max()
+        assert diff < 1e-10 * max(1.0, np.abs(A @ x).max()), diff
+
+
+@pytest.mark.tier3
+def test_mixed_linear_patch_machine_precision(device):
+    m, c, dm = _mixed_dm(device)
+    LIN = lambda x: 1.0 + 2 * x[:, 0] - 3 * x[:, 1] + 0.5 * x[:, 2]
+    u = DirichletPoisson(dm).solve(g_fn=LIN, f_fn=lambda x: np.zeros(len(x)), tol=1e-13)
+    assert l2_error(dm, u, LIN) < 1e-11

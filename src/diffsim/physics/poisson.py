@@ -4,26 +4,43 @@ from ..assembly.femelm import FEMElm, fe_N, fe_detJxW_s
 from ..assembly.operators import _kernel_cache
 
 
-def gauss_points(mesh, tables):
-    """Physical Gauss-point coords, [Ne*nqp, dim], ordering (e, q).
+def gauss_points(mesh, tables_by_p):
+    """Physical Gauss-point coords per polynomial degree bin.
+
+    Returns ``dict[int, np.ndarray]`` mapping each degree ``pv`` to an array
+    of shape ``[ne_pv * nqp_pv, dim]``.  Ordering within each bin is
+    (element, quadrature-point) flat, matching the kernels' ``e * nqp + q``
+    indexing.
+
+    ``tables_by_p`` may be a single ``Tables`` object (uniform mesh back-compat,
+    wrapped internally as ``{mesh.p: tables_by_p}``).
 
     Reference lattice uses the same x-fastest reversed-itertools idiom as
-    basis_tables so (e,q) flat ordering matches the kernels' q loop.
+    ``basis_tables`` so the (e, q) flat ordering is consistent with the kernels.
     Physical scale: 2^{-lmax(mesh.dim)} per anchor unit.
     """
     from itertools import product as iproduct
     from ..octree import morton
     from ..mesh.basis import gauss_1d
+
+    if not isinstance(tables_by_p, dict):
+        tables_by_p = {mesh.p: tables_by_p}
+
     dim = mesh.dim
-    pts, _ = gauss_1d(tables.p)
-    nq1 = len(pts)
-    # x-fastest ordering: iproduct varies last factor fastest, [::-1] reverses
-    qidx = np.array(list(iproduct(*[range(nq1)] * dim)), np.int64)[:, ::-1]
-    ref = pts[qidx]                                      # [nqp, dim]
-    lo = mesh.tree.anchors() * 2.0 ** (-morton.lmax(dim))
-    h = mesh.tree.h()
-    xq = lo[:, None, :] + (ref[None, :, :] + 1.0) * 0.5 * h[:, None, None]
-    return xq.reshape(-1, dim)
+    lo_all = mesh.tree.anchors() * 2.0 ** (-morton.lmax(dim))
+    h_all = mesh.tree.h()
+    result: dict = {}
+    for pv in sorted(tables_by_p):
+        pts, _ = gauss_1d(pv)
+        nq1 = len(pts)
+        qidx = np.array(list(iproduct(*[range(nq1)] * dim)), np.int64)[:, ::-1]
+        ref = pts[qidx]                        # [nqp_pv, dim]
+        eids = mesh.bins[pv]
+        lo = lo_all[eids]                      # [ne_pv, dim]
+        h = h_all[eids]                        # [ne_pv]
+        xq = lo[:, None, :] + (ref[None, :, :] + 1.0) * 0.5 * h[:, None, None]
+        result[pv] = xq.reshape(-1, dim)
+    return result
 
 
 def make_load_kernel(nbf: int, nqp: int, dim: int = 3):
@@ -92,11 +109,15 @@ def make_l2_kernel(nbf: int, nqp: int, dim: int = 3):
 
 
 def l2_error(dm, u_all: np.ndarray, u_exact_fn) -> float:
-    xq = gauss_points(dm.mesh, dm.tables)
-    uq = wp.array(u_exact_fn(xq), dtype=wp.float64, device=dm.device)
+    """L2 error || u_h - u_exact ||, summed over all per-degree bins."""
+    xq_by_bin = gauss_points(dm.mesh, dm.tables_by_p)
     ud = wp.array(u_all.astype(np.float64), dtype=wp.float64, device=dm.device)
     out = wp.zeros(1, dtype=wp.float64, device=dm.device)
-    k = make_l2_kernel(dm.tables.nbf, dm.tables.nqp, dm.dim)
-    wp.launch(k, dim=len(dm.mesh.tree),
-              inputs=[dm.conn, dm.h, dm.N, dm.w, ud, uq, out], device=dm.device)
+    for pv, b in dm.bins.items():
+        xq = xq_by_bin[pv]
+        uq = wp.array(u_exact_fn(xq), dtype=wp.float64, device=dm.device)
+        k = make_l2_kernel(b["nbf"], b["nqp"], dm.dim)
+        wp.launch(k, dim=len(b["eids"]),
+                  inputs=[b["conn"], b["h"], b["N"], b["w"], ud, uq, out],
+                  device=dm.device)
     return float(np.sqrt(out.numpy()[0]))

@@ -76,12 +76,16 @@ class DirichletPoisson:
         n_free = dm.n_free
 
         # --- Assemble load vector F (full nodes) projected to free nodes ---
-        xq = gauss_points(dm.mesh, dm.tables)
-        fq = wp.array(f_fn(xq), dtype=wp.float64, device=d)
+        # Loop over per-degree bins; each bin contributes to the same F_full
+        # via atomic_add inside make_load_kernel.
+        xq_by_bin = gauss_points(dm.mesh, dm.tables_by_p)
         F_full = wp.zeros(dm.n_nodes, dtype=wp.float64, device=d)
-        lk = make_load_kernel(dm.tables.nbf, dm.tables.nqp, dm.tables.dim)
-        wp.launch(lk, dim=len(dm.mesh.tree),
-                  inputs=[dm.conn, dm.h, dm.N, dm.w, fq, F_full], device=d)
+        for pv, b in dm.bins.items():
+            xq = xq_by_bin[pv]
+            fq = wp.array(f_fn(xq), dtype=wp.float64, device=d)
+            lk = make_load_kernel(b["nbf"], b["nqp"], dm.dim)
+            wp.launch(lk, dim=len(b["eids"]),
+                      inputs=[b["conn"], b["h"], b["N"], b["w"], fq, F_full], device=d)
         F_free = wp.zeros(n_free, dtype=wp.float64, device=d)
         wp.launch(csr_spmv, dim=n_free, inputs=[*dm.Tt_dev, F_full, F_free], device=d)
 
