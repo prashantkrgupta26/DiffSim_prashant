@@ -47,3 +47,17 @@ def test_G3_positive_semidefinite(device):
         assert v @ op.matvec_numpy(v) >= -1e-10
     one = np.ones(len(c.free_nodes))
     assert np.abs(op.matvec_numpy(one)).max() < 1e-11   # constants in nullspace (pure Neumann)
+
+def test_S3_matrix_free_vs_assembled(device):
+    from diffsim.assembly.operators import assemble_csr, operator_diagonal
+    for p in (1, 2):
+        m, c, dm = _setup(p, adaptive=True, device=device)
+        A = assemble_csr(dm)
+        op = ConstrainedOperator(dm)
+        rng = np.random.default_rng(5)
+        for _ in range(20):
+            x = rng.standard_normal(dm.n_free)
+            diff = np.abs(A @ x - op.matvec_numpy(x)).max()
+            assert diff < 1e-10 * max(1.0, np.abs(A @ x).max()), (p, diff)
+        d = operator_diagonal(dm)
+        assert np.allclose(d, A.diagonal(), atol=1e-12)

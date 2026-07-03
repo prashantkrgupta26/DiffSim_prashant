@@ -178,3 +178,47 @@ class ConstrainedOperator:
         yd = wp.zeros(self.dm.n_free, dtype=wp.float64, device=self.dm.device)
         self.matvec(xd, yd)
         return yd.numpy()
+
+
+def make_poisson_element_matrices(nbf: int, nqp: int):
+    key = ("poisson_Ke", nbf, nqp)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel
+    def poisson_Ke(h: wp.array(dtype=wp.float64), dNtab: wp.array3d(dtype=wp.float64),
+                   wtab: wp.array(dtype=wp.float64),
+                   Ke: wp.array3d(dtype=wp.float64)):        # [Ne, nbf, nbf]
+        e = wp.tid()
+        fe = FEMElm(); fe.e = e; fe.he = h[e]
+        for q in range(nqp):
+            fe.q = q
+            dJxW = fe_detJxW(wtab, fe)
+            for a in range(nbf):
+                for b in range(nbf):
+                    v = (fe_dN(dNtab, fe, a, 0) * fe_dN(dNtab, fe, b, 0) +
+                         fe_dN(dNtab, fe, a, 1) * fe_dN(dNtab, fe, b, 1) +
+                         fe_dN(dNtab, fe, a, 2) * fe_dN(dNtab, fe, b, 2)) * dJxW
+                    Ke[e, a, b] = Ke[e, a, b] + v
+
+    _kernel_cache[key] = poisson_Ke
+    return poisson_Ke
+
+
+def assemble_csr(dm):
+    ne, nbf, nqp = len(dm.mesh.tree), dm.tables.nbf, dm.tables.nqp
+    Ke = wp.zeros((ne, nbf, nbf), dtype=wp.float64, device=dm.device)
+    k = make_poisson_element_matrices(nbf, nqp)
+    wp.launch(k, dim=ne, inputs=[dm.h, dm.dN, dm.w, Ke], device=dm.device)
+    Keh = Ke.numpy()
+    conn = dm.mesh.conn
+    rows = np.repeat(conn, nbf, axis=1).ravel()
+    cols = np.tile(conn, (1, nbf)).ravel()
+    K = sp.coo_matrix((Keh.ravel(), (rows, cols)),
+                      shape=(dm.n_nodes, dm.n_nodes)).tocsr()
+    T = dm.constraints.T.tocsr()
+    return (T.T @ K @ T).tocsr()
+
+
+def operator_diagonal(dm) -> np.ndarray:
+    return np.asarray(assemble_csr(dm).diagonal())
