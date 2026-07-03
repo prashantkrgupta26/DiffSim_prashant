@@ -4,17 +4,7 @@ import scipy.sparse as sp
 from ..octree import morton
 from ..octree.lookup import LeafLookup
 from .nodes import Mesh
-
-# NOTE: `from .basis import lagrange_1d` is intentionally omitted.
-# basis.py is created in Task 8 and is not yet available; the local
-# _basis_1d helper below is sufficient for p in {1, 2}.
-
-
-def _basis_1d(p, xi):
-    """1-D Lagrange basis functions on [-1, 1] for polynomial degree p."""
-    if p == 1:
-        return np.array([0.5 * (1 - xi), 0.5 * (1 + xi)])
-    return np.array([0.5 * xi * (xi - 1.0), 1.0 - xi * xi, 0.5 * xi * (xi + 1.0)])
+from .basis import lagrange_1d
 
 
 @dataclass(frozen=True)
@@ -84,7 +74,7 @@ def build_constraints(mesh: Mesh) -> Constraints:
         e = int(owner[n])
         # Reference coordinates of node n inside owner element e, mapped to [-1, 1]
         xi = 2.0 * (mesh.node_icoords[n] - anchors2[e]) / size2[e] - 1.0
-        w1 = [_basis_1d(p, xi[d]) for d in range(3)]
+        w1 = [lagrange_1d(p, xi[d])[0] for d in range(3)]
         for k in range(npe):
             for j in range(npe):
                 for i in range(npe):
