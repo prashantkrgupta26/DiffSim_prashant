@@ -29,9 +29,9 @@ A GPU-native, natively differentiable, adaptive octree FEM framework for immerse
 - Mixed-precision arithmetic: per-element precision, iterative refinement (IR) and GMRES-IR, tensor-core paths (FASTEST Track MF).
 - Adaptive additive-manufacturing (FDM printing) simulation: element activation, layer-synchronous adaptivity, digital-twin (faster-than-real-time) target.
 - Backward Euler (BDF1) and BDF2 time integration (plus θ-method, matching existing codes).
-- Dimension-generic k-D trees, k ∈ {2, 3, 4}: quadtrees for cheap 2D prototyping, octrees for 3D, sedectrees for space-time (2D+t as k=3; 3D+t as k=4), with per-axis periodic topology (spatially periodic domains; periodic-in-time limit-cycle solves). See §12.
-- Truncated Hierarchical B-splines (THB) as a second basis family (p=2 default, p=3 supported): C^(p−1) continuity, no hanging nodes, nested spaces for GMG, formulated on incomplete octrees with SBM. See §13.
-- Mixed-order Lagrange meshes (p1/p2 in one mesh) under the one-knob rule (across any face, either h or p changes, never both), motivated by SBM Neumann shifts requiring the element Hessian in a boundary band. Rigorous hanging/trace verification for p1-only, p2-only, and mixed meshes. See §14.
+- Dimension-generic k-D trees, k ∈ {2, 3, 4}: quadtrees for cheap 2D prototyping, octrees for 3D, sedectrees for space-time (2D+t as k=3; 3D+t as k=4), with per-axis periodic topology (spatially periodic domains; periodic-in-time limit-cycle solves). See §11.
+- Truncated Hierarchical B-splines (THB) as a second basis family (p=2 default, p=3 supported): C^(p−1) continuity, no hanging nodes, nested spaces for GMG, formulated on incomplete octrees with SBM. See §12.
+- Mixed-order Lagrange meshes (p1/p2 in one mesh) under the one-knob rule (across any face, either h or p changes, never both), motivated by SBM Neumann shifts requiring the element Hessian in a boundary band. Rigorous hanging/trace verification for p1-only, p2-only, and mixed meshes. See §13.
 - Nomenclature consistent with Dendrite-KT / TalyFEM / Proteus (Hughes FEM textbook + DiffPack heritage): `Integrands` / `Integrands4side` as the user-facing weak-form API.
 - Reuse NVIDIA-native components wherever they exist (AMGX, cuDSS, cuSPARSE, cuBLAS/CUTLASS, NCCL, Warp mesh/BVH/volume primitives, OptiX where warranted).
 
@@ -53,7 +53,7 @@ Both methods immerse geometry in a non-conforming octree and enforce BCs weakly 
 
 Secondary: fixed quadrature ⇒ fixed sparsity ⇒ adjoint solves reuse forward operators/preconditioners; no sliver cells ⇒ adjoint solves as well-conditioned as forward; SBM's information requirement (distance vectors only) is exactly what every geometry backend produces natively, whereas IMGA sub-cell in/out tests against a neural SDF would differentiate a sign function.
 
-**Hanging-node removal (considered and rejected).** The group's central-node decomposition (Shadkhah et al.; IPDPS 2025) removes hanging nodes by templated local subdivision into pyramids/tets, yielding ~30–37% condition-number reduction and net CPU wall-time wins. It is rejected for this framework: the simplex elements it introduces break the three pillars of the GPU performance architecture — uniform tensor-product kernels (sum-factorization), (p, precision) element binning, and the batched-GEMM/tensor-core apply path (MF2). Conditioning is instead recovered via preconditioning (low-order proxy AMG, MF3 selector) and structurally via THB (§13), which reaches the hanging-free endpoint inside tensor structure. The Shadkhah conditioning/iteration numbers remain the benchmark bar the T-operator and THB paths are measured against.
+**Hanging-node removal (considered and rejected).** The group's central-node decomposition (Shadkhah et al.; IPDPS 2025) removes hanging nodes by templated local subdivision into pyramids/tets, yielding ~30–37% condition-number reduction and net CPU wall-time wins. It is rejected for this framework: the simplex elements it introduces break the three pillars of the GPU performance architecture — uniform tensor-product kernels (sum-factorization), (p, precision) element binning, and the batched-GEMM/tensor-core apply path (MF2). Conditioning is instead recovered via preconditioning (low-order proxy AMG, MF3 selector) and structurally via THB (§12), which reaches the hanging-free endpoint inside tensor structure. The Shadkhah conditioning/iteration numbers remain the benchmark bar the T-operator and THB paths are measured against.
 
 ### 1.6 Success criteria
 
@@ -125,7 +125,7 @@ Five layers, strict downward dependencies. Physics and geometry are data-driven 
 
 ### 2.4 L2 Discretization
 
-- **ElementKernels:** tensorized reference-element operators parameterized by basis order p and dimension k (GEMM-cast assembly; Warp tiles / tensor cores for p2). Kernels are *typed per (p, precision) bin* (§2.5). Mixed p1/p2 in one mesh via per-element order tags + p-transition constraints under the one-knob rule (§14).
+- **ElementKernels:** tensorized reference-element operators parameterized by basis order p and dimension k (GEMM-cast assembly; Warp tiles / tensor cores for p2). Kernels are *typed per (p, precision) bin* (§2.5). Mixed p1/p2 in one mesh via per-element order tags + p-transition constraints under the one-knob rule (§13).
 - **BasisTransform (unifying abstraction):** every nonconforming or non-nodal basis is expressed as a sparse transformation applied at assembly — global `T` (h-hanging constraints, p-transition constraints) or per-element extraction blocks `E_e` (THB, §13). Element kernels always see a fixed-size tensor-product local basis; the transform is *data* (congruence `E_eᵀK_eE_e`, or the `TᵀAT` matvec chain), never control flow. Adjoint = transpose in all cases. Universal invariant test: rows of T / columns of E_e sum to 1 (partition of unity) at machine precision.
 - **SurrogateBoundary:** element classification (λ-criterion via Gauss-point oracle queries), face extraction, distance-vector evaluation (§4).
 - **Assembler:** matrix-free actions (Krylov operator applies) and assembled CSR (for AMGX/cuDSS and preconditioners), both from the same integrands. Deterministic mode: no floating-point atomics (coloring or gather-based assembly), pinned reduction order.
@@ -391,27 +391,27 @@ Three distinct classes — only the third is user-facing:
 | Milestone | Deliverable | Gates | Feeds |
 |---|---|---|---|
 | M0 | Octree foundation: Morton build, carve, 2:1, hanging constraints, p1/p2 tensorized assembly, CG/BiCGStab, NonlinearSolver (Newton–Krylov, validated on Bratu) — **complete** | Tiers 1–3; patch tests | S1/MF1 substrate |
-| M0.5 | k-generic refactor (k=2,3,4 core; per-axis periodic topology), mixed p1/p2 constraints (one-knob rule), rigorous hanging/trace verification tier (§14.3 batteries 1–3, excl. the SBM Neumann acceptance test which needs M1) | machine-precision patch/trace/fuzz batteries, p1/p2/mixed | foundation for all subsequent milestones |
+| M0.5 | k-generic refactor (k=2,3,4 core; per-axis periodic topology), mixed p1/p2 constraints (one-knob rule), rigorous hanging/trace verification tier (§13.3 batteries 1–3, excl. the SBM Neumann acceptance test which needs M1) | machine-precision patch/trace/fuzz batteries, p1/p2/mixed | foundation for all subsequent milestones |
 | M1 | Differentiable octree-SBM Poisson → NS (both steppers, BDF1/BDF2), static 3D, all four geometry backends; shape + viscosity gradients | Tiers 4–7 + AD; cylinder/sphere/cavity; gradients vs FD | S1, D1 spike |
 | M2 | Heat + Mass bricks, block coupler, neural closures in-the-loop (viscosity retrain demo) | Nu/Sh benchmarks; dNu/dκ | S2 |
 | M3 | Mixed precision: (p, precision) binning, IR/GMRES-IR, tensor-core p2 path | Tier MP; cliff reproduction; parity | MF1, MF2 kernels, MF3 evidence |
 | M4 | Topology epochs: AMR (4 indicator families incl. DWR), moving rigid body + Leray-corrected transfer, AMThermal brick | epoch idempotence/memory; Dütsch cylinder; Bunny faster-than-print | MF4, moving-body paper, AM twin |
 | M5 | Multi-GPU NVLink: partition, halo overlap, NCCL, multi-device adjoint | ≥80% to 4 GPUs; deterministic mode | MF2 |
 | M6 | Capstone inverses: electrode-shape design (PNP), AM process-parameter optimization, one control rollout | end-to-end gradient demos at scale | D1, MF6, flagship |
-| M7 | THB module (§13): HB/THB extraction on incomplete octrees, SBM pairing (guard cells, weak BCs), Poisson→NS, GMG exploration | PoU invariants; O(h³) MMS at p=2; DOF-savings vs Lagrange; conditioning benchmark vs Shadkhah bar | THB program (user's notes); CH stretch |
-| M8 | Space-time bricks (§12.2): GLS heat (k=3), space-time VMS NS (k=4), periodic limit cycles, space-time SBM demo (moving body as static 4D surface) | space-time MMS orders; cylinder shedding in one solve; adjoint-in-one-solve gradient demo | space-time program; D1 |
+| M7 | THB module (§12): HB/THB extraction on incomplete octrees, SBM pairing (guard cells, weak BCs), Poisson→NS, GMG exploration | PoU invariants; O(h³) MMS at p=2; DOF-savings vs Lagrange; conditioning benchmark vs Shadkhah bar | THB program (user's notes); CH stretch |
+| M8 | Space-time bricks (§11.2): GLS heat (k=3), space-time VMS NS (k=4), periodic limit cycles, space-time SBM demo (moving body as static 4D surface) | space-time MMS orders; cylinder shedding in one solve; adjoint-in-one-solve gradient demo | space-time program; D1 |
 
-Blueprint chapters ship with their milestones (design → prototype evidence → frozen chapter). PNP and CHNS bricks slot after M2 as pure L3 additions; elasticity/shells prioritized by student need. M1's SBM Neumann work includes the p2-band acceptance test (§14.3.3). M7 (THB) requires M1's surrogate-boundary infrastructure; M8 (space-time) requires M0.5's k=4 foundation. Stretch (post-M7, from FASTEST): THB/C¹ primal Cahn–Hilliard with per-level precision.
+Blueprint chapters ship with their milestones (design → prototype evidence → frozen chapter). PNP and CHNS bricks slot after M2 as pure L3 additions; elasticity/shells prioritized by student need. M1's SBM Neumann work includes the p2-band acceptance test (§13.3.3). M7 (THB) requires M1's surrogate-boundary infrastructure; M8 (space-time) requires M0.5's k=4 foundation. Stretch (post-M7, from FASTEST): THB/C¹ primal Cahn–Hilliard with per-level precision.
 
 ---
 
-## 12. Dimension-Generic k-D Trees & Space-Time (feature a)
+## 11. Dimension-Generic k-D Trees & Space-Time (feature a)
 
-### 12.1 Foundation generalization
+### 11.1 Foundation generalization
 
 All L1/L2 algorithms (build, balance, node dedup, constraint construction, kernel factories) are parameterized by k ∈ {2, 3, 4}: constants 2^k (children), 3^k−1 (neighbors), (p+1)^k (basis), per-k Morton spread/compact functions, LMAX = 31/21/15. The SC'19 Dendro-KT algorithms (TreeSort, one-pass auxiliary-octant balancing, bottom-up node dedup with coarse-side hanging ownership, traversal matvec) are k-agnostic in structure — the prototype's host implementations parameterize the same way. k=2 becomes the cheap prototyping/verification dimension; the k-genericity refactor happens early (milestone M0.5), before more 3D-hardcoded code accumulates.
 
-### 12.2 Space-time formulation (k=3 for 2D+t; k=4 for 3D+t)
+### 11.2 Space-time formulation (k=3 for 2D+t; k=4 for 3D+t)
 
 Time is one more coordinate: space-time advection ã = (a, 1); GLS (linear parabolic) or space-time VMS (NS, spatiotemporal fine scales, Temam skew-symmetrization) with τ built from the *physical anisotropic* element metric; the initial condition is Dirichlet data on the Γ₀ face; one global solve over the block (Newton, with pseudo-transient continuation as globalization — the group's papers document PETSc-equivalent recipes). Bases Q1/Q2 tesseracts. A posteriori space-time residual estimators drive fully 4D-local refinement (spatially varying effective Δt).
 
@@ -421,39 +421,39 @@ Time is one more coordinate: space-time advection ã = (a, 1); GLS (linear parab
 
 **Periodic-in-time (limit cycles):** with the t-axis flagged periodic, temporal boundary terms cancel under integration by parts and periodicity is node identification across t=0/t=T (wrap-around connectivity). Unknown-period problems add one bordered scalar unknown η (T as a field with ∂η/∂t = 0) plus a phase condition pinning one DOF. Direct limit-cycle solves (vortex shedding, oscillating bodies, stator–rotor with both spatial and temporal periodic axes) without transients.
 
-## 13. THB-Splines on Incomplete Octrees with SBM (feature b)
+## 12. THB-Splines on Incomplete Octrees with SBM (feature b)
 
-### 13.1 Construction (Bornemann subdivision + Giannelli truncation, on our tree)
+### 11.1 Construction (Bornemann subdivision + Giannelli truncation, on our tree)
 
 Uniform B-splines as integer translates on the dyadic grid — no knot vectors stored; two-scale weights are compile-time constants (p=2: ¼,¾,¾,¼; p=3: ⅛,½,¾,½,⅛-family). Active-function selection is the Kraft/Giannelli rule (supp ⊆ Ω^ℓ ∧ supp ⊄ Ω^(ℓ+1)) — pure octant support queries. Truncation = diagonal masks (I−X^m) in the subdivision cascade, restoring convex partition of unity and shrinking supports. **Per-element extraction:** on each leaf (level λ), every active function restricted to the leaf is a row of `E_e = restriction[ (∏_{m=ℓ+1}^{λ} (I−X^m) R^m) e_i ]` over the (p+1)^k level-λ local basis — Bornemann's subdivision projection with Giannelli's masks; dyadic-rational entries, computed from active-set bitmasks, cached per epoch. Elements = leaf octants; assembly = congruence transform per the BasisTransform abstraction (§2.4). Skipping the masks yields HB — both variants ship (p=2 THB stiffness conditioning can exceed HB on aggressive grading; benchmark both).
 
 **Admissibility = existing machinery:** 2:1 balance + a 1-ring refinement footprint around marked octants satisfies Kraft's non-touching-boundaries condition and Giannelli's sufficient grading (linear memory, bounded truncation depth).
 
-### 13.2 Incomplete octrees + SBM (the novel pairing)
+### 11.2 Incomplete octrees + SBM (the novel pairing)
 
 Bornemann's effective-domain/guard-cell construction is the boundary recipe: retain a p-cell halo of octants beyond the surrogate boundary so every analysis cell carries its complete (p+1)^k basis; discard functions whose support misses the effective domain; impose all BCs weakly (Nitsche → SBM shift — B-splines are non-interpolatory, so weak BCs are natural, and Bornemann's own Nitsche usage is the published precedent). SBM integrates over whole retained cells only ⇒ no cut supports, no trimmed quadrature, no open-knot boundary logic. Remaining research question (owned by this framework): reduced-support conditioning near the surrogate — addressed by the retention rule + MF3 conditioning analysis; neither reference paper handles immersed boundaries, making THB-SBM-on-incomplete-octrees the publishable contribution.
 
-### 13.3 Inherited properties
+### 12.3 Inherited properties
 
 C^(p−1) continuity (C¹ at p=2: continuous fluxes, no jump terms in estimators, in-element Hessians for the Neumann shift without mixed-p machinery); convex partition of unity; nested spaces → geometric multigrid; exact linear two-scale refinement transfer (u^(ℓ+1) = Sᵀu^ℓ — epoch transitions exact under refinement; least-squares coarsening, still linear/adjointable). Validation fixtures: the group's Python THB p=2 reference (prototype-then-port principle).
 
-## 14. Mixed-Order Lagrange & Hanging-Node Verification (feature c)
+## 13. Mixed-Order Lagrange & Hanging-Node Verification (feature c)
 
-### 14.1 Motivation and marking rule
+### 13.1 Motivation and marking rule
 
 SBM Neumann/flux conditions shift the derivative: the surrogate term contains the Hessian correction `n_i ∂_i∂_j u d_j`, identically zero inside p1 elements — the representability failure documented in the group's local-p-refinement draft. Remedy: a geometric p2 band near the surrogate boundary, p(T) = 2 for cells in the band, 1 elsewhere. **The one hard rule (from the draft): every shifted-Neumann quadrature point lies inside p2 cells.** Band thickness is a swept robustness parameter (layer-sweep test). Sign/placement conventions in the shifted-Neumann weak form are verified against Main & Scovazzi before implementation.
 
-### 14.2 One-knob rule and constraints
+### 13.2 One-knob rule and constraints
 
 Across any face, either h changes (2:1, equal p) or p changes (equal level), never both — a spec constraint, stricter than the draft (which leaves h+p interaction unanalyzed). Every constraint is then a pure tensor-product 1D interpolation: h-hanging rows use the coarse owner's basis (M0, validated); p-transition rows use the minimum rule — the p2 interface trace is demoted to the p1 (linear) trace: edge midpoint = ½(corners), face midpoint = ¼(corners). Both families are rows of the same global T; global DOF numbering is built after both constraint families (the draft's Step 4). Storage unification: p1 hanging nodes are a subset of the p2 node lattice (IPDPS quadratic-DA embedding) — allocate the p2 lattice once, activate per-element subsets.
 
-### 14.3 Rigorous verification tier (extends the cuFEM P-tests)
+### 13.3 Rigorous verification tier (extends the cuFEM P-tests)
 
 1. **p1-only:** M0's P3 extended — multi-interface, boundary-touching hanging nodes, 3D edge+face hanging combinations, plus randomized refinement fuzz: N random balanced trees asserting (i) T rows sum to 1 at machine precision, (ii) exact linear reproduction, (iii) **trace conformity** — interface jump of a random constrained field is zero at machine precision at dense face sample points (the C⁰ criterion the group's Delaunay counterexample shows is the one that matters — faces, not just nodes).
 2. **p2-only:** same battery with the bar raised: *quadratic* patch test at machine precision through p2 hanging constraints (the owner trace is quadratic, so exactness is required), plus order-3 MMS on adaptive meshes.
 3. **Mixed p1/p2:** linear patch at machine precision on arbitrary mixes (both knobs exercised in one mesh, never on one face); trace-conformity fuzz across p-faces; error measured on Ω, not Ω̃ (the draft's warning); and the purpose-built acceptance test — SBM Neumann (heated-cylinder Nusselt) with a p2 band vs p1-everywhere, demonstrating restored second-order flux convergence, with a band-thickness layer sweep showing rate insensitivity once quadrature coverage is met.
 
-## 15. Risks & Mitigations
+## 14. Risks & Mitigations
 
 | Risk | Mitigation |
 |---|---|
