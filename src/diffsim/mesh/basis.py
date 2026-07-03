@@ -20,32 +20,33 @@ def lagrange_1d(p: int, xi: float):
 @dataclass(frozen=True)
 class Tables:
     p: int
+    dim: int
     nbf: int
     nqp: int
     N: np.ndarray    # [nqp, nbf]
-    dN: np.ndarray   # [nqp, nbf, 3] (reference derivatives)
+    dN: np.ndarray   # [nqp, nbf, dim] (reference derivatives)
     w: np.ndarray    # [nqp]
 
-def basis_tables(p: int) -> Tables:
+def basis_tables(p: int, dim: int = 3) -> Tables:
+    from itertools import product as iproduct
     pts, wts = gauss_1d(p)
     npe, nq1 = p + 1, len(pts)
-    nbf, nqp = npe**3, nq1**3
-    N = np.zeros((nqp, nbf)); dN = np.zeros((nqp, nbf, 3)); w = np.zeros(nqp)
-    q = 0
-    for qk in range(nq1):
-        for qj in range(nq1):
-            for qi in range(nq1):                     # x fastest
-                Nx, dNx = lagrange_1d(p, pts[qi])
-                Ny, dNy = lagrange_1d(p, pts[qj])
-                Nz, dNz = lagrange_1d(p, pts[qk])
-                w[q] = wts[qi] * wts[qj] * wts[qk]
-                for k in range(npe):
-                    for j in range(npe):
-                        for i in range(npe):
-                            a = i + npe * j + npe * npe * k
-                            N[q, a] = Nx[i] * Ny[j] * Nz[k]
-                            dN[q, a, 0] = dNx[i] * Ny[j] * Nz[k]
-                            dN[q, a, 1] = Nx[i] * dNy[j] * Nz[k]
-                            dN[q, a, 2] = Nx[i] * Ny[j] * dNz[k]
-                q += 1
-    return Tables(p, nbf, nqp, N, dN, w)
+    nbf, nqp = npe**dim, nq1**dim
+    # x-fastest multi-indices for both qp and nodes (product varies last
+    # factor fastest -> reverse columns; matches nodes._local_offsets)
+    qidx = np.array(list(iproduct(*[range(nq1)] * dim)), np.int64)[:, ::-1]
+    aidx = np.array(list(iproduct(*[range(npe)] * dim)), np.int64)[:, ::-1]
+    N = np.zeros((nqp, nbf)); dN = np.zeros((nqp, nbf, dim)); w = np.zeros(nqp)
+    N1 = np.zeros((nq1, npe)); dN1 = np.zeros((nq1, npe))
+    for q in range(nq1):
+        N1[q], dN1[q] = lagrange_1d(p, pts[q])
+    for q in range(nqp):
+        w[q] = np.prod(wts[qidx[q]])
+        for a in range(nbf):
+            vals = N1[qidx[q], aidx[a]]                    # per-axis 1D values
+            N[q, a] = np.prod(vals)
+            for d in range(dim):
+                terms = vals.copy()
+                terms[d] = dN1[qidx[q, d], aidx[a, d]]
+                dN[q, a, d] = np.prod(terms)
+    return Tables(p, dim, nbf, nqp, N, dN, w)
