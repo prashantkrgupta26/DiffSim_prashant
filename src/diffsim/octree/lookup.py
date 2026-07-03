@@ -2,13 +2,31 @@ import numpy as np
 from . import morton
 from .build import Octree
 
-# Face order matches spec §3 BoundaryTypes.WALL: X_MINUS..Z_PLUS
-FACE_OFFSETS = np.array(
-    [[-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1]], np.int64
-)
+def face_offsets(dim: int) -> np.ndarray:
+    """Face order: axis0-, axis0+, axis1-, axis1+, ... (3D == BoundaryTypes.WALL)."""
+    out = []
+    for ax in range(dim):
+        for sgn in (-1, 1):
+            off = [0] * dim
+            off[ax] = sgn
+            out.append(off)
+    return np.array(out, np.int64)
+
+FACE_OFFSETS = face_offsets(3)   # back-compat constant (3D, matches M0's BoundaryTypes.WALL)
+
+def _wrap(anchors: np.ndarray, tree: Octree) -> np.ndarray:
+    """Wrap probe coords modulo the grid on periodic axes; leave others."""
+    G = 1 << morton.lmax(tree.dim)
+    a = anchors.copy()
+    for ax in range(tree.dim):
+        if tree.periodic[ax]:
+            a[:, ax] %= G
+    return a
 
 class LeafLookup:
-    """Containment lookup: LMAX-grid anchor -> leaf index, via truncated keys."""
+    """Containment lookup: lmax-grid anchor -> leaf index via truncated keys.
+    Periodic axes wrap before the search (spec S11.1). O(N * lmax) host
+    prototype loop — documented delta; cuFEM uses traversal."""
     def __init__(self, tree: Octree):
         self.tree = tree
         self._map = {}
@@ -16,15 +34,16 @@ class LeafLookup:
             self._map[(int(k), int(l))] = i
 
     def find(self, anchors: np.ndarray) -> np.ndarray:
-        anchors = np.asarray(anchors, np.int64).reshape(-1, 3)
+        dim = self.tree.dim
+        L = morton.lmax(dim)
+        anchors = _wrap(np.asarray(anchors, np.int64).reshape(-1, dim), self.tree)
         out = np.full(len(anchors), -1, np.int64)
-        G = 1 << morton.LMAX
+        G = 1 << L
         inside = np.all((anchors >= 0) & (anchors < G), axis=1)
         for i in np.where(inside)[0]:
             a = anchors[i]
-            for lvl in range(morton.LMAX, -1, -1):
-                xyz = a >> (morton.LMAX - lvl)
-                key = int(morton.encode(xyz[None, :], lvl)[0])
+            for lvl in range(L, -1, -1):
+                key = int(morton.encode((a >> (L - lvl))[None, :], lvl, dim=dim)[0])
                 j = self._map.get((key, lvl))
                 if j is not None:
                     out[i] = j
@@ -34,15 +53,12 @@ class LeafLookup:
 def face_neighbors(tree: Octree) -> list:
     lk = LeafLookup(tree)
     anchors = tree.anchors()
-    size = (1 << (morton.LMAX - tree.levels.astype(np.int64)))[:, None]
+    size = (1 << (morton.lmax(tree.dim) - tree.levels.astype(np.int64)))[:, None]
     center_off = size // 2
     out = []
-    for f in range(6):
-        off = FACE_OFFSETS[f]
-        # probe point: just outside the face, at the face center
-        probe = anchors + center_off
-        probe = probe + off * (center_off + 1)  # step past the face plane
+    for off in face_offsets(tree.dim):
+        probe = anchors + center_off + off * (center_off + 1)
         idx = lk.find(probe)
-        idx[idx == np.arange(len(tree))] = -1   # safety: never self
+        idx[idx == np.arange(len(tree))] = -1
         out.append(idx)
     return out
