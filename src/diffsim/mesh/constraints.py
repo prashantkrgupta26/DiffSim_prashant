@@ -1,9 +1,10 @@
 from dataclasses import dataclass
+from itertools import product as iproduct
 import numpy as np
 import scipy.sparse as sp
 from ..octree import morton
 from ..octree.lookup import LeafLookup
-from .nodes import Mesh
+from .nodes import Mesh, _local_offsets
 from .basis import lagrange_1d
 
 
@@ -15,12 +16,12 @@ class Constraints:
 
 
 def build_constraints(mesh: Mesh) -> Constraints:
-    tree, p = mesh.tree, mesh.p
+    tree, p, dim = mesh.tree, mesh.p, mesh.dim
     lk = LeafLookup(tree)
     Nn = len(mesh.node_coords)
     lev = tree.levels.astype(np.int64)
-    size2 = 2 * (1 << (morton.LMAX - lev))   # element size on doubled grid, per element
-    anchors2 = tree.anchors() * 2             # element anchors on doubled grid
+    size2 = 2 * (1 << (morton.lmax(dim) - lev))   # element size on doubled grid, per element
+    anchors2 = tree.anchors() * 2                   # element anchors on doubled grid
 
     # Build node -> list-of-elements incidence from conn
     node_elems = [[] for _ in range(Nn)]
@@ -29,26 +30,25 @@ def build_constraints(mesh: Mesh) -> Constraints:
             node_elems[a].append(e)
 
     # Doubled-grid domain size (exclusive upper bound)
-    G2 = 2 * (1 << morton.LMAX)
+    G2 = 2 * (1 << morton.lmax(dim))
 
     hanging = np.zeros(Nn, bool)
     owner = np.full(Nn, -1, np.int64)
 
+    probes = np.array(list(iproduct((-1, 0), repeat=dim)), np.int64)
     for n in range(Nn):
         ic = mesh.node_icoords[n]
-        # Probe the up-to-8 octants that geometrically touch this node.
-        # Each probe is offset by (dx, dy, dz) in {-1, 0}^3 on the doubled grid,
-        # then halved to reach the LMAX grid where LeafLookup operates.
+        # Probe the up-to-2^dim octants that geometrically touch this node.
+        # Each probe is offset by dp in {-1, 0}^dim on the doubled grid,
+        # then halved to reach the lmax grid where LeafLookup operates.
+        # LeafLookup.find handles periodic wrapping and returns -1 for
+        # out-of-range probes on non-periodic axes.
         touch = set()
-        for dx in (-1, 0):
-            for dy in (-1, 0):
-                for dz in (-1, 0):
-                    probe2 = ic + np.array([dx, dy, dz], np.int64)
-                    if np.any(probe2 < 0) or np.any(probe2 >= G2):
-                        continue
-                    idx = lk.find((probe2 // 2)[None, :])[0]
-                    if idx >= 0:
-                        touch.add(int(idx))
+        for dp in probes:
+            probe2 = ic + dp
+            idx = lk.find((probe2 // 2)[None, :])[0]
+            if idx >= 0:
+                touch.add(int(idx))
         carriers = set(node_elems[n])
         non_carriers = touch - carriers
         if non_carriers:
@@ -60,6 +60,7 @@ def build_constraints(mesh: Mesh) -> Constraints:
     free_of = np.full(Nn, -1, np.int64)
     free_of[free_nodes] = np.arange(len(free_nodes), dtype=np.int64)
 
+    offs = _local_offsets(p, dim)
     rows, cols, vals = [], [], []
 
     # Identity rows for free nodes
@@ -69,26 +70,32 @@ def build_constraints(mesh: Mesh) -> Constraints:
         vals.append(1.0)
 
     # Interpolation rows for hanging nodes
-    npe = p + 1
     for n in np.where(hanging)[0]:
         e = int(owner[n])
-        # Reference coordinates of node n inside owner element e, mapped to [-1, 1]
-        xi = 2.0 * (mesh.node_icoords[n] - anchors2[e]) / size2[e] - 1.0
-        w1 = [lagrange_1d(p, xi[d])[0] for d in range(3)]
-        for k in range(npe):
-            for j in range(npe):
-                for i in range(npe):
-                    a = i + npe * j + npe * npe * k
-                    w = w1[0][i] * w1[1][j] * w1[2][k]
-                    if abs(w) < 1e-14:
-                        continue
-                    tgt = int(mesh.conn[e, a])
-                    assert not hanging[tgt], (
-                        "2:1 balance guarantees owner nodes are free"
-                    )
-                    rows.append(int(n))
-                    cols.append(int(free_of[tgt]))
-                    vals.append(float(w))
+        # Reference coordinates of node n inside owner element e, mapped to [-1, 1].
+        # For periodic axes, shift d_ic into the owner's box to handle seam nodes.
+        d_ic = mesh.node_icoords[n] - anchors2[e]
+        for ax in range(dim):
+            if tree.periodic[ax]:
+                if d_ic[ax] > size2[e]:
+                    d_ic[ax] -= G2
+                elif d_ic[ax] < 0:
+                    d_ic[ax] += G2
+        xi = 2.0 * d_ic / size2[e] - 1.0
+        w1 = [lagrange_1d(p, xi[d])[0] for d in range(dim)]
+        for a in range(len(offs)):
+            w = 1.0
+            for d in range(dim):
+                w *= w1[d][offs[a, d]]
+            if abs(w) < 1e-14:
+                continue
+            tgt = int(mesh.conn[e, a])
+            assert not hanging[tgt], (
+                "2:1 balance guarantees owner nodes are free"
+            )
+            rows.append(int(n))
+            cols.append(int(free_of[tgt]))
+            vals.append(float(w))
 
     T = sp.csr_matrix(
         (vals, (rows, cols)),

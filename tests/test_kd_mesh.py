@@ -37,6 +37,24 @@ def test_fully_periodic_2d():
 
 @pytest.mark.parametrize("dim", [2, 4])
 @pytest.mark.parametrize("p", [1, 2])
+def test_kd_hanging_constraints(dim, p):
+    from diffsim.octree.build import refine_elements
+    from diffsim.octree.balance import balance2to1
+    from diffsim.mesh.constraints import build_constraints
+    t = build_uniform(1, dim=dim)
+    mask = np.zeros(len(t), bool); mask[0] = True
+    t = balance2to1(refine_elements(t, mask))
+    m = build_mesh(t, p=p)
+    c = build_constraints(m)
+    assert c.hanging.sum() > 0
+    assert np.allclose(np.asarray(c.T.sum(axis=1)).ravel(), 1.0, atol=1e-13)
+    coef = np.arange(1, dim + 1, dtype=np.float64)
+    f = lambda x: 1.0 + x @ coef                      # linear field in dim vars
+    u_all = c.T @ f(m.node_coords[c.free_nodes])
+    assert np.allclose(u_all, f(m.node_coords), atol=1e-12)
+
+@pytest.mark.parametrize("dim", [2, 4])
+@pytest.mark.parametrize("p", [1, 2])
 def test_kd_basis_tables(dim, p):
     tb = basis_tables(p, dim=dim)
     assert tb.dim == dim and tb.nbf == (p + 1) ** dim and tb.dN.shape == (tb.nqp, tb.nbf, dim)
