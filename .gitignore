@@ -6,3 +6,4 @@ mypapers/
 __pycache__/
 *.egg-info/
 .claude/
+MyPapers/
