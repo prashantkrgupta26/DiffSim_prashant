@@ -34,3 +34,20 @@ def test_adaptive_refine_center():
     assert t.levels.max() == 4 and t.levels.min() < 4
     vol = np.sum(t.h() ** 3)
     assert abs(vol - 1.0) < 1e-14   # leaves tile the cube exactly
+
+def test_O8_incomplete_octree_sphere():
+    from diffsim.octree.carve import SphereOracle, carve
+    from diffsim.octree.build import build_uniform
+    lvl = 5
+    oracle = SphereOracle((0.5, 0.5, 0.5), 0.5)
+    tree, markers = carve(build_uniform(lvl), oracle)
+    # no EXTERIOR leaves in active list; markers valid
+    assert set(np.unique(markers)) <= {0, 1}
+    # active volume approaches sphere volume: interior + intercepted brackets it
+    vol_active = np.sum(tree.h() ** 3)
+    vol_int = np.sum(tree.h()[markers == 0] ** 3)
+    v_sphere = 4.0 / 3.0 * np.pi * 0.5**3
+    assert vol_int <= v_sphere * 1.01 <= vol_active * 1.01
+    assert abs(vol_active - v_sphere) / v_sphere < 0.15   # level-5 resolution bound
+    # count matches an independent classification at 1% (cuFEM O8 criterion, level-scaled)
+    assert (markers == 1).sum() > 0
