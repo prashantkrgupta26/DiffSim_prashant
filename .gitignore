@@ -5,3 +5,4 @@ mypapers/
 .venv/
 __pycache__/
 *.egg-info/
+.claude/
