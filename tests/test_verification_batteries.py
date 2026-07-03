@@ -37,8 +37,8 @@ def _checks(m, c, rng, reproduce_quadratic):
     coef = rng.standard_normal(dim)
     lin = lambda x: 3.0 + x @ coef
     u = c.T @ lin(m.node_coords[c.free_nodes])
-    assert np.allclose(u, lin(m.node_coords), atol=1e-11)
-    assert trace_conformity_max_jump(m, u) < 1e-11
+    assert np.allclose(u, lin(m.node_coords), atol=1e-12)
+    assert trace_conformity_max_jump(m, u) < 1e-12
 
     if reproduce_quadratic:
         # Quadratic reproduction: valid on p2-only meshes (owner trace is quadratic)
@@ -107,3 +107,117 @@ def test_battery_mixed(trial):
 
     m = build_mesh(t, p)
     _checks(m, build_constraints(m), rng, reproduce_quadratic=False)
+
+
+def test_chain_closure_deterministic():
+    """Deterministic regression for the p→h→free transitive chain in mixed meshes.
+
+    Mesh: build_uniform(1, dim=3) with element 0 (Morton-sorted anchor [0,0,0])
+    refined once → 8 level-2 children + 7 level-1 elements; balance2to1 is a
+    no-op since the maximum face-adjacent level difference is 2−1 = 1.
+
+    Element 0 (level 2, anchor [0,0,0]) is the unique level-2 element whose
+    ALL face-neighbors are also level-2, so it can be promoted to p2 without
+    violating the one-knob rule.  Its p1 face-neighbors (elems 1/2/4) each
+    border a level-1 element on their far face, so some of their corners are
+    h-hanging.  The p-hanging midpoints on elem 0's p2 faces are owned by
+    those p1 elements; the raw single-level interpolation rows for those
+    p-hanging nodes therefore target h-hanging nodes — the p→h chain.
+
+    Structural assertion: recompute raw single-level ownership rows (same probe
+    logic as constraints.py, without chain resolution) and assert ≥1 raw row
+    has a target that is itself hanging.  If this assertion fails, the mesh
+    topology has changed and the test no longer exercises transitive closure.
+    """
+    from diffsim.octree.lookup import LeafLookup, face_neighbors as _face_nbrs
+    from diffsim.mesh.nodes import _local_offsets
+    from diffsim.octree import morton
+    from itertools import product as iproduct
+
+    # --- Build mesh ---
+    t = build_uniform(1, dim=3)
+    mask = np.zeros(len(t), bool)
+    mask[0] = True   # refine element at Morton-sorted index 0 (anchor [0,0,0])
+    t = balance2to1(refine_elements(t, mask))
+    lev = t.levels.astype(int)
+    assert len(t) == 15 and np.count_nonzero(lev == 2) == 8, (
+        f"unexpected tree shape: {len(t)} elems, {np.count_nonzero(lev==2)} at level 2"
+    )
+
+    # Identify valid p2 candidates: level-2 elements with ALL face-neighbors
+    # at the same level (one-knob compatible with p2 promotion).
+    nbrs = _face_nbrs(t)
+    same_level_face = np.ones(len(t), bool)
+    for nb in nbrs:
+        ok = nb >= 0
+        same_level_face[ok] &= (lev[ok] == lev[nb[ok]])
+    cand = np.where(same_level_face & (lev == 2))[0]
+    assert len(cand) == 1 and cand[0] == 0, (
+        f"expected exactly elem 0 as p2 candidate, got {cand}"
+    )
+
+    p = np.ones(len(t), np.int8)
+    p[0] = 2
+    m = build_mesh(t, p)
+    c = build_constraints(m)
+
+    # --- Structural chain-presence assertion ---
+    # Recompute raw single-level ownership rows (owner element + Lagrange
+    # weights) WITHOUT chain resolution.  Assert ≥1 raw target is hanging.
+    # If this fails, the mesh no longer contains the chain and the test is
+    # no longer a valid regression for transitive closure.
+    lk = LeafLookup(t)
+    levels64 = t.levels.astype(np.int64)
+    dps = np.array(list(iproduct((-1, 0), repeat=3)), np.int64)
+    node_elems: list = [[] for _ in range(len(m.node_coords))]
+    conn_row: dict = {}
+    for pv, eids in m.bins.items():
+        cn = m.conn_of[pv]
+        for r, e in enumerate(eids):
+            conn_row[int(e)] = (pv, r)
+            for a in cn[r]:
+                node_elems[int(a)].append(int(e))
+    a2 = t.anchors() * 2
+    s2 = 2 * (1 << (morton.lmax(3) - levels64))
+    ic2n = {tuple(ic.tolist()): i for i, ic in enumerate(m.node_icoords)}
+
+    chain_found = False
+    for n in np.where(c.hanging)[0]:
+        ic = m.node_icoords[n]
+        touch: set = set()
+        for dp in dps:
+            idx = lk.find(((ic + dp) // 2)[None, :])[0]
+            if idx >= 0:
+                touch.add(int(idx))
+        non_c = touch - set(node_elems[n])
+        if not non_c:
+            continue
+        oe = min(non_c, key=lambda e: (levels64[e], int(m.p_elem[e])))
+        pv_o, _ = conn_row[oe]
+        step = s2[oe] // pv_o
+        for off in _local_offsets(pv_o, 3):
+            corner_n = ic2n.get(tuple((a2[oe] + off * step).tolist()))
+            if corner_n is not None and c.hanging[corner_n]:
+                chain_found = True
+                break
+        if chain_found:
+            break
+
+    assert chain_found, (
+        "no p→h chain in raw rows: mesh topology changed and no longer exercises "
+        "transitive closure — update the mesh construction in this test"
+    )
+
+    # (a) build_constraints returned without error (reached this line)
+    # (b) Partition of unity — row sums == 1 proves all T rows resolve to free nodes
+    assert np.allclose(np.asarray(c.T.sum(axis=1)).ravel(), 1.0, atol=1e-12), (
+        "partition of unity failed after chain resolution"
+    )
+    # (c) Linear reproduction exact to 1e-12
+    rng = np.random.default_rng(42)
+    coef = rng.standard_normal(3)
+    lin = lambda x: 3.0 + x @ coef
+    u = c.T @ lin(m.node_coords[c.free_nodes])
+    assert np.allclose(u, lin(m.node_coords), atol=1e-12), (
+        "linear reproduction failed after chain resolution"
+    )
