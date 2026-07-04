@@ -78,7 +78,7 @@ Create: tests/baselines/m1a_baselines.json   # locked in Task 11
 
 **Steps:**
 
-- [ ] **Step 1: Install torch and record versions**
+- [x] **Step 1: Install torch and record versions**
 
 ```bash
 .venv/bin/pip install torch
@@ -98,7 +98,7 @@ markers = [
 ]
 ```
 
-- [ ] **Step 2: M0.5 deferred cleanups (docs/superpowers/m0-deferred-findings.md items)**
+- [x] **Step 2: M0.5 deferred cleanups (docs/superpowers/m0-deferred-findings.md items)**
 
 1. Delete `fe_dN` and `fe_detJxW` from `femelm.py` (zero callers); drop them from `assembly/__init__.py` re-exports and the unused import in `operators.py` (keep `fe_N`).
 2. `nodes.py`: replace `assert set(np.unique(p_elem)) <= {1, 2}` with `raise ValueError(f"p_elem must contain only 1 and 2, got {sorted(set(np.unique(p_elem)))}")` guarded by an `if`.
@@ -119,11 +119,11 @@ markers = [
 
 (`rnorm` must be initialized before the loop: `rnorm = np.sqrt(blas.dot(r, r, d))` after `r = wp.clone(bd)`.)
 
-- [ ] **Step 3: Tests (additive)**
+- [x] **Step 3: Tests (additive)**
 
 Append to `tests/test_mixedp.py`: `build_mesh(tree, p=np.full(len(tree), 3, np.int8))` raises `ValueError`. Append to `tests/test_s_solvers.py`: bicgstab on a 2×2 system with `b` orthogonal to the Krylov direction that forces `rho` breakdown returns `converged=False` with a `"breakdown"` key (construct: `op` = identity CSR-like operator via a tiny stub with `.device`/`.n_free`/`.matvec`, `rhat ⊥ r` is impossible at it=1 since `rhat = r = b`; instead assert the guard path via a singular operator `A = [[0,1],[0,0]]`-like stub driving `rhat·v → 0`). Keep this test minimal — the guard is defensive; the assertion is "no ZeroDivisionError, clean info dict".
 
-- [ ] **Step 4: Full suite + commit**
+- [x] **Step 4: Full suite + commit**
 
 `.venv/bin/pytest -q` → 109 + new pass.
 
