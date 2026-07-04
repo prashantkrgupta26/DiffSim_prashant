@@ -3,6 +3,13 @@ import scipy.sparse as sp
 import warp as wp
 from .femelm import FEMElm, fe_dN_s, fe_detJxW_s
 
+# Volume kernels are never differentiated through wp.Tape (adjoints go through
+# the assembled-CSR transpose; spec S5.2). Skipping backward codegen halves the
+# module compile cost, which matters: dim=4 p2 kernels (nbf=81, unrolled) took
+# ~280 s/module WITH backward on this workstation (measured 2026-07-04, RTX
+# 6000 Ada, warp 1.14). M1b's matrix-free tape path must flip this per-kernel.
+wp.set_module_options({"enable_backward": False})
+
 # Dim-keyed float64 vector types for gradient accumulation.
 _VEC = {2: wp.vec2d, 3: wp.vec3d, 4: wp.vec4d}
 

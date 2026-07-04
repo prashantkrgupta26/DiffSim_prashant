@@ -3,6 +3,9 @@ import warp as wp
 from ..assembly.femelm import FEMElm, fe_N, fe_detJxW_s
 from ..assembly.operators import _kernel_cache
 
+# Load/L2 kernels are never taped (see operators.py note); skip backward codegen.
+wp.set_module_options({"enable_backward": False})
+
 
 def gauss_points(mesh, tables_by_p):
     """Physical Gauss-point coords per polynomial degree bin.

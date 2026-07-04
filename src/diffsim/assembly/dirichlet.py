@@ -1,5 +1,9 @@
 import numpy as np
 import warp as wp
+
+# Mask kernels are never taped (see operators.py note); skip backward codegen.
+wp.set_module_options({"enable_backward": False})
+
 from .operators import ConstrainedOperator, csr_spmv
 from ..physics.poisson import make_load_kernel, gauss_points
 from ..solvers.krylov import cg

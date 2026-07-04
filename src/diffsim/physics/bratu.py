@@ -1,5 +1,9 @@
 import numpy as np
 import warp as wp
+
+# gp_interp is never taped (see operators.py note); skip backward codegen.
+wp.set_module_options({"enable_backward": False})
+
 from ..assembly.operators import ConstrainedOperator, _kernel_cache
 from ..assembly.dirichlet import _BCOperator
 from ..physics.poisson import make_load_kernel
