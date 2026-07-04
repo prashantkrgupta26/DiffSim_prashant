@@ -250,7 +250,7 @@ Eikonal shortcut (`near_eikonal=True` backends): `d = −ψ(x)∇ψ(x)/‖∇ψ(
 
 **Steps:**
 
-- [ ] **Step 1: Failing tests** (append; still `tier4`)
+- [x] **Step 1: Failing tests** (append; still `tier4`)
 
 ```python
 from diffsim.geometry.project import distance_numpy, distance_torch, closest_point
@@ -317,7 +317,7 @@ def test_admissibility_sphere():
     assert diag["eps_inf"] < 1e-11 and abs(diag["c0"] - 1.0) < 1e-12
 ```
 
-- [ ] **Step 2: Verify failure, then implement `project.py`.** Core shape:
+- [x] **Step 2: Verify failure, then implement `project.py`.** Core shape:
 
 ```python
 class _ClosestPoint(torch.autograd.Function):
@@ -351,7 +351,7 @@ class _ClosestPoint(torch.autograd.Function):
 
 Zero out rows where `ok == False` (mask ȳ) and surface the mask. `distance_torch` composes: `y, ok = closest_point(...)`; `d = y − x`; `n` from a fresh autograd `∇ψ(y)` normalized (this consumes the custom Function's backward for the y-dependence and the params' direct dependence together).
 
-- [ ] **Step 3: Run new tests + full suite + commit**
+- [x] **Step 3: Run new tests + full suite + commit**
 
 ```bash
 git add -A && git commit -m "feat: Newton closest-point projection with IFT adjoint (Tier-2 VJP 3)"

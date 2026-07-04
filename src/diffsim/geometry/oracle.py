@@ -50,3 +50,43 @@ class SDFOracle:
 
     def velocity(self, pts: np.ndarray, t: float = 0.0) -> np.ndarray:
         return np.zeros_like(np.asarray(pts, np.float64))
+
+
+def admissibility(oracle: SDFOracle, band_pts: np.ndarray) -> dict:
+    """Runtime admissibility diagnostics (spec S4.1), evaluated on a band of
+    query points near the boundary:
+
+      eps_inf            max |psi(y*)| over converged projections (residual
+                         geometry error — the epsilon_inf estimate)
+      c0                 min |grad psi| over the band (c0_hat)
+      d_hausdorff_bound  eps_inf / min(1, c0)
+      newton_ok_frac     fraction of points whose projection converged
+    """
+    from .project import _newton_iterate, _psi_grad
+
+    x = torch.as_tensor(np.ascontiguousarray(band_pts, np.float64))
+    y, _s, ok = _newton_iterate(oracle, x)
+    psi_y, _ = _psi_grad(oracle, y)
+    _, g_band = _psi_grad(oracle, x)
+    c0 = float(g_band.norm(dim=1).min())
+    eps = float(psi_y[ok].abs().max()) if bool(ok.any()) else float("inf")
+    return {
+        "eps_inf": eps,
+        "c0": c0,
+        "d_hausdorff_bound": eps / min(1.0, c0) if c0 > 0 else float("inf"),
+        "newton_ok_frac": float(ok.to(torch.float64).mean()),
+    }
+
+
+def warn_refinement_plateau(diag: dict, h: float, p: int) -> bool:
+    """Warn when geometry error bounds what refinement can buy: the
+    eps_inf ~ h^(p+1) rule (spec S4.1). Returns True if the warning fired."""
+    import warnings
+
+    if diag["d_hausdorff_bound"] > h ** (p + 1):
+        warnings.warn(
+            f"geometry-limited refinement plateau: Hausdorff bound "
+            f"{diag['d_hausdorff_bound']:.2e} exceeds h^(p+1) = {h ** (p + 1):.2e}; "
+            "refining the mesh further cannot reduce the error")
+        return True
+    return False
