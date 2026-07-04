@@ -25,7 +25,18 @@
    the IFT backward differentiates. The blueprint chapter should state the
    augmented system as THE projection definition, with the simple update as
    warm start only.
-3. **`build_constraints` host probe loop:** 48 s for 4D p2 (7105 nodes), from
+3. **Krylov host-sync latency is fatal on WSL2 at prototype sizes (Task 6
+   finding; hard requirement for M1b matrix-free).** bicgstab does ~6
+   host-synchronizing `blas.dot` calls per iteration (~10 ms round-trip each
+   on WSL2); nonsymmetric SBM-Nitsche systems at tol 1e-14 need thousands of
+   iterations => the 16-test P4 battery took 71 min via bicgstab vs 89 s via
+   scipy splu (SBMPoisson default solver="direct", the cuDSS-analogue of the
+   spec S5.4 reuse map; solver choice is invisible to gradients — Tier-2 VJP
+   boundary). M1b's matrix-free NS path CANNOT use direct solves: it needs
+   fused/batched reductions (single-sync iterations), pipelined bicgstab, or
+   CUDA-graph capture — this is the concrete instantiation of the M0
+   "dot() sync-per-call" deferred item, now with numbers.
+4. **`build_constraints` host probe loop:** 48 s for 4D p2 (7105 nodes), from
    calling `LeafLookup.find` once per (node, probe) instead of batching all
    2^dim probes across all nodes into one `find` call. Vectorize in a
    deliberate pass with the S13.3 batteries as the safety net — not a drive-by

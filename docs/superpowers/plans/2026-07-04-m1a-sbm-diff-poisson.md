@@ -614,7 +614,7 @@ RHS kernel `make_sbm_dirichlet_be(...)` (key `"sbm_dir_be"`): `be_full[conn[e,a]
 
 **Steps:**
 
-- [ ] **Step 1: Failing tests** (`tests/test_sbm_poisson.py`, `pytestmark = pytest.mark.tier5`)
+- [x] **Step 1: Failing tests** (`tests/test_sbm_poisson.py`, `pytestmark = pytest.mark.tier5`)
 
 ```python
 import numpy as np
@@ -711,9 +711,9 @@ def test_operator_nonsymmetric_documented(device):
     assert asym > 1e-12
 ```
 
-- [ ] **Step 2: Verify failure, implement.** Care points: (i) the Dirichlet data is evaluated at the **mapped** points `geo.xq + geo.d` — `g_fn` receives those, not `geo.xq`; (ii) face `Ae` scatter uses the **unconstrained** node ids then the same T-congruence as the volume part (single COO concat before `tocsr`, matching `assemble_csr`'s pattern — factor its bin loop so `SBMPoisson` can reuse the volume triplets without re-assembling); (iii) `bicgstab` tol 1e-14 for patch tests (tests pass tighter tol per spec §9.2 class 2); (iv) if the level-5 circle at λ=0.5 exposes a partially-exposed face (possible at coarse levels), bump the test level — the invariant error message tells you.
+- [x] **Step 2: Verify failure, implement.** Care points: (i) the Dirichlet data is evaluated at the **mapped** points `geo.xq + geo.d` — `g_fn` receives those, not `geo.xq`; (ii) face `Ae` scatter uses the **unconstrained** node ids then the same T-congruence as the volume part (single COO concat before `tocsr`, matching `assemble_csr`'s pattern — factor its bin loop so `SBMPoisson` can reuse the volume triplets without re-assembling); (iii) `bicgstab` tol 1e-14 for patch tests (tests pass tighter tol per spec §9.2 class 2); (iv) if the level-5 circle at λ=0.5 exposes a partially-exposed face (possible at coarse levels), bump the test level — the invariant error message tells you.
 
-- [ ] **Step 3: Run + full suite + commit**
+- [x] **Step 3: Run + full suite + commit**
 
 ```bash
 git add -A && git commit -m "feat: SBM Dirichlet Poisson (assembled path); P4 rotated-geometry patch keystone"

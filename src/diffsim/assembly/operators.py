@@ -284,13 +284,11 @@ def make_poisson_element_matrices(nbf: int, nqp: int, dim: int = 3):
     return poisson_Ke
 
 
-def assemble_csr(dm):
-    """Assemble global constrained stiffness matrix T^T K T.
-
-    Loops over per-degree bins: each bin gets its own Ke kernel launch and
-    its own COO triplets.  All bin COOs are concatenated before the single
-    ``coo_matrix -> tocsr`` call so shared interface nodes are summed once.
-    """
+def volume_triplets(dm):
+    """Unconstrained COO triplets (rows, cols, vals) of the volume Poisson
+    stiffness at kappa = 1, over all per-degree bins. Callers concatenate
+    additional (e.g. SBM face) triplets before the single tocsr so shared
+    nodes are summed once."""
     all_rows, all_cols, all_vals = [], [], []
     for pv, b in dm.bins.items():
         ne_bin = len(b["eids"])
@@ -305,13 +303,41 @@ def assemble_csr(dm):
         all_rows.append(np.repeat(conn, nbf, axis=1).ravel())
         all_cols.append(np.tile(conn, (1, nbf)).ravel())
         all_vals.append(Keh.ravel())
-    rows = np.concatenate(all_rows)
-    cols = np.concatenate(all_cols)
-    vals = np.concatenate(all_vals)
+    return (np.concatenate(all_rows), np.concatenate(all_cols),
+            np.concatenate(all_vals))
+
+
+def assemble_csr(dm):
+    """Assemble global constrained stiffness matrix T^T K T."""
+    rows, cols, vals = volume_triplets(dm)
     K = sp.coo_matrix((vals, (rows, cols)),
                       shape=(dm.n_nodes, dm.n_nodes)).tocsr()
     T = dm.constraints.T.tocsr()
     return (T.T @ K @ T).tocsr()
+
+
+class CSROperator:
+    """Operator-protocol wrapper for an assembled scipy CSR on device:
+    .matvec(x_wp, y_wp), .matvec_numpy(x), .n_free, .device. The adjoint
+    operator is simply CSROperator(A.T.tocsr(), device) — Tier-2 VJP #1's
+    assembled-path form (spec S5.2)."""
+
+    def __init__(self, A: sp.csr_matrix, device):
+        A = A.tocsr()
+        self.device = device
+        self.n_free = A.shape[0]
+        self._dev = _csr_to_device(A, device)
+
+    def matvec(self, x: wp.array, y: wp.array):
+        wp.launch(csr_spmv, dim=self.n_free,
+                  inputs=[*self._dev, x, y], device=self.device)
+
+    def matvec_numpy(self, x: np.ndarray) -> np.ndarray:
+        xd = wp.array(np.ascontiguousarray(x, np.float64),
+                      dtype=wp.float64, device=self.device)
+        yd = wp.zeros(self.n_free, dtype=wp.float64, device=self.device)
+        self.matvec(xd, yd)
+        return yd.numpy()
 
 
 def operator_diagonal(dm) -> np.ndarray:
