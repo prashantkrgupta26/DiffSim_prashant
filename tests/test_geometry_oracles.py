@@ -220,3 +220,26 @@ def test_admissibility_sphere():
     assert diag["eps_inf"] < 1e-11
     assert abs(diag["c0"] - 1.0) < 1e-12
     assert diag["d_hausdorff_bound"] < 1e-11
+
+
+def test_projection_4d():
+    # k=4 structural invariant (dim-coverage policy): projection and IFT
+    # machinery are dim-generic. Eikonal shortcut + Newton path on a 4-sphere.
+    s = Sphere((0.5,) * 4, 0.35)
+    rng = np.random.default_rng(11)
+    x = 0.5 + 0.3 * rng.uniform(-1, 1, (50, 4))
+    d, n, ok = distance_numpy(s, x)
+    assert ok.all()
+    r = np.linalg.norm(x - 0.5, axis=1)
+    assert np.allclose(np.linalg.norm(x + d - 0.5, axis=1), 0.35, atol=1e-11)
+    assert np.allclose(n, (x - 0.5) / r[:, None], atol=1e-11)
+    # Newton path (non-eikonal blend of two 4-spheres) + IFT gradient smoke
+    a = Sphere((0.45,) * 4, 0.25)
+    b = Sphere((0.55,) * 4, 0.25)
+    o = Union(a, b, k=0.03)
+    for pp in o.params:
+        pp.requires_grad_(True)
+    d_t, n_t, ok = distance_torch(o, x[:8])
+    assert ok.numpy().all()
+    (g_r,) = torch.autograd.grad(d_t.sum(), [a.radius])
+    assert np.isfinite(float(g_r))

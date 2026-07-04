@@ -17,6 +17,13 @@ def lagrange_1d(p: int, xi: float):
         dN = np.array([xi - 0.5, -2.0 * xi, xi + 0.5])
     return N, dN
 
+def lagrange_1d_d2(p: int, xi: float):
+    """Second derivatives of the 1D Lagrange basis: zero for p1, the constant
+    [1, -2, 1] for p2 (xi-independent)."""
+    if p == 1:
+        return np.zeros(2)
+    return np.array([1.0, -2.0, 1.0])
+
 @dataclass(frozen=True)
 class Tables:
     p: int

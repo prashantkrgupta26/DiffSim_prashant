@@ -23,6 +23,7 @@
 - The `.numpy()` host boundaries in Krylov/BLAS (M0 deferred finding #1) are **routed around, not through**: gradients never tape through a solve; solves are Tier-2 VJPs (adjoint solve on `A.T`).
 - SBM Nitsche operators are **nonsymmetric** (the adjoint-consistency term −κ(∇w·ñ)(∇u·d) has no transpose partner): SBM solves use `bicgstab` (guards added in Task 1), never `cg`.
 - New pytest markers: `tier4` (geometry oracles, classification, surrogate extraction), `tier5` (SBM solves, MMS, backends), `ad` (gradient checks).
+- **Dim-coverage policy (adopted 2026-07-04; binds every task here and M1b/M1c):** every new L1/L2-level feature ships with tests at ALL of k = 2, 3, 4 for **structural invariants** (machine-precision patch tests, PoU/closure identities, classification/extraction, constraint properties) — cheap, and they catch dim-hardcoding immediately (spec §11.1's "before 3D-hardcoded code accumulates" logic). **Convergence ladders** run at k=2 (primary) + one k=3 confirmation; k=4 ladders wait for M8 space-time MMS. **Physics benchmarks** are k=3 (plus 2D where the papers have them). Hard rule: each k=4 test stays under ~2 min (coarse level, p1 unless the feature is p-specific).
 - Code standards (spec §16): header docblocks (equation + spec/paper reference, symbol glossary, layout notes, invariants) on every new module/kernel; block-level comments only. Commits: conventional style.
 
 ## File Structure
@@ -371,7 +372,7 @@ git add -A && git commit -m "feat: Newton closest-point projection with IFT adjo
 
 **Steps:**
 
-- [ ] **Step 1: Failing tests** (`tests/test_face_tables.py`, `pytestmark = pytest.mark.tier2`)
+- [x] **Step 1: Failing tests** (`tests/test_face_tables.py`, `pytestmark = pytest.mark.tier2`)
 
 ```python
 import numpy as np
@@ -423,7 +424,7 @@ def test_p1_d2N_zero():
     assert np.abs(face_tables(1, 3).d2N).max() == 0.0
 ```
 
-- [ ] **Step 2: Verify failure, implement, run, full suite, commit**
+- [x] **Step 2: Verify failure, implement, run, full suite, commit**
 
 ```bash
 git add -A && git commit -m "feat: face basis tables with second derivatives (N/dN/d2N at face GPs)"
@@ -448,7 +449,7 @@ Narrowband helper for tests: `narrowband_refine(oracle, max_level, dim, pad=1.0)
 
 **Steps:**
 
-- [ ] **Step 1: Failing tests** (`tests/test_sbm_surrogate.py`, `pytestmark = pytest.mark.tier4`)
+- [x] **Step 1: Failing tests** (`tests/test_sbm_surrogate.py`, `pytestmark = pytest.mark.tier4`)
 
 ```python
 import numpy as np
@@ -534,9 +535,9 @@ def test_exterior_configuration():
     assert (np.einsum("id,id->i", geo.n, to_center) > 0.9).all()
 ```
 
-- [ ] **Step 2: Verify failure, implement `surrogate.py`.** Notes: probes just outside face f of element e: anchor-grid point `center(e) + off_f * (size_e/2 + 1)` (the `face_neighbors` idiom); sub-probes shift the tangent axes by ±size_e/4. Outer-boundary detection: probe coordinate out of `[0, 2^lmax)` on a non-periodic axis. Reuse `LeafLookup`, `face_offsets`. Determinism: pure integer/array ops, single-threaded host code.
+- [x] **Step 2: Verify failure, implement `surrogate.py`.** Notes: probes just outside face f of element e: anchor-grid point `center(e) + off_f * (size_e/2 + 1)` (the `face_neighbors` idiom); sub-probes shift the tangent axes by ±size_e/4. Outer-boundary detection: probe coordinate out of `[0, 2^lmax)` on a non-periodic axis. Reuse `LeafLookup`, `face_offsets`. Determinism: pure integer/array ops, single-threaded host code.
 
-- [ ] **Step 3: Run + full suite + commit**
+- [x] **Step 3: Run + full suite + commit**
 
 ```bash
 git add -A && git commit -m "feat: lambda classification, surrogate extraction, epoch geometry cache + pi/4 lock"
@@ -675,6 +676,12 @@ def test_P4_patch_rotated_box_3d(device):
     b = Box((0.5, 0.5, 0.5), (0.25, 0.18, 0.22),
             rotation=torch.tensor([0.3, 0.5, 0.2], dtype=torch.float64))
     _patch(b, 4, 1, 1.0, 3, device)
+
+
+def test_P4_patch_sphere_4d(device):
+    # dim-coverage policy: SBM machinery is k-generic; the patch is the cheap
+    # machine-precision structural check at k=4 (coarse level, p1, lam=1).
+    _patch(Sphere((0.5,) * 4, 0.35), 3, 1, 1.0, 4, device)
 
 
 def test_P4_patch_exterior_with_outer_dirichlet(device):
