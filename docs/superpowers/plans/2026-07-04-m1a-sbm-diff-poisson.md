@@ -169,7 +169,7 @@ plus `admissibility(oracle, band_pts) -> dict` (Task 3 fills the projection-depe
 
 **Steps:**
 
-- [ ] **Step 1: Failing tests** (`tests/test_geometry_oracles.py`, `pytestmark = pytest.mark.tier4`)
+- [x] **Step 1: Failing tests** (`tests/test_geometry_oracles.py`, `pytestmark = pytest.mark.tier4`)
 
 ```python
 import numpy as np
@@ -215,11 +215,11 @@ def test_params_graph():
     assert abs(float(s.radius.grad) + 1.0) < 1e-14
 ```
 
-- [ ] **Step 2: Run to verify failure** — `.venv/bin/pytest tests/test_geometry_oracles.py -v` → FAIL (module missing).
+- [x] **Step 2: Run to verify failure** — `.venv/bin/pytest tests/test_geometry_oracles.py -v` → FAIL (module missing).
 
-- [ ] **Step 3: Implement `oracle.py` + `csg.py`** per interfaces above. Every tensor `torch.float64`. `params` collects leaf tensors recursively (children first). Rodrigues rotation for dim=3; scalar angle for dim=2. Header docblocks cite spec §4.1 and note the ψ<0-inside-Ω convention.
+- [x] **Step 3: Implement `oracle.py` + `csg.py`** per interfaces above. Every tensor `torch.float64`. `params` collects leaf tensors recursively (children first). Rodrigues rotation for dim=3; scalar angle for dim=2. Header docblocks cite spec §4.1 and note the ψ<0-inside-Ω convention.
 
-- [ ] **Step 4: Run + full suite + commit**
+- [x] **Step 4: Run + full suite + commit**
 
 ```bash
 git add -A && git commit -m "feat: GeometryOracle protocol + AnalyticCSG torch backend"
