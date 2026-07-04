@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**M1 phasing:** M1 (spec §1.3, roadmap §10) ships in three plans. **M1a (this plan):** SBM core + all four geometry backends + differentiable Poisson with shape and conductivity gradients — Tier 4/5 + the AD foundations (Tier-2 VJPs #1 and #3). **M1b (next):** NS-VMS forward — both steppers, BDF1/BDF2, cylinder/sphere/cavity benchmarks. **M1c:** NS adjoints (shape + viscosity gradients) + neural-SDF hero demo. M1b's plan is authored after M1a merges, absorbing its findings (the M0→M0.5 pattern).
+**M1 phasing:** M1 (spec §1.3, roadmap §10) ships in three plans. **M1a (this plan):** SBM core + three geometry backends (AnalyticCSG, STL/TriMesh, GridSDF) + differentiable Poisson with shape and conductivity gradients — Tier 4/5 + the AD foundations (Tier-2 VJPs #1 and #3). **M1b (next):** NS-VMS forward — both steppers, BDF1/BDF2, cylinder/sphere/cavity benchmarks; the domain flag flips to `"outside"` (flow around the object). **M1c:** NS adjoints (shape + viscosity gradients) + NeuralSDF backend + neural-SDF hero demo (completing M1's four-backend gate). M1b's plan is authored after M1a merges, absorbing its findings (the M0→M0.5 pattern).
 
-**Goal:** Octree-SBM Poisson (Dirichlet + Neumann) on carved k-D meshes, with the GeometryOracle contract implemented by AnalyticCSG, GridSDF, STL/TriMesh, and NeuralSDF backends, and end-to-end adjoint gradients w.r.t. geometry parameters and conductivity κ validated against finite differences. Gates: **P4 keystone** (SBM linear patch on rotated geometries at all λ, machine precision), SBM MMS orders (p1 → 2, p2 → 3, error measured on Ω), the **π/4 area-correction locked test**, the **§13.3.3 p2-band Neumann acceptance test** (restored flux order + layer-sweep insensitivity), and **three-way gradient checks** (adjoint vs torch-twin vs central FD, rel < 1e-6).
+**Goal:** Octree-SBM Poisson (Dirichlet + Neumann) on carved k-D meshes, with the GeometryOracle contract implemented by AnalyticCSG, STL/TriMesh, and GridSDF backends (NeuralSDF completes the set in M1c), and end-to-end adjoint gradients w.r.t. geometry parameters and conductivity κ validated against finite differences. Gates: **P4 keystone** (SBM linear patch on rotated geometries at all λ, machine precision), SBM MMS orders (p1 → 2, p2 → 3, error measured on Ω), the **π/4 area-correction locked test**, the **§13.3.3 p2-band Neumann acceptance test** (restored flux order + layer-sweep insensitivity), and **three-way gradient checks** (adjoint vs torch-twin vs central FD, rel < 1e-6).
 
 **Architecture:** Geometry lives in torch (FP64) behind the SDF-oracle contract; distance vectors come from the framework Newton closest-point projection whose backward is the implicit-function theorem (Tier-2 VJP #3, spec §5.2). Per topology epoch (spec §4.2): carve → λ-classify at Gauss points → extract surrogate faces → one batched oracle evaluation of (d, n, n̄·n) cached FP64. SBM face terms are new Warp kernel factories on face-restricted basis tables; M1a solves use the **assembled-CSR path** (matrix-free SBM matvec arrives with NS in M1b), so the adjoint operator is literally `A.T` (Tier-2 VJP #1). ∂R/∂θ is a Warp-tape sweep over pure face-residual kernels chained into the torch geometry graph. Spec: §4 (pipeline), §1.5/§5.2 (differentiability), §13.1–13.3 (Neumann shift, p2 band), §9 (verification).
 
@@ -16,7 +16,7 @@
 - FP64 spine (spec §2.2.4): all geometry data (ψ, d, n, corr), residuals, and reductions are FP64. Torch code uses `torch.float64` explicitly — never rely on default dtype.
 - Verification pass criteria are fixed (spec §9.2): patch tests atol 1e-11; observed orders within ±0.10 over the last 3 of ≥4 levels; gradient checks rel < 1e-6 (FP64); baseline comparisons rtol 1e-6.
 - Kernel cache keys: every new factory keys on a distinct name string plus `(nbf, nqf, dim)` — no two integrands share a key (M0 deferred finding #3).
-- **Sign convention (locked here, used everywhere):** oracle ψ < 0 **inside the computational domain Ω**. Retention keeps elements by interior Gauss-point fraction. True-boundary outward normal n = ∇ψ(y)/‖∇ψ(y)‖ (points out of Ω). Surrogate normal ñ = axis-aligned outward from Ω̃. d = y − x̃ points from the surrogate Gauss point to its closest point y on Γ.
+- **Domain-side flag (locked here, used everywhere):** primitives keep ψ < 0 inside the shape; the **computational domain is selected by `domain ∈ {"inside", "outside"}`**, threaded through `classify_lambda`, `GeometryData.evaluate`, and the error masks — an eventual user config knob (spec §3.1 InputData). M1a solves the physics **inside** the object: `domain="inside"` (Ω = {ψ<0}) is the default. M1b's flow problems are **outside** the object: `domain="outside"` (Ω = {ψ>0}) — exercised now by this plan's exterior-configuration tests so M1b inherits a tested path. Retention counts Gauss points on the domain side. True-boundary outward normal n = s·∇ψ(y)/‖∇ψ(y)‖ with s = +1 ("inside") / −1 ("outside") — always pointing out of Ω; corr = ñ·n uses this oriented n. Surrogate normal ñ = axis-aligned outward from Ω̃. d = y − x̃ points from the surrogate Gauss point to its closest point y on Γ.
 - **No partially-exposed surrogate faces (M1a invariant):** every surrogate face is a whole element face (validated by sub-face probes at extraction; `ValueError` on violation). Narrowband refinement to a uniform level near Γ guarantees this. General nonconforming surrogate facets are deferred to M4 (epochs/AMR). Rationale: SC'21 cancellation-node rule, spec §2.3.
 - Weak-form sign/placement conventions follow Main & Scovazzi (JCP 2018, Dirichlet) and Atallah–Scovazzi (CMAME 2020, Neumann) as transcribed in Tasks 6/8; the transcriptions below are the contract (spec §13.1 requires this verification — it is done in this plan; re-derive the Γ̃→Γ limit sanity checks in the tests).
 - Purity (spec §3.2): all new face kernels are pure — every Gauss-point datum arrives via arrays; no hidden state. This is what makes the ∂R/∂θ tape sweep valid.
@@ -41,7 +41,6 @@ Create: src/diffsim/geometry/csg.py          # AnalyticCSG: primitives, rigid tr
 Create: src/diffsim/geometry/project.py      # Newton closest-point projection + IFT VJP (Tier-2 #3)
 Create: src/diffsim/geometry/gridsdf.py      # GridSDF: voxel grid + multilinear interp (torch)
 Create: src/diffsim/geometry/trimesh.py      # TriMeshOracle: wp.Mesh queries + FP64 torch refinement
-Create: src/diffsim/geometry/neuralsdf.py    # NeuralSDF MLP + fit_sdf trainer
 Create: src/diffsim/mesh/faces.py            # FaceTables: N/dN/d2N at face Gauss points
 Create: src/diffsim/mesh/pointeval.py        # point-evaluation weight matrix (probe QoIs)
 Create: src/diffsim/sbm/__init__.py
@@ -63,7 +62,7 @@ Create: tests/baselines/m1a_baselines.json   # locked in Task 11
 - `geometry.oracle.SDFOracle`: abstract base — `psi(x: torch.Tensor[N,dim]) -> torch.Tensor[N]` (dtype float64, graph-connected to `self.params`), `params: list[torch.Tensor]`, `near_eikonal: bool = False`. Provides numpy-facing `classify(pts) -> psi[N]`, `distance_vector(pts) -> (d[N,dim], n[N,dim], ok[N] bool)`, `velocity(pts, t) -> zeros` (static, M1). `admissibility(oracle, band_pts) -> dict(eps_inf, c0, d_hausdorff_bound, newton_ok_frac)`.
 - `geometry.project.closest_point(oracle, x_t: torch.Tensor) -> (y_t, ok)` — custom `torch.autograd.Function`, IFT backward; `distance_torch(oracle, x_np) -> (d_t, n_t, ok)` — full torch graph from `oracle.params` (adjoint driver re-runs this in backward); `distance_numpy(oracle, x_np)` — detached FP64 arrays for the forward pipeline.
 - `mesh.faces.face_tables(p, dim) -> FaceTables(p, dim, nqf, N[2*dim,nqf,nbf], dN[2*dim,nqf,nbf,dim], d2N[2*dim,nqf,nbf,dim,dim], w[nqf])` — face id `f = 2*ax + side`, side 0 = minus (ñ = −e_ax), matching `face_offsets` order; reference-element quantities (physical: dN·(2/h), d2N·(2/h)², dS = w·(h/2)^(dim−1)).
-- `sbm.surrogate.classify_lambda(tree, oracle, lam) -> (tree_retained, frac_in[Nret])` and `extract_surrogate(tree_retained) -> SurrogateFaces(elem[Nf] int64, face[Nf] int8)`; `face_gauss_points(tree, sf, ftab) -> xq[Nf*nqf, dim]`; `GeometryData.evaluate(oracle, tree, sf, ftab) -> GeometryData(xq, d, n, corr, ok)` (all FP64 numpy, frozen per epoch).
+- `sbm.surrogate.classify_lambda(tree, oracle, lam, domain="inside") -> (tree_retained, frac_in[Nret])` and `extract_surrogate(tree_retained) -> SurrogateFaces(elem[Nf] int64, face[Nf] int8)`; `face_gauss_points(tree, sf, ftab) -> xq[Nf*nqf, dim]`; `GeometryData.evaluate(oracle, tree, sf, ftab, domain="inside") -> GeometryData(xq, d, n, corr, ok)` (all FP64 numpy, frozen per epoch; `n` oriented out of Ω per the domain flag).
 - `assembly.operators.CSROperator(A_scipy_csr, device)` — `.matvec(x_wp, y_wp)`, `.matvec_numpy(x)`, `.n_free`, `.device` (the operator protocol, formalizing the M0 deferred item).
 - `sbm.poisson.SBMPoisson(dm, geo, sf, oracle_g=None, neumann=None, kappa=1.0, alpha=10.0)` — `.assemble() -> (A_csr, b, meta)` (constrained, outer strong Dirichlet by row replacement), `.solve(...) -> u_all[Nn]`, `.surrogate_flux(u_all) -> float` (area-corrected shifted flux ∫_Γ̃ κ(S∇u·n)(n·ñ) dS̃).
 - `sbm.adjoint.solve_adjoint(A_csr, dJdu_free, device) -> lam_free`; `shape_gradient(problem, u_all, lam_free, oracle) -> dict(param_tensor -> grad)`; `kappa_gradient(problem, u_all, lam_free) -> float`.
@@ -148,7 +147,7 @@ git add -A && git commit -m "chore: torch dep, M0.5 deferred cleanups, bicgstab 
 - `Union(a, b, k=0.0)` / `Intersection(a, b, k=0.0)` — exact min/max at k=0; polynomial smooth blend for k>0 (`h = clamp(0.5 + 0.5*(ψb−ψa)/k, 0, 1); smin = lerp(ψb, ψa, h) − k*h*(1−h)`). Smooth blends are NOT eikonal → `near_eikonal=False` (exercises Newton projection).
 - `Translate(child, offset)`.
 
-Sign convention: primitives are ψ < 0 inside the shape; the **computational domain** is wherever the composed oracle is negative (interior problem: the shape itself; exterior problem: `Complement`).
+Sign convention: primitives are ψ < 0 inside the shape; **which side is the computational domain is chosen by the `domain` flag downstream** (see Global Constraints), not by the oracle. `Complement` remains a set operation for composing shapes (e.g., a plate with a hole), not the mechanism for exterior domains.
 
 `oracle.py` provides:
 
@@ -440,10 +439,10 @@ git add -A && git commit -m "feat: face basis tables with second derivatives (N/
 
 **Semantics (spec §4.2):**
 
-- `classify_lambda(tree, oracle, lam, n1=3)`: sample ψ on the per-element `n1^dim` tensor Gauss lattice (reuse the `gauss_1d(2)` points mapped to each element); `frac_in = (#ψ<0)/n1^dim`. Retain elements with `frac_in ≥ lam` (Interior have frac 1 and are always retained; frac 0 dropped). `lam = 1.0` → only fully-interior elements (flux-accurate surrogate strictly inside Ω); `lam = 0.5` → optimal surrogate. Returns the retained `Octree` + `frac_in` for diagnostics.
+- `classify_lambda(tree, oracle, lam, domain="inside", n1=3)`: sample ψ on the per-element `n1^dim` tensor Gauss lattice (reuse the `gauss_1d(2)` points mapped to each element); `frac_in = (#on-domain-side)/n1^dim` where the domain side is ψ<0 (`"inside"`) or ψ>0 (`"outside"`). Retain elements with `frac_in ≥ lam` (Interior have frac 1 and are always retained; frac 0 dropped). `lam = 1.0` → only fully-interior elements (flux-accurate surrogate strictly inside Ω); `lam = 0.5` → optimal surrogate. Returns the retained `Octree` + `frac_in` for diagnostics.
 - `extract_surrogate(tree_retained)`: a face of a retained element is surrogate iff **no retained element lies across it AND it is not on the unit-cube boundary**. Probe just outside each face center via `LeafLookup.find`; validate with the `2^(dim−1)` sub-face probes — if the sub-probes disagree (partially exposed face), raise `ValueError("partially exposed surrogate face; refine the narrowband uniformly (M1a invariant)")`. Returns `SurrogateFaces(elem, face)` sorted by (elem, face) for determinism.
 - `face_gauss_points(tree, sf, ftab)`: physical coords of the `nqf` face Gauss points per surrogate face (fixed axis at the face plane, tangent axes at Gauss ξ mapped by `lo + (ξ+1)h/2`), flat `[Nf*nqf, dim]` in (face, q) order — kernels index `fi*nqf + q`.
-- `GeometryData.evaluate(oracle, tree, sf, ftab)`: one batched oracle call (spec §4.2 step 4): `d, n, ok = oracle.distance_vector(xq)`; `corr[i] = ñ_face(i) · n[i]`; assert `ok.all()` (raise with the admissibility report otherwise); everything FP64, immutable per epoch.
+- `GeometryData.evaluate(oracle, tree, sf, ftab, domain="inside")`: one batched oracle call (spec §4.2 step 4): `d, n_grad, ok = oracle.distance_vector(xq)`; `n = s·n_grad` with `s = +1/−1` per the domain flag (n always out of Ω); `corr[i] = ñ_face(i) · n[i]`; assert `ok.all()` (raise with the admissibility report otherwise); everything FP64, immutable per epoch.
 
 Narrowband helper for tests: `narrowband_refine(oracle, max_level, dim, pad=1.0)` — `build_adaptive` with predicate `|ψ(center)| ≤ pad·√dim·h` (h arrives as `[N,1]`, broadcast-ready — the documented M0 signature), then `balance2to1`, then `classify_lambda`. This produces uniform-level narrowbands, satisfying the M1a invariant by construction.
 
@@ -455,7 +454,7 @@ Narrowband helper for tests: `narrowband_refine(oracle, max_level, dim, pad=1.0)
 import numpy as np
 import pytest
 from diffsim.octree.build import build_uniform
-from diffsim.geometry.csg import Sphere, Complement
+from diffsim.geometry.csg import Sphere
 from diffsim.mesh.faces import face_tables
 from diffsim.sbm.surrogate import (classify_lambda, extract_surrogate,
                                    face_gauss_points, GeometryData)
@@ -523,12 +522,13 @@ def test_partially_exposed_face_raises():
         extract_surrogate(ret2)
 
 def test_exterior_configuration():
+    # domain = square minus disk (the M1b configuration), via the domain flag
     tree = build_uniform(5, dim=2)
-    oracle = Complement(Sphere((0.5, 0.5), 0.25))   # domain = square minus disk
-    ret, _ = classify_lambda(tree, oracle, 1.0)
+    oracle = Sphere((0.5, 0.5), 0.25)
+    ret, _ = classify_lambda(tree, oracle, 1.0, domain="outside")
     sf = extract_surrogate(ret)
     ftab = face_tables(1, 2)
-    geo = GeometryData.evaluate(oracle, ret, sf, ftab)
+    geo = GeometryData.evaluate(oracle, ret, sf, ftab, domain="outside")
     # normals point INTO the disk (outward from the domain)
     to_center = (0.5 - geo.xq) / np.linalg.norm(0.5 - geo.xq, axis=1, keepdims=True)
     assert (np.einsum("id,id->i", geo.n, to_center) > 0.9).all()
@@ -625,29 +625,29 @@ from diffsim.mesh.constraints import build_constraints
 from diffsim.mesh.basis import basis_tables
 from diffsim.mesh.faces import face_tables
 from diffsim.assembly.operators import DeviceMesh
-from diffsim.geometry.csg import Sphere, Box, Complement
+from diffsim.geometry.csg import Sphere, Box
 from diffsim.sbm.surrogate import classify_lambda, extract_surrogate, GeometryData
 from diffsim.sbm.poisson import SBMPoisson
 
 
-def sbm_setup(oracle, level, p, lam, dim, device):
+def sbm_setup(oracle, level, p, lam, dim, device, domain="inside"):
     tree = build_uniform(level, dim=dim)
-    ret, _ = classify_lambda(tree, oracle, lam)
+    ret, _ = classify_lambda(tree, oracle, lam, domain=domain)
     sf = extract_surrogate(ret)
     mesh = build_mesh(ret, p=p)
     cons = build_constraints(mesh)
     dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(p, dim=dim), device)
-    geo = GeometryData.evaluate(oracle, ret, sf, face_tables(p, dim))
+    geo = GeometryData.evaluate(oracle, ret, sf, face_tables(p, dim), domain=domain)
     return dm, geo, sf
 
 
 LIN = {2: (0.7, np.array([1.3, -0.4])), 3: (0.7, np.array([1.3, -0.4, 0.9]))}
 
 
-def _patch(oracle, level, p, lam, dim, device, atol=1e-11):
+def _patch(oracle, level, p, lam, dim, device, atol=1e-11, domain="inside"):
     c0, cv = LIN[dim]
     u_lin = lambda x: c0 + x @ cv
-    dm, geo, sf = sbm_setup(oracle, level, p, lam, dim, device)
+    dm, geo, sf = sbm_setup(oracle, level, p, lam, dim, device, domain=domain)
     prob = SBMPoisson(dm, geo, sf, g_fn=u_lin, kappa=1.0, alpha=10.0)
     u = prob.solve(f_fn=lambda x: np.zeros(len(x)))
     err = np.abs(u - u_lin(dm.mesh.node_coords)).max()
@@ -678,9 +678,9 @@ def test_P4_patch_rotated_box_3d(device):
 
 
 def test_P4_patch_exterior_with_outer_dirichlet(device):
-    # square minus disk: SBM on the disk + strong Dirichlet on the outer square
-    oracle = Complement(Sphere((0.5, 0.5), 0.25))
-    _patch(oracle, 5, 1, 1.0, 2, device)
+    # square minus disk (the M1b configuration): SBM on the disk + strong outer
+    # Dirichlet, domain = {psi > 0} via the flag
+    _patch(Sphere((0.5, 0.5), 0.25), 5, 1, 1.0, 2, device, domain="outside")
 
 
 def test_alpha_insensitivity_of_patch(device):
@@ -723,7 +723,7 @@ git add -A && git commit -m "feat: SBM Dirichlet Poisson (assembled path); P4 ro
 **Configurations:**
 
 1. **Interior disk (2D):** Ω = disk(c=(0.5,0.5), r=0.3), u* = sin(πx)sin(πy), f = 2π²u*, all boundary via SBM Dirichlet. Levels 4–7, p1 → order 2; levels 4–6, p2 → order 3. λ = 1.0 and one λ = 0.5 spot check (same order).
-2. **Exterior square-minus-disk (2D):** strong outer Dirichlet + SBM disk, same u*. Levels 4–7, p1.
+2. **Exterior square-minus-disk (2D, `domain="outside"` — the M1b configuration):** strong outer Dirichlet + SBM disk, same u*. Levels 4–7, p1.
 3. **Interior sphere (3D):** u* = sin(πx)sin(πy)sin(πz), f = 3π²u*, levels 3–5, p1 → order 2 (one 3D confirmation; 2D carries the ladder per spec §11.1 "k=2 is the cheap verification dimension").
 4. κ ≠ 1 spot check: config 1 at κ = 2.5, f = 2.5·2π²u* — identical errors to κ=1 within rtol 1e-12 (pure scaling).
 
@@ -734,14 +734,17 @@ Order asserted via least-squares slope of log(err) vs log(h) over the last 3 lev
 - [ ] **Step 1: Failing tests** — the MMS ladder helper:
 
 ```python
-def _mms_ladder(oracle, levels, p, lam, dim, device, u_fn, f_fn, kappa=1.0):
+def _mms_ladder(oracle, levels, p, lam, dim, device, u_fn, f_fn, kappa=1.0,
+                domain="inside"):
+    sgn = -1.0 if domain == "inside" else 1.0
     errs = []
     for lv in levels:
-        dm, geo, sf = sbm_setup(oracle, lv, p, lam, dim, device)
+        dm, geo, sf = sbm_setup(oracle, lv, p, lam, dim, device, domain=domain)
         prob = SBMPoisson(dm, geo, sf, g_fn=u_fn, kappa=kappa)
         u = prob.solve(f_fn=f_fn, g_outer_fn=u_fn)
         from diffsim.physics.poisson import l2_error_masked
-        errs.append(l2_error_masked(dm, u, u_fn, lambda x: oracle.classify(x) < 0))
+        errs.append(l2_error_masked(dm, u, u_fn,
+                                    lambda x: sgn * oracle.classify(x) > 0))
     return np.array(errs)
 
 def _slope(errs, levels):
@@ -795,7 +798,7 @@ Kernels: `make_sbm_neumann_Ae(nbf, nqf, dim)` (key `"sbm_neu_Ae"`) — inputs ad
 
 `surrogate_flux(u_all) -> float`: ∫_Γ̃ κ(S∇u·n)(n·ñ) dS̃ — the area-corrected shifted estimate of the true-boundary flux ∫_Γ κ∇u·n dΓ (the "Nusselt" observable; kernel key `"sbm_flux"`).
 
-**Acceptance test (§13.3.3):** exterior square-minus-disk, u* = sin(πx)cos(πy) (nonzero flux on the disk), strong outer Dirichlet from u*, SBM **Neumann** on the disk with q_N = κ∇u*·n evaluated at mapped points. Measure `|surrogate_flux(u) − F*|` where F* = ∫_Γ κ∇u*·n dΓ (semi-analytic: 1D trapezoid quadrature over the circle at 4096 points, computed in the test).
+**Acceptance test (§13.3.3):** exterior square-minus-disk (`domain="outside"`), u* = sin(πx)cos(πy) (nonzero flux on the disk), strong outer Dirichlet from u*, SBM **Neumann** on the disk with q_N = κ∇u*·n evaluated at mapped points. Measure `|surrogate_flux(u) − F*|` where F* = ∫_Γ κ∇u*·n dΓ (semi-analytic: 1D trapezoid quadrature over the circle at 4096 points, computed in the test).
 
 1. **π/4 lock (solve level):** with `corr` forced to 1 (test-only flag `_area_correction=False`), the flux error stalls O(1); with correction, it converges.
 2. **p1 vs p2 band:** uniform-level mesh, `p_elem = 2` for elements within `n_layers·h` of the disk (|ψ(center)| test), 1 elsewhere; one-knob is trivially satisfied (single level). p1-everywhere flux order degraded (≈1); band n_layers=2 restores order ≈2 (±0.10 both).
@@ -813,31 +816,30 @@ git add -A && git commit -m "feat: SBM Neumann (area correction + Hessian shift)
 
 ---
 
-### Task 9: GridSDF, TriMesh (STL), NeuralSDF backends + cross-backend oracle suite
+### Task 9: TriMesh (STL) + GridSDF backends + cross-backend oracle suite
 
 **Files:**
-- Create: `src/diffsim/geometry/gridsdf.py`, `src/diffsim/geometry/trimesh.py`, `src/diffsim/geometry/neuralsdf.py`
+- Create: `src/diffsim/geometry/gridsdf.py`, `src/diffsim/geometry/trimesh.py`
 - Test: append to `tests/test_geometry_oracles.py` (tier4 unit) and `tests/test_sbm_poisson.py` (tier5 cross-backend)
+
+(NeuralSDF is deferred to M1c with the hero demo; the oracle contract and the IFT projection it rides on are fully exercised here by the two non-analytic backends.)
 
 **GridSDF:** voxel corner values `V [n+1]^dim` (torch FP64, the differentiable parameter = level-set shape optimization, spec §4.1) on the unit cube; `psi(x)` = multilinear interpolation written with explicit gather + lerp (autograd-clean, exact FP64 — not `grid_sample`). `from_oracle(oracle, n)` sampler. `near_eikonal=False` (interpolation of an SDF is only approximately eikonal) → Newton projection. Note: ψ is C⁰ across cell faces — Newton on a multilinear field converges within cells; cap+mask handles edge cases, and the admissibility report quantifies ε̂∞ ~ Δx².
 
 **TriMeshOracle:** vertices `verts` (torch FP64 [Nv,3], the differentiable parameter), triangles `tris` (int32 [Nt,3]). Forward queries via `wp.Mesh` (fp32) for **candidate location only**: `wp.mesh_query_point_sign_winding_number` → (sign, nearest triangle index). FP64 refinement in torch: exact closest-point-on-triangle for the found triangle (clamped barycentric regions; region selected from the FP64 computation, then the smooth per-region formula keeps autograd exactness — piecewise-smooth per spec §1.5). `psi = sign·‖x − y‖`; `distance_vector` overridden (no Newton): `d = y − x`, `n = sign-corrected triangle/edge/vertex normal via normalize(x−y)·(−sign)` — document: n from the closest-point direction, exact for points off the surface. `icosphere(n_sub, center, radius)` generator (subdivided icosahedron, no file I/O) + `load_stl(path)` (binary STL via `struct`, no new dependency). `params = [verts]`.
 2D note: TriMesh is 3D-only (document); the cross-backend suite runs it on the 3D sphere case.
 
-**NeuralSDF:** MLP in raw torch FP64 (`torch.nn` allowed): `dim → 64 → 64 → 1`, `tanh` activations (smooth ⇒ Hessians exist for IFT), skip connection from input to the last layer. `fit_sdf(target_oracle, dim, seed, n_pts=20000, iters=2000, lr=1e-3, band=0.15)`: sample points in the band + uniform, loss = MSE on ψ + 0.1·eikonal penalty `(‖∇ψ‖−1)²` (the Lipschitz-bounded training contract, spec §6.3); deterministic seed; assert final band ε∞ < 3e-4. `params = list(mlp.parameters())`, `near_eikonal=False`.
-
-**Cross-backend verification suite (the oracle suite, spec §1.3 "all four backends exercised"):** one parametrized tier5 test running the interior-sphere SBM Dirichlet solve per backend and comparing to the AnalyticCSG baseline:
+**Cross-backend verification suite (the oracle suite; three of M1's four backends here — NeuralSDF joins the same parametrized test in M1c):** one parametrized tier5 test running the interior-sphere SBM Dirichlet solve per backend and comparing to the AnalyticCSG baseline:
 
 ```python
-@pytest.mark.parametrize("backend", ["csg", "grid", "trimesh", "neural"])
+@pytest.mark.parametrize("backend", ["csg", "trimesh", "grid"])
 def test_cross_backend_sphere_mms(backend, device):
     dim, level, r = 3, 4, 0.32
     target = Sphere((0.5,) * 3, r)
     oracle = {
         "csg": lambda: target,
-        "grid": lambda: GridSDF.from_oracle(target, n=128),
         "trimesh": lambda: icosphere(3, (0.5,) * 3, r),
-        "neural": lambda: fit_sdf(target, dim=3, seed=20260704),
+        "grid": lambda: GridSDF.from_oracle(target, n=128),
     }[backend]()
     u = lambda x: np.sin(np.pi * x[:, 0]) * np.sin(np.pi * x[:, 1]) * np.sin(np.pi * x[:, 2])
     f = lambda x: 3 * np.pi ** 2 * u(x)
@@ -851,16 +853,16 @@ def test_cross_backend_sphere_mms(backend, device):
     assert err < 2.0 * baseline + 10.0 * diag["eps_inf"]
 ```
 
-plus tier4 unit tests per backend: projection/closest-point accuracy vs the analytic sphere (`grid`: < 5·Δx²; `trimesh`: < faceting sagitta bound `r(1−cos θ)` computed from the subdivision level; `neural`: < 10·fitted ε∞), sign correctness inside/outside, admissibility report sanity, and the **P4-with-approximate-geometry check**: linear patch error < 50·ε̂∞ (validates that the diagnostics bound what the patch test sees — analytic backends stay at 1e-11).
+plus tier4 unit tests per backend: projection/closest-point accuracy vs the analytic sphere (`grid`: < 5·Δx²; `trimesh`: < faceting sagitta bound `r(1−cos θ)` computed from the subdivision level), sign correctness inside/outside, admissibility report sanity, and the **P4-with-approximate-geometry check**: linear patch error < 50·ε̂∞ (validates that the diagnostics bound what the patch test sees — analytic backends stay at 1e-11).
 
 **Steps:**
 
 - [ ] **Step 1: Failing unit tests per backend** (as specified above)
-- [ ] **Step 2: Implement the three backends** (each with a header docblock citing spec §4.1's backend table and the differentiable-parameter column)
-- [ ] **Step 3: Cross-backend suite; run; full suite; commit.** NeuralSDF training runs once per session (`@pytest.fixture(scope="session")`) on `cuda:0`; keep it < 60 s.
+- [ ] **Step 2: Implement the two backends** (each with a header docblock citing spec §4.1's backend table and the differentiable-parameter column)
+- [ ] **Step 3: Cross-backend suite; run; full suite; commit.**
 
 ```bash
-git add -A && git commit -m "feat: GridSDF/TriMesh/NeuralSDF backends + cross-backend oracle suite"
+git add -A && git commit -m "feat: TriMesh(STL) + GridSDF backends + cross-backend oracle suite"
 ```
 
 ---
@@ -932,14 +934,13 @@ def test_frozen_classification_trust_region(device):
     # here additionally assert the retained key set is bit-identical.
     ...
 
-def test_gradient_grid_stl_neural(device):
-    # grid: dJ/dV for 5 random voxels vs FD (rel 1e-6)
+def test_gradient_grid_stl(device):
     # stl:  dJ/dverts for 3 random vertices (9 comps) vs FD (rel 1e-5 —
     #       fp32 BVH candidate selection is forward-only; FP64 refinement keeps
     #       the gradient itself exact, but candidate flips near Voronoi edges
     #       justify the slightly looser bar; assert no flip via triangle-id equality)
-    # neural: directional derivative along a random unit weight-direction
-    #         <grad, v> vs FD of J(w + eps v) (rel 1e-6)
+    # grid: dJ/dV for 5 random voxels vs FD (rel 1e-6)
+    # (neural weight-direction check arrives with the NeuralSDF backend in M1c)
     ...
 ```
 
@@ -963,7 +964,7 @@ git add -A && git commit -m "feat: adjoint shape/kappa gradients (Tier-2 VJP 1 +
 
 **Baselines (`m1a_baselines.json`, locked at rtol 1e-6 like m0/m05):** MMS error ladders (Task 7 configs), Neumann flux-error ladders p1/p2-band (Task 8), corrected-perimeter value (Task 5), cross-backend solve errors (Task 9), and the three-way gradient values for the CSG case (Task 10). Regression test `test_m1a_baselines_locked` compares with rtol 1e-6 and a formatted mismatch message (M0.5 informational finding: format the diff, not a raw tuple).
 
-**Docs:** mark the addressed items in `m0-deferred-findings.md` (dead code, ValueError, docstrings, bicgstab guards, operator protocol, integrand-tag keys); open `m1a-deferred-findings.md` recording at minimum: matrix-free SBM matvec + transposed matvec (needed by M1b NS), nonconforming surrogate facets (M4), `ConstrainedOperator` scratch-buffer reentrancy (M1b, GPU streams), TriMesh 2D support, GridSDF tricubic option, and anything discovered during execution.
+**Docs:** mark the addressed items in `m0-deferred-findings.md` (dead code, ValueError, docstrings, bicgstab guards, operator protocol, integrand-tag keys); open `m1a-deferred-findings.md` recording at minimum: matrix-free SBM matvec + transposed matvec (needed by M1b NS), nonconforming surrogate facets (M4), `ConstrainedOperator` scratch-buffer reentrancy (M1b, GPU streams), TriMesh 2D support, GridSDF tricubic option, NeuralSDF backend + weight-direction gradient check (M1c, with the hero demo), surfacing the `domain` flag through the eventual `InputData` config (spec §3.1), and anything discovered during execution.
 
 **Steps:**
 
@@ -981,6 +982,6 @@ git add -A && git commit -m "feat: shape-inverse capstone; lock m1a baselines; M
 ## Execution notes
 
 - **Order is strict** (each task consumes the previous task's interfaces). Tasks 2–4 are independent of each other after Task 1 and may be parallelized by separate workers if desired; everything from Task 5 on is sequential.
-- **Runtime discipline:** the full suite must stay under ~5 minutes on the workstation GPU (CI gate, spec §9.3). The expensive items are the 3D MMS level-5 solve, NeuralSDF fitting (session-scoped fixture), and the capstone. If any test exceeds its budget, shrink the level, never the tolerance.
+- **Runtime discipline:** the full suite must stay under ~5 minutes on the workstation GPU (CI gate, spec §9.3). The expensive items are the 3D MMS level-5 solve and the capstone. If any test exceeds its budget, shrink the level, never the tolerance.
 - **When something fails to converge or a formula looks sign-suspect:** the Γ̃→Γ limit tests (d=0 recovers classical Nitsche/Neumann) and the α-insensitivity patch test isolate weak-form bugs from geometry bugs. Trust the patch test: if P4 fails at 1e-11 the weak form or the geometry cache is wrong — do not loosen the tolerance (spec §9.2: pass criteria are the contract).
-- **M1b inputs to carry forward** (record in m1a-deferred-findings as they materialize): measured bicgstab iteration counts vs α and λ (feeds the MF3 conditioning narrative), NeuralSDF ε∞ vs solve-error data (the geometry-limited-refinement plateau, spec §4.1), and the adjoint/forward wall-clock ratio (spec §9.3 gate: ≤ 2.5×).
+- **M1b inputs to carry forward** (record in m1a-deferred-findings as they materialize): measured bicgstab iteration counts vs α and λ (feeds the MF3 conditioning narrative), GridSDF Δx vs solve-error data (the geometry-limited-refinement plateau, spec §4.1), the `domain="outside"` test coverage M1b builds on, and the adjoint/forward wall-clock ratio (spec §9.3 gate: ≤ 2.5×).
