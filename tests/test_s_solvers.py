@@ -43,3 +43,13 @@ def test_S1_reported_residual_matches_recomputed(device):
     x, info = cg(op, b, tol=1e-10)
     relres = np.linalg.norm(b - A @ x) / np.linalg.norm(b)
     assert abs(relres - info["relres"]) < 1e-9
+
+def test_S3_bicgstab_breakdown_guard(device):
+    # Skew-symmetric A makes rhat . (A p) = b^T A b = 0 exactly at iteration 1:
+    # a textbook BiCGStab breakdown. The guard must bail out cleanly with a
+    # tagged info dict instead of dividing by zero.
+    A = np.array([[0.0, 1.0], [-1.0, 0.0]])
+    b = np.array([1.0, 1.0])
+    x, info = bicgstab(DenseOp(A, device), b, maxiter=50)
+    assert info["converged"] is False
+    assert info["breakdown"] == "rhat_v"

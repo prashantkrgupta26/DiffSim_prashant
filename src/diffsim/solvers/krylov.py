@@ -45,6 +45,7 @@ def bicgstab(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None):
     x = wp.zeros(n, dtype=wp.float64, device=d)
     r = wp.clone(bd)
     rhat = wp.clone(bd)
+    rnorm = np.sqrt(blas.dot(r, r, d))
     p = wp.zeros(n, dtype=wp.float64, device=d)
     v = wp.zeros(n, dtype=wp.float64, device=d)
     s = wp.zeros(n, dtype=wp.float64, device=d)
@@ -56,6 +57,11 @@ def bicgstab(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None):
     bnorm = max(np.sqrt(blas.dot(bd, bd, d)), 1e-300)
     for it in range(1, maxiter + 1):
         rho_new = blas.dot(rhat, r, d)
+        # Breakdown guards: rho or rhat.v collapsing to ~0 means the shadow
+        # residual has become orthogonal — bail out cleanly, never divide.
+        if abs(rho_new) < 1e-300 * bnorm * bnorm:
+            return x.numpy(), {"iters": it, "relres": rnorm / bnorm,
+                               "converged": False, "breakdown": "rho"}
         beta = (rho_new / rho) * (alpha / omega) if it > 1 else 0.0
         # p = r + beta (p - omega v)
         blas.axpy(-omega, v, p, d)
@@ -65,7 +71,11 @@ def bicgstab(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None):
         else:
             wp.copy(ph, p)
         op.matvec(ph, v)
-        alpha = rho_new / blas.dot(rhat, v, d)
+        rhat_v = blas.dot(rhat, v, d)
+        if abs(rhat_v) < 1e-300 * bnorm * bnorm:
+            return x.numpy(), {"iters": it, "relres": rnorm / bnorm,
+                               "converged": False, "breakdown": "rhat_v"}
+        alpha = rho_new / rhat_v
         wp.copy(s, r); blas.axpy(-alpha, v, s, d)
         if Minv is not None:
             blas.hadamard(Minv, s, sh, d)

@@ -121,3 +121,8 @@ def test_mixed_linear_patch_machine_precision(device):
     LIN = lambda x: 1.0 + 2 * x[:, 0] - 3 * x[:, 1] + 0.5 * x[:, 2]
     u = DirichletPoisson(dm).solve(g_fn=LIN, f_fn=lambda x: np.zeros(len(x)), tol=1e-13)
     assert l2_error(dm, u, LIN) < 1e-11
+
+def test_p_elem_out_of_range_raises():
+    t = build_uniform(1, dim=3)
+    with pytest.raises(ValueError, match="p_elem"):
+        build_mesh(t, np.full(len(t), 3, np.int8))

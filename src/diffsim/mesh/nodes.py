@@ -56,7 +56,9 @@ def build_mesh(tree: Octree, p) -> Mesh:
     dim = tree.dim
     p_elem = (np.full(len(tree), p, np.int8) if np.isscalar(p)
               else np.asarray(p, np.int8))
-    assert set(np.unique(p_elem)) <= {1, 2}
+    if not set(np.unique(p_elem)) <= {1, 2}:
+        raise ValueError(
+            f"p_elem must contain only 1 and 2, got {sorted(set(np.unique(p_elem)))}")
     uniform = len(np.unique(p_elem)) == 1
     if not uniform:
         _validate_one_knob(tree, p_elem)

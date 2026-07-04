@@ -2,7 +2,7 @@
 name = "diffsim"
 version = "0.0.1"
 requires-python = ">=3.10"
-dependencies = ["warp-lang>=1.7", "numpy>=1.26", "scipy>=1.11"]
+dependencies = ["warp-lang>=1.7", "numpy>=1.26", "scipy>=1.11", "torch>=2.4"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
@@ -20,4 +20,7 @@ markers = [
   "tier1: sanity & determinism (octree infrastructure)",
   "tier2: connectivity & patch tests",
   "tier3: operator & assembly correctness",
+  "tier4: geometry oracles, classification, surrogate extraction",
+  "tier5: SBM solves, MMS orders, backend cross-verification",
+  "ad: adjoint/gradient checks (Tier AD)",
 ]

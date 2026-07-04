@@ -1,7 +1,7 @@
 import numpy as np
 import scipy.sparse as sp
 import warp as wp
-from .femelm import FEMElm, fe_N, fe_dN, fe_detJxW, fe_dN_s, fe_detJxW_s
+from .femelm import FEMElm, fe_dN_s, fe_detJxW_s
 
 # Dim-keyed float64 vector types for gradient accumulation.
 _VEC = {2: wp.vec2d, 3: wp.vec3d, 4: wp.vec4d}
@@ -126,6 +126,12 @@ class DeviceMesh:
     Accepts ``tables_by_p`` as either a single ``Tables`` object (uniform
     back-compat, wrapped internally as ``{mesh.p: tables}``) or a
     ``dict[int, Tables]`` for mixed-p meshes.
+
+    Back-compat accessor asymmetry (deliberate): ``conn``/``h``/``N``/``dN``/
+    ``w`` assert a single-bin (uniform) mesh, because silently returning one
+    bin's arrays for a mixed mesh would drop elements. ``tables`` does NOT
+    assert — it returns the max-p Tables, which is well-defined for any mesh
+    (quadrature metadata, not per-element data).
     """
 
     def __init__(self, mesh, constraints, tables_by_p, device):
@@ -186,6 +192,8 @@ class DeviceMesh:
 
 
 def integrate_volume(dm: DeviceMesh) -> float:
+    """Total mesh volume. Uniform mesh only (single-bin DeviceMesh); mixed-p
+    meshes raise at the first back-compat accessor (``dm.h``)."""
     out = wp.zeros(1, dtype=wp.float64, device=dm.device)
     kernel = make_volume_kernel(dm.tables.nqp, dm.dim)
     wp.launch(kernel, dim=len(dm.mesh.tree),

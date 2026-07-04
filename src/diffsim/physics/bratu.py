@@ -25,7 +25,13 @@ def make_gp_interp_kernel(nbf: int, nqp: int):
 
 
 class BratuProblem:
-    """F(u) = A_bc u - b_bc(lambda e^u), homogeneous Dirichlet on the unit cube."""
+    """F(u) = A_bc u - b_bc(lambda e^u), homogeneous Dirichlet on the unit cube.
+
+    Uniform mesh only (single-bin DeviceMesh). Note: a mixed-p mesh constructs
+    silently (the constructor only reads ``dm.tables``, which has no
+    single-bin assert) and fails at the first ``residual``/``jac_action``
+    call, where ``dm.conn`` asserts.
+    """
     def __init__(self, dm, lam):
         self.dm, self.lam = dm, lam
         self.op = ConstrainedOperator(dm)
