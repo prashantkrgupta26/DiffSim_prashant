@@ -149,3 +149,16 @@
    position stands: cuDSS to the memory ceiling, AMGX for SPD subsystems.
    src/diffsim/solvers/block_precond.py kept as the experiment harness,
    marked EXPERIMENTAL, not in the dispatch.
+
+9. **The constraints wall was LeafLookup.find, and it is closed (overnight
+   campaign (a); Dendro-KT exploration).** Two-stage diagnosis, both
+   measured: batching build_constraints' callers alone gained 1.0x — the
+   per-point Python level-walk lived INSIDE find. Vectorized find
+   (per-level sorted key arrays + one searchsorted sweep, finest-first)
+   plus the batched sort/segment constraint builder: the L7-adapted 2D
+   case went 203.31 s -> 0.31 s (656x), bit-identical across the mesh zoo
+   (dims 2/3/4, adapted, periodic, mixed-p; reference kept as the oracle).
+   Every find caller accelerates (classification, pointeval, faces); the
+   FULL SUITE dropped from ~50 min to 26:42. The m0.5 deferred item and
+   P1's measured bottleneck-inversion are now historical; 3D at scale is
+   unblocked (harvest: band L6/L7, sphere Re=300).
