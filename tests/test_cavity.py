@@ -81,3 +81,33 @@ def test_cavity_re100_ghia(device):
     i_min = int(np.argmin(u_c))
     assert abs(GHIA_Y[i_min] - 0.4531) < 0.2, GHIA_Y[i_min]
     assert u_c[i_min] < -0.15, u_c[i_min]
+
+
+def test_cavity_re100_ghia_leray(device):
+    """Spec S17 discipline: the SAME benchmark through the Leray stepper.
+    True-transient march (BDF2) to steady; same Ghia tolerance."""
+    from diffsim.steppers.leray import LerayProjectionStepper
+    level, Re, dt = 5, 100.0, 0.05
+    tree = build_uniform(level, dim=2)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), device)
+    st = LerayProjectionStepper(
+        dm, 1.0 / Re, dt, f_fn=lambda x, t: np.zeros((len(x), 2)),
+        g_fn=_lid_g, order=1, picard_iters=1)
+    st.set_initial(lambda x: np.zeros((len(x), 2)))
+    # MEASURED: the centerline profile converges to du_ghia = 0.0035 by
+    # step 150 while the max-rate criterion plateaus ~1e-2 (a slowly
+    # decaying pressure-splitting oscillation that never touches the
+    # profile) — so march a FIXED 200 steps and assert the physics, not
+    # the rate. Note: the Leray profile lands ~10x closer to Ghia than the
+    # coarse tolerance requires.
+    for _ in range(200):
+        u, p = st.step()
+    W_u = point_eval_weights(mesh, np.stack(
+        [np.full_like(GHIA_Y, 0.5), GHIA_Y], axis=1))
+    T = dm.constraints.T.tocsr()
+    u_c = np.asarray(W_u @ np.asarray(T @ u[:, 0]))
+    du = np.abs(u_c - GHIA_U).max()
+    assert du < 0.06, (du, u_c.round(4).tolist())
+    assert du < 0.02, du     # measured 0.0035 — lock well inside it
