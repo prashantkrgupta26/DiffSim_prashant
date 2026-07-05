@@ -1,4 +1,10 @@
-"""Tutorial 02 — Differentiable simulation: find the hidden circle.
+"""E1 — Differentiable simulation: find the hidden circle.
+
+LEARNING OUTCOME. You can close the design loop: define a quantity of
+interest on simulation output, obtain d(QoI)/d(geometry) by the ADJOINT
+method (one extra linear solve, cost independent of the number of
+parameters), and drive gradient descent that re-carves the mesh every
+iteration.
 
 THE GAME. Someone solved the Poisson problem of tutorial 01 on a SECRET disk
 (center and radius unknown to you) and handed you only nine probe readings
@@ -24,7 +30,7 @@ well-defined. Between iterations the world is rebuilt: new retained set, new
 surrogate, new constraints. Gradients survive because they never depended on
 mesh topology, only on the smooth geometric quantities.
 
-Run:  python tutorials/02_shape_optimization.py     (~2 min)
+Run:  python tutorials/E_differentiable/E1_shape_optimization.py     (~2 min)
 """
 import numpy as np
 import torch
@@ -109,7 +115,7 @@ if __name__ == "__main__":
     print(f"true      theta = {truth}")
     print(f"|error|         = {np.abs(found - truth).round(6)}")
     print("""
-EXERCISES
+EXPLORE
   (a) Delete probes until recovery fails. How few readings determine three
       geometric unknowns, and which configurations are degenerate?
   (b) The conductivity was kappa = 1.3. Add it as a fourth unknown using
@@ -119,3 +125,8 @@ EXERCISES
       same machinery (see test_gradient_gridsdf_voxels) — congratulations,
       you are doing level-set topology optimization.
 """)
+
+# PERFORMANCE CORNER: per optimization iteration, time forward solve vs
+# adjoint solve vs tape sweep vs re-carving. The adjoint should cost ~one
+# forward solve REGARDLESS of having 3 or 3000 parameters — the whole point
+# of adjoints. Verify by optimizing GridSDF voxels (thousands of theta).

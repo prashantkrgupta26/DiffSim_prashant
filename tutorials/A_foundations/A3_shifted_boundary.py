@@ -1,6 +1,13 @@
-"""Tutorial 01 — Poisson on an immersed disk with the Shifted Boundary Method.
+"""A3 — Immersed geometry: the Shifted Boundary Method.
 
-THE PROBLEM. Solve  -div(grad u) = f  INSIDE a disk of radius 0.3 centered in
+LEARNING OUTCOME. You can solve a PDE on a domain that has NO body-fitted
+mesh — only a signed-distance oracle — and you understand the three moving
+parts: element classification (keep/discard), the surrogate staircase
+boundary, and the Taylor shift that restores accuracy. You also meet the
+INHOMOGENEOUS boundary data that A2 deferred: here g lives on the TRUE
+circle and is mapped to the staircase by the shift.
+
+BACKGROUND. THE PROBLEM. Solve  -div(grad u) = f  INSIDE a disk of radius 0.3 centered in
 the unit square, with u = g on the circle — but WITHOUT a body-fitted mesh.
 The mesh is a uniform Cartesian octree of the whole square; the circle is
 known only through a signed-distance oracle psi(x) (negative inside).
@@ -19,7 +26,10 @@ pick u*(x) = sin(pi x) cos(pi y), derive f = -lap(u*), impose g = u*, and
 measure how fast the discrete solution converges to u* under refinement.
 Expected: second order in L2 for linear elements. You will see it.
 
-Run:  python tutorials/01_poisson_immersed_disk.py
+EXPECTED RESULTS: errors ~ 3.2e-3 / 6.6e-4 / 1.5e-4, orders 2.28 / 2.13
+(slightly superconvergent early — common for SBM on smooth geometry).
+
+Run:  python tutorials/A_foundations/A3_shifted_boundary.py
 """
 import numpy as np
 
@@ -101,7 +111,7 @@ if __name__ == "__main__":
         print(f"  level {a} -> {b}:  order = "
               f"{np.log2(errors[a] / errors[b]):.2f}")
     print("""
-EXERCISES
+EXPLORE
   (a) Set p=2 in solve_at_level and watch the order go to 3 — then read
       _shift_fn_for in src/diffsim/sbm/poisson.py to see the Hessian term
       that makes it possible (and why p=1 must NOT include it).
@@ -113,3 +123,8 @@ EXERCISES
       Sphere((0.5,0.5),0.3), n=128) — the same solve through a sampled
       voxel geometry. Compare the error floors.
 """)
+
+# PERFORMANCE CORNER: classification samples psi at Gauss points inside a
+# Lipschitz narrow band. Time classify_lambda vs level at 4..8 and fit the
+# exponent. It should track the number of INTERCEPTED elements O(2^level),
+# not the total O(4^level) — the narrow band is why.

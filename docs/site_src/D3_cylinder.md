@@ -1,0 +1,129 @@
+# D3 — Flow past an immersed cylinder: obstacles and forces
+
+LEARNING OUTCOME. You can compose everything: a carved exterior domain
+(A6), the vector shifted-boundary condition for no-slip on the obstacle
+(A3's machinery, per velocity component), a pseudo-time march to steady
+flow (D2), and a FORCE observable — drag and lift from the shifted
+traction on the surrogate boundary. You report a drag coefficient with
+its configuration attached (confinement matters!).
+
+BACKGROUND. Re = U D / nu = 20: steady, symmetric twin-vortex wake.
+Domain [0,1]^2, cylinder r = 0.07 at (0.3, 0.5) — 14% blockage, so expect
+Cd ABOVE the unbounded-flow value (~2.0); our locked CI reference at
+level 5 is Cd = 2.847. Forces come from
+    F = oint ( p n_hat - nu grad(u).n_hat ) dS
+on the surrogate staircase, area-corrected to the true circle, with
+n_hat the OBSTACLE-outward normal (orientation contract in
+diffsim/sbm/vector.py — it was measured, not guessed).
+
+EXPECTED RESULTS (level 5, ~50 pseudo-steps, ~15 s):
+    Cd = 2.85 +/- 0.01,  |Cl| < 1e-3  (symmetric wake)
+
+Run:  python tutorials/D_flow/D3_cylinder.py
+
+??? example "Full script — `tutorials/D_flow/D3_cylinder.py` (run it!)"
+
+    ```python
+    import numpy as np
+    import scipy.sparse as sp
+    from scipy.sparse.linalg import splu
+    
+    from diffsim.octree.build import build_uniform
+    from diffsim.mesh.nodes import build_mesh
+    from diffsim.mesh.constraints import build_constraints
+    from diffsim.mesh.basis import basis_tables
+    from diffsim.mesh.faces import face_tables
+    from diffsim.assembly.operators import DeviceMesh
+    from diffsim.geometry.csg import Sphere
+    from diffsim.sbm.surrogate import classify_lambda, extract_surrogate, GeometryData
+    from diffsim.sbm.vector import sbm_vector_dirichlet, surrogate_traction
+    from diffsim.api.ns_bricks import assemble_linear_ns
+    from diffsim.physics.poisson import gauss_points
+    
+    DEVICE = "cuda:0"
+    R, CTR, U_IN = 0.07, (0.3, 0.5), 1.0
+    NU = 2 * U_IN * R / 20.0                        # Re_D = 20
+    
+    
+    if __name__ == "__main__":
+        level, ndof, dim, dt = 5, 3, 2, 0.05
+        # ---- carve the exterior domain and prepare the SBM data (A6 + A3) ----
+        oracle = Sphere(CTR, R)
+        tree = build_uniform(level, dim=2)
+        ret, _ = classify_lambda(tree, oracle, 0.5, domain="outside")
+        sf = extract_surrogate(ret)
+        mesh = build_mesh(ret, p=1)
+        cons = build_constraints(mesh)
+        dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), DEVICE)
+        geo = GeometryData.evaluate(oracle, ret, sf, face_tables(1, 2),
+                                    domain="outside")
+        T = cons.T.tocsr()
+        T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
+        nfree = T.shape[1]
+        coords = mesh.node_coords[cons.free_nodes]
+        xq = gauss_points(mesh, dm.tables_by_p)
+        on = lambda v, c: np.abs(coords[:, c] - v) < 1e-12
+        strong = np.where(on(0.0, 0) | on(0.0, 1) | on(1.0, 1))[0]
+        g_strong = np.zeros((len(strong), 2))
+        g_strong[np.abs(coords[strong, 0]) < 1e-12, 0] = U_IN   # uniform inflow
+    
+        def gp_field(u_node):
+            full = np.asarray(T @ u_node)
+            aq, dq = {}, {}
+            for pv in dm.bins:
+                tb = dm.tables_by_p[pv]
+                vals = full[mesh.conn_of[pv]]
+                aq[pv] = np.einsum("qa,ead->eqd", tb.N, vals).reshape(-1, dim)
+                h = mesh.tree.h()[mesh.bins[pv]]
+                dq[pv] = (np.einsum("qad,ead->eq", tb.dN, vals)
+                          * (2.0 / h)[:, None]).reshape(-1)
+            return aq, dq
+    
+        # ---- pseudo-time march (D2's pattern, plus the SBM face block) ----
+        x = np.zeros(nfree * ndof)
+        sigma = 1.0 / dt
+        qref = 0.5 * U_IN ** 2 * 2 * R
+        for step in range(1, 161):
+            u_node = x.reshape(nfree, ndof)[:, :dim]
+            aq, dq = gp_field(u_node)
+            fq = {pv: aq[pv] / dt for pv in xq}      # BDF1 history term
+            A, b = assemble_linear_ns(dm, aq, dq, fq, NU, sigma=sigma)
+            Af, bf = sbm_vector_dirichlet(          # no-slip on the cylinder
+                dm, sf, geo, lambda y: np.zeros((len(y), 2)), NU, ndof)
+            A = (A + T_vec.T @ Af @ T_vec).tolil()
+            b = b + np.asarray(T_vec.T @ bf)
+            for k, i in enumerate(strong):
+                for c in range(dim):
+                    r = i * ndof + c
+                    A.rows[r] = [int(r)]
+                    A.data[r] = [1.0]
+                    b[r] = g_strong[k, c]
+            pin = int(np.argmax(coords[:, 0] + coords[:, 1])) * ndof + dim
+            A.rows[pin] = [pin]
+            A.data[pin] = [1.0]
+            b[pin] = 0.0
+            x_new = splu(A.tocsr().tocsc()).solve(b)
+            rate = np.abs(x_new - x).max() / dt
+            x = x_new
+            if step > 10 and rate < 5e-3:
+                break
+        F = surrogate_traction(dm, sf, geo, np.asarray(T_vec @ x), NU, ndof)
+        print(f"steady after {step} steps:  Cd = {F[0] / qref:.3f}   "
+              f"Cl = {F[1] / qref:+.5f}")
+        print("""
+    EXPLORE
+      (a) Break the symmetry: move the cylinder to (0.3, 0.45). How large is
+          Cl now, and which way does it point? Sanity-check the sign with the
+          Bernoulli argument (faster flow on the wide side).
+      (b) Raise Re to 60 (drop nu). The steady march stops converging — the
+          wake wants to shed. Switch to a TRUE transient run (keep proper BDF2
+          history, march ~10 convective times) and plot Cl(t): the von Karman
+          street. Estimate the Strouhal number St = f D / U.
+      (c) Blockage study: shrink r (and raise the level to keep D/h fixed).
+          Cd should fall toward the unbounded ~2.0-2.1 literature band.
+      (d) PERFORMANCE CORNER: the SBM face block (sbm_vector_dirichlet) is
+          re-assembled every step although the geometry never moves. Cache it
+          (it is additive!) and measure the saving. Then find the next
+          biggest per-step cost and say what you would cache or fuse next.
+    """)
+    ```

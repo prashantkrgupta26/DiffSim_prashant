@@ -1,0 +1,141 @@
+# A4 — Mixed elements: p1 and p2 in one mesh, and the minimum rule
+
+LEARNING OUTCOME. You can build a mesh where different elements carry
+different polynomial orders, you know what the MINIMUM RULE does at a
+p2/p1 interface (the p2 trace is constrained down to p1 — a hanging-node-
+style constraint), and you can predict the consequence: global accuracy is
+set by where you SPEND the p2, not how much of it you buy.
+
+BACKGROUND. Local p-refinement is the cheapest accuracy money in FEM — IF
+the high-order region covers where the solution is rich. We solve the A1
+problem on a uniform mesh where only the left half (x < 0.5) is p2. The
+manufactured solution comes in two flavors:
+  case L: u* rich on the LEFT  (sin(2 pi x) decaying in x) — p2 well spent;
+  case R: the mirror image, rich on the RIGHT — p2 wasted, p1 limits you.
+The interface constraints are exactly the machinery that the Neumann band
+finding (m1a findings 4b) is about: a p2 element next to a p1 element does
+NOT get to keep its quadratic face modes.
+
+EXPECTED RESULTS (measured; each is a lesson):
+    rich-L: 4.31e-3 / 1.30e-3 / 3.56e-4   orders 1.73 / 1.87
+    rich-R: 6.52e-3 / 1.64e-3 / 4.11e-4   orders 1.99 / 2.00
+  (i) Both cases converge at order ~2: the p1 half sets the RATE — a chain
+      is as slow as its weakest link. p-refinement buys ORDER only if it
+      covers the whole domain.
+ (ii) Spending p2 on the rich half helps (rich-L beats rich-R at every
+      level) — but only by a CONSTANT (1.5x at level 4), and the margin
+      SHRINKS under refinement. Why? Decompose the error by half (we did:
+      at strong oscillation the rich half's error is ~the same under p1
+      and p2!) — the minimum-rule interface constraints hold the p2 side
+      to p1 accuracy in a band along the interface, and the interface here
+      sits right where case L's field is still rich. The p2 payoff needs
+      the p2/p1 interface pushed away from the rich region — which is
+      EXACTLY the m1a Neumann-band finding (4b) wearing steady-state
+      clothes.
+
+Run:  python tutorials/A_foundations/A4_mixed_elements.py
+
+??? example "Full script — `tutorials/A_foundations/A4_mixed_elements.py` (run it!)"
+
+    ```python
+    import numpy as np
+    from scipy.sparse.linalg import splu
+    import warp as wp
+    
+    from diffsim.octree.build import build_uniform
+    from diffsim.mesh.nodes import build_mesh
+    from diffsim.mesh.constraints import build_constraints
+    from diffsim.mesh.basis import basis_tables
+    from diffsim.assembly.operators import DeviceMesh, assemble_csr
+    from diffsim.physics.poisson import (gauss_points, make_load_kernel,
+                                         l2_error_masked)
+    
+    DEVICE = "cuda:0"
+    
+    
+    def fields(rich_side):
+        """u* rich (high curvature) on one side, gentle on the other."""
+        s = +1.0 if rich_side == "L" else -1.0
+    
+        def u(x):
+            # arg 2 pi (1-t)^2 has its steep gradients where t -> 0: choose t
+            # so that happens on the requested side (t = x makes x=0 rich)
+            t = x[:, 0] if rich_side == "L" else 1.0 - x[:, 0]
+            return np.sin(1.5 * np.pi * (1 - t) ** 2) * np.sin(np.pi * x[:, 1])
+    
+        # manufactured f by high-accuracy central differences (a legitimate MMS
+        # shortcut when hand-derivatives get tedious; error ~1e-10 << h^3)
+        def f(x, eps=1e-5):
+            lap = np.zeros(len(x))
+            for c in (0, 1):
+                xp = x.copy(); xp[:, c] += eps
+                xm = x.copy(); xm[:, c] -= eps
+                lap += (u(xp) - 2 * u(x) + u(xm)) / eps ** 2
+            return -lap
+        return u, f
+    
+    
+    def solve(level, rich_side):
+        tree = build_uniform(level, dim=2)
+        anchors = tree.anchors() / (tree.anchors().max() + (
+            tree.anchors().max() == 0))
+        # p2 on the LEFT half, p1 on the right (uniform level => one-knob safe)
+        G = 1 << level
+        xs = tree.anchors()[:, 0] / float(G)
+        p_elem = np.where(xs < 0.5, 2, 1).astype(np.int8)
+        mesh = build_mesh(tree, p=p_elem)
+        cons = build_constraints(mesh)
+        tables = {pv: basis_tables(pv, dim=2) for pv in mesh.bins}
+        dm = DeviceMesh.from_mesh(mesh, cons, tables, DEVICE)
+        u_star, f_star = fields(rich_side)
+        A = assemble_csr(dm)
+        F_full = wp.zeros(dm.n_nodes, dtype=wp.float64, device=DEVICE)
+        xq = gauss_points(mesh, dm.tables_by_p)
+        for pv, b in dm.bins.items():
+            fq = wp.array(f_star(xq[pv]), dtype=wp.float64, device=DEVICE)
+            lk = make_load_kernel(b["nbf"], b["nqp"], dm.dim)
+            wp.launch(lk, dim=len(b["eids"]),
+                      inputs=[b["conn"], b["h"], b["N"], b["w"], fq, F_full],
+                      device=DEVICE)
+        b_vec = np.asarray(cons.T.T @ F_full.numpy())
+        coords = mesh.node_coords[cons.free_nodes]
+        bdry = np.where(mesh.boundary_nodes[cons.free_nodes])[0]
+        A = A.tolil()
+        for i in bdry:
+            A.rows[i] = [int(i)]
+            A.data[i] = [1.0]
+            b_vec[i] = u_star(coords[i:i + 1])[0]
+        u_free = splu(A.tocsr().tocsc()).solve(b_vec)
+        u_all = np.asarray(cons.T @ u_free)
+        err = l2_error_masked(dm, u_all, u_star, lambda x: np.ones(len(x), bool))
+        return err, dm.constraints.T.shape[1]
+    
+    
+    if __name__ == "__main__":
+        for side in ("L", "R"):
+            errs, dofs = zip(*[solve(lv, side) for lv in (4, 5, 6)])
+            orders = [np.log2(errs[i] / errs[i + 1]) for i in range(2)]
+            print(f"rich-{side} (p2 on left): errors "
+                  + "  ".join(f"{e:.3e}" for e in errs)
+                  + "   orders " + "  ".join(f"{o:.2f}" for o in orders)
+                  + f"   (dofs {dofs[-1]})")
+        print("""
+    EXPLORE
+      (a) Print len(cons.rows)-style constraint counts (inspect
+          build_constraints output) and find the interface constraints. How
+          many are there per interface element at p2/p1? Draw the constrained
+          edge mode.
+      (b) Move the p2 region to a strip |x-0.5| < 0.25 straddling the
+          interface of richness. Does half the p2 budget buy most of the
+          benefit?
+      (c) Connect to the Neumann band finding (m1a findings 4b): there, the
+          constrained trace modes sat next to elements whose HESSIANS entered
+          the boundary condition. Re-read the finding and restate it in this
+          chapter's vocabulary.
+      (d) PERFORMANCE CORNER: p2 elements cost ~ (3/2)^d more DOFs and their
+          element kernels ~ (9/4)^d more work per element in 2-D. Measure
+          assembly time p1-uniform vs p2-uniform vs this 50/50 mesh at level 6.
+          Is mixed-p assembly the mean of the two, and why would per-BIN kernel
+          launches make it so?
+    """)
+    ```

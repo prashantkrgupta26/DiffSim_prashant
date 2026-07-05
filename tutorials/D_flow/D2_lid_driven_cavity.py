@@ -1,4 +1,9 @@
-"""Tutorial 03 — Navier–Stokes: the lid-driven cavity, validated.
+"""D2 — Navier-Stokes validation: the lid-driven cavity vs Ghia (1982).
+
+LEARNING OUTCOME. You can validate a flow solver against archival
+literature data and state the tolerance honestly (a 33x33 grid vs Ghia's
+129x129). You meet the linearized monolithic stepper: ONE (u,p) solve per
+pseudo-time step, convection frozen at the previous velocity.
 
 THE PROBLEM. The classic incompressible-flow benchmark: a unit box of fluid,
 three no-slip walls, and a lid sliding at u = 1. At Re = 100 the flow settles
@@ -17,7 +22,7 @@ WHAT IS RUNNING UNDERNEATH.
   previous velocity (the production "linearized monolithic" stepper),
   marched with BDF1 until nothing changes.
 
-Run:  python tutorials/03_lid_driven_cavity.py     (~30 s)
+Run:  python tutorials/D_flow/D2_lid_driven_cavity.py     (~30 s)
 """
 import numpy as np
 
@@ -76,7 +81,7 @@ if __name__ == "__main__":
     print(f"\nmax |diff| = {np.abs(u_c - GHIA_U).max():.4f}   "
           f"(a 33x33 grid vs Ghia's 129x129 — tolerance 0.06)")
     print("""
-EXERCISES
+EXPLORE
   (a) Refine to level 6 and watch the profile tighten (runtime ~4x).
   (b) Swap in the Leray pressure-projection stepper (see
       tests/test_cavity.py::test_cavity_re100_ghia_leray) — same physics
@@ -86,3 +91,8 @@ EXERCISES
       march, or the coarse-grid profile? (Ghia's Re=400 column is in the
       1982 paper.)
 """)
+
+# PERFORMANCE CORNER: each pseudo-time step assembles AND factorizes (the
+# advecting field changes). Time assemble vs splu per step at level 6; then
+# read src/diffsim/solvers/krylov_dev.py and estimate the speedup of
+# replacing splu with the fused BiCGStab (P2 measures it).

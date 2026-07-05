@@ -1,5 +1,6 @@
 # The DiffSim curriculum
 
+
 A progressive course in GPU-native, differentiable finite elements — from a
 2-D manufactured solution to Navier–Stokes and shape optimization. We assume
 you know FEM basics (weak forms, shape functions, quadrature); everything
