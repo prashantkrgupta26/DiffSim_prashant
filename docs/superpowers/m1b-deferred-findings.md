@@ -50,3 +50,14 @@
    Mitigations for the 3D benchmark task: warp max_unroll module option /
    rolled dof-loops for dim>=3 NS kernels; document the first-run cost in
    CI notes. 2D NS kernels compile in seconds.
+
+7. **Immersed-cylinder Re=20 smoke config + measured drag (Task 8b):**
+   [0,1]^2, cylinder r=0.07 at (0.3, 0.5) (blockage 14%), uniform inflow,
+   no-slip walls, free outflow, level 5, lambda=0.5, BDF1 pseudo-time:
+   steady in 50 steps, Cd = 2.847, Cl = -3e-5 (machine-symmetric wake).
+   Confined-cylinder literature at this blockage ~2.0-2.8 — coarse-grid
+   SBM lands at the top of the band; lock the MEASURED value in
+   m1b_baselines at the benchmark task and compare against a wall-resolved
+   reference there. Traction ORIENTATION CONTRACT (measured, was flipped):
+   geo.n is domain-outward = INTO the obstacle; F_obstacle integrand is
+   +p*geo.n - nu (S grad u).geo.n.

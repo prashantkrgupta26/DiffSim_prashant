@@ -82,13 +82,15 @@ def sbm_vector_dirichlet(dm, sf, geo, g_fn, nu, ndof, alpha=10.0,
 
 
 def surrogate_traction(dm, sf, geo, x_all, nu, ndof):
-    """Body force from the surrogate boundary: F_j = int_Gamma~ [-p n_j
-    + nu (S grad u_j) . n] (n.n_tilde) dS~ — the production SurfaceLoop
-    Force = (-p n_j + viscous) pattern with the M1a shifted-flux +
-    area-correction machinery (Surrogate2True). x_all: FULL node-major
-    (u, p) vector. Host-side observable (spec S14 layer kernelizes later).
-    n is the domain-outward normal (INTO the obstacle for exterior flow), so
-    F as written is the force OF the fluid ON the obstacle."""
+    """Force of the fluid ON the immersed obstacle: F = oint sigma . n_hat
+    dS with n_hat the OBSTACLE-outward normal. ORIENTATION CONTRACT
+    (measured on the Re=20 cylinder: Cd = -2.85 before the flip, +2.85
+    after — drag must point downstream): geo.n is the DOMAIN-outward normal
+    = INTO the obstacle for exterior flow, so n_hat = -geo.n and the
+    integrand is +p*geo.n - nu (S grad u).geo.n. Production SurfaceLoop
+    Force = (-p n_j + viscous) pattern, area-corrected (Surrogate2True).
+    x_all: FULL node-major (u, p) vector. Host-side observable (spec S14
+    layer kernelizes later)."""
     dim = dm.dim
     mesh = dm.mesh
     p_face = np.unique(np.asarray(mesh.p_elem)[sf.elem])
@@ -117,5 +119,5 @@ def surrogate_traction(dm, sf, geo, x_all, nu, ndof):
             # (the p2 Hessian-shift variant lands with the p2 NS bricks)
             gradu = dN[q].T @ un
             pq = N[q] @ pn
-            F += w * (-pq * n + nu * (gradu.T @ n))
+            F += w * (pq * n - nu * (gradu.T @ n))   # n_hat = -geo.n
     return F
