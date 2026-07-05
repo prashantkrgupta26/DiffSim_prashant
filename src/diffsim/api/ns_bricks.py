@@ -39,7 +39,11 @@ def make_linear_ns_Ae(nbf: int, nqp: int, dim: int):
     dim_pow = float(dim)
     dim_f = float(dim)
 
-    @wp.kernel(module="unique", enable_backward=False)
+    # findings 6: the fully-unrolled dim-3 ndof=4 element kernel was a
+    # >79-min one-time nvrtc compile; rolled loops (max_unroll=0) trade a
+    # few %% runtime for a compile measured in minutes (finding-1b pattern).
+    @wp.kernel(module="unique", enable_backward=False,
+               module_options=({"max_unroll": 0} if dim >= 3 else {}))
     def lin_ns_Ae(conn: wp.array2d(dtype=wp.int32),
                   h: wp.array(dtype=wp.float64),
                   Ntab: wp.array2d(dtype=wp.float64),
@@ -47,8 +51,9 @@ def make_linear_ns_Ae(nbf: int, nqp: int, dim: int):
                   wtab: wp.array(dtype=wp.float64),
                   aq: wp.array2d(dtype=wp.float64),
                   div_aq: wp.array(dtype=wp.float64),
+                  gaq: wp.array2d(dtype=wp.float64),
                   nu: wp.float64, sigma: wp.float64, sig2tau: wp.float64,
-                  s_skew: wp.float64,
+                  s_skew: wp.float64, newton: wp.int32,
                   Ae: wp.array3d(dtype=wp.float64)):
         e = wp.tid()
         fe = FEMElm()
@@ -107,6 +112,18 @@ def make_linear_ns_Ae(nbf: int, nqp: int, dim: int):
                             (Na * fe_dN_s(dNtab, fe, b, i, dscale)
                              + tauM * fe_dN_s(dNtab, fe, a, i, dscale)
                              * resu) * dJxW)
+                    # NEWTON cross-term (du.grad)a — component-coupling
+                    # block Na (grad a)_{ij} Nb; Galerkin only (SUPG stays
+                    # Picard-level, standard practice — documented delta
+                    # from full Newton). RHS partner (a.grad)a is folded
+                    # into f_eff by the caller, so it inherits SUPG/PSPG
+                    # consistency for free.
+                    if newton == 1:
+                        for i in range(dim):
+                            for j in range(dim):
+                                wp.atomic_add(
+                                    Ae, e, ndof * a + i, ndof * b + j,
+                                    Na * Nb * gaq[gp, i * dim + j] * dJxW)
                     # PSPG pressure-pressure: tauM grad q . grad p
                     wp.atomic_add(Ae, e, ndof * a + dim, ndof * b + dim,
                                   tauM * lap * dJxW)
@@ -125,7 +142,11 @@ def make_linear_ns_be(nbf: int, nqp: int, dim: int):
     dim_pow = float(dim)
     dim_f = float(dim)
 
-    @wp.kernel(module="unique", enable_backward=False)
+    # findings 6: the fully-unrolled dim-3 ndof=4 element kernel was a
+    # >79-min one-time nvrtc compile; rolled loops (max_unroll=0) trade a
+    # few %% runtime for a compile measured in minutes (finding-1b pattern).
+    @wp.kernel(module="unique", enable_backward=False,
+               module_options=({"max_unroll": 0} if dim >= 3 else {}))
     def lin_ns_be(conn: wp.array2d(dtype=wp.int32),
                   h: wp.array(dtype=wp.float64),
                   Ntab: wp.array2d(dtype=wp.float64),
@@ -168,7 +189,8 @@ def make_linear_ns_be(nbf: int, nqp: int, dim: int):
 
 
 def assemble_linear_ns(dm, aq_by_bin, div_aq_by_bin, fq_by_bin, nu,
-                       sigma=0.0, sig2tau=None, s_skew=0.5):
+                       sigma=0.0, sig2tau=None, s_skew=0.5,
+                       gaq_by_bin=None, newton=False):
     """(A, b) constrained, node-major ndof=dim+1. aq/div_aq/fq: per-bin GP
     arrays (host numpy). sig2tau defaults to (2 sigma)^2."""
     dim = dm.dim
@@ -185,6 +207,11 @@ def assemble_linear_ns(dm, aq_by_bin, div_aq_by_bin, fq_by_bin, nu,
                       device=d)
         dq = wp.array(np.ascontiguousarray(div_aq_by_bin[pv]),
                       dtype=wp.float64, device=d)
+        ga_np = (np.zeros((len(aq_by_bin[pv]), dim * dim))
+                 if gaq_by_bin is None else
+                 np.ascontiguousarray(
+                     gaq_by_bin[pv].reshape(-1, dim * dim)))
+        gaq = wp.array(ga_np, dtype=wp.float64, device=d)
         fq = wp.array(np.ascontiguousarray(fq_by_bin[pv]), dtype=wp.float64,
                       device=d)
         Ae = wp.zeros((ne, nbf * ndof, nbf * ndof), dtype=wp.float64,
@@ -193,9 +220,11 @@ def assemble_linear_ns(dm, aq_by_bin, div_aq_by_bin, fq_by_bin, nu,
         kA = make_linear_ns_Ae(nbf, nqp, dim)
         kb = make_linear_ns_be(nbf, nqp, dim)
         wp.launch(kA, dim=ne, inputs=[b["conn"], b["h"], b["N"], b["dN"],
-                                      b["w"], aq, dq, wp.float64(nu),
+                                      b["w"], aq, dq, gaq, wp.float64(nu),
                                       wp.float64(sigma), wp.float64(sig2tau),
-                                      wp.float64(s_skew), Ae], device=d)
+                                      wp.float64(s_skew),
+                                      wp.int32(1 if newton else 0), Ae],
+                  device=d)
         wp.launch(kb, dim=ne, inputs=[b["conn"], b["h"], b["N"], b["dN"],
                                       b["w"], aq, fq, wp.float64(nu),
                                       wp.float64(sig2tau), be], device=d)

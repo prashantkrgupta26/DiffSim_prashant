@@ -34,9 +34,15 @@ from ..solvers.timestepping import bdf_coeffs, bdf_order_now, History
 
 class LerayProjectionStepper:
     def __init__(self, dm, nu, dt, f_fn, g_fn, order=2, picard_iters=2,
-                 timestab=True, ppe_finescale=False):
+                 timestab=True, ppe_finescale=False, predictor="picard"):
         self.dm, self.nu, self.dt, self.order = dm, nu, dt, order
         self.picard_iters = picard_iters
+        # 'picard' (v1) or 'newton' (the draft's Algorithm 1): Newton adds
+        # the (du.grad)a cross-block in the momentum operator and folds the
+        # (a.grad)a RHS partner into f_eff (which hands it SUPG/PSPG
+        # consistency for free). SUPG linearization stays Picard-level —
+        # the standard, documented delta from exact Newton.
+        self.predictor = predictor
         self.timestab = timestab
         # v1 STABILITY FINDING (measured blowup ~7e5 on the vortex MMS):
         # sigma*tau_m ~ 0.8 at gate dt's, so treating tau_m r_m EXPLICITLY
@@ -161,14 +167,26 @@ class LerayProjectionStepper:
         # pressure DOFS PINNED to p*) ----
         a_node = 2.0 * u1 - u2 if u2 is not None else u1.copy()
         uhat = None
+        self.predictor_diffs = []
+        prev_iter = None
         for _ in range(self.picard_iters):
             aq_d = self._gp_vals(a_node, grad=True)
             aq, gaq = aq_d
+            gaq_flat = {pv: gaq[pv].reshape(-1, dim, dim).transpose(0, 2, 1)
+                        for pv in aq}     # [g, i, j] = da_i/dx_j
             dq = {pv: np.einsum("gdd->g", gaq[pv].reshape(-1, dim, dim))
                   for pv in aq}
+            newton = self.predictor == "newton"
+            if newton:
+                conv_a = {pv: np.einsum("gj,gij->gi", aq[pv],
+                                        gaq_flat[pv]) for pv in aq}
+                fq_it = {pv: fq_base[pv] + conv_a[pv] for pv in aq}
+            else:
+                fq_it = fq_base
             A, b = assemble_linear_ns(
-                dm, aq, dq, fq_base, self.nu, sigma=sigma,
-                sig2tau=((2.0 * sigma) ** 2 if self.timestab else 0.0))
+                dm, aq, dq, fq_it, self.nu, sigma=sigma,
+                sig2tau=((2.0 * sigma) ** 2 if self.timestab else 0.0),
+                gaq_by_bin=(gaq_flat if newton else None), newton=newton)
             A = A.tolil()
             for k, i in enumerate(self.dir_nodes):
                 for c in range(dim):
@@ -183,6 +201,10 @@ class LerayProjectionStepper:
                 b[r] = p_node_full[i]
             x = splu(A.tocsr().tocsc()).solve(b)
             uhat = x.reshape(self.n_free, ndof)[:, :dim]
+            if prev_iter is not None:
+                self.predictor_diffs.append(
+                    float(np.abs(uhat - prev_iter).max()))
+            prev_iter = uhat
             a_node = uhat
         # ---- Step 2: PPE with tau_m fine-scale RHS ----
         uq, guq = self._gp_vals(uhat, grad=True)

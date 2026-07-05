@@ -98,3 +98,33 @@ def test_bdf1_vs_bdf2(device):
     e2 = np.sqrt(((u2 - ref) ** 2).sum(1).mean())
     e1 = np.sqrt(((u1 - ref) ** 2).sum(1).mean())
     assert e1 > 2.5 * e2, (e1, e2)
+
+
+def test_finescale_extrap_order2(device):
+    # conventions item 1 active (production default): temporal order 2 holds
+    T = 0.25
+    ref, _ = _run(4, 64, T, device, timestab=False)
+    errs = []
+    for n in (8, 16, 32):
+        u, _ = _run(4, n, T, device, timestab=False)
+        errs.append(np.sqrt(((u - ref) ** 2).sum(1).mean()))
+    rates = [np.log2(errs[i] / errs[i + 1]) for i in range(2)]
+    assert rates[-1] > 1.7, (errs, rates)
+
+
+def test_finescale_mechanism_live(device):
+    # the correction changes the solution measurably (degenerate-observable
+    # rule) and both variants stay stable
+    T = 0.2
+    st_on = _make_stepper(4, T / 8, device, timestab=False)
+    st_off = _make_stepper(4, T / 8, device, timestab=False)
+    st_off.finescale_extrap = False
+    st_on.set_initial(lambda x: u_ex(x, 0.0))
+    st_off.set_initial(lambda x: u_ex(x, 0.0))
+    for _ in range(8):
+        a = st_on.step()
+        b = st_off.step()
+    d = np.abs(a - b).max()
+    assert np.isfinite(d)
+    assert d > 1e-10, d                     # engaged
+    assert d < 0.1, d                       # a correction, not a rewrite

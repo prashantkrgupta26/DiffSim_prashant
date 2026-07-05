@@ -5,10 +5,10 @@ Per step tn -> tn+1:
 1. BDF order via the t < 1.5dt bootstrap; sigma = b0/dt.
 2. Advecting field a = extrapolation (order 1/2) of the previous velocities,
    evaluated at Gauss points; div a computed CONSISTENTLY from the discrete
-   field (dN contraction). v1 NOTE: the production fine-scale correction
-   (u_pre - tauM res_M_pre before extrapolating) is deferred to the
-   benchmark task — it sharpens constants, not convergence order; recorded
-   as a TODO tied to conventions item 1.
+   field (dN contraction), with the production FINE-SCALE CORRECTION
+   (conventions item 1): a = extrapolation of (u_pre - tauM res_M_pre),
+   residual explicit from history with the BE time term (item 5);
+   finescale_extrap=False recovers the plain extrapolation.
 3. RHS f_eff = f(t_{n+1}) - (b1 u^n + b2 u^{n-1})/dt — the history term is
    part of the linearized strong residual, so it flows through the SUPG/PSPG
    consistency terms too (the be kernel takes the combined field).
@@ -29,7 +29,7 @@ from ..solvers.timestepping import (bdf_coeffs, bdf_order_now,
 
 class LinearizedMonolithicStepper:
     def __init__(self, dm, nu, dt, f_fn, g_fn, order=2, p_pin_value_fn=None,
-                 timestab=True, s_skew=0.5):
+                 timestab=True, s_skew=0.5, finescale_extrap=True):
         """f_fn(x, t) -> [N, dim] body force; g_fn(x, t) -> [N, dim] boundary
         velocity; p_pin_value_fn(x0, t) -> pin value (default 0)."""
         self.dm, self.nu, self.dt, self.order = dm, nu, dt, order
@@ -38,6 +38,14 @@ class LinearizedMonolithicStepper:
         # dt-ladder studies at ~2e-3 (temporal-order gates run it OFF)
         self.timestab = timestab
         self.s_skew = s_skew
+        # production conventions item 1: the advecting field is the
+        # extrapolation of the FINE-SCALE-CORRECTED velocity
+        # u_corr = u_pre - tauM res_M_pre with the residual fully explicit
+        # (BE time term from PRE levels, conventions item 5). Correction is
+        # a Gauss-point field (the fine scale lives at GPs); the discrete
+        # divergence for the s-skew term stays that of the COARSE
+        # extrapolated field (standard VMS practice).
+        self.finescale_extrap = finescale_extrap
         self.f_fn, self.g_fn = f_fn, g_fn
         self.p_pin_value_fn = p_pin_value_fn or (lambda x0, t: 0.0)
         self.ndof = dm.dim + 1
@@ -80,6 +88,37 @@ class LinearizedMonolithicStepper:
                       * (2.0 / h)[:, None]).reshape(-1)
         return aq, dq
 
+    def _corrected_gp(self, u_a, u_b, p_a, t_a, sig2tau):
+        """GP field of (u_a - tauM res_M) with res_M = (u_a-u_b)/dt (BE)
+        + u_a.grad(u_a) + grad(p_a) - f(t_a); nu-lap dropped at p1."""
+        dm = self.dm
+        aq_a, _ = self._gp_eval(u_a)
+        aq_b, _ = self._gp_eval(u_b)
+        from ..physics.vms import tau_metric_host
+        out = {}
+        for pv, b in dm.bins.items():
+            tb = dm.tables_by_p[pv]
+            h = dm.mesh.tree.h()[dm.mesh.bins[pv]]
+            nqp = tb.nqp
+            he = np.repeat(h, nqp)
+            conn = dm.mesh.conn_of[pv]
+            full_u = np.asarray(dm.constraints.T @ u_a)
+            full_p = np.asarray(dm.constraints.T @ p_a)
+            gu = (np.einsum("qad,ea...->eqd...", tb.dN, full_u[conn])
+                  * (2.0 / h)[:, None, None, None]).reshape(
+                -1, dm.dim, dm.dim)
+            gp_ = (np.einsum("qad,ea->eqd", tb.dN, full_p[conn])
+                   * (2.0 / h)[:, None, None]).reshape(-1, dm.dim)
+            agu = np.einsum("gd,gdc->gc", aq_a[pv], gu)
+            res = ((aq_a[pv] - aq_b[pv]) / self.dt + agu + gp_
+                   - self.f_fn(self.xq[pv], t_a))
+            umag = np.sqrt((aq_a[pv] ** 2).sum(1))
+            tau, _ = tau_metric_host(umag, he, self.nu, dt=None, dim=dm.dim)
+            if sig2tau > 0.0:
+                tau = 1.0 / np.sqrt(sig2tau + 1.0 / tau ** 2)
+            out[pv] = aq_a[pv] - tau[:, None] * res
+        return out
+
     def step(self):
         dm = self.dm
         t_new = self.t + self.dt
@@ -93,6 +132,19 @@ class LinearizedMonolithicStepper:
         a_node = extrapolate_velocity(min(o, 2 if u2 is not None else 1),
                                       u1, u2)
         aq, dq = self._gp_eval(a_node)
+        if self.finescale_extrap and self.hist.have(2):
+            sig2tau = (2.0 * sigma) ** 2 if self.timestab else 0.0
+            p1_ = self.hist.pre1.reshape(self.n_free, self.ndof)[:, dm.dim]
+            c_n = self._corrected_gp(u1, u2, p1_, self.t, sig2tau)
+            if self.hist.have(3):
+                u3 = self._node_field(self.hist.pre3)
+                p2_ = self.hist.pre2.reshape(self.n_free,
+                                             self.ndof)[:, dm.dim]
+                c_m = self._corrected_gp(u2, u3, p2_, self.t - self.dt,
+                                         sig2tau)
+                aq = {pv: 2.0 * c_n[pv] - c_m[pv] for pv in aq}
+            else:
+                aq = c_n
         # history contribution at GPs (part of the strong residual)
         h_node = b1 * u1 + (b2 * u2 if (b2 != 0.0 and u2 is not None)
                             else 0.0)

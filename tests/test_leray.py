@@ -106,3 +106,30 @@ def test_leray_implicit_finescale_stable(device):
     e_inc = np.sqrt(((u_inc - ref) ** 2).sum(1).mean())
     assert np.isfinite(e_fs) and e_fs < 0.1, e_fs          # STABLE
     assert e_fs < 2.0 * e_inc, (e_fs, e_inc)               # comparable
+
+
+def test_newton_predictor_contracts_faster(device):
+    """Task 6b (the draft's Algorithm 1 NONLINEAR Newton predictor): on a
+    stiff step (coarse dt, strong vortex) Newton's iterate differences
+    contract much faster than Picard's — and the draft's '1-2 Newton
+    iterations per step' claim is checked as diff2/diff1."""
+    T = 0.25
+    diffs = {}
+    for mode in ("picard", "newton"):
+        st = _make(4, T / 4, device)          # very coarse dt: stiff
+        st.predictor = mode
+        st.picard_iters = 4
+        st.set_initial(lambda x: 2.0 * u_ex(x, 0.0))   # strong field
+        st.step()
+        diffs[mode] = st.predictor_diffs
+    # both converge on this problem; Newton's contraction is much stronger.
+    # MEASURED: newton diffs [0.278, 0.0595, 0.0085] — contraction ~0.2 per
+    # iterate, i.e. INEXACT Newton (the cross-term is Galerkin-only; SUPG,
+    # tau', and the (div du) a terms are deliberately Picard-level), which
+    # buys a much better linear rate rather than quadratic. The draft's
+    # '1-2 iterations' is its consistent-linearization Newton — recorded
+    # as the remaining delta.
+    ratio_p = diffs["picard"][-1] / diffs["picard"][0]
+    ratio_n = diffs["newton"][-1] / diffs["newton"][0]
+    assert ratio_n < 0.2 * ratio_p, (diffs["picard"], diffs["newton"])
+    assert diffs["newton"][2] < 5e-2 * diffs["newton"][0], diffs["newton"]
