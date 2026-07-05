@@ -66,3 +66,24 @@
    reference there. Traction ORIENTATION CONTRACT (measured, was flipped):
    geo.n is domain-outward = INTO the obstacle; F_obstacle integrand is
    +p*geo.n - nu (S grad u).geo.n.
+
+6b. **Finding 6 CLOSED: max_unroll=0 takes the dim-3 NS element kernel from
+   >79 min to 1.3 s of compile** (decorator-level module_options on the
+   unique module; measured end-to-end incl. first launch). RULE: every
+   dim>=3 fat element kernel declares max_unroll=0 unless a measured hot
+   path justifies unrolling. 3-D flow is unblocked.
+
+7b. **Leray Newton predictor is INEXACT Newton (measured contraction
+   ~0.2/iterate vs Picard's ~0.5)**: the (du.grad)a cross-block is
+   Galerkin-only; SUPG/tau'/(div du)a linearizations stay Picard-level
+   (standard practice). The draft's '1-2 iterations' presumes consistent
+   linearization — recorded as the remaining delta. RHS partner (a.grad)a
+   folds into f_eff so it inherits SUPG/PSPG consistency for free.
+
+8. **Benchmark measurements (level-6 CI variants, 2026-07-05):** cavity
+   Re=1000 max|du| vs Ghia = 0.0727 (65^2 grid, 900 pseudo-steps); cylinder
+   Re=100 converges to Cd = 1.351 (unbounded literature ~1.33!) but a
+   STEADY inflow tilt does not trigger shedding in 28 time units at this
+   blockage/dissipation — a TRANSIENT kick run is the St config. Jacobi
+   BiCGStab breaks down (NaN) on the 3-D SBM system at 356k DOFs — the
+   measured case for the ASM/multigrid preconditioner item.
