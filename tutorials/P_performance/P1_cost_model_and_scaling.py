@@ -24,11 +24,20 @@ GPU-specific effects the 1-D document could not show you:
 (iii) HOST<->DEVICE SYNC: every .numpy() readback stalls the GPU pipeline
       (m1a findings 3 measured ~10 ms under load on WSL2).
 
-EXPECTED RESULTS: assembly exponent ~1.0; splu exponent between 1.3 and
-1.6; constraints ~1.0 but with a large constant (the known m0.5 finding);
-the total pivoting from assembly-dominated to solve-dominated somewhere
-around level 8; and a dense-solve memory-cliff estimate for YOUR GPU/host
-printed at the end.
+EXPECTED RESULTS (measured, levels 5-8) — read the INVERSION of the 1-D
+document's story:
+    constraints: exponents 0.99/0.97/0.95 = O(n) as predicted, BUT
+        4.1 s -> 222 s: an O(n) stage with a giant Python-loop constant
+        DOMINATES EVERYTHING (500x the factorization at level 8). In the
+        1-D document the O(n^3) solve wins asymptotically; on this stack,
+        at reachable sizes, a linear stage with a bad constant wins. Both
+        bottleneck species are real; only measurement tells you which one
+        you have. (This is the known m0.5 finding — the host probe loop —
+        queued for vectorization.)
+    assemble: exponents 0.36 -> 0.65 -> 0.90, climbing toward 1: the GPU
+        LAUNCH FLOOR (rule (i)) — at small n you time overhead, not work.
+    factorize: 1.14 -> 1.25, climbing toward the ~1.5 asymptote; only
+        0.41 s at n = 66k. backsolve: ~O(n log n), milliseconds.
 
 Run:  python tutorials/P_performance/P1_cost_model_and_scaling.py
 """
