@@ -34,6 +34,7 @@ from ..solvers.timestepping import bdf_coeffs, bdf_order_now, History
 
 class LerayProjectionStepper:
     def __init__(self, dm, nu, dt, f_fn, g_fn, order=2, picard_iters=2,
+                 solver="splu",
                  timestab=True, ppe_finescale=False, predictor="picard"):
         self.dm, self.nu, self.dt, self.order = dm, nu, dt, order
         self.picard_iters = picard_iters
@@ -53,6 +54,10 @@ class LerayProjectionStepper:
         # fine-scale PPE term stays behind this flag until the implicit
         # weighting lands (m1b findings TODO, benchmark task).
         self.ppe_finescale = ppe_finescale
+        # linear-solve backend for ALL three sub-solves (predictor: nonsym;
+        # PPE + mass updates: SPD): "splu" | "fused" | "amgx"
+        self.solver = solver
+        self._solver_cache = {}
         self.f_fn, self.g_fn = f_fn, g_fn
         self.ndof = dm.dim + 1
         self.hist = History()          # velocity-only history [n_free*dim]
@@ -68,7 +73,7 @@ class LerayProjectionStepper:
         self.K_p = assemble_csr(dm)
         self._K_p_lu = None
         self.M = self._mass_matrix()
-        self._M_lu = splu(self.M.tocsc())
+        self._M_lu = None            # mass solves go through solve_linear
 
     # ---------------- helpers ----------------
     def _mass_matrix(self):
@@ -199,7 +204,10 @@ class LerayProjectionStepper:
                 A.rows[r] = [int(r)]
                 A.data[r] = [1.0]
                 b[r] = p_node_full[i]
-            x = splu(A.tocsr().tocsc()).solve(b)
+            from ..solvers.linsolve import solve_linear
+            x = solve_linear(A.tocsr(), b, solver=self.solver, sym=False,
+                             device=self.dm.device,
+                             cache=self._solver_cache)
             uhat = x.reshape(self.n_free, ndof)[:, :dim]
             if prev_iter is not None:
                 self.predictor_diffs.append(
@@ -252,15 +260,19 @@ class LerayProjectionStepper:
             Kp.rows[0] = [0]
             Kp.data[0] = [1.0]
             rhs_free[0] = 0.0
-            phi = splu(Kp.tocsr().tocsc()).solve(rhs_free)
+            from ..solvers.linsolve import solve_linear
+            phi = solve_linear(Kp.tocsr(), rhs_free, solver=self.solver,
+                               sym=True, device=self.dm.device,
+                               cache=self._solver_cache)
         else:
             Kp = self.K_p.tolil()
             Kp.rows[0] = [0]
             Kp.data[0] = [1.0]
             rhs_free[0] = 0.0                      # pin (enclosed flow)
-            if self._K_p_lu is None:
-                self._K_p_lu = splu(Kp.tocsr().tocsc())
-            phi = self._K_p_lu.solve(rhs_free)
+            from ..solvers.linsolve import solve_linear
+            phi = solve_linear(Kp.tocsr(), rhs_free, solver=self.solver,
+                               sym=True, device=self.dm.device,
+                               cache=self._solver_cache, cache_key="ppe")
         # The PPE unknown is the pressure INCREMENT phi = p_hat - p*: the
         # RHS carries only (u_hat, grad q)-type terms, so the solution IS
         # the increment. (Treating it as the total pressure double-counts
@@ -281,8 +293,11 @@ class LerayProjectionStepper:
                          - dphi_g[pv].reshape(ne, nqp, dim)[:, :, c] / sigma)
                 be = np.einsum("qa,eq,q,e->ea", tb.N, integ, tb.w, jac)
                 np.add.at(rhs_c, dm.mesh.conn_of[pv].ravel(), be.ravel())
-            u_new[:, c] = self._M_lu.solve(
-                np.asarray(dm.constraints.T.T @ rhs_c))
+            from ..solvers.linsolve import solve_linear
+            u_new[:, c] = solve_linear(
+                self.M, np.asarray(dm.constraints.T.T @ rhs_c),
+                solver=self.solver, sym=True, device=dm.device,
+                cache=self._solver_cache, cache_key="mass")
         # strong Dirichlet on the updated field (draft: trace preserved)
         u_new[self.dir_nodes] = gvals
         # ---- Step 4 ----

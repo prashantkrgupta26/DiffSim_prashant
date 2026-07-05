@@ -25,7 +25,8 @@ from diffsim.assembly.operators import DeviceMesh                # noqa: E402
 from diffsim.mesh.pointeval import point_eval_weights            # noqa: E402
 
 
-def run(level, re, stepper_name, device="cuda:0", max_steps=2000, dt=0.05):
+def run(level, re, stepper_name, device="cuda:0", max_steps=2000, dt=0.05,
+        solver="splu"):
     tree = build_uniform(level, dim=2)
     mesh = build_mesh(tree, p=1)
     cons = build_constraints(mesh)
@@ -34,12 +35,12 @@ def run(level, re, stepper_name, device="cuda:0", max_steps=2000, dt=0.05):
         from diffsim.steppers.linearized import LinearizedMonolithicStepper
         st = LinearizedMonolithicStepper(
             dm, 1.0 / re, dt, f_fn=lambda x, t: np.zeros((len(x), 2)),
-            g_fn=_lid_g, order=1)
+            g_fn=_lid_g, order=1, solver=solver)
     else:
         from diffsim.steppers.leray import LerayProjectionStepper
         st = LerayProjectionStepper(
             dm, 1.0 / re, dt, f_fn=lambda x, t: np.zeros((len(x), 2)),
-            g_fn=_lid_g, order=1, picard_iters=1)
+            g_fn=_lid_g, order=1, picard_iters=1, solver=solver)
     st.set_initial(lambda x: np.zeros((len(x), 2)))
     prev, steps = None, 0
     for steps in range(1, max_steps + 1):
@@ -64,12 +65,14 @@ if __name__ == "__main__":
     ap.add_argument("--re", type=float, default=100.0)
     ap.add_argument("--stepper", default="both",
                     choices=["monolithic", "leray", "both"])
+    ap.add_argument("--solver", default="splu",
+                    choices=["splu", "fused", "amgx"])
     args = ap.parse_args()
     steppers = (["monolithic", "leray"] if args.stepper == "both"
                 else [args.stepper])
     have_ref = args.re == 100.0
     for name in steppers:
-        u_c, v_c, steps = run(args.level, args.re, name)
+        u_c, v_c, steps = run(args.level, args.re, name, solver=args.solver)
         print(f"\n=== {name} | level {args.level} | Re {args.re:g} | "
               f"{steps} steps ===")
         print(f"{'y':>8} {'u(0.5,y)':>10}" + ("  {:>10}".format("Ghia")

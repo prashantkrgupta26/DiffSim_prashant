@@ -200,8 +200,11 @@ def _make_bicgstab_kernels():
 
     @wp.kernel(module="unique", enable_backward=False)
     def bs_beta(scal: wp.array(dtype=wp.float64), first: wp.int32):
+        if scal[10] != wp.float64(0.0):
+            return                                 # frozen after breakdown
         # beta = (rho_new/rho)(alpha/omega); breakdown flag on tiny rho_new
-        eps = wp.float64(1.0e-300) * scal[6]
+        # (relative to |rhat||r| ~ rnorm-scale, via bnorm2 proxy)
+        eps = wp.float64(1.0e-30) * scal[6]
         if wp.abs(scal[4]) < eps:
             scal[10] = wp.float64(1.0)         # rho breakdown
         if first == 1:
@@ -216,11 +219,15 @@ def _make_bicgstab_kernels():
                     v: wp.array(dtype=wp.float64),
                     scal: wp.array(dtype=wp.float64)):
         i = wp.tid()
+        if scal[10] != wp.float64(0.0):
+            return
         p[i] = r[i] + scal[9] * (p[i] - scal[3] * v[i])
 
     @wp.kernel(module="unique", enable_backward=False)
     def bs_alpha(scal: wp.array(dtype=wp.float64)):
-        eps = wp.float64(1.0e-300) * scal[6]
+        if scal[10] != wp.float64(0.0):
+            return
+        eps = wp.float64(1.0e-30) * scal[6]
         if wp.abs(scal[1]) < eps:
             scal[10] = wp.float64(2.0)         # rhat_v breakdown
             scal[2] = wp.float64(0.0)
@@ -233,10 +240,14 @@ def _make_bicgstab_kernels():
                     v: wp.array(dtype=wp.float64),
                     scal: wp.array(dtype=wp.float64)):
         i = wp.tid()
+        if scal[10] != wp.float64(0.0):
+            return
         s[i] = r[i] - scal[2] * v[i]
 
     @wp.kernel(module="unique", enable_backward=False)
     def bs_omega(scal: wp.array(dtype=wp.float64)):
+        if scal[10] != wp.float64(0.0):
+            return
         if scal[7] > wp.float64(0.0):
             scal[3] = scal[8] / scal[7]
         else:
@@ -251,6 +262,8 @@ def _make_bicgstab_kernels():
                      t: wp.array(dtype=wp.float64),
                      scal: wp.array(dtype=wp.float64)):
         i = wp.tid()
+        if scal[10] != wp.float64(0.0):
+            return
         x[i] = x[i] + scal[2] * ph[i] + scal[3] * sh[i]
         r[i] = s[i] - scal[3] * t[i]
 
@@ -261,10 +274,13 @@ def _make_bicgstab_kernels():
 
 
 def bicgstab_dev(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None,
-                 check_every=10, sync_counter=None):
+                 check_every=10, sync_counter=None, max_restarts=50):
     """Single-sync device BiCGStab (Jacobi-preconditioned). Breakdown guards
-    live ON DEVICE (scalars[10]); the periodic sync reads both the residual
-    and the flag. Same contract as krylov.bicgstab."""
+    live ON DEVICE (scalars[10]) and FREEZE all update kernels, so the state
+    at the periodic host check is the last pre-breakdown iterate; the host
+    then RESTARTS (rhat <- r, scalars reset) up to max_restarts times — the
+    standard cure for rho-breakdown on hard nonsymmetric systems (measured
+    on the L6 cavity monolithic block). Same contract as krylov.bicgstab."""
     _make_bicgstab_kernels()
     d = op.device
     n = op.n_free
@@ -305,7 +321,7 @@ def bicgstab_dev(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None,
 
     it = 0
     first = 1
-    info_state = None
+    restarts = 0
     while it < maxiter:
         for _ in range(min(check_every, maxiter - it)):
             it += 1
@@ -333,9 +349,19 @@ def bicgstab_dev(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None,
             sync_counter.count += 1
         rnorm2, flag = float(vals[5]), float(vals[10])
         if flag != 0.0:
+            if restarts < max_restarts:
+                restarts += 1
+                wp.copy(rhat, r)                    # restart from last good r
+                st = np.zeros(12)
+                st[0] = st[2] = st[3] = 1.0
+                st[5] = rnorm2
+                st[6] = bnorm ** 2
+                wp.copy(scal, wp.array(st, dtype=wp.float64, device=d))
+                first = 1
+                continue
             return x.numpy(), {"iters": it,
                                "relres": np.sqrt(rnorm2) / bnorm,
-                               "converged": False,
+                               "converged": False, "restarts": restarts,
                                "breakdown": "rho" if flag == 1.0 else "rhat_v"}
         if rnorm2 < thresh2:
             return x.numpy(), {"iters": it,

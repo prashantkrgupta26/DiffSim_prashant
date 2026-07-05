@@ -29,7 +29,8 @@ from ..solvers.timestepping import (bdf_coeffs, bdf_order_now,
 
 class LinearizedMonolithicStepper:
     def __init__(self, dm, nu, dt, f_fn, g_fn, order=2, p_pin_value_fn=None,
-                 timestab=True, s_skew=0.5, finescale_extrap=True):
+                 timestab=True, s_skew=0.5, finescale_extrap=True,
+                 solver="splu"):
         """f_fn(x, t) -> [N, dim] body force; g_fn(x, t) -> [N, dim] boundary
         velocity; p_pin_value_fn(x0, t) -> pin value (default 0)."""
         self.dm, self.nu, self.dt, self.order = dm, nu, dt, order
@@ -46,6 +47,10 @@ class LinearizedMonolithicStepper:
         # divergence for the s-skew term stays that of the COARSE
         # extrapolated field (standard VMS practice).
         self.finescale_extrap = finescale_extrap
+        # linear-solve backend: "splu" (host direct) | "fused" (device
+        # single-sync BiCGStab) | "amgx" (AMG-preconditioned, GPU)
+        self.solver = solver
+        self._solver_cache = {}
         self.f_fn, self.g_fn = f_fn, g_fn
         self.p_pin_value_fn = p_pin_value_fn or (lambda x0, t: 0.0)
         self.ndof = dm.dim + 1
@@ -163,7 +168,9 @@ class LinearizedMonolithicStepper:
         A.rows[self.pin_row] = [self.pin_row]
         A.data[self.pin_row] = [1.0]
         b[self.pin_row] = self.p_pin_value_fn(self.free_coords[0], t_new)
-        x = splu(A.tocsr().tocsc()).solve(b)
+        from ..solvers.linsolve import solve_linear
+        x = solve_linear(A.tocsr(), b, solver=self.solver, sym=False,
+                         device=self.dm.device, cache=self._solver_cache)
         self.hist.rotate(x, dt=self.dt)
         self.t = t_new
         return x.reshape(self.n_free, self.ndof)
