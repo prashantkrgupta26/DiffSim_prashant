@@ -111,13 +111,10 @@ def run_case(dim, level, band_layers, solver):
         # fused Jacobi-BiCGStab diverges on the nonsym SBM system at 356k
         # DOFs — measured), cuDSS fallback (GPU direct, 48 GB budget)
         A, b, meta = prob.assemble(f_star(dim), g_outer_fn=us)
-        try:
-            from diffsim.solvers.amgx import amgx_solve
-            x = amgx_solve(A, b, sym=False, tol=1e-11)
-        except Exception as e:
-            log(f"    amgx failed ({str(e)[:60]}); falling back to cuDSS")
-            from diffsim.solvers.linsolve import solve_linear
-            x = solve_linear(A, b, solver="cudss")
+        # cuDSS first (exact; AMGX classical measured not_converged on
+        # the nonsym SBM system at 356k DOFs — needs a tuned config, queued)
+        from diffsim.solvers.linsolve import solve_linear
+        x = solve_linear(A, b, solver="cudss")
         u = np.asarray(dm.constraints.T @ x)
     err = l2_error_masked(dm, u, us, lambda x: oracle.classify(x) > 0)
     n_free = dm.constraints.T.shape[1]

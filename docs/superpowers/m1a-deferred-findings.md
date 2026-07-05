@@ -143,3 +143,10 @@ verify the sensitivity/observable it measures is NONZERO at the truth
    (dominant error component crossing zero in preasymptotic recovery);
    the honest 3-D asymptotic rate needs L7 (~2.8M DOFs — cuDSS-feasible on
    48 GB, attempt queued). L6 build: 18.6 min end-to-end (was hours).
+   (g) 3-D L7 (~2.8M DOFs): the BUILD now completes (findings m1b-9 +
+   the dense-broadcast fix) but cuDSS factorization ALLOC_FAILED on the
+   48 GB card — the single-GPU direct ceiling measured exactly where the
+   capacity estimate placed it (3-D L6-L7 boundary). The L6->L7 order pair
+   (dip-hypothesis verdict) awaits either a tuned AMGX config for the
+   nonsym SBM system or multi-GPU AMGX — both queued. The band study
+   record stands at L4-L6.
