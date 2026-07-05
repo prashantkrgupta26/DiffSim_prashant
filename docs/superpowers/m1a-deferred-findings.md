@@ -89,6 +89,21 @@ verify the sensitivity/observable it measures is NONZERO at the truth
    |F*| at level 5 (discretization order), corr-off adds the ~27% (4/pi-1)
    staircase inflation. Locks now measurement-based; primary observable is
    L2 on Omega (the draft's own Fig. 6 evidence).
+   (e) COMPREHENSIVE VALIDATION (2026-07-05, exterior sphere r=0.25,
+   lambda=1 keep-all, node-band(3) vs p1-only):
+   2-D levels 5-8: band errors 6.62e-4 / 1.75e-4 / 4.53e-5 / 1.09e-5,
+   orders 1.92 / 1.95 / 2.06 — sustained second order to 58k DOFs; p1-only
+   6.78e-3 / 4.84e-3 / 2.16e-3 / 1.13e-3, orders 0.49 / 1.16 / 0.93 —
+   pinned at ~1 at every scale (104x accuracy gap at L8). Band elements
+   grow like the boundary (~2x/level, 188 -> 1416) vs mesh 4x/level: the
+   band's relative cost VANISHES under refinement.
+   3-D levels 4-5: at L4 (sphere ~8 elems across) the band is 4.3x WORSE
+   than p1 (1.99e-2 vs 4.68e-3) — preasymptotic: the shift machinery
+   amplifies unresolved-geometry error. At L5 it snaps in: 5.70e-4 vs
+   3.52e-3 (6.2x better). RULE: engage the p2 band only once the feature
+   is ~15+ elements across. L6 3-D bounded by the build_constraints host
+   loop (finding 6 / m0.5) — vectorizing it is the unlock for 3-D band
+   studies at scale. Driver: benchmarks/band_study.py.
 4c. **WARP 1.14 ADJOINT BUG (Task 10; report upstream; HARD RULE for all
    taped kernels incl. M1b matrix-free).** The loop-reassignment pattern
    `jacS = wp.float64(1.0); for _ in range(dim-1): jacS = jacS * half`
