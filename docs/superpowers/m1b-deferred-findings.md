@@ -1,0 +1,52 @@
+# M1b Deferred Findings (running log)
+
+1. **tau's transient term floors temporal-convergence studies (Task 5b,
+   measured).** With timeStab on, tau_M carries (2 b0/dt)^2, so each dt in a
+   ladder solves a slightly DIFFERENT spatially-stabilized problem; the
+   ladder floored at ~2.4e-3 (rates 0.79 then -0.09) on the level-4 vortex
+   MMS. With the production timeStab toggle off in the ladder runs: clean
+   order 2. Rule: temporal-order gates run timestab=False; physics runs keep
+   the production default (on). This is presumably WHY production carries
+   the toggle — record in the verification-tier docs.
+
+2. **WSL2 idle-queue syncs are cheap; the pathology needs queued load (Task
+   1, measured).** A 27-iteration 15 ms CG microbench showed host-sync ~=
+   fused (syncs ~0.1 ms on an empty queue); at 200k DOFs the fused path is
+   4.6x per-iteration (0.321 vs 1.485 ms). Speedup assertions in CI must be
+   per-iteration at meaningful size, or they flap.
+
+3. **Warp closure-name typing:** `wp.float64(dim)` on a bare closure int
+   coerces that name kernel-wide (breaks `range(dim)`); use a separately
+   named float constant for exponents. (Cousin of m1a finding 4c — warp
+   codegen care points now have their own section in the tutorial plan.)
+
+4. **v1 deltas to close before the benchmark task (5c/8):** production
+   fine-scale-corrected extrapolation (u_pre - tauM res_M_pre) not yet in
+   the advecting field; strong-Dirichlet row surgery via tolil per step is
+   O(n) host work — move to the precomputed-row masked-assembly pattern;
+   splu per step -> matrix-free + fused BiCGStab (Task 1 machinery) once
+   sizes demand.
+
+5. **Leray stepper v1 (Task 6, all measured on the vortex MMS):** (a) the
+   pressure INCREMENT trap: the PPE with RHS sigma(u_hat, grad q) solves for
+   phi = p_hat - p*, not the total pressure — treating it as total
+   double-counts p* every step (compounding blowup ~7e5). (b) Explicit
+   fine-scale in the PPE RHS is unstable at sigma*tau_m ~ 0.8 (r_m contains
+   sigma*u_hat); the draft keeps tau_m grad(p_hat) implicit — the
+   (1+sigma*tau_m)-weighted PPE operator is the TODO (flag ppe_finescale).
+   (c) Temporal ladder 1.86 -> 1.10: BDF2 regime decaying to the O(dt)
+   splitting floor — classic incremental behavior; rotational correction /
+   implicit fine scale raise the floor (benchmark task). (d) At
+   splitting-dominated dt a second Picard pass does not reduce error —
+   direction-asserting it was another degenerate-observable trap.
+   (e) Head-to-head at level 4, n=16: Leray within 4x monolithic accuracy,
+   divergence sentinel within 2x — the spec S17 both-steppers gate.
+
+6. **3D NS element-kernel compile economics (Task 7, measured in flight):**
+   the dim=3 lin_ns_Ae kernel (nbf=8, nqp=8, ndof=4 node-major blocks,
+   quadruple-nested a/b/i/j unroll) is a >53-min one-time nvrtc compile —
+   the M1a dim-4 pattern (finding 1b) recurring one dimension earlier
+   because ndof multiplies the block. Disk-cached content-keyed afterward.
+   Mitigations for the 3D benchmark task: warp max_unroll module option /
+   rolled dof-loops for dim>=3 NS kernels; document the first-run cost in
+   CI notes. 2D NS kernels compile in seconds.
