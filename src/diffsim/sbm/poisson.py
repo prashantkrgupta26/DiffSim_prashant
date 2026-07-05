@@ -781,10 +781,14 @@ class SBMPoisson:
             idx = np.where(dirf)[0]
             if len(idx):
                 # strong outer Dirichlet by row replacement (nonsym solver
-                # anyway; identity rows keep the Jacobi diagonal sane)
+                # anyway; identity rows keep the Jacobi diagonal sane).
+                # Direct LIL row surgery — NOT A[idx, :] = 0, which makes
+                # scipy broadcast a DENSE (len(idx) x N) zero block
+                # (measured: 1.71 TiB attempted at 3D L7, 98k rows x 2.4M).
                 A = A.tolil()
-                A[idx, :] = 0.0
-                A[idx, idx] = 1.0
+                for i in idx:
+                    A.rows[i] = [int(i)]
+                    A.data[i] = [1.0]
                 A = A.tocsr()
                 coords = dm.mesh.node_coords[dm.constraints.free_nodes][idx]
                 rhs = rhs.copy()
