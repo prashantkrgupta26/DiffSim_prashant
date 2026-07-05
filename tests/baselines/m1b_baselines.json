@@ -20,10 +20,10 @@
       "value": 1.352
     },
     "cylinder_re100_strouhal": {
-      "cl_amp_at_t16": 0.0275,
-      "config": "level 7, BDF2 dt=0.02, t_end=16, 14% blockage, kick 0.05U for t<0.5",
-      "rtol_note": "St elevated above unbounded ~0.164 by confinement; amplitude likely still growing at t=16 \u2014 saturation horizon is a nightly-campaign item",
-      "value": 0.2053
+      "cl_amp_saturated": 0.0276,
+      "config": "level 7, BDF2 dt=0.02, t_end=40 (SATURATED: amp identical over the last quarter and vs t=16), 14% blockage",
+      "rtol_note": "confinement elevates St above unbounded ~0.164 and caps the limit-cycle amplitude at 0.028; unconfined-domain config is the remaining nightly item",
+      "value": 0.2059
     },
     "sphere_re100_cd": {
       "config": "level 4 3D, BDF1 pseudo-time, 56 steps",
