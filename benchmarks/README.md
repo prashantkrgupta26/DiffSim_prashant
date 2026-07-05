@@ -20,3 +20,29 @@ number in this table.
 Both steppers (monolithic linearized, Leray projection) run every benchmark —
 a standing project discipline (spec §17): two time-discretizations agreeing
 on the same physics is a cheap, powerful cross-check.
+
+## Solver backends
+
+All drivers accept `--solver {splu, fused, cudss, amgx}`:
+
+- `splu` — host direct (scipy). Fine small; refactorizes every new matrix.
+- `fused` — device single-sync Krylov (ours). Wins on SPD systems; Jacobi
+  preconditioning is not competitive on the monolithic (u,p) block.
+- `cudss` — NVIDIA cuDSS via `pip install nvmath-python[cu12]`. GPU direct:
+  the drop-in splu replacement and the MEASURED default for stepping
+  (cavity L8: 2.4 s/step vs splu 16.9 s — 7.1x).
+- `amgx` — NVIDIA AMGX (algebraic multigrid): the large-scale path for the
+  SPD subsystems (Leray PPE); classical AMG does not converge on the
+  coupled (u,p) block (findings 8e) — block preconditioning is the open
+  production item. Build once:
+      git clone --recursive https://github.com/NVIDIA/AMGX
+      cmake -B build -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.4/bin/nvcc \
+            -DCMAKE_CUDA_ARCHITECTURES=<arch> AMGX
+      make -C build -j amgxsh
+      cp build/libamgxsh.so <repo>/extern/
+      pip install --no-build-isolation <path-to-pyamgx-clone>  # AMGX_DIR set
+  Configs: AMGX's own validated JSONs, packaged under
+  src/diffsim/solvers/amgx_configs (see m1b findings 8 for the sharp edges).
+
+Measured per-step timings: see the table in m1b findings 8 / the commit that
+introduced this section.

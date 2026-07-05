@@ -202,9 +202,11 @@ def _make_bicgstab_kernels():
     def bs_beta(scal: wp.array(dtype=wp.float64), first: wp.int32):
         if scal[10] != wp.float64(0.0):
             return                                 # frozen after breakdown
-        # beta = (rho_new/rho)(alpha/omega); breakdown flag on tiny rho_new
-        # (relative to |rhat||r| ~ rnorm-scale, via bnorm2 proxy)
-        eps = wp.float64(1.0e-30) * scal[6]
+        # beta = (rho_new/rho)(alpha/omega); breakdown = rho_new tiny
+        # RELATIVE TO THE CURRENT RESIDUAL (scal[5] = rnorm2): near
+        # convergence rho shrinks legitimately with r — scaling against
+        # bnorm^2 misfires there (measured: 'breakdown' at relres 1e-27)
+        eps = wp.float64(1.0e-12) * scal[5]
         if wp.abs(scal[4]) < eps:
             scal[10] = wp.float64(1.0)         # rho breakdown
         if first == 1:
@@ -227,7 +229,7 @@ def _make_bicgstab_kernels():
     def bs_alpha(scal: wp.array(dtype=wp.float64)):
         if scal[10] != wp.float64(0.0):
             return
-        eps = wp.float64(1.0e-30) * scal[6]
+        eps = wp.float64(1.0e-12) * scal[5]
         if wp.abs(scal[1]) < eps:
             scal[10] = wp.float64(2.0)         # rhat_v breakdown
             scal[2] = wp.float64(0.0)
@@ -316,7 +318,8 @@ def bicgstab_dev(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None,
     thresh2 = max(tol * bnorm, atol) ** 2
     # rho/alpha/omega start at 1 by convention
     ones = np.zeros(12); ones[0] = ones[2] = ones[3] = 1.0
-    ones[6] = bnorm ** 2
+    ones[5] = bnorm ** 2      # rnorm2 seed: breakdown thresholds are
+    ones[6] = bnorm ** 2      # RELATIVE to scal[5]; zero would disarm them
     wp.copy(scal, wp.array(ones, dtype=wp.float64, device=d))
 
     it = 0
@@ -348,6 +351,10 @@ def bicgstab_dev(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None,
         if sync_counter is not None:
             sync_counter.count += 1
         rnorm2, flag = float(vals[5]), float(vals[10])
+        if rnorm2 < thresh2:                       # converged wins over any
+            return x.numpy(), {"iters": it,       # concurrent breakdown flag
+                               "relres": np.sqrt(rnorm2) / bnorm,
+                               "converged": True, "restarts": restarts}
         if flag != 0.0:
             if restarts < max_restarts:
                 restarts += 1

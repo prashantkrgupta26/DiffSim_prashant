@@ -115,6 +115,8 @@ def test_bicgstab_dev_breakdown_guard(device):
     A = sp.csr_matrix(np.array([[0.0, 1.0], [-1.0, 0.0]]))  # skew: rhat.Ab=0
     op = CSROperator(A, device)
     x, info = bicgstab_dev(op, np.array([1.0, 1.0]), maxiter=50,
-                           check_every=5)
+                           check_every=5, max_restarts=3)
     assert info["converged"] is False
-    assert info.get("breakdown") == "rhat_v"
+    # with restart-on-breakdown semantics: either the restart budget is
+    # exhausted (breakdown reported) or maxiter hits first with restarts>0
+    assert info.get("breakdown") == "rhat_v" or info.get("restarts", 0) > 0, info

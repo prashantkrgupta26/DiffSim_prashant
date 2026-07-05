@@ -87,3 +87,46 @@
    blockage/dissipation — a TRANSIENT kick run is the St config. Jacobi
    BiCGStab breaks down (NaN) on the 3-D SBM system at 356k DOFs — the
    measured case for the ASM/multigrid preconditioner item.
+
+8. **GPU solver backends in the steppers (Task 5/8 follow-on; user-directed
+   pyamgx + cuDSS adoption; all measured):** both steppers now dispatch
+   solver in {splu, fused, cudss, amgx}; 11/11 parity matrix green.
+   (a) Fused Jacobi-BiCGStab is UNCOMPETITIVE on the stabilized monolithic
+   (u,p) block: ~36k iterations at cavity-L6 (~7 s/step vs splu 0.33 s) —
+   Jacobi cannot precondition the saddle-point coupling; this is the
+   measured case for AMG/direct GPU backends. The SPD sub-solves (PPE,
+   mass) are fine fused.
+   (b) bicgstab_dev hardening, three measured bugs: rho-breakdown must
+   FREEZE the device state (guards in every update kernel) or NaNs churn
+   until the periodic host check; breakdown thresholds must be relative to
+   the CURRENT residual (scal[5]) not bnorm^2, and scal[5] must be SEEDED
+   at bnorm^2 (zero disarms the guard); the host check must test
+   convergence BEFORE breakdown (near convergence rho is legitimately
+   tiny — 'breakdown' fired at relres 1e-27). Restart-on-breakdown
+   (rhat <- r) with a cap replaces failure.
+   (c) AMGX integration lessons: use the BUNDLED validated configs
+   (src/configs/*.json; hand-rolled config dicts abort the process at
+   Solver.create); AMGX objects are process-global SINGLETONS (multiple
+   live Resources sets segfault); do NOT register pyamgx.finalize at
+   atexit in a process holding warp/torch CUDA state — teardown-order
+   SIGABRT after green tests (exit 134). Configs packaged in
+   solvers/amgx_configs; libamgxsh.so staged in extern/ (gitignored),
+   self-loaded via ctypes.
+   (d) cuDSS (nvmath-python DirectSolver) = GPU splu: pip-installable,
+   parity-exact, right default for per-step-new-matrix stepping at
+   prototype scale; AMGX is the production/large-scale path (setup 3.7 ms
+   + solve 1.2 ms on the probe; iteration counts flat in h by design).
+   (e) MEASURED per-step timings, cavity monolithic stepper (RTX 6000 Ada):
+        level    n        splu       cudss      amgx          fused
+        L6       12675    308 ms     147 ms     FAIL(intern)  FAIL(stall)
+        L7       49923    2684 ms    589 ms     FAIL(noconv)  FAIL
+        L8       198147   16938 ms   2401 ms    FAIL(noconv)  FAIL
+   cuDSS wins the monolithic block outright (7.1x over splu at L8) — the
+   GPU-direct default. Classical AMG NOT converging on the coupled (u,p)
+   VMS block is textbook (saddle-point structure needs block/physics-aware
+   preconditioning, not blackbox AMG); AMGX's role here is the SPD
+   subsystems (Leray PPE at scale) where its parity gates pass. OPEN
+   (production path): (i) block-preconditioned monolithic solves — AMG on
+   the velocity block + Schur approximation, via AMGX as preconditioner
+   inside our fused Krylov; (ii) true matrix-free NS matvec to kill the
+   per-step host CSR assembly (now the largest remaining host cost).

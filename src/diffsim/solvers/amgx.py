@@ -17,65 +17,86 @@ import numpy as np
 _ctx = {"initialized": False}
 
 
+def _preload_libamgx():
+    """Locate libamgxsh.so without requiring LD_LIBRARY_PATH: the repo's
+    extern/ staging dir first (see benchmarks/README for the build), then
+    the system loader."""
+    import ctypes
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "..", "..", "..", "extern",
+                              "libamgxsh.so"),
+                 "libamgxsh.so"):
+        try:
+            ctypes.CDLL(cand, mode=ctypes.RTLD_GLOBAL)
+            return
+        except OSError:
+            continue
+
+
 def _ensure_init():
+    _preload_libamgx()
     import pyamgx
     if not _ctx["initialized"]:
         pyamgx.initialize()
         _ctx["initialized"] = True
-        atexit.register(pyamgx.finalize)
+        # NO atexit finalize, deliberately: in a process that also holds
+        # warp/torch CUDA state, atexit teardown order is arbitrary; once
+        # another library has torn the context down, AMGX's finalize-time
+        # pool audit SIGABRTs the process (measured: pytest exits 134
+        # AFTER a fully green summary). The OS reclaims everything at
+        # process death; finalize is optional at exit.
 
 
 def _config(sym: bool, tol: float):
-    import pyamgx
-    if sym:
-        cfg = {
-            "config_version": 2,
-            "solver": {
-                "solver": "PCG",
-                "preconditioner": {"solver": "AMG", "algorithm": "CLASSICAL",
-                                   "max_levels": 20, "cycle": "V",
-                                   "smoother": "BLOCK_JACOBI",
-                                   "presweeps": 1, "postsweeps": 1},
-                "max_iters": 1000, "tolerance": tol,
-                "convergence": "RELATIVE_INI_CORE", "monitor_residual": 1,
-            },
-        }
-    else:
-        cfg = {
-            "config_version": 2,
-            "solver": {
-                "solver": "PBICGSTAB",
-                "preconditioner": {"solver": "AMG", "algorithm": "CLASSICAL",
-                                   "max_levels": 20, "cycle": "V",
-                                   "smoother": "BLOCK_JACOBI",
-                                   "presweeps": 1, "postsweeps": 1},
-                "max_iters": 2000, "tolerance": tol,
-                "convergence": "RELATIVE_INI_CORE", "monitor_residual": 1,
-            },
-        }
+    """Load AMGX's own validated example configs (bundled with the AMGX
+    source; copies staged in extern/amgx_configs) and override tolerance.
+    Hand-rolled config dicts are a trap: AMGX rejects malformed configs at
+    Solver.create ("Incorrect parameters") or, worse, aborts the process.
+    SPD  -> PCG + classical-AMG V-cycle (Jacobi smoother)
+    nonsym -> BiCGStab + classical-AMG preconditioner (Jacobi smoother)"""
     import json
+    import os
+    import pyamgx
+    here = os.path.join(os.path.dirname(__file__), "amgx_configs")
+    fname = ("PCG_CLASSICAL_V_JACOBI.json" if sym
+             else "PBICGSTAB_CLASSICAL_JACOBI.json")
+    with open(os.path.join(here, fname)) as fh:
+        cfg = json.load(fh)
+    cfg["solver"]["tolerance"] = tol
+    cfg["solver"]["max_iters"] = 2000
+    cfg["solver"]["monitor_residual"] = 1
+    cfg["solver"].setdefault("convergence", "RELATIVE_INI_CORE")
+    cfg["solver"]["print_solve_stats"] = 0
+    cfg["verbosity_level"] = 1              # errors only; kills pool spam
     return pyamgx.Config().create(json.dumps(cfg))
 
 
 def amgx_solve(A, b, sym=False, tol=1e-10, cache=None, cache_key=None):
-    """Solve on the GPU via AMGX. A: scipy CSR (FP64), b: host vector."""
-    import pyamgx
+    """Solve on the GPU via AMGX. A: scipy CSR (FP64), b: host vector.
+
+    LIFETIME RULE (measured the hard way): AMGX objects are process-global
+    SINGLETONS here — one (config, resources, matrix, vectors, solver) set
+    per symmetry class, created once and reused for every solve. Multiple
+    live Resources sets in one process (e.g. per-stepper caches) segfault
+    inside AMGX. The caller-provided cache is therefore ignored for AMGX;
+    sparsity/value changes are handled by re-upload + re-setup per call."""
     _ensure_init()
+    import pyamgx
     A = A.tocsr()
     A.sort_indices()
-    key = ("amgx", cache_key, sym) if cache_key is not None else None
-    state = cache.get(key) if (cache is not None and key) else None
+    key = ("singleton", bool(sym))
+    state = _ctx.get(key)
     if state is None:
         cfg = _config(sym, tol)
         rsc = pyamgx.Resources().create_simple(cfg)
-        M = pyamgx.Matrix().create(rsc)
-        X = pyamgx.Vector().create(rsc)
-        B = pyamgx.Vector().create(rsc)
-        slv = pyamgx.Solver().create(rsc, cfg)
-        state = {"cfg": cfg, "rsc": rsc, "M": M, "X": X, "B": B, "slv": slv,
-                 "setup_nnz": -1}
-        if cache is not None and key:
-            cache[key] = state
+        state = {"cfg": cfg, "rsc": rsc,
+                 "M": pyamgx.Matrix().create(rsc),
+                 "X": pyamgx.Vector().create(rsc),
+                 "B": pyamgx.Vector().create(rsc),
+                 "slv": pyamgx.Solver().create(rsc, cfg)}
+        _ctx[key] = state
+
     M, X, B, slv = state["M"], state["X"], state["B"], state["slv"]
     M.upload_CSR(A)
     slv.setup(M)
@@ -83,8 +104,7 @@ def amgx_solve(A, b, sym=False, tol=1e-10, cache=None, cache_key=None):
     x = np.zeros_like(b)
     X.upload(x)
     slv.solve(B, X)
-    status = slv.status
-    if status not in ("success",):
-        raise RuntimeError(f"AMGX solve status: {status}")
+    if slv.status not in ("success",):
+        raise RuntimeError(f"AMGX solve status: {slv.status}")
     X.download(x)
     return x
