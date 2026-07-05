@@ -1,5 +1,7 @@
-"""Block preconditioner for the monolithic stabilized (u,p) NS system
-(m1b findings 8e's open item (i)).
+"""EXPERIMENTAL — block preconditioner for the monolithic stabilized (u,p)
+NS system (m1b findings 8e item (i); STATUS in findings 8f: v1 measured
+NOT yet effective — kept as the harness for the preconditioner study, not
+wired into the linsolve dispatch).
 
 The assembled block, in node-major interleaved DOFs, is permuted to
 
@@ -53,8 +55,8 @@ class BlockAMGPreconditioner:
         self.sigma, self.nu = sigma, nu
         self.Kp = Kp.tocsr()
         self.Mp_diag = np.asarray(Mp_diag)
-        self._amg_F = _AMGXCycle(self.F, sym=False)
-        self._amg_Kp = _AMGXCycle(self.Kp, sym=True)
+        self._amg_F = _AMGXCycle(self.F, sym=False, cycles=1)
+        self._amg_Kp = _AMGXCycle(self.Kp, sym=True, cycles=3)
 
     def apply(self, r):
         r = np.asarray(r)
@@ -75,16 +77,29 @@ class BlockAMGPreconditioner:
 
 class _AMGXCycle:
     """A persistent AMGX solver used as a PRECONDITIONER: setup once per
-    matrix, apply a fixed small number of cycles per call (loose tol).
-    Uses the process-global init + lifetime rules of solvers/amgx.py."""
+    matrix, apply a HARD-CAPPED number of cycles per call. CARE POINT
+    (measured): reusing a solver-grade config (max_iters=2000, tol 1e-4)
+    turns every preconditioner application into a near-full solve — the
+    first probe ground for 19+ minutes against cuDSS's 147 ms. A
+    preconditioner must be a fixed, cheap operator."""
 
-    def __init__(self, A, sym):
-        from .amgx import _ensure_init, _config
+    def __init__(self, A, sym, cycles=1):
+        from .amgx import _ensure_init
         _ensure_init()
+        import json
+        import os
         import pyamgx
-        self._pyamgx = pyamgx
-        cfg_tol = 1e-4
-        self.cfg = _config(sym, cfg_tol)
+        here = os.path.join(os.path.dirname(__file__), "amgx_configs")
+        fname = ("PCG_CLASSICAL_V_JACOBI.json" if sym
+                 else "PBICGSTAB_CLASSICAL_JACOBI.json")
+        with open(os.path.join(here, fname)) as fh:
+            cfg = json.load(fh)
+        cfg["solver"]["max_iters"] = int(cycles)
+        cfg["solver"]["tolerance"] = 0.0        # never early-exit
+        cfg["solver"]["monitor_residual"] = 1
+        cfg["solver"]["print_solve_stats"] = 0
+        cfg["verbosity_level"] = 1
+        self.cfg = pyamgx.Config().create(json.dumps(cfg))
         self.rsc = pyamgx.Resources().create_simple(self.cfg)
         self.M = pyamgx.Matrix().create(self.rsc)
         self.X = pyamgx.Vector().create(self.rsc)
@@ -96,7 +111,7 @@ class _AMGXCycle:
         self.slv.setup(self.M)
         self._x = np.zeros(A.shape[0])
 
-    def solve(self, b, tol=1e-3, iters=4):
+    def solve(self, b, **_ignored):
         self.B.upload(np.ascontiguousarray(b, np.float64))
         self._x[:] = 0.0
         self.X.upload(self._x)

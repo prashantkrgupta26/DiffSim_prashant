@@ -130,3 +130,22 @@
    the velocity block + Schur approximation, via AMGX as preconditioner
    inside our fused Krylov; (ii) true matrix-free NS matvec to kill the
    per-step host CSR assembly (now the largest remaining host cost).
+   (f) Block preconditioner v1 (AMGX-in-GMRES on the monolithic block):
+   MEASURED NOT EFFECTIVE YET — recorded so nobody retraces it blind.
+   Two probes on the step-4 cavity-L6 system (n=38k): (i) with solver-grade
+   AMGX configs as the "preconditioner" each application ran a near-full
+   solve — 19+ min vs cuDSS 147 ms (rule: preconditioner applications must
+   be hard-capped cycles; _AMGXCycle now bakes max_iters into the config);
+   (ii) with proper 1/3-cycle applications the cost moved to the outer
+   GMRES: ~10k applications in 15 min WITHOUT convergence — the first-cut
+   Cahouet-Chabard Schur (sigma Kp^-1 + nu Mp^-1) + single-V-cycle F does
+   not cluster the spectrum of the PSPG/SUPG-stabilized block. Refinement
+   candidates, in payoff order: fold the assembled PSPG block C into S~
+   (our C IS tau-scaled Kp — relative scaling is the suspect); audit G's
+   SUPG contribution sign/scale; 2-3 cycles on F; FGMRES instead of GMRES
+   (the preconditioner is nonlinear across applications). CLASSIFIED as a
+   research-grade follow-up with a proper study harness (iteration counts
+   vs {Schur variant x cycles x Re x dt}); until it lands, the production
+   position stands: cuDSS to the memory ceiling, AMGX for SPD subsystems.
+   src/diffsim/solvers/block_precond.py kept as the experiment harness,
+   marked EXPERIMENTAL, not in the dispatch.
