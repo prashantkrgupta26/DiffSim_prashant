@@ -135,3 +135,11 @@ verify the sensitivity/observable it measures is NONZERO at the truth
    2^dim probes across all nodes into one `find` call. Vectorize in a
    deliberate pass with the S13.3 batteries as the safety net — not a drive-by
    edit (M0.5-validated code). Now the largest single suite cost at dim=4.
+   (f) 3-D band, levels 4-6 (overnight campaign; L6 unblocked by findings
+   m1b-9 + solved by cuDSS after fused-Jacobi DIVERGED and AMGX classical
+   returned not_converged at 356k nonsym SBM DOFs): errors 1.99e-2 /
+   5.70e-4 / 1.38e-3 — NON-MONOTONE. Reading: the L4->L5 'order 5.1' snap
+   and the L5->L6 rise are consistent with an error-cancellation DIP at L5
+   (dominant error component crossing zero in preasymptotic recovery);
+   the honest 3-D asymptotic rate needs L7 (~2.8M DOFs — cuDSS-feasible on
+   48 GB, attempt queued). L6 build: 18.6 min end-to-end (was hours).

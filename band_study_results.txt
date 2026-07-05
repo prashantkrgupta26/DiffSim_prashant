@@ -1,0 +1,14 @@
+
+===== dim=3  (r=0.25, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+
+===== dim=3  (r=0.25, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+
+===== dim=3  (r=0.25, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+    WARNING: solver not converged: {'iters': 10200, 'relres': np.float64(4.2368840966212215e+23), 'converged': False, 'restarts': 50, 'breakdown': 'rho'}
+  band(3) L6: err=3.6850e+22  dofs=356374  band_elems=13984  surrfaces=4392  [1117s, krylov]
+  orders band(3): 
+
+===== dim=3  (r=0.25, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+    amgx failed (AMGX solve status: not_converged); falling back to cuDSS
+  band(3) L6: err=1.3781e-03  dofs=356374  band_elems=13984  surrfaces=4392  [1141s, krylov]
+  orders band(3): 

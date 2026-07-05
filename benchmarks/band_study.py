@@ -107,14 +107,17 @@ def run_case(dim, level, band_layers, solver):
     if solver == "direct":
         u = prob.solve(f_fn=f_star(dim), g_outer_fn=us)
     else:
-        # fused device BiCGStab on the assembled system (3D large levels)
-        from diffsim.solvers.krylov_dev import bicgstab_dev
+        # 3D large levels: AMGX (scalar elliptic = its wheelhouse; the
+        # fused Jacobi-BiCGStab diverges on the nonsym SBM system at 356k
+        # DOFs — measured), cuDSS fallback (GPU direct, 48 GB budget)
         A, b, meta = prob.assemble(f_star(dim), g_outer_fn=us)
-        op = CSROperator(A, DEV)
-        x, info = bicgstab_dev(op, b, tol=1e-11, atol=1e-13, maxiter=60000,
-                               diag=np.asarray(A.diagonal()), check_every=200)
-        if not info.get("converged"):
-            log(f"    WARNING: solver not converged: {info}")
+        try:
+            from diffsim.solvers.amgx import amgx_solve
+            x = amgx_solve(A, b, sym=False, tol=1e-11)
+        except Exception as e:
+            log(f"    amgx failed ({str(e)[:60]}); falling back to cuDSS")
+            from diffsim.solvers.linsolve import solve_linear
+            x = solve_linear(A, b, solver="cudss")
         u = np.asarray(dm.constraints.T @ x)
     err = l2_error_masked(dm, u, us, lambda x: oracle.classify(x) > 0)
     n_free = dm.constraints.T.shape[1]
