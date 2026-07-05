@@ -246,3 +246,16 @@ S5.1 sketch where they differ:
   sphere Re=100 Cd=0.381 (L4 pipeline lock, preasymptotic).
 - Jacobi-BiCGStab breaks down on the 356k-DOF 3-D SBM system: ASM/AMG
   preconditioning is the M1c-adjacent infrastructure item (amgx.py stub).
+
+
+## M1b delta log (2026-07-05)
+
+- Leray stepper implemented per Algorithm 1 with two measured deltas
+  documented in code: Picard-for-Newton (v1) and incremental-PPE form
+  (the draft's tau_m grad(p_hat) implicit treatment implemented behind
+  ppe_finescale; findings 5).
+- tau timeStab toggle: REQUIRED off for temporal-order studies (findings
+  1); production default stays on.
+- Solver stack beyond production's PETSc map: cuDSS default, AMGX for SPD
+  subsystems, fused device Krylov; production bcgs+asm has no analogue yet
+  (block preconditioning tracked, findings 8f).

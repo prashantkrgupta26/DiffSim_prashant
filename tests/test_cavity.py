@@ -111,3 +111,39 @@ def test_cavity_re100_ghia_leray(device):
     du = np.abs(u_c - GHIA_U).max()
     assert du < 0.06, (du, u_c.round(4).tolist())
     assert du < 0.02, du     # measured 0.0035 — lock well inside it
+
+
+# Ghia, Ghia & Shin (1982), Re = 1000 — u on the vertical centerline
+GHIA_U_1000 = np.array([0.0000, -0.18109, -0.20196, -0.22220, -0.29730,
+                        -0.38289, -0.27805, -0.10648, -0.06080, 0.05702,
+                        0.18719, 0.33304, 0.46604, 0.51117, 0.57492,
+                        0.65928, 1.00000])
+
+
+def test_cavity_re1000_ghia(device):
+    """Re = 1000, level 6 (65x65 vs Ghia's 129x129), cuDSS solves. The
+    thin boundary layers make this the real stabilization test; coarse-CI
+    tolerance 0.12 (level 7 tightens it — nightly config)."""
+    level, Re, dt = 6, 1000.0, 0.05
+    tree = build_uniform(level, dim=2)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), device)
+    st = LinearizedMonolithicStepper(
+        dm, 1.0 / Re, dt, f_fn=lambda x, t: np.zeros((len(x), 2)),
+        g_fn=_lid_g, order=1, solver="cudss")
+    st.set_initial(lambda x: np.zeros((len(x), 2)))
+    prev = None
+    for steps in range(1, 2001):
+        x = st.step()
+        u = x[:, :2]
+        if prev is not None and np.abs(u - prev).max() / dt < 2e-4:
+            break
+        prev = u.copy()
+    assert steps < 2000, "no steady state"
+    W_u = point_eval_weights(mesh, np.stack(
+        [np.full_like(GHIA_Y, 0.5), GHIA_Y], axis=1))
+    T = dm.constraints.T.tocsr()
+    u_c = np.asarray(W_u @ np.asarray(T @ u[:, 0]))
+    du = np.abs(u_c - GHIA_U_1000).max()
+    assert du < 0.12, (du, u_c.round(4).tolist())

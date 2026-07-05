@@ -78,8 +78,22 @@ Tutorial chapters ⑤ (transient heat — needs only a brick on existing machine
       3D NS kernels: max_unroll=0, compile 79min -> 1.3s.
 - [~] Task 9: energy stability s=1/2 measured (monotone decay); MMS ladders
       exist for both steppers — OPEN: s=1 contrast documentation sweep
-- [ ] Task 10: tutorial chapters + spec S5.1 amendment + findings
-      finalization
+- [x] Task 10: tutorial chapters (curriculum tracks C1/D2/D3 supersede
+      the planned chapters), spec S5.1+S5.4 amendment appended, conventions
+      delta log, findings 1-8 complete
+
+## M1c input list (handoff)
+
+1. NS adjoints: the s=1/2 self-adjointness identity is LOCKED (test_vms);
+   taped NS face/residual kernels must follow findings 4c patterns; solver
+   adjoints route around cuDSS/AMGX (transpose solves).
+2. NeuralSDF backend joins the cross-backend suite (m1a pattern).
+3. Hero demo: shape optimization in flow — the E1 tutorial machinery +
+   vector SBM + surrogate_traction as the QoI path.
+4. Performance debts that gate scale: vectorize build_constraints (the
+   measured wall, P1/findings 6), matrix-free NS matvec, block
+   preconditioner study (task #6), multi-GPU via AMGX-distributed.
+
 
 Findings log: docs/superpowers/m1b-deferred-findings.md (7 entries, all
 measured).

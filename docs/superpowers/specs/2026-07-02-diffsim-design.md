@@ -599,3 +599,19 @@ Notes: Track-MF holds ~10× Track-S capacity (the memory argument for matrix-fre
 ## Appendix A: Source basis
 
 Design synthesized from the group's papers (octree-SBM NS; SBM thermal; INR-SBM flow; Neural-SBM elasticity; neural-geometry theory; IMGA LES; SC'21 incomplete octrees; IPDPS Proteus; CPC/JCP CHNS; NS-PNP JCP + weak-BC CMAME; conservative AMR; neural viscosity closure; thin shells; pressure-robust transfer (in progress); linearized-VMS exact adjoint; Helmholtz–Leray projection VMS; FEAD AM thermal), the cuFEM verification plan, the FASTEST program document, and the Proteus/Dendrite-KT/talylite codebases (nomenclature mined from source). Features (a)–(c) additionally draw on: SC'19 4D tree-based space-time FEM (Ishii et al.); space-time GLS advection-diffusion and space-time VMS NS (Khara et al.); periodic space-time draft (Khara/Dyja et al.); Giannelli et al. THB-splines (CMAME 2016); Bornemann & Cirak subdivision-based HB-spline FEM (CMAME 2013); the group's THB program notes and Python THB reference; hanging-node removal papers (Shadkhah et al.; IPDPS 2025 — considered and rejected, §1.5); and the local-p-refinement SBM Neumann draft (mixed p1/p2 band).
+
+
+---
+## AMENDMENT (M1b, 2026-07-05) — S5.1 Leray predictor + solver map
+
+1. S5.1's "Oseen-linearized predictor" for the Leray stepper is OVERRIDDEN
+   by the Helmholtz-Leray VMS draft's Algorithm 1 (user directive): the
+   momentum predictor is NONLINEAR (Newton; Picard implemented as v1),
+   fine scale recomputed per iterate, h-based tau_m, NO tau_C, PPE solves
+   the pressure INCREMENT, p* <- p_hat. Measured behavior and the two
+   derivation traps: m1b-deferred-findings 5.
+2. S5.4's solver reuse map is instantiated (findings 8): cuDSS
+   (nvmath-python) is the measured stepping default to the single-GPU
+   memory ceiling; AMGX for SPD subsystems at scale (natively multi-GPU);
+   the fused single-sync Krylov for SPD subsolves; block preconditioning
+   of the monolithic system is a tracked research item (findings 8f).
