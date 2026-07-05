@@ -48,6 +48,7 @@ def make_linear_ns_Ae(nbf: int, nqp: int, dim: int):
                   aq: wp.array2d(dtype=wp.float64),
                   div_aq: wp.array(dtype=wp.float64),
                   nu: wp.float64, sigma: wp.float64, sig2tau: wp.float64,
+                  s_skew: wp.float64,
                   Ae: wp.array3d(dtype=wp.float64)):
         e = wp.tid()
         fe = FEMElm()
@@ -80,8 +81,8 @@ def make_linear_ns_Ae(nbf: int, nqp: int, dim: int):
                         agu += aq[gp, d] * fe_dN_s(dNtab, fe, b, d, dscale)
                         lap += fe_dN_s(dNtab, fe, a, d, dscale) \
                             * fe_dN_s(dNtab, fe, b, d, dscale)
-                    # skew s=1/2 convection + mass + viscous (per component)
-                    conv = agu + wp.float64(0.5) * diva * Nb
+                    # generalized M_{a,s} convection (s runtime; default 1/2)
+                    conv = agu + s_skew * diva * Nb
                     # linearized momentum strong residual factor on u_b:
                     resu = sigma * Nb + conv
                     diag = (sigma * Na * Nb + Na * conv + nu * lap
@@ -167,7 +168,7 @@ def make_linear_ns_be(nbf: int, nqp: int, dim: int):
 
 
 def assemble_linear_ns(dm, aq_by_bin, div_aq_by_bin, fq_by_bin, nu,
-                       sigma=0.0, sig2tau=None):
+                       sigma=0.0, sig2tau=None, s_skew=0.5):
     """(A, b) constrained, node-major ndof=dim+1. aq/div_aq/fq: per-bin GP
     arrays (host numpy). sig2tau defaults to (2 sigma)^2."""
     dim = dm.dim
@@ -194,7 +195,7 @@ def assemble_linear_ns(dm, aq_by_bin, div_aq_by_bin, fq_by_bin, nu,
         wp.launch(kA, dim=ne, inputs=[b["conn"], b["h"], b["N"], b["dN"],
                                       b["w"], aq, dq, wp.float64(nu),
                                       wp.float64(sigma), wp.float64(sig2tau),
-                                      Ae], device=d)
+                                      wp.float64(s_skew), Ae], device=d)
         wp.launch(kb, dim=ne, inputs=[b["conn"], b["h"], b["N"], b["dN"],
                                       b["w"], aq, fq, wp.float64(nu),
                                       wp.float64(sig2tau), be], device=d)

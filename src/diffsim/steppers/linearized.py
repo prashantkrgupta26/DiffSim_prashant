@@ -29,7 +29,7 @@ from ..solvers.timestepping import (bdf_coeffs, bdf_order_now,
 
 class LinearizedMonolithicStepper:
     def __init__(self, dm, nu, dt, f_fn, g_fn, order=2, p_pin_value_fn=None,
-                 timestab=True):
+                 timestab=True, s_skew=0.5):
         """f_fn(x, t) -> [N, dim] body force; g_fn(x, t) -> [N, dim] boundary
         velocity; p_pin_value_fn(x0, t) -> pin value (default 0)."""
         self.dm, self.nu, self.dt, self.order = dm, nu, dt, order
@@ -37,6 +37,7 @@ class LinearizedMonolithicStepper:
         # the stabilized SPATIAL problem varies with dt — measured to floor
         # dt-ladder studies at ~2e-3 (temporal-order gates run it OFF)
         self.timestab = timestab
+        self.s_skew = s_skew
         self.f_fn, self.g_fn = f_fn, g_fn
         self.p_pin_value_fn = p_pin_value_fn or (lambda x0, t: 0.0)
         self.ndof = dm.dim + 1
@@ -99,7 +100,8 @@ class LinearizedMonolithicStepper:
         fq = {pv: self.f_fn(self.xq[pv], t_new) - hq[pv] for pv in self.xq}
         A, b = assemble_linear_ns(dm, aq, dq, fq, self.nu, sigma=sigma,
                                   sig2tau=((2.0 * sigma) ** 2
-                                           if self.timestab else 0.0))
+                                           if self.timestab else 0.0),
+                                  s_skew=self.s_skew)
         A = A.tolil()
         gvals = self.g_fn(self.free_coords[self.dir_nodes], t_new)
         for k, r in enumerate(self.dir_rows):
