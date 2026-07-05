@@ -54,3 +54,29 @@ Tutorial chapters ⑤ (transient heat — needs only a brick on existing machine
 - Task 1 before everything (findings 3/4c make it foundational); Tasks 2–4 parallelizable after 1; 5–7 sequential; 8–9 after 7.
 - Full suite + commit per green task; benchmarks enter CI only in their coarse variants.
 - Any weak-form ambiguity: production file:line first (conventions doc), then the papers, then measurement — in that order, and record which level decided it.
+
+## Progress ledger (2026-07-05 overnight session)
+
+- [x] Task 1: single-sync Krylov (CG+BiCGStab, 4.6x/iter, sync-count gates)
+      + vector matrix-free operator (kron-CSR parity 1e-13)
+- [x] Task 2: Integrands brick API v1 (lego gate reproduces m1a baseline)
+- [x] Task 3: VMS tau both forms + M_{a,s} adjoint identity locked
+- [x] Task 4: BDF tables/bootstrap/history (orders 1/2 + variable-step 2)
+- [x] Task 5: linearized monolithic brick (steady Stokes/Oseen order 2)
+      + stepper (temporal order 2; timestab finding)
+- [x] Task 6: Leray projection stepper v1 (incremental; ladder 1.86->1.10;
+      head-to-head gate) — OPEN: implicit (1+sigma*tau_m) PPE weighting,
+      Newton predictor upgrade
+- [x] Task 7: vector SBM Dirichlet + backflow + surrogate_traction
+      (2D machine-exact; 3D case env-guarded pending ~1h kernel compile)
+- [~] Task 8: cavity Re=100 vs Ghia PASSED (coarse CI variant); cylinder
+      Re=20 smoke PASSED (Cd=2.847 recorded) — OPEN: full benchmark
+      configs, m1b_baselines.json lock, sphere Re=300, Leray-vs-monolithic
+      on benchmarks
+- [~] Task 9: energy stability s=1/2 measured (monotone decay); MMS ladders
+      exist for both steppers — OPEN: s=1 contrast documentation sweep
+- [ ] Task 10: tutorial chapters + spec S5.1 amendment + findings
+      finalization
+
+Findings log: docs/superpowers/m1b-deferred-findings.md (7 entries, all
+measured).

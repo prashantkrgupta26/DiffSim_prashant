@@ -86,6 +86,32 @@ class LerayProjectionStepper:
         T = dm.constraints.T.tocsr()
         return (T.T @ M @ T).tocsr()
 
+    def _weighted_stiffness(self, w_gp_by_bin):
+        """K_w[a,b] = int w(x) grad N_a . grad N_b — per-GP weights (the
+        implicit fine-scale PPE operator, weight 1/sigma + tau_m)."""
+        dm = self.dm
+        rows, cols, vals = [], [], []
+        for pv, b in dm.bins.items():
+            tb = dm.tables_by_p[pv]
+            h = dm.mesh.tree.h()[dm.mesh.bins[pv]]
+            jac = (h / 2.0) ** dm.dim
+            dsc2 = (2.0 / h) ** 2
+            ne = len(h)
+            wq = w_gp_by_bin[pv].reshape(ne, tb.nqp)
+            Ke = np.einsum("qad,qbd,q,eq,e->eab", tb.dN, tb.dN, tb.w, wq,
+                           jac * dsc2)
+            conn = dm.mesh.conn_of[pv].astype(np.int64)
+            nbf = conn.shape[1]
+            rows.append(np.repeat(conn, nbf, axis=1).ravel())
+            cols.append(np.tile(conn, (1, nbf)).ravel())
+            vals.append(Ke.ravel())
+        Nn = dm.n_nodes
+        K = sp.coo_matrix((np.concatenate(vals),
+                           (np.concatenate(rows), np.concatenate(cols))),
+                          shape=(Nn, Nn)).tocsr()
+        T = dm.constraints.T.tocsr()
+        return (T.T @ K @ T).tocsr()
+
     def _gp_vals(self, node_scalar_or_vec, grad=False):
         """Node field (n_free[, k]) -> per-bin GP values (and gradients)."""
         dm = self.dm
@@ -161,6 +187,7 @@ class LerayProjectionStepper:
         # ---- Step 2: PPE with tau_m fine-scale RHS ----
         uq, guq = self._gp_vals(uhat, grad=True)
         pq_g = self._gp_vals(self.p_star, grad=True)[1]
+        w_gp = {}
         rhs = np.zeros(dm.n_nodes)
         for pv, b_ in dm.bins.items():
             tb = dm.tables_by_p[pv]
@@ -177,9 +204,14 @@ class LerayProjectionStepper:
             agu = np.einsum("gd,gdc->gc",
                             aqv, guq[pv].reshape(-1, dim, dim))
             if self.ppe_finescale:
+                # IMPLICIT fine scale (draft-faithful; findings 5b): the
+                # phi-part of r_m moves to the LHS -> weight (1/sigma+tau_m)
+                # on the stiffness; RHS flux = u_hat - tau_m r_m_expl
+                # (coefficients bounded: (1 - sigma tau_m) u_hat - ...).
                 r_m = (sigma * aqv + agu + pq_g[pv].reshape(-1, dim)
                        - fq_base[pv])
-                flux = sigma * (aqv - taum[:, None] * r_m)
+                flux = aqv - taum[:, None] * r_m
+                w_gp[pv] = 1.0 / sigma + taum
             else:
                 flux = sigma * aqv
             # b_q = int grad(N_q) . flux
@@ -193,17 +225,24 @@ class LerayProjectionStepper:
                            jac * dsc)
             np.add.at(rhs, conn.ravel(), be.ravel())
         rhs_free = np.asarray(dm.constraints.T.T @ rhs)
-        Kp = self.K_p.tolil()
-        Kp.rows[0] = [0]
-        Kp.data[0] = [1.0]
-        rhs_free[0] = 0.0                          # pin (enclosed flow)
-        if self._K_p_lu is None:
-            self._K_p_lu = splu(Kp.tocsr().tocsc())
+        if self.ppe_finescale:
+            Kp = self._weighted_stiffness(w_gp).tolil()   # per-step tau_m
+            Kp.rows[0] = [0]
+            Kp.data[0] = [1.0]
+            rhs_free[0] = 0.0
+            phi = splu(Kp.tocsr().tocsc()).solve(rhs_free)
+        else:
+            Kp = self.K_p.tolil()
+            Kp.rows[0] = [0]
+            Kp.data[0] = [1.0]
+            rhs_free[0] = 0.0                      # pin (enclosed flow)
+            if self._K_p_lu is None:
+                self._K_p_lu = splu(Kp.tocsr().tocsc())
+            phi = self._K_p_lu.solve(rhs_free)
         # The PPE unknown is the pressure INCREMENT phi = p_hat - p*: the
-        # RHS carries only sigma(u_hat, grad q), so the solution IS the
-        # increment. (Treating it as the total pressure double-counts p*
-        # every step — measured compounding blowup ~7e5 on the vortex MMS.)
-        phi = self._K_p_lu.solve(rhs_free)
+        # RHS carries only (u_hat, grad q)-type terms, so the solution IS
+        # the increment. (Treating it as the total pressure double-counts
+        # p* every step — measured compounding blowup ~7e5.)
         p_hat = self.p_star + phi
         # ---- Step 3: velocity update u = u_hat - (1/sigma) grad(phi) ----
         dphi_g = self._gp_vals(phi, grad=True)[1]

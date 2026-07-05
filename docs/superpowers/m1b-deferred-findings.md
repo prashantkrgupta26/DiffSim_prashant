@@ -32,8 +32,13 @@
    phi = p_hat - p*, not the total pressure — treating it as total
    double-counts p* every step (compounding blowup ~7e5). (b) Explicit
    fine-scale in the PPE RHS is unstable at sigma*tau_m ~ 0.8 (r_m contains
-   sigma*u_hat); the draft keeps tau_m grad(p_hat) implicit — the
-   (1+sigma*tau_m)-weighted PPE operator is the TODO (flag ppe_finescale).
+   sigma*u_hat); the draft keeps tau_m grad(p_hat) implicit. CLOSED same
+   night: the (1/sigma + tau_m)-weighted PPE operator (phi-part of r_m on
+   the LHS, RHS flux u_hat - tau_m r_m_expl with bounded coefficients) is
+   STABLE and within 2x incremental accuracy on the ladder point (measured;
+   test_leray_implicit_finescale_stable). Default stays ppe_finescale=False
+   until the benchmark task picks per-case; the draft-faithful path exists
+   and is gated.
    (c) Temporal ladder 1.86 -> 1.10: BDF2 regime decaying to the O(dt)
    splitting floor — classic incremental behavior; rotational correction /
    implicit fine scale raise the floor (benchmark task). (d) At

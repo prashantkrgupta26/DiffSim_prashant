@@ -89,3 +89,20 @@ def test_leray_picard_mechanism_live(device):
     scale = np.sqrt((ref ** 2).sum(1).mean())
     assert np.isfinite(d) and scale < 10.0
     assert d > 1e-5 * scale, (d, scale)
+
+
+def test_leray_implicit_finescale_stable(device):
+    """Findings 5b closure: with the IMPLICIT (1/sigma + tau_m)-weighted PPE
+    the fine-scale term is STABLE (the explicit form blew up ~7e5) and no
+    less accurate than the incremental scheme on the same ladder point."""
+    T = 0.25
+    st = _make(4, T / 16, device)
+    st.ppe_finescale = True
+    for _ in range(16):
+        u_fs, _ = st.step()
+    ref, _ = _run(4, 64, T, device)
+    e_fs = np.sqrt(((u_fs - ref) ** 2).sum(1).mean())
+    u_inc, _ = _run(4, 16, T, device)
+    e_inc = np.sqrt(((u_inc - ref) ** 2).sum(1).mean())
+    assert np.isfinite(e_fs) and e_fs < 0.1, e_fs          # STABLE
+    assert e_fs < 2.0 * e_inc, (e_fs, e_inc)               # comparable
