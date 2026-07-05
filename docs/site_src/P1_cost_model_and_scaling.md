@@ -24,20 +24,21 @@ GPU-specific effects the 1-D document could not show you:
 (iii) HOST<->DEVICE SYNC: every .numpy() readback stalls the GPU pipeline
       (m1a findings 3 measured ~10 ms under load on WSL2).
 
-EXPECTED RESULTS (measured, levels 5-8) — read the INVERSION of the 1-D
-document's story:
-    constraints: exponents 0.99/0.97/0.95 = O(n) as predicted, BUT
-        4.1 s -> 222 s: an O(n) stage with a giant Python-loop constant
-        DOMINATES EVERYTHING (500x the factorization at level 8). In the
-        1-D document the O(n^3) solve wins asymptotically; on this stack,
-        at reachable sizes, a linear stage with a bad constant wins. Both
-        bottleneck species are real; only measurement tells you which one
-        you have. (This is the known m0.5 finding — the host probe loop —
-        queued for vectorization.)
-    assemble: exponents 0.36 -> 0.65 -> 0.90, climbing toward 1: the GPU
-        LAUNCH FLOOR (rule (i)) — at small n you time overhead, not work.
-    factorize: 1.14 -> 1.25, climbing toward the ~1.5 asymptote; only
-        0.41 s at n = 66k. backsolve: ~O(n log n), milliseconds.
+EXPECTED RESULTS (measured, levels 5-8) — a story in two acts:
+    ACT 1 (before 2026-07-05): constraints measured O(n) as predicted BUT
+        with a giant Python-loop constant — 222 s at level 8, 500x the
+        factorization. An O(n) stage with a bad constant beat the O(n^1.5)
+        solve at every reachable size: the INVERSE of the 1-D document's
+        bottleneck story. Both bottleneck species are real.
+    ACT 2 (after m1b findings 9 — the per-point lookup was vectorized into
+        per-level sorted-key searchsorted sweeps): constraints at level 8
+        now 0.71 s (313x), and the crown RETURNS to the textbook holder:
+        factorize 1.16 s > constraints 0.71 s ~ mesh 0.56 s >> assemble
+        0.07 s. Measure your own table; small-n exponents remain noisy
+        (launch floor, rule (i)).
+    The meta-lesson outranks both acts: the ranking of stages is an
+    EMPIRICAL, VERSIONED fact about the code — remeasure after every
+    optimization, because your bottleneck story WILL go stale.
 
 Run:  python tutorials/P_performance/P1_cost_model_and_scaling.py
 
