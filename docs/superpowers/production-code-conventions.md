@@ -259,3 +259,31 @@ S5.1 sketch where they differ:
 - Solver stack beyond production's PETSc map: cuDSS default, AMGX for SPD
   subsystems, fused device Krylov; production bcgs+asm has no analogue yet
   (block preconditioning tracked, findings 8f).
+
+## Dendro-KT / Dendro-5.01 insights (2026-07-05 exploration; file:line in repo clones)
+
+1. CONSTRAINTS WITHOUT POINT LOCATION (the build_constraints fix): Dendro-KT
+   never per-node-searches. Generate all 2^k-duplicated node instances,
+   Morton-SORT, then one segment-count sweep: a node on a k'-cell is
+   non-hanging iff it appears exactly 2^(dim-cdim) times at its location
+   (SFC_NodeSort::resolveInterface_lowOrder, nsort.tcc:1266,1302-1308);
+   mixed-level => coarser wins; scatter map produced in the same pass.
+   Dendro-5.01 does hanging classification ON DEVICE as a pure gather:
+   compare owner node's octant level to element level (GPU mesh_gpu.cuh
+   is_node_hanging). Sort + segment-count + gather — all warp-friendly.
+2. MATRIX-FREE T OPERATOR: constraints applied inside the matvec as
+   per-axis tensor-product 1D interpolation selected by child bits
+   (RefElement IKD_Parent2Child / Child2Parent, matvec.h:450,502;
+   KroneckerProduct<dim>, refel.h:215) — null non-hanging contributions
+   before the transpose (matvec.h:497-499). Dimension-generic k=2,3,4.
+3. TREESORT/BALANCE: breadth-first counting-sort bucketing on Morton child
+   index (tsort.cpp:229,318-324) — comparison-free, ideal for GPU
+   segmented sort + prefix sums; 2:1 via bottom-up auxiliary octants.
+4. 4D LESSON: everything is 1<<dim bucketing + tensor-product 1D operators
+   — the 4D element op is (p+1) 1D applies, never a dense (p+1)^4 matrix;
+   decompose interpolation by k-face dimension (matvec.h:487-495). Directly
+   applicable to our M8 space-time and today's dim-4 compile monsters.
+5. GPU PARALLELISM: parallelize over BLOCKS/segments, not elements —
+   element parallelism races at hanging boundaries (Dendro-5.01
+   findings/unzip_openmp.txt); per-thread interp scratch mandatory;
+   reindex + SIMD tensor kernels gave 3.5-5x.
