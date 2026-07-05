@@ -39,9 +39,14 @@ def _domain_sign(domain: str) -> float:
 
 def classify_lambda(tree: Octree, oracle, lam: float, domain: str = "inside",
                     n1: int = 5, lipschitz_bound: float = 2.0):
-    """Retain elements whose domain-side VOLUME FRACTION is >= lam (spec S4.2
-    step 2). lam = 1.0 keeps only fully-interior elements (flux-accurate
-    surrogate strictly inside Omega); lam = 0.5 is the optimal surrogate.
+    """Element classification with the PRODUCTION lambda convention
+    (RatioGPSBM, Dendrite/FlowBench SBMMarker): an INTERCEPTED element is
+    retained iff its domain-OUTSIDE volume fraction (1 - frac_in) <= lam.
+    So lam = 1.0 retains ALL intercepted elements (production Poisson/thermal
+    default; surrogate hugs Gamma from outside, Omega~ superset of Omega);
+    lam = 0.5 keeps majority-inside elements (flow-past-cylinder value);
+    lam = 0.0 keeps only fully-interior elements (Omega~ strictly inside).
+    Fully-interior elements are always retained; fully-outside always dropped.
 
     The fraction is a quadrature estimate: weighted indicator sum on an
     n1^dim tensor Gauss-Legendre lattice (n1 >= 2, arbitrary order via
@@ -59,8 +64,8 @@ def classify_lambda(tree: Octree, oracle, lam: float, domain: str = "inside",
     Returns (retained Octree, frac[Nret]).
     """
     sgn = _domain_sign(domain)
-    if not 0.0 < lam <= 1.0:
-        raise ValueError(f"lam must be in (0, 1], got {lam}")
+    if not 0.0 <= lam <= 1.0:
+        raise ValueError(f"lam must be in [0, 1], got {lam}")
     if n1 < 2:
         raise ValueError(f"n1 must be >= 2, got {n1}")
     dim = tree.dim
@@ -87,7 +92,9 @@ def classify_lambda(tree: Octree, oracle, lam: float, domain: str = "inside",
         psi = oracle.classify(xq).reshape(len(band), len(offs))
         frac[band] = ((sgn * psi > 0.0) * wq[None, :]).sum(axis=1) / wq.sum()
 
-    keep = frac >= lam
+    # production retention rule: interior always kept, exterior always
+    # dropped, intercepted kept iff inactive fraction <= lam
+    keep = (frac == 1.0) | ((frac > 0.0) & (1.0 - frac <= lam))
     ret = Octree(tree.keys[keep], tree.levels[keep], dim=dim,
                  periodic=tree.periodic)
     return ret, frac[keep]

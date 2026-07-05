@@ -58,7 +58,7 @@ def make_poisson_matvec(nbf: int, nqp: int, dim: int = 3):
 
     VEC = _VEC[dim]
 
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def poisson_mv(
         conn: wp.array2d(dtype=wp.int32),
         h: wp.array(dtype=wp.float64),
@@ -107,7 +107,7 @@ def make_volume_kernel(nqp: int, dim: int = 3):
     if key in _kernel_cache:
         return _kernel_cache[key]
 
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def volume_k(
         h: wp.array(dtype=wp.float64),
         wtab: wp.array(dtype=wp.float64),
@@ -259,7 +259,7 @@ def make_poisson_element_matrices(nbf: int, nqp: int, dim: int = 3):
     if key in _kernel_cache:
         return _kernel_cache[key]
 
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def poisson_Ke(h: wp.array(dtype=wp.float64), dNtab: wp.array3d(dtype=wp.float64),
                    wtab: wp.array(dtype=wp.float64),
                    Ke: wp.array3d(dtype=wp.float64)):        # [Ne, nbf, nbf]
@@ -284,20 +284,65 @@ def make_poisson_element_matrices(nbf: int, nqp: int, dim: int = 3):
     return poisson_Ke
 
 
-def volume_triplets(dm):
+def make_poisson_element_matrices_var(nbf: int, nqp: int, dim: int = 3):
+    """Var-kappa variant of poisson_Ke: stiffness weighted by a per-Gauss-
+    point coefficient kq[e*nqp + q] (spatially-varying / field-dependent
+    conductivity — the closure-hook pathway, spec S6.3). Kept separate from
+    the scalar kernel so the scalar path's module hash is untouched; unify
+    in the M1b matrix-free rewrite."""
+    key = ("poisson_Ke_var", nbf, nqp, dim)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def poisson_Ke_var(h: wp.array(dtype=wp.float64),
+                       dNtab: wp.array3d(dtype=wp.float64),
+                       wtab: wp.array(dtype=wp.float64),
+                       kq: wp.array(dtype=wp.float64),      # [Ne*nqp]
+                       Ke: wp.array3d(dtype=wp.float64)):
+        e = wp.tid()
+        fe = FEMElm(); fe.e = e; fe.he = h[e]
+        half = fe.he * wp.float64(0.5)
+        jac = wp.float64(1.0)
+        for _ in range(dim):
+            jac = jac * half
+        dscale = wp.float64(2.0) / fe.he
+        for q in range(nqp):
+            fe.q = q
+            dJxW = fe_detJxW_s(wtab, fe, jac) * kq[e * nqp + q]
+            for a in range(nbf):
+                for b in range(nbf):
+                    v = wp.float64(0.0)
+                    for d in range(dim):
+                        v = v + fe_dN_s(dNtab, fe, a, d, dscale) * fe_dN_s(dNtab, fe, b, d, dscale)
+                    Ke[e, a, b] = Ke[e, a, b] + v * dJxW
+
+    _kernel_cache[key] = poisson_Ke_var
+    return poisson_Ke_var
+
+
+def volume_triplets(dm, kq_by_bin=None):
     """Unconstrained COO triplets (rows, cols, vals) of the volume Poisson
-    stiffness at kappa = 1, over all per-degree bins. Callers concatenate
-    additional (e.g. SBM face) triplets before the single tocsr so shared
-    nodes are summed once."""
+    stiffness, over all per-degree bins. kappa = 1 by default; pass
+    kq_by_bin (dict pv -> FP64 [ne_bin*nqp] Gauss-point coefficients) for a
+    spatially-varying coefficient. Callers concatenate additional (e.g. SBM
+    face) triplets before the single tocsr so shared nodes are summed once."""
     all_rows, all_cols, all_vals = [], [], []
     for pv, b in dm.bins.items():
         ne_bin = len(b["eids"])
         nbf = b["nbf"]
         nqp = b["nqp"]
         Ke = wp.zeros((ne_bin, nbf, nbf), dtype=wp.float64, device=dm.device)
-        k = make_poisson_element_matrices(nbf, nqp, dm.dim)
-        wp.launch(k, dim=ne_bin, inputs=[b["h"], b["dN"], b["w"], Ke],
-                  device=dm.device)
+        if kq_by_bin is None:
+            k = make_poisson_element_matrices(nbf, nqp, dm.dim)
+            wp.launch(k, dim=ne_bin, inputs=[b["h"], b["dN"], b["w"], Ke],
+                      device=dm.device)
+        else:
+            kq = wp.array(np.ascontiguousarray(kq_by_bin[pv], np.float64),
+                          dtype=wp.float64, device=dm.device)
+            k = make_poisson_element_matrices_var(nbf, nqp, dm.dim)
+            wp.launch(k, dim=ne_bin, inputs=[b["h"], b["dN"], b["w"], kq, Ke],
+                      device=dm.device)
         Keh = Ke.numpy()
         conn = dm.mesh.conn_of[pv]                      # int32 [ne_bin, nbf]
         all_rows.append(np.repeat(conn, nbf, axis=1).ravel())

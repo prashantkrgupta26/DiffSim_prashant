@@ -55,7 +55,7 @@ def make_load_kernel(nbf: int, nqp: int, dim: int = 3):
     if key in _kernel_cache:
         return _kernel_cache[key]
 
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def load(conn: wp.array2d(dtype=wp.int32), h: wp.array(dtype=wp.float64),
              Ntab: wp.array2d(dtype=wp.float64), wtab: wp.array(dtype=wp.float64),
              fq: wp.array(dtype=wp.float64),          # f at Gauss points, [Ne*nqp]
@@ -86,7 +86,7 @@ def make_l2_kernel(nbf: int, nqp: int, dim: int = 3):
     if key in _kernel_cache:
         return _kernel_cache[key]
 
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def l2(conn: wp.array2d(dtype=wp.int32), h: wp.array(dtype=wp.float64),
            Ntab: wp.array2d(dtype=wp.float64), wtab: wp.array(dtype=wp.float64),
            u: wp.array(dtype=wp.float64), uq_exact: wp.array(dtype=wp.float64),
@@ -109,6 +109,60 @@ def make_l2_kernel(nbf: int, nqp: int, dim: int = 3):
 
     _kernel_cache[key] = l2
     return l2
+
+
+def make_l2_masked_kernel(nbf: int, nqp: int, dim: int = 3):
+    """L2 error with a per-Gauss-point FP64 mask: accumulates
+    ||u_h - u_exact||^2 over masked points only. SBM uses this to measure
+    error on the TRUE domain Omega, not the surrogate Omega~ (the S13.3.3
+    warning: Omega~ \\ Omega carries extrapolation error that is not part of
+    the method's accuracy claim)."""
+    key = ("l2m", nbf, nqp, dim)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def l2m(conn: wp.array2d(dtype=wp.int32), h: wp.array(dtype=wp.float64),
+            Ntab: wp.array2d(dtype=wp.float64), wtab: wp.array(dtype=wp.float64),
+            u: wp.array(dtype=wp.float64), uq_exact: wp.array(dtype=wp.float64),
+            mask: wp.array(dtype=wp.float64),        # [Ne*nqp] 0/1
+            out: wp.array(dtype=wp.float64)):
+        e = wp.tid()
+        fe = FEMElm(); fe.e = e; fe.he = h[e]
+        half = fe.he * wp.float64(0.5)
+        jac = wp.float64(1.0)
+        for _ in range(dim):
+            jac = jac * half
+        acc = wp.float64(0.0)
+        for q in range(nqp):
+            fe.q = q
+            uh = wp.float64(0.0)
+            for a in range(nbf):
+                uh += fe_N(Ntab, fe, a) * u[conn[e, a]]
+            diff = uh - uq_exact[e * nqp + q]
+            acc += diff * diff * mask[e * nqp + q] * fe_detJxW_s(wtab, fe, jac)
+        wp.atomic_add(out, 0, acc)
+
+    _kernel_cache[key] = l2m
+    return l2m
+
+
+def l2_error_masked(dm, u_all: np.ndarray, u_exact_fn, mask_fn) -> float:
+    """L2 error over {x : mask_fn(x)} — mask_fn maps [M, dim] -> bool [M]."""
+    xq_by_bin = gauss_points(dm.mesh, dm.tables_by_p)
+    ud = wp.array(u_all.astype(np.float64), dtype=wp.float64, device=dm.device)
+    out = wp.zeros(1, dtype=wp.float64, device=dm.device)
+    for pv, b in dm.bins.items():
+        xq = xq_by_bin[pv]
+        uq = wp.array(np.ascontiguousarray(u_exact_fn(xq), np.float64),
+                      dtype=wp.float64, device=dm.device)
+        mq = wp.array(np.ascontiguousarray(mask_fn(xq), np.float64),
+                      dtype=wp.float64, device=dm.device)
+        k = make_l2_masked_kernel(b["nbf"], b["nqp"], dm.dim)
+        wp.launch(k, dim=len(b["eids"]),
+                  inputs=[b["conn"], b["h"], b["N"], b["w"], ud, uq, mq, out],
+                  device=dm.device)
+    return float(np.sqrt(out.numpy()[0]))
 
 
 def l2_error(dm, u_all: np.ndarray, u_exact_fn) -> float:

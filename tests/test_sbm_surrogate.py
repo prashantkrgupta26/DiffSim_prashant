@@ -24,10 +24,10 @@ def _circle_case(level, lam):
 def test_lambda_retention_ordering():
     tree = build_uniform(5, dim=2)
     oracle = Sphere((0.5, 0.5), 0.3)
-    n_all = [len(classify_lambda(tree, oracle, lam)[0]) for lam in (0.25, 0.5, 1.0)]
-    assert n_all[0] >= n_all[1] >= n_all[2] > 0   # retention shrinks with lambda
-    ret1, frac1 = classify_lambda(tree, oracle, 1.0)
-    assert (frac1 == 1.0).all()                    # lam=1: fully-interior only
+    n_all = [len(classify_lambda(tree, oracle, lam)[0]) for lam in (0.0, 0.5, 1.0)]
+    assert 0 < n_all[0] <= n_all[1] <= n_all[2]   # retention GROWS with lambda (production RatioGPSBM)
+    ret1, frac1 = classify_lambda(tree, oracle, 0.0)
+    assert (frac1 == 1.0).all()                    # lam=0: fully-interior only
 
 
 def test_surrogate_faces_enclose_domain():
@@ -40,7 +40,7 @@ def test_surrogate_faces_enclose_domain():
 
 
 def test_geometry_data_circle():
-    oracle, ret, sf = _circle_case(6, 1.0)
+    oracle, ret, sf = _circle_case(6, 0.0)
     ftab = face_tables(1, 2)
     geo = GeometryData.evaluate(oracle, ret, sf, ftab)
     # d points from surrogate GP to the circle: x + d lies on it
@@ -58,7 +58,7 @@ def test_pi_over_4_area_correction_lock(level):
     """LOCKED (spec S4.2 step 5): staircase perimeter of a circle -> 8r; the
     (n_bar . n) corrected perimeter -> 2 pi r. Ratio -> pi/4. Without the
     correction, any surrogate-boundary flux integral inherits the 4/pi error."""
-    oracle, ret, sf = _circle_case(level, 1.0)
+    oracle, ret, sf = _circle_case(level, 0.0)
     ftab = face_tables(1, 2)
     geo = GeometryData.evaluate(oracle, ret, sf, ftab)
     h = ret.h()[sf.elem]
@@ -116,7 +116,7 @@ def test_exterior_configuration():
     # domain = square minus disk (the M1b configuration), via the domain flag
     tree = build_uniform(5, dim=2)
     oracle = Sphere((0.5, 0.5), 0.25)
-    ret, _ = classify_lambda(tree, oracle, 1.0, domain="outside")
+    ret, _ = classify_lambda(tree, oracle, 0.0, domain="outside")
     sf = extract_surrogate(ret)
     ftab = face_tables(1, 2)
     geo = GeometryData.evaluate(oracle, ret, sf, ftab, domain="outside")
@@ -137,12 +137,12 @@ def test_lambda_volume_fraction_accuracy():
     # frac * h^2 over ALL elements (lam -> 0+) reproduces the disk area.
     tree = build_uniform(5, dim=2)
     oracle = Sphere((0.5, 0.5), 0.3)
-    ret, frac = classify_lambda(tree, oracle, lam=1e-12, n1=5)
+    ret, frac = classify_lambda(tree, oracle, lam=1.0, n1=5)
     area = (frac * ret.h() ** 2).sum()
     exact = np.pi * 0.3 ** 2
     assert abs(area - exact) < 5e-3 * exact
     # denser rule is at least as accurate
-    _, frac9 = classify_lambda(tree, oracle, lam=1e-12, n1=9)
+    _, frac9 = classify_lambda(tree, oracle, lam=1.0, n1=9)
     area9 = (frac9 * ret.h() ** 2).sum()
     assert abs(area9 - exact) <= abs(area - exact) + 1e-12
 
@@ -152,7 +152,7 @@ def test_lambda_narrowband_fastpath_exact():
     # retained sets and fracs vs dense-everywhere (lipschitz_bound=inf).
     tree = build_uniform(5, dim=2)
     oracle = Sphere((0.5, 0.5), 0.3)
-    for lam in (0.5, 1.0):
+    for lam in (0.5, 0.0):
         r1, f1 = classify_lambda(tree, oracle, lam)
         r2, f2 = classify_lambda(tree, oracle, lam, lipschitz_bound=np.inf)
         assert np.array_equal(r1.keys, r2.keys)
@@ -164,13 +164,13 @@ def test_lambda_and_surrogate_4d():
     # 4-ball volume: pi^2 r^4 / 2.
     oracle = Sphere((0.5,) * 4, 0.35)
     tree = build_uniform(3, dim=4)
-    ret, frac = classify_lambda(tree, oracle, lam=1e-12, n1=5)
+    ret, frac = classify_lambda(tree, oracle, lam=1.0, n1=5)
     vol = (frac * ret.h() ** 4).sum()
     exact = np.pi ** 2 * 0.35 ** 4 / 2.0
     assert abs(vol - exact) < 0.02 * exact
     # narrowband fast path exact in 4D too
-    r2, f2 = classify_lambda(tree, oracle, 1.0, lipschitz_bound=np.inf)
-    r1, f1 = classify_lambda(tree, oracle, 1.0)
+    r2, f2 = classify_lambda(tree, oracle, 0.0, lipschitz_bound=np.inf)
+    r1, f1 = classify_lambda(tree, oracle, 0.0)
     assert np.array_equal(r1.keys, r2.keys)
     # surrogate extraction + geometry cache on the lam=1 retained set
     sf = extract_surrogate(r1)

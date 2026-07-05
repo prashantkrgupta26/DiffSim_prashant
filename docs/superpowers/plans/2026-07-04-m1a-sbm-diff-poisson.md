@@ -738,7 +738,7 @@ Order asserted via least-squares slope of log(err) vs log(h) over the last 3 lev
 
 **Steps:**
 
-- [ ] **Step 1: Failing tests** — the MMS ladder helper:
+- [x] **Step 1: Failing tests** — the MMS ladder helper:
 
 ```python
 def _mms_ladder(oracle, levels, p, lam, dim, device, u_fn, f_fn, kappa=1.0,
@@ -774,9 +774,9 @@ def test_mms_disk_p2_order3(device):
 
 plus the exterior-2D, 3D-sphere, λ=0.5, and κ=2.5 variants per the configuration list.
 
-- [ ] **Step 2: Verify failure (l2_error_masked missing), implement, run.** The 3D level-5 case runs on `cuda:0`; keep it as the largest problem in the suite (~1.5e5 elements retained — fine).
+- [x] **Step 2: Verify failure (l2_error_masked missing), implement, run.** The 3D level-5 case runs on `cuda:0`; keep it as the largest problem in the suite (~1.5e5 elements retained — fine).
 
-- [ ] **Step 3: Full suite + commit**
+- [x] **Step 3: Full suite + commit**
 
 ```bash
 git add -A && git commit -m "test: SBM Dirichlet MMS orders (interior/exterior, p1/p2, 2D/3D, error on Omega)"
@@ -784,22 +784,32 @@ git add -A && git commit -m "test: SBM Dirichlet MMS orders (interior/exterior, 
 
 ---
 
+### Task 7b: Spatially-varying kappa (added 2026-07-04, stakeholder request)
+
+**Files:** modify `src/diffsim/assembly/operators.py` (var-κ element-matrix factory + `volume_triplets(dm, kq_by_bin=None)`), `src/diffsim/sbm/poisson.py` (var-κ face kernel variants; `SBMPoisson(kappa=scalar | callable)`); tests appended to `tests/test_sbm_poisson.py`.
+
+**Semantics:** `kappa` callable ⇒ evaluated per Gauss point (volume GPs per bin; face terms use κ(x̃) at the surrogate GP — the local PDE coefficient). Positivity validated. The κ-linearity meta (`A1`/`bg1`) is scalar-only; field-κ assemble returns `meta["field_kappa"]=True` with `A1=None` — the field-κ GRADIENT (dJ/dκ per GP / closure params) is M2's closure interface, not M1a. Scalar path and kernels untouched (separate `_var` factories; unify in the M1b matrix-free rewrite).
+
+**Tests:** (i) var-κ linear patch, machine precision — linear κ = 1 + x + 2y with linear u makes −∇·(κ∇u) = −∇κ·b constant, and every integrand is polynomial within quadrature exactness, so 1e-10 must hold; run at k = 2 (level 5), 3 (level 3), 4 (level 3) per the dim-coverage policy; (ii) MMS order 2: u = sin(πx)sin(πy), κ = 1 + x + 2y, f = −∇κ·∇u + 2π²κu, levels [4,5,6], slope 2 ± 0.10; (iii) scalar/callable consistency: constant callable κ=2.5 reproduces the scalar-κ solution to 1e-13.
+
+- [x] **Steps:** tests (failing) → var-κ kernels + SBMPoisson branch → run → full suite → commit.
+
 ### Task 8: SBM Neumann — area correction + Hessian shift + §13.3.3 p2-band acceptance
 
 **Files:**
 - Modify: `src/diffsim/sbm/poisson.py` (Neumann face kernels + `surrogate_flux`)
 - Test: `tests/test_sbm_neumann.py`
 
-**Weak form (Atallah–Scovazzi 2020; S∇u = ∇u + H(u)·d is the shifted gradient, q̄_N = q_N(x̃+d) the prescribed true flux κ∇u·n∘M):** the true-boundary term −∫_Γ w q_N dS becomes, on the surrogate,
+**Weak form — VERIFIED against the group's local-p-refinement draft (Ganapathysubramanian & Samundra, "Local p-Refinement for Shifted-Boundary Neumann Conditions", MyPapers/hangingNodes/paper_mixed_SK_VALPHA.pdf, Eq. 21; checked 2026-07-04).** With a = n·ñ and q̄ = q(M(x̃)) the mapped true flux (κ-scaled), the paper's convention **shifts only the normal flux component** — the tangential part stays the surrogate field's own (an earlier transcription here added a tangential Hessian-shift term (Hd)·(bτ); same order, but the paper's form is the contract):
 
 ```
-LHS += − ∫_Γ̃N κ w [ (S∇u)·ñ − (n·ñ)((S∇u)·n) ] dS        (u-dependent tangential correction)
-RHS += + ∫_Γ̃N w (n·ñ) q̄_N dS                              (area-corrected mapped flux data)
+LHS += − ∫_Γ̃N κ w [ a·(n·∇u + nᵀH(u)·d) − ñ·∇u ] dS      (Eq. 21 B'-term, u-dependent)
+RHS += + ∫_Γ̃N w · a · q̄ dS                                (area-corrected mapped flux data)
 ```
 
-Sanity limits (assert in tests): Γ̃ → Γ (n = ñ, d = 0) kills the LHS correction and recovers the classical Neumann term; **dropping (n·ñ) from the RHS inflates any flux-driven solution by the staircase ratio (the π/4 pathology — locked)**. For p1, H ≡ 0 truncates S∇u — the §13.1 representability failure; the p2 band restores it. The **hard rule** (spec §13.1): every shifted-Neumann quadrature point lies inside p2 cells — asserted in the band test.
+Sanity limits (assert in tests): Γ̃ → Γ (n = ñ, d = 0, a = 1) kills the LHS correction and recovers the classical Neumann term; **dropping a = n·ñ from the RHS inflates any flux-driven solution by the staircase ratio (the π/4 pathology — locked)**. For p1, the diagonal Hessian terms vanish elementwise — the paper's representability failure; the p2 band restores it. The **hard rule** (paper §2.3 / spec §13.1): every shifted-Neumann quadrature point lies inside p2 cells — asserted in the band test. Error measured on Ω (paper §7 "practical details").
 
-Kernels: `make_sbm_neumann_Ae(nbf, nqf, dim)` (key `"sbm_neu_Ae"`) — inputs add `nvec [Nf*nqf, dim]`, `corr [Nf*nqf]`, `d2Nf [2*dim, nqf, nbf, dim, dim]`; per (q, b): `S∇u_b[i] = dN_b[i]·dscale + Σ_j d2N_b[i,j]·d2scale·d_j` with `d2scale = dscale²`, then `Ae[fi,a,b] −= κ·Na·(S∇u_b·ñ − corr·(S∇u_b·n))·dS`. RHS `make_sbm_neumann_be` (key `"sbm_neu_be"`): `be[conn[a]] += Na·corr·q̄_q·dS`.
+Kernels: `make_sbm_neumann_Ae(nbf, nqf, dim)` (key `"sbm_neu_Ae"`) — inputs add `nvec [Nf*nqf, dim]`, `corr [Nf*nqf]` (= a), `d2Nf [2*dim, nqf, nbf, dim*dim]`; per (q, b): `Hd_b[i] = Σ_j d2N_b[i,j]·d2scale·d_j`, then `Ae[fi,a,b] −= κ·Na·( corr·(n·∇N_b + n·Hd_b) − ñ·∇N_b )·dS`. RHS `make_sbm_neumann_be` (key `"sbm_neu_be"`): `be[conn[a]] += Na·corr·q̄_q·dS`.
 
 `SBMPoisson` gains `neumann=(sf_N, geo_N, q_fn)` — a problem may carry Dirichlet faces, Neumann faces, or both (disjoint `SurrogateFaces` sets; the test splits a circle's faces is NOT needed — M1a configs use all-Dirichlet or all-Neumann-on-the-disk + strong outer Dirichlet for well-posedness).
 

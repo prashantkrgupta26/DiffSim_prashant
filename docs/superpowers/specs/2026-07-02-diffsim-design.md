@@ -532,6 +532,29 @@ Both are hard requirements; the tension is resolved structurally, not by comprom
 3. **Performance annotations.** Every non-obvious optimization documents *why it exists and what it bought* (measured, with the profile date/hardware) — optimizations without receipts are reverted on sight. Profile before optimizing; the §9.3 roofline model defines "optimized"; no cleverness without a measured win.
 4. Style baseline: Google-style per talylite docs/style.md (§3.1); pure integrands (§3.2); tolerance policy (§9.2).
 
+## 16b. Documentation & Onboarding Deliverables (stakeholder requirements, 2026-07-04)
+
+1. **GPU-only production contract (restates §2/§9.3 as a requirement):** production
+   runs execute entirely on GPU; the only device→host transfers are results output
+   and checkpointing (§14's async streams). Per-epoch setup may stage through host in
+   the prototype; the inner time-stepping loop may not (M1b onward). The §9.3 gates
+   enforce this.
+2. **Onboarding website:** an interactive documentation site that (a) onboards new
+   users and (b) helps existing users navigate the codebase. Generated from the §16
+   kernel docblocks plus narrative chapters so docs cannot drift from code. Staged:
+   skeleton + M1 content ships with M1c; grows per milestone thereafter.
+3. **User-equation authoring stays Integrands-style (§3 restated as a promise):**
+   users code new equations / edit existing ones exactly as in Taly/Dendrite/DiffPack
+   — CEquation + Integrands_Ae/be + Integrands4side, FEMElm accessors, NodeData/VecInfo,
+   solver_options blocks. The brick API ships with M1b's physics bricks.
+4. **Pedagogical walkthrough + graded problem sequence** (assumes FEM basics): ①
+   uniform-mesh Poisson, strong BCs; ② adaptive octree Poisson (hanging nodes); ③
+   immersed SBM Poisson (circle/sphere); ④ SBM Neumann + p2 band; ⑤ transient heat
+   (BDF2); ⑥ lid-driven cavity; ⑦ SBM flow past a cylinder; ⑧ differentiable shape
+   optimization. Each chapter pairs prose derivation → the exact Integrands code →
+   a runnable config → verification of the expected result (orders/benchmarks), and
+   doubles as an acceptance test.
+
 ## 17. Risks & Mitigations
 
 | Risk | Mitigation |

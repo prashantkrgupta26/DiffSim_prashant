@@ -14,7 +14,7 @@ def make_gp_interp_kernel(nbf: int, nqp: int):
     if key in _kernel_cache:
         return _kernel_cache[key]
 
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def gp_interp(conn: wp.array2d(dtype=wp.int32), Ntab: wp.array2d(dtype=wp.float64),
                   u: wp.array(dtype=wp.float64), uq: wp.array(dtype=wp.float64)):
         e = wp.tid()
