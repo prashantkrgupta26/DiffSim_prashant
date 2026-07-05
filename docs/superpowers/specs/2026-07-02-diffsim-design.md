@@ -532,6 +532,17 @@ Both are hard requirements; the tension is resolved structurally, not by comprom
 3. **Performance annotations.** Every non-obvious optimization documents *why it exists and what it bought* (measured, with the profile date/hardware) — optimizations without receipts are reverted on sight. Profile before optimizing; the §9.3 roofline model defines "optimized"; no cleverness without a measured win.
 4. Style baseline: Google-style per talylite docs/style.md (§3.1); pure integrands (§3.2); tolerance policy (§9.2).
 
+## 5.1 AMENDMENT (2026-07-05, M1b Task 10; user directive 2026-07-04)
+
+The LerayProjection stepper follows the Helmholtz-Leray VMS draft's
+Algorithm 1, NOT this spec's original Oseen sketch: NONLINEAR momentum
+predictor (implemented: inexact Newton — Galerkin cross-term (du.grad)a,
+(a.grad)a folded into f_eff; measured contraction ~0.2/iterate), PPE on the
+pressure INCREMENT with the fine-scale term IMPLICIT ((1/sigma+tau_m)-
+weighted operator; the explicit form is unstable at sigma*tau_m ~ 0.8,
+measured), h-based tau_m (draft Eq. 45), NO tau_C, p* <- p_hat. Details and
+measured traps: docs/superpowers/m1b-deferred-findings.md entry 5.
+
 ## 16b. Documentation & Onboarding Deliverables (stakeholder requirements, 2026-07-04)
 
 1. **GPU-only production contract (restates §2/§9.3 as a requirement):** production

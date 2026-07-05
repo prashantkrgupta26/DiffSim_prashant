@@ -230,3 +230,19 @@ S5.1 sketch where they differ:
   (lam=1) surrogates produce slivers.
 - FlowBench_NSHT + Flow-Bench-Dendrite agent reports pending (flux/Nusselt extraction,
   lin-NS lid-driven variants) — append here when they land.
+
+
+## M1b closure addenda (2026-07-05)
+
+- Inexact-Newton delta (Leray predictor): cross-term Galerkin-only; SUPG /
+  tau' / (div du) a linearizations stay Picard-level. Measured contraction
+  0.2/iterate (vs draft's consistent-Newton 1-2 iterations claim).
+- HARD RULE: dim>=3 fat element kernels declare module_options
+  {"max_unroll": 0} (compile 79 min -> 1.3 s measured, zero accuracy delta).
+- Benchmark anchors now locked in tests/baselines/m1b_baselines.json:
+  cavity Re=100 (mono du=0.0324/leray 0.0035 L5) and Re=1000 (du=0.0727 L6)
+  vs Ghia; cylinder Re=20 Cd=2.847 / Re=100 Cd=1.352 (lit ~1.33; wake
+  numerically stable at 14% blockage, D/h=9 — St is the L7 nightly);
+  sphere Re=100 Cd=0.381 (L4 pipeline lock, preasymptotic).
+- Jacobi-BiCGStab breaks down on the 356k-DOF 3-D SBM system: ASM/AMG
+  preconditioning is the M1c-adjacent infrastructure item (amgx.py stub).

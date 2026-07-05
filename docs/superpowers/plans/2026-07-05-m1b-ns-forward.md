@@ -67,12 +67,15 @@ Tutorial chapters ⑤ (transient heat — needs only a brick on existing machine
 - [x] Task 6: Leray projection stepper v1 (incremental; ladder 1.86->1.10;
       head-to-head gate) — OPEN: implicit (1+sigma*tau_m) PPE weighting,
       Newton predictor upgrade
+- [x] Task 5c: fine-scale-corrected extrapolation (default ON, gated)
+- [x] Task 6b: Newton predictor (inexact; measured 0.2/iterate)
 - [x] Task 7: vector SBM Dirichlet + backflow + surrogate_traction
       (2D machine-exact; 3D case env-guarded pending ~1h kernel compile)
-- [~] Task 8: cavity Re=100 vs Ghia PASSED (coarse CI variant); cylinder
-      Re=20 smoke PASSED (Cd=2.847 recorded) — OPEN: full benchmark
-      configs, m1b_baselines.json lock, sphere Re=300, Leray-vs-monolithic
-      on benchmarks
+- [x] Task 8: cavity Re=100 both steppers + Re=1000 (du=0.0727 L6);
+      cylinder Re=20 (Cd=2.847) + Re=100 (Cd=1.352, wake stable at this
+      blockage — St deferred to L7 nightly); sphere Re=100 smoke (first 3D
+      SBM+NS, Cd=0.381 pipeline lock); m1b_baselines.json locked.
+      3D NS kernels: max_unroll=0, compile 79min -> 1.3s.
 - [~] Task 9: energy stability s=1/2 measured (monotone decay); MMS ladders
       exist for both steppers — OPEN: s=1 contrast documentation sweep
 - [ ] Task 10: tutorial chapters + spec S5.1 amendment + findings
@@ -80,3 +83,21 @@ Tutorial chapters ⑤ (transient heat — needs only a brick on existing machine
 
 Findings log: docs/superpowers/m1b-deferred-findings.md (7 entries, all
 measured).
+
+
+## M1c input list (handoff)
+
+1. NS adjoints: the M_{a,1/2} self-adjointness is locked (test_vms); the
+   taped-kernel rules (findings 4c m1a) and the Tier-2 VJP pattern
+   (sbm/adjoint.py) are the templates. Stepper checkpointing for the
+   reverse sweep is the design question.
+2. NeuralSDF backend: SDFOracle contract + admissibility (geometry/oracle),
+   torch-native — slot alongside gridsdf/trimesh; cross-backend suite is
+   the gate.
+3. Hero demo: shape-optimize an obstacle in channel flow — every piece
+   exists (E1 tutorial loop x D3 configuration x NS adjoint).
+4. Infrastructure debts that will bite M1c: ASM/AMG preconditioner (356k
+   3D breakdown measured), build_constraints vectorization (~2h at L6-3D),
+   strong-Dirichlet masked assembly (tolil row surgery is O(n) host/step).
+5. Deferred physics validations: cylinder St (L7 nightly), sphere Re=300,
+   3D band study L6+ (needs items in 4).
