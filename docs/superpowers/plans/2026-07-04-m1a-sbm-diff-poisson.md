@@ -815,6 +815,8 @@ Kernels: `make_sbm_neumann_Ae(nbf, nqf, dim)` (key `"sbm_neu_Ae"`) — inputs ad
 
 `surrogate_flux(u_all) -> float`: ∫_Γ̃ κ(S∇u·n)(n·ñ) dS̃ — the area-corrected shifted estimate of the true-boundary flux ∫_Γ κ∇u·n dΓ (the "Nusselt" observable; kernel key `"sbm_flux"`).
 
+**OUTCOME (2026-07-05, measured):** implemented per Eq. 21 (verified consistent — exact-data control at order 2.00); the load-bearing discovery is that the p2 band must be NODE-adjacent and >= 3 layers (face-ring 1-2 layers cap at order ~1: the face-element Hessians get pinched by minimum-rule p1 traces; node-band3 = 2.01/2.04). Flux observables: sin*cos MMS has zero net flux (unusable for area-correction locks); with a flux-carrying quadratic MMS the corrected flux error converges (7.6% -> ~3%) while uncorrected DATA stalls at its O(1) floor (~13.7%) — the lock asserts convergence-vs-stall. Full story in m1a-deferred-findings 4b.
+
 **Acceptance test (§13.3.3):** exterior square-minus-disk (`domain="outside"`), u* = sin(πx)cos(πy) (nonzero flux on the disk), strong outer Dirichlet from u*, SBM **Neumann** on the disk with q_N = κ∇u*·n evaluated at mapped points. Measure `|surrogate_flux(u) − F*|` where F* = ∫_Γ κ∇u*·n dΓ (semi-analytic: 1D trapezoid quadrature over the circle at 4096 points, computed in the test).
 
 1. **π/4 lock (solve level):** with `corr` forced to 1 (test-only flag `_area_correction=False`), the flux error stalls O(1); with correction, it converges.
@@ -823,9 +825,9 @@ Kernels: `make_sbm_neumann_Ae(nbf, nqf, dim)` (key `"sbm_neu_Ae"`) — inputs ad
 
 **Steps:**
 
-- [ ] **Step 1: Failing tests** (`tests/test_sbm_neumann.py`, `tier5`; helpers shared from `test_sbm_poisson` via a small `tests/helpers/sbm_cases.py` if imports get awkward)
-- [ ] **Step 2: Verify failure; implement kernels + `surrogate_flux`; wire `neumann=` into assemble.** Care points: (i) mixed-p face binning must route each face to its element's p-bin tables (p2 band ⇒ all Neumann faces in the p2 bin — assert); (ii) `d2N` physical scaling is `(2/h)²`; (iii) Neumann-only-on-disk + outer strong Dirichlet keeps the system nonsingular.
-- [ ] **Step 3: Run (expect the three acceptance properties), full suite, commit**
+- [x] **Step 1: Failing tests** (`tests/test_sbm_neumann.py`, `tier5`; helpers shared from `test_sbm_poisson` via a small `tests/helpers/sbm_cases.py` if imports get awkward)
+- [x] **Step 2: Verify failure; implement kernels + `surrogate_flux`; wire `neumann=` into assemble.** Care points: (i) mixed-p face binning must route each face to its element's p-bin tables (p2 band ⇒ all Neumann faces in the p2 bin — assert); (ii) `d2N` physical scaling is `(2/h)²`; (iii) Neumann-only-on-disk + outer strong Dirichlet keeps the system nonsingular.
+- [x] **Step 3: Run (expect the three acceptance properties), full suite, commit**
 
 ```bash
 git add -A && git commit -m "feat: SBM Neumann (area correction + Hessian shift); S13.3.3 p2-band acceptance"
@@ -874,9 +876,9 @@ plus tier4 unit tests per backend: projection/closest-point accuracy vs the anal
 
 **Steps:**
 
-- [ ] **Step 1: Failing unit tests per backend** (as specified above)
-- [ ] **Step 2: Implement the two backends** (each with a header docblock citing spec §4.1's backend table and the differentiable-parameter column)
-- [ ] **Step 3: Cross-backend suite; run; full suite; commit.**
+- [x] **Step 1: Failing unit tests per backend** (as specified above)
+- [x] **Step 2: Implement the two backends** (each with a header docblock citing spec §4.1's backend table and the differentiable-parameter column)
+- [x] **Step 3: Cross-backend suite; run; full suite; commit.**
 
 ```bash
 git add -A && git commit -m "feat: TriMesh(STL) + GridSDF backends + cross-backend oracle suite"
@@ -910,7 +912,7 @@ Face residual kernels (keys `"sbm_dir_res"`, `"sbm_neu_res"`): compute the face 
 
 **Steps:**
 
-- [ ] **Step 1: Failing tests** (`tests/test_ad_gradients.py`, `pytestmark = pytest.mark.ad`)
+- [x] **Step 1: Failing tests** (`tests/test_ad_gradients.py`, `pytestmark = pytest.mark.ad`)
 
 ```python
 def _fd_check(J_of_theta, theta0, g_analytic, rel=1e-6, eps=1e-6):
@@ -961,9 +963,9 @@ def test_gradient_grid_stl(device):
     ...
 ```
 
-- [ ] **Step 2: Verify failure; implement `adjoint.py` (+ residual kernels + `pointeval.py` + `reference.py`).** Care points: (i) λ_full = `T @ lam_free` (host scipy) then to device — the tape seed; (ii) cotangent sign: tape gives λᵀ∂R/∂•, gradient is its negation; (iii) torch backward call: `torch.autograd.backward([d_t, gbar_t, ...], [torch.from_numpy(dbar), ...])` accumulates into `oracle.params[i].grad`; zero grads first; (iv) the FD legs re-run carve→classify→solve — assert the retained Morton key arrays are identical between +ε and −ε evaluations (else shrink ε; generic positions make this robust); (v) `ConstrainedOperator` scratch-buffer non-reentrancy (M0 finding) is irrelevant here (CSR path) — note it in `adjoint.py`'s docblock for M1b.
+- [x] **Step 2: Verify failure; implement `adjoint.py` (+ residual kernels + `pointeval.py` + `reference.py`).** Care points: (i) λ_full = `T @ lam_free` (host scipy) then to device — the tape seed; (ii) cotangent sign: tape gives λᵀ∂R/∂•, gradient is its negation; (iii) torch backward call: `torch.autograd.backward([d_t, gbar_t, ...], [torch.from_numpy(dbar), ...])` accumulates into `oracle.params[i].grad`; zero grads first; (iv) the FD legs re-run carve→classify→solve — assert the retained Morton key arrays are identical between +ε and −ε evaluations (else shrink ε; generic positions make this robust); (v) `ConstrainedOperator` scratch-buffer non-reentrancy (M0 finding) is irrelevant here (CSR path) — note it in `adjoint.py`'s docblock for M1b.
 
-- [ ] **Step 3: Run + full suite + commit**
+- [x] **Step 3: Run + full suite + commit**
 
 ```bash
 git add -A && git commit -m "feat: adjoint shape/kappa gradients (Tier-2 VJP 1 + tape sweep + torch twin); three-way AD gate"

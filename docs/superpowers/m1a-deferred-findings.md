@@ -56,6 +56,41 @@
    elemOrder==2 for the same reason. Implemented: per-p shift selection in
    the kernel factories (_shift_fn_for). Blueprint chapter: "Taylor shift at
    basis order — never above it."
+4b. **SBM Neumann p2-band: thickness/adjacency is LOAD-BEARING, not a free
+   parameter (Task 8 overnight diagnosis; for the local-p draft's authors).**
+   Measured, exterior-disk MMS, levels 5-7, lam=0: (a) Eq. 21 as written is
+   consistent and EXONERATED — with exact surrogate-point data the pipeline
+   is clean order 2.00/2.00 at p1; (b) fully-shifting the tangential term
+   (Atallah S-grad on the surrogate-normal side only) makes things WORSE
+   (one-sided O(d) inconsistency) — reverted; (c) the real mechanism: band
+   elements carrying the Hessian must be decoupled from the minimum-rule p1
+   trace constraints — face-neighbor rings of 1-2 layers cap at order ~1
+   (0.85/1.04), 4 layers restore 2; NODE-adjacent growth ('cells touching',
+   the draft's semantics) is clean at >= 3 layers (2.01/2.04), marginal at 2
+   (1.78/1.37). p2_band now grows by node adjacency; the draft's layer-sweep
+   claim needs the caveat "insensitive once thick enough" + explicit
+   adjacency definition. (d) TOTAL-FLUX observable care points, twice burned: the sin*cos MMS has
+   ZERO net flux through the disk (F* = 3e-16) — it can neither test the
+   area correction nor distinguish flux errors; and the apparent
+   "conservation identity" (flux == F* to machine zero) was the same
+   artifact. With a flux-carrying quadratic MMS: corr-on flux error ~7.6%
+   |F*| at level 5 (discretization order), corr-off adds the ~27% (4/pi-1)
+   staircase inflation. Locks now measurement-based; primary observable is
+   L2 on Omega (the draft's own Fig. 6 evidence).
+4c. **WARP 1.14 ADJOINT BUG (Task 10; report upstream; HARD RULE for all
+   taped kernels incl. M1b matrix-free).** The loop-reassignment pattern
+   `jacS = wp.float64(1.0); for _ in range(dim-1): jacS = jacS * half`
+   inside a kernel differentiated by wp.Tape produces gradients scaled by
+   EXACTLY 1/jacS for ALL differentiable inputs (measured 32.000x at
+   h=1/16, dim=2, uniformly — even inputs entering linearly far from jacS;
+   verified by kernel-level FD, and the torch dense twin + pipeline FD
+   agreed with each other to 7 digits against it). Forward values are
+   correct — only the adjoint is wrong. Fix: compute such factors without
+   reassignment (wp.pow). RULE: no overwritten-local accumulation patterns
+   in ANY enable_backward=True kernel; add a tape-vs-kernel-FD unit test for
+   every new taped kernel. (This is also a testament to the three-way gate:
+   adjoint-vs-twin caught a plausible 32x-wrong gradient that FD-only
+   spot-checks at loose tolerance might have rationalized.)
 5. **Weak-form conventions verified against the group's papers (2026-07-04,
    MyPapers/).** (a) Dirichlet: matches the octree-SBM paper (Mehdi et al.,
    Eq. 7) in every sign; ONE deliberate delta — our penalty tests against the

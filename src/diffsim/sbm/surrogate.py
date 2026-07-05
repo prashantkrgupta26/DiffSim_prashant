@@ -26,7 +26,7 @@ import numpy as np
 
 from ..octree import morton
 from ..octree.build import Octree
-from ..octree.lookup import LeafLookup, face_offsets
+from ..octree.lookup import LeafLookup, face_offsets, face_neighbors
 
 
 def _domain_sign(domain: str) -> float:
@@ -167,6 +167,44 @@ def face_gauss_points(tree: Octree, sf: SurrogateFaces, ftab) -> np.ndarray:
     ref = ftab.xi[sf.face]                          # [Nf, nqf, dim]
     xq = lo[:, None, :] + (ref + 1.0) * 0.5 * h[:, None, None]
     return xq.reshape(-1, dim)
+
+
+def p2_band(tree: Octree, sf: SurrogateFaces, n_layers: int = 2) -> np.ndarray:
+    """Per-element polynomial-order marker for the SBM Neumann band (the
+    local-p-refinement draft's Eq. 7): p = 2 on every surrogate-face element
+    plus (n_layers - 1) NODE-adjacent rings (diagonal-inclusive — the
+    draft's 'cells touching' semantics), p = 1 elsewhere. Growth from the
+    actual face set guarantees the hard rule (every shifted-Neumann
+    quadrature point inside p2 cells) for any n_layers >= 1.
+
+    MEASURED (2026-07-05 overnight): ring growth by FACE neighbors is too
+    thin at diagonals — the surrogate-face elements' discrete Hessians get
+    pinched by the minimum-rule p1 trace constraints and the Neumann shift
+    caps at L2 order ~1 (band1 0.92, band2 1.04); a thick band restores
+    clean order 2 (face-band4: 1.99/2.02). Node adjacency reaches the same
+    quality at smaller n_layers."""
+    if n_layers < 1:
+        raise ValueError(f"n_layers must be >= 1, got {n_layers}")
+    from ..mesh.nodes import build_mesh
+    p_elem = np.ones(len(tree), np.int8)
+    band = set(int(e) for e in np.unique(sf.elem))
+    if n_layers > 1:
+        m1 = build_mesh(tree, p=1)
+        conn = m1.conn
+        node_elems = [[] for _ in range(len(m1.node_coords))]
+        for e in range(len(tree)):
+            for nd in conn[e]:
+                node_elems[int(nd)].append(e)
+        cur = set(band)
+        for _ in range(n_layers - 1):
+            nxt = set()
+            for e in cur:
+                for nd in conn[e]:
+                    nxt.update(node_elems[int(nd)])
+            cur = nxt - band
+            band |= nxt
+    p_elem[sorted(band)] = 2
+    return p_elem
 
 
 @dataclass(frozen=True)
