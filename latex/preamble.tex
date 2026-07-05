@@ -1,0 +1,42 @@
+\usepackage[margin=2.5cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[colorlinks=true,linkcolor=blue!60!black,urlcolor=blue!60!black]{hyperref}
+\usepackage{microtype}
+
+% ---- chapter-contract environments -------------------------------------
+\usepackage{tcolorbox}
+\newtcolorbox{outcome}{colback=blue!4,colframe=blue!50!black,
+  title=Learning outcome,fonttitle=\bfseries}
+\newtcolorbox{expected}{colback=green!4,colframe=green!40!black,
+  title=Expected results (measured),fonttitle=\bfseries}
+\newtcolorbox{explore}{colback=orange!5,colframe=orange!60!black,
+  title=Explore,fonttitle=\bfseries}
+
+% ---- code listings ------------------------------------------------------
+\definecolor{codebg}{RGB}{248,248,248}
+\definecolor{codekw}{RGB}{0,60,160}
+\definecolor{codestr}{RGB}{150,60,0}
+\definecolor{codecmt}{RGB}{90,120,90}
+\lstdefinestyle{diffsim}{
+  language=Python,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{codekw}\bfseries,
+  stringstyle=\color{codestr},
+  commentstyle=\color{codecmt}\itshape,
+  backgroundcolor=\color{codebg},
+  frame=single, framerule=0.3pt, rulecolor=\color{black!20},
+  breaklines=true, breakatwhitespace=true,
+  showstringspaces=false,
+  columns=fullflexible, keepspaces=true,
+  numbers=left, numberstyle=\tiny\color{black!40}, numbersep=6pt,
+  literate={—}{--}1 {–}{-}1 {≈}{$\approx$}1 {≥}{$\geq$}1 {≤}{$\leq$}1
+           {²}{$^2$}1 {³}{$^3$}1 {½}{$\tfrac12$}1 {τ}{$\tau$}1
+           {σ}{$\sigma$}1 {ν}{$\nu$}1 {ψ}{$\psi$}1 {λ}{$\lambda$}1
+           {Γ}{$\Gamma$}1 {Ω}{$\Omega$}1 {∇}{$\nabla$}1 {→}{$\to$}1,
+}
+\lstset{style=diffsim}

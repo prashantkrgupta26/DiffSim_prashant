@@ -1,0 +1,73 @@
+% DiffSim — The Curriculum (Overleaf-ready course packet)
+%
+% Structure: this main.tex \input's one file per chapter from chapters/,
+% grouped into parts (tracks). Add a chapter = add one \input line.
+% Chapters are GENERATED from the runnable tutorials (tutorials/*/*.py)
+% by tutorials/build_latex.py — the scripts are the source of truth; feel
+% free to hand-polish the generated .tex (regeneration is manual, never
+% automatic, precisely so polish survives).
+\documentclass[11pt,a4paper,oneside]{report}
+
+\input{preamble}
+
+\title{\Huge\textbf{DiffSim}\\[0.5em]
+       \Large Differentiable Finite Elements on Adaptive Octrees\\[0.25em]
+       \large A Pedagogical Curriculum}
+\author{The Baskar Group}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\chapter*{How to use this packet}
+Every chapter follows one contract: a \emph{learning outcome} (what you can
+do afterwards), \emph{background} (the minimum theory), a complete,
+documented, runnable script, \emph{expected results} --- measured numbers
+you must reproduce, not aspirations --- and \emph{explore} questions worth
+a lab-notebook entry. Each chapter also carries a \emph{performance
+corner}: a measurement task in the spirit of the group's computational-cost
+exercise. Run everything; distrust any claim you did not measure.
+
+The scripts live in \texttt{tutorials/} in the repository and are the
+source of truth; this packet is their typeset companion. Suggested paths:
+application users A1$\to$A3$\to$A6$\to$C1$\to$D2$\to$D3; methods students
+straight through; differentiable-simulation students
+A1$\to$A3$\to$E1 then backfill.
+
+\tableofcontents
+
+\part{Foundations: steady diffusion}
+\input{chapters/A1_mms_convergence}
+\input{chapters/A2_boundary_conditions}
+\input{chapters/A3_shifted_boundary}
+\input{chapters/A4_mixed_elements}
+\input{chapters/A5_three_dimensions}
+\input{chapters/A6_complex_geometry}
+
+\part{Nonlinear problems}
+\input{chapters/B1_bratu_newton}
+\input{chapters/B2_bratu_3d}
+
+\part{Time-dependent problems}
+\input{chapters/C1_heat_bdf}
+\input{chapters/C2_advection_diffusion}
+
+\part{Incompressible flow}
+\input{chapters/D1_ns_mms}
+\input{chapters/D2_lid_driven_cavity}
+\input{chapters/D3_cylinder}
+
+\part{Differentiable simulation}
+\input{chapters/E1_shape_optimization}
+
+\part{Performance}
+\input{chapters/P1_cost_model_and_scaling}
+\input{chapters/P2_solver_showdown}
+
+% Future tracks (uncomment as they land):
+% \part{Coupled multiphysics}
+% \input{chapters/F1_ns_ht}          % flow + heat
+% \input{chapters/F2_ch_ns}          % Cahn-Hilliard two-phase
+% \input{chapters/F3_ns_pnp}         % electrokinetics
+
+\end{document}
