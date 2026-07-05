@@ -19,6 +19,12 @@
       "rtol_note": "lit ~1.33 unbounded; 14% blockage",
       "value": 1.352
     },
+    "cylinder_re100_strouhal": {
+      "cl_amp_at_t16": 0.0275,
+      "config": "level 7, BDF2 dt=0.02, t_end=16, 14% blockage, kick 0.05U for t<0.5",
+      "rtol_note": "St elevated above unbounded ~0.164 by confinement; amplitude likely still growing at t=16 \u2014 saturation horizon is a nightly-campaign item",
+      "value": 0.2053
+    },
     "sphere_re100_cd": {
       "config": "level 4 3D, BDF1 pseudo-time, 56 steps",
       "rtol_note": "pipeline lock; D/h=3.8 preasymptotic",
