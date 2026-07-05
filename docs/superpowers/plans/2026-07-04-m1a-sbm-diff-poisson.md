@@ -987,10 +987,10 @@ git add -A && git commit -m "feat: adjoint shape/kappa gradients (Tier-2 VJP 1 +
 
 **Steps:**
 
-- [ ] **Step 1: Write the capstone test (failing: baseline file missing), implement the loop, tune iterations for runtime**
-- [ ] **Step 2: Generate + lock baselines; write the regression test**
-- [ ] **Step 3: Docs updates**
-- [ ] **Step 4: Full suite (all markers), commit**
+- [x] **Step 1: Write the capstone test (failing: baseline file missing), implement the loop, tune iterations for runtime**
+- [x] **Step 2: Generate + lock baselines; write the regression test**
+- [x] **Step 3: Docs updates**
+- [x] **Step 4: Full suite (all markers), commit**
 
 ```bash
 git add -A && git commit -m "feat: shape-inverse capstone; lock m1a baselines; M1a deferred findings"

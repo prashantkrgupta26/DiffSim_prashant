@@ -1,4 +1,16 @@
-# M1a Deferred Findings (running log; finalized in Task 11)
+# M1a Deferred Findings (FINALIZED 2026-07-05 — M1a complete)
+
+## 0. Test-design care points: the degenerate-MMS trilogy (one night, three
+## bites — write this into the verification-tier docs)
+
+Manufactured solutions/QoIs can be silently BLIND to the mechanism under
+test: (a) sin*cos on a centered disk has ZERO net flux — cannot exercise the
+Neumann area correction; (b) the same zero made "flux == F*" look like a
+conservation identity (it was 0 == 0); (c) a LINEAR patch problem has u == g
+on ANY domain (the P4 exactness property!), so dJ/d(geometry) is identically
+zero and gradient tests compare noise to noise. RULE: before locking a test,
+verify the sensitivity/observable it measures is NONZERO at the truth
+(assert the magnitude, not just the match).
 
 ## Performance findings from Task 1 (2026-07-04, RTX 6000 Ada, warp 1.14, WSL2)
 

@@ -242,7 +242,10 @@ def test_shape_inverse_recovers_circle(device):
     opt = torch.optim.Adam([theta], lr=2.0e-2)
     theta.requires_grad_(True)
     J_hist = []
-    for it in range(60):
+    for it in range(100):
+        if it == 60:                       # settle Adam's oscillation
+            for gp_ in opt.param_groups:
+                gp_["lr"] = 4.0e-3
         th = theta.detach().numpy()
         cx, cy, r = [float(v) for v in th]
         oracle = Sphere((cx, cy), r)
