@@ -1,0 +1,88 @@
+"""Tutorial 03 — Navier–Stokes: the lid-driven cavity, validated.
+
+THE PROBLEM. The classic incompressible-flow benchmark: a unit box of fluid,
+three no-slip walls, and a lid sliding at u = 1. At Re = 100 the flow settles
+into one primary vortex. Ghia, Ghia & Shin (1982) tabulated the steady
+centerline velocity profiles from a 129x129 fine-grid solve; every CFD code
+since has been judged against those two columns of numbers. So is ours.
+
+WHAT IS RUNNING UNDERNEATH.
+- Equal-order Q1/Q1 velocity-pressure on the octree, kept stable by
+  VMS/PSPG stabilization (tau_M-weighted residual terms; grad-div tau_C).
+- Convection in the s = 1/2 skew form  a.grad(u) + (1/2) div(a) u  — the
+  discretely ENERGY-STABLE choice: the advection operator is exactly
+  skew-symmetric, so convection cannot create kinetic energy (we verify this
+  as a test, and it is also what will make the adjoint elegant in M1c).
+- One LINEAR solve per pseudo-time step: convection is frozen at the
+  previous velocity (the production "linearized monolithic" stepper),
+  marched with BDF1 until nothing changes.
+
+Run:  python tutorials/03_lid_driven_cavity.py     (~30 s)
+"""
+import numpy as np
+
+from diffsim.octree.build import build_uniform
+from diffsim.mesh.nodes import build_mesh
+from diffsim.mesh.constraints import build_constraints
+from diffsim.mesh.basis import basis_tables
+from diffsim.assembly.operators import DeviceMesh
+from diffsim.steppers.linearized import LinearizedMonolithicStepper
+from diffsim.mesh.pointeval import point_eval_weights
+
+DEVICE = "cuda:0"
+
+# Ghia, Ghia & Shin (1982), Re = 100: u on the vertical centerline x = 0.5
+GHIA_Y = np.array([0.0000, 0.0547, 0.0625, 0.0703, 0.1016, 0.1719, 0.2813,
+                   0.4531, 0.5000, 0.6172, 0.7344, 0.8516, 0.9531, 0.9609,
+                   0.9688, 0.9766, 1.0000])
+GHIA_U = np.array([0.0000, -0.03717, -0.04192, -0.04775, -0.06434, -0.10150,
+                   -0.15662, -0.21090, -0.20581, -0.13641, 0.00332, 0.23151,
+                   0.68717, 0.73722, 0.78871, 0.84123, 1.00000])
+
+
+def lid(x, t):
+    g = np.zeros((len(x), 2))
+    g[np.abs(x[:, 1] - 1.0) < 1e-12, 0] = 1.0     # the moving lid
+    return g
+
+
+if __name__ == "__main__":
+    level, Re, dt = 5, 100.0, 0.05
+    tree = build_uniform(level, dim=2)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), DEVICE)
+    stepper = LinearizedMonolithicStepper(
+        dm, nu=1.0 / Re, dt=dt,
+        f_fn=lambda x, t: np.zeros((len(x), 2)), g_fn=lid, order=1)
+    stepper.set_initial(lambda x: np.zeros((len(x), 2)))
+
+    prev = None
+    for step in range(1, 401):
+        x = stepper.step()
+        u = x[:, :2]
+        if prev is not None and np.abs(u - prev).max() / dt < 2e-4:
+            print(f"steady after {step} pseudo-time steps")
+            break
+        prev = u.copy()
+
+    W = point_eval_weights(mesh, np.stack(
+        [np.full_like(GHIA_Y, 0.5), GHIA_Y], axis=1))
+    u_c = np.asarray(W @ np.asarray(dm.constraints.T @ u[:, 0]))
+
+    print(f"\n{'y':>8} {'u (ours)':>10} {'u (Ghia)':>10} {'diff':>9}")
+    for y, uo, ug in zip(GHIA_Y, u_c, GHIA_U):
+        print(f"{y:>8.4f} {uo:>10.4f} {ug:>10.4f} {uo - ug:>9.4f}")
+    print(f"\nmax |diff| = {np.abs(u_c - GHIA_U).max():.4f}   "
+          f"(a 33x33 grid vs Ghia's 129x129 — tolerance 0.06)")
+    print("""
+EXERCISES
+  (a) Refine to level 6 and watch the profile tighten (runtime ~4x).
+  (b) Swap in the Leray pressure-projection stepper (see
+      tests/test_cavity.py::test_cavity_re100_ghia_leray) — same physics
+      through a completely different time-splitting; the profiles must
+      agree. They do, to 0.0035.
+  (c) Raise Re to 400. What breaks first: steadiness of the pseudo-time
+      march, or the coarse-grid profile? (Ghia's Re=400 column is in the
+      1982 paper.)
+""")
