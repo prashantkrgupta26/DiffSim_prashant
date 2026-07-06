@@ -147,3 +147,47 @@ def test_residual_matches_assembled(device):
     r_kernel = np.asarray(T_vec.T @ r.numpy())
     scale = np.abs(r_assembled).max()
     assert np.abs(r_kernel - r_assembled).max() < 1e-12 * scale
+
+
+def test_nu_gradient_adjoint_vs_fd(device):
+    """First NS PHYSICS gradient: dJ/dnu on the linearized system at a
+    frozen advecting field (the production epoch pattern: aq held, x
+    solves A(aq, nu) x = b). J = 0.5 sum(u^2) over velocity dofs.
+    Adjoint: A^T lam = dJ/dx; dJ/dnu = -lam^T dR/dnu via the taped kernel.
+    FD: re-solve the LINEAR system at nu +- eps (aq frozen — matches the
+    partial derivative the adjoint computes)."""
+    import scipy.sparse as sp
+    import scipy.sparse.linalg as spla
+    dm, xq, aq, dq, x_full, _ = _setup(3, device)
+    nu, sigma = 0.05, 20.0
+    pv = list(dm.bins)[0]
+    fq = {pv: np.zeros((len(xq[pv]), 2))}
+
+    def solve(nu_val):
+        A, bvec = assemble_linear_ns(dm, aq, dq, fq, nu_val, sigma=sigma)
+        rng = np.random.default_rng(11)
+        bvec = rng.standard_normal(A.shape[0])   # generic rhs, same seed
+        return A, bvec, spla.spsolve(A.tocsc(), bvec)
+
+    A, bvec, xc = solve(nu)
+    T = dm.constraints.T.tocsr()
+    T_vec = sp.kron(T, sp.identity(3, format="csr"), format="csr")
+    x_node = np.asarray(T_vec @ xc)
+    # J = 0.5 * sum over velocity dofs of x^2 (constrained dofs)
+    vel_mask = np.tile([1.0, 1.0, 0.0], len(x_node) // 3)
+    J = 0.5 * float((x_node * vel_mask) @ x_node)
+    dJdx_node = x_node * vel_mask
+    dJdx = np.asarray(T_vec.T @ dJdx_node)
+    lam = spla.spsolve(A.tocsc().T, dJdx)
+    lam_node = np.asarray(T_vec @ lam)
+    _, dnu = ns_volume_cotangents(dm, aq, dq, nu, sigma, 0.5,
+                                  x_node, lam_node)
+    eps = 1e-6
+    _, _, xp = solve(nu + eps)
+    _, _, xm = solve(nu - eps)
+    xpn = np.asarray(T_vec @ xp)
+    xmn = np.asarray(T_vec @ xm)
+    Jp = 0.5 * float((xpn * vel_mask) @ xpn)
+    Jm = 0.5 * float((xmn * vel_mask) @ xmn)
+    fd = (Jp - Jm) / (2 * eps)
+    assert abs(fd - dnu) < 1e-5 * max(abs(fd), 1e-12), (fd, dnu, J)
