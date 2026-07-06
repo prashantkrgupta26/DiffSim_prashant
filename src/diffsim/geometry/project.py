@@ -74,7 +74,7 @@ def _jz(s, g, H):
     return Jz
 
 
-def _newton_iterate(oracle, x):
+def _newton_iterate(oracle, x, y0=None):
     """Project x onto {psi = 0} at the CLOSEST point. Returns (y, s, ok).
 
     The simple gradient-projection update y <- y - psi grad_psi/|grad_psi|^2
@@ -88,7 +88,16 @@ def _newton_iterate(oracle, x):
     x = x.detach()
     N, dim = x.shape
     # Phase 1: gradient projection onto the zero set (warm start).
-    y = x.clone()
+    # y0 (FOOT CONTINUATION): warm-start from a previous nearby solve's
+    # feet — keeps the BRANCH SELECTION continuous across small geometry
+    # perturbations. Measured need: wrinkly provided-INR surfaces put
+    # medial points chronically near the boundary; cold-started feet flip
+    # branches at alpha-perturbations ~1e-5, making any objective through
+    # the face terms micro-nonsmooth (J/|g| ~ 7e-6). With continuation,
+    # r(alpha) is smooth on the selected branch — which is exactly what
+    # the IFT backward differentiates.
+    y = x.clone() if y0 is None else torch.as_tensor(
+        np.ascontiguousarray(y0, np.float64)).clone()
     for _ in range(20):
         psi, g = _psi_grad(oracle, y)
         if (psi.abs() <= _TOL).all():
@@ -381,14 +390,14 @@ def distance_torch(oracle, x_np):
     return d, n, ok
 
 
-def distance_numpy(oracle, x_np):
+def distance_numpy(oracle, x_np, y0=None):
     """Detached FP64 numpy (d, n, ok) — the forward-pipeline path."""
     with torch.no_grad():
         if oracle.near_eikonal:
             d, n, ok = distance_torch(oracle, x_np)
             return d.numpy(), n.numpy(), ok.numpy()
     x = torch.as_tensor(np.ascontiguousarray(x_np, np.float64))
-    y, s, ok = _newton_iterate(oracle, x)
+    y, s, ok = _newton_iterate(oracle, x, y0=y0)
     d = (y - x).numpy()
     _, g = _psi_grad(oracle, y)
     n = (g / g.norm(dim=1, keepdim=True).clamp_min(1e-300)).numpy()

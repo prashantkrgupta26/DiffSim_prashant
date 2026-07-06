@@ -44,9 +44,9 @@ class SDFOracle:
         with torch.no_grad():
             return self.psi(x).numpy()
 
-    def distance_vector(self, pts: np.ndarray):
+    def distance_vector(self, pts: np.ndarray, y0: np.ndarray = None):
         from .project import distance_numpy
-        return distance_numpy(self, pts)
+        return distance_numpy(self, pts, y0=y0)
 
     def velocity(self, pts: np.ndarray, t: float = 0.0) -> np.ndarray:
         return np.zeros_like(np.asarray(pts, np.float64))

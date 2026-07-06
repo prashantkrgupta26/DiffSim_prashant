@@ -31,6 +31,8 @@ from .oracle import SDFOracle
 class ProvidedINROracle(SDFOracle):
     near_eikonal = False
 
+    _Vscale = None
+
     def __init__(self, layers, final_w, final_b, w0s, skip_at, dim=3,
                  head=0, modes=None, window_center=0.0, window_half=1.0):
         """layers: list of (W [out,in], b [out]) numpy; w0s per layer;
@@ -99,7 +101,10 @@ class ProvidedINROracle(SDFOracle):
     def psi(self, x01: torch.Tensor) -> torch.Tensor:
         theta = self._theta0
         if self._V is not None:
-            theta = theta + self._V @ self.alpha
+            a = self.alpha
+            if getattr(self, "_Vscale", None) is not None:
+                a = a / self._Vscale
+            theta = theta + self._V @ a
         return self.features(x01) @ theta + self._fbias
 
 
@@ -111,11 +116,31 @@ def extract_modes(oracle: ProvidedINROracle, band_pts01: np.ndarray,
     stability: min |cos| principal-angle diagonostic vs an independent
     sample draw when check_pts01 given (paper's reproducibility rule)."""
     with torch.no_grad():
-        H = oracle.features(torch.tensor(np.asarray(band_pts01, np.float64)))
+        band_t = torch.tensor(np.asarray(band_pts01, np.float64))
+        H = oracle.features(band_t)
         G = H.T @ H
         evals, evecs = torch.linalg.eigh(G)
         idx = torch.argsort(evals, descending=True)[:k]
         V = evecs[:, idx]
+        # NORMALIZE to surface-displacement units: unit alpha_k moves the
+        # zero level set by ~unit length (delta_x ~ delta_psi/|grad psi|).
+        # Raw Gram eigenvectors have RMS feature responses O(1-10): a
+        # "small-looking" alpha of 0.01 then moves the surface MULTIPLE
+        # CELLS (measured: 2.5 cells -> J barriers, false basins in
+        # recovery problems). In these units alpha is grid-intuitive.
+        x_g = band_t.clone().requires_grad_(True)
+        with torch.enable_grad():
+            psi_g = oracle.psi(x_g)
+            (gpsi,) = torch.autograd.grad(psi_g.sum(), x_g)
+        gnorm = gpsi.norm(dim=1).clamp_min(1e-12).mean()
+        # displacement scales kept SEPARATE: V stays orthonormal (the
+        # stability metric and any subspace math depend on it); psi()
+        # applies theta = theta0 + V @ (alpha / scale) so alpha is in
+        # surface-displacement units
+        scale = torch.ones(V.shape[1], dtype=torch.float64)
+        for k_ in range(V.shape[1]):
+            scale[k_] = (((H @ V[:, k_]) ** 2).mean().sqrt()
+                         / gnorm).clamp_min(1e-30)
         stability = None
         if check_pts01 is not None:
             H2 = oracle.features(torch.tensor(
@@ -126,5 +151,6 @@ def extract_modes(oracle: ProvidedINROracle, band_pts01: np.ndarray,
             s = torch.linalg.svdvals(V.T @ V2)
             stability = float(s.min())
     oracle._V = V
+    oracle._Vscale = scale
     oracle.alpha = torch.zeros(k, dtype=torch.float64)
     return V.numpy(), evals[idx].numpy(), stability

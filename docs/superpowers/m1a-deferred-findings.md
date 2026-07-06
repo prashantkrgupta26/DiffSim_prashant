@@ -196,3 +196,20 @@ FAMILY, measured by term-masked bisection:
    q*(b+a) (~128 bodies at p1/3-D), not the Ae form's a*b*dof explosion —
    first call including full backward codegen: 107 s, cached thereafter.
    All 4c gates green first run. No kernel splitting needed.
+
+4f. **SBM-probe objectives over wrinkly INR geometry have steep local
+   structure below the edit scale (measured, open).** Sphere-INR Poisson
+   probe-recovery at L5: objective consistent (J(alpha*) = 3e-30
+   sentinel), gradient adjoint==FD, Jacobian well-conditioned (cond 6.9)
+   — yet dJ/d(displacement) at the origin is ~100x the mean slope to the
+   target, and every descent method (GD, LM/GN, with epoch management,
+   foot continuation, displacement-normalized modes) converges to a
+   local minimum 20x closer to zero than alpha*. The NS analogue (hero
+   H1) converges — advective measurement enrichment. Mechanism unknown
+   (wobble x Nitsche-penalty interplay?); handed to the tutorial's
+   EXPLORE 6-7 and the N6 research fork. Along the way, three durable
+   framework pieces landed: displacement-unit mode normalization
+   (orthonormal V + scale vector), epoch trust-region management
+   (re-carve on |d| > 0.35h), and FOOT CONTINUATION (anchored per-epoch
+   warm starts -> deterministic objectives + continuous branch
+   selection).

@@ -221,10 +221,12 @@ class GeometryData:
 
     @classmethod
     def evaluate(cls, oracle, tree: Octree, sf: SurrogateFaces, ftab,
-                 domain: str = "inside") -> "GeometryData":
+                 domain: str = "inside",
+                 warm_feet: np.ndarray = None) -> "GeometryData":
         sgn = -_domain_sign(domain)      # out-of-domain: +grad for "inside"
         xq = face_gauss_points(tree, sf, ftab)
-        d, n_grad, ok = oracle.distance_vector(xq)
+        d, n_grad, ok = oracle.distance_vector(
+            xq, y0=(xq + warm_feet) if warm_feet is not None else None)
         if not ok.all():
             from ..geometry.oracle import admissibility
             raise RuntimeError(

@@ -165,7 +165,7 @@ class TriMeshOracle(SDFOracle):
         with torch.no_grad():
             return (sign * (p - y).norm(dim=1)).numpy()
 
-    def distance_vector(self, pts: np.ndarray):
+    def distance_vector(self, pts: np.ndarray, y0=None):  # y0 ignored: BVH selects candidates
         d_t, n_t, ok = self.distance_torch(pts)
         return d_t.detach().numpy(), n_t.detach().numpy(), ok
 
