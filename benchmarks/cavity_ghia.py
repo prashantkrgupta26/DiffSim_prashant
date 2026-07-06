@@ -66,7 +66,7 @@ if __name__ == "__main__":
     ap.add_argument("--stepper", default="both",
                     choices=["monolithic", "leray", "both"])
     ap.add_argument("--solver", default="splu",
-                    choices=["splu", "fused", "amgx"])
+                    choices=["splu", "fused", "amgx", "cudss"])
     args = ap.parse_args()
     steppers = (["monolithic", "leray"] if args.stepper == "both"
                 else [args.stepper])
