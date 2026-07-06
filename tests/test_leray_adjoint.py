@@ -21,7 +21,7 @@ def _lid(x, t):
     return g
 
 
-def _make(nu, device, steps=3, picard=1):
+def _make(nu, device, steps=3, picard=1, finescale=False):
     tree = build_uniform(4, dim=2)
     mesh = build_mesh(tree, p=1)
     cons = build_constraints(mesh)
@@ -29,7 +29,7 @@ def _make(nu, device, steps=3, picard=1):
     st = LerayProjectionStepper(
         dm, nu, 0.05, f_fn=lambda x, t: np.zeros((len(x), 2)),
         g_fn=_lid, order=2, picard_iters=picard)
-    st.ppe_finescale = False
+    st.ppe_finescale = finescale
     st.set_initial(lambda x: np.zeros((len(x), 2)))
     for _ in range(steps):
         st.step()
@@ -39,10 +39,11 @@ def _make(nu, device, steps=3, picard=1):
 import pytest as _pt
 
 
-@_pt.mark.parametrize("picard", [1, 2])
-def test_leray_step_nu_gradient(picard, device):
+@_pt.mark.parametrize("picard,finescale",
+                      [(1, False), (2, False), (1, True)])
+def test_leray_step_nu_gradient(picard, finescale, device):
     nu0 = 0.02
-    st = _make(nu0, device, picard=picard)
+    st = _make(nu0, device, picard=picard, finescale=finescale)
     adj = LerayStepAdjoint(st)             # capture frozen pre-step state
     u_new, _ = st.step()
     dJdu = u_new.copy()                    # J = 0.5 sum u^2
@@ -52,7 +53,8 @@ def test_leray_step_nu_gradient(picard, device):
     eps = 1e-6
     Js = []
     for dnu in (+eps, -eps):
-        st2 = _make(nu0, device, picard=picard)  # identical history (seed
+        st2 = _make(nu0, device, picard=picard,
+                    finescale=finescale)  # identical history (seed
         #                                    path: deterministic stepper)
         st2.nu = nu0 + dnu
         u2, _ = st2.step()
