@@ -287,3 +287,25 @@ S5.1 sketch where they differ:
    element parallelism races at hanging boundaries (Dendro-5.01
    findings/unzip_openmp.txt); per-thread interp scratch mandatory;
    reindex + SIMD tensor kernels gave 3.5-5x.
+
+## cuFEM exploration (github.com/mshadkhah/cuFEM, 2026-07-06; file:line in clone)
+
+Single-GPU CUDA/C++ linear-Morton octree FEM (uint64 Morton<<5|level,
+DMAX=19), element-parallel flat kernels throughout. Verdicts for us:
+1. VALIDATES our lookup: their "traversal" is sorted-Morton
+   thrust::lower_bound + ancestor classification (NeighborTopology.cu:
+   129-181) — the same algorithm as our per-level searchsorted; nothing
+   faster found.
+2. ADOPT: dense precomputed FaceNeighbor[oct*2dim+face] table built once
+   (NeighborTopology.cuh:41-50) instead of re-searching per use.
+3. M2 REFERENCE: on-device hanging/Dirichlet constraint ELIMINATION
+   folded into assembly (<=4 masters w/ weights, master-DOF-only system;
+   HangingNodeConstraints.cuh:7-26, FiniteElementSpace.cuh:46-52) — the
+   GPU-native constraints design when we migrate off host T-matrices.
+4. VALIDATES interleaved node-major DOFs (row = node*ndof + dof,
+   Assembler.inl:56).
+5. AVOID: their CSR numeric assembly = per-element atomicAdd with
+   binary-search-per-column (AssemblyUtils.cuh:11-68) — atomic-contention
+   anti-pattern at scale; coloring/matrix-free stays our plan.
+6. Solver = AMGX aggregation-CG only; geometry = STL ray-cast cut-cell
+   (no SBM, no differentiability, no VMS) — no overlap with our edge.
