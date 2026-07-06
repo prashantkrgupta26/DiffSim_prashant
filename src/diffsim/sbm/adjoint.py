@@ -113,7 +113,7 @@ def make_sbm_neumann_residual(nbf: int, nqf: int, dim: int):
                     corr: wp.array(dtype=wp.float64),     # DIFF
                     qbar: wp.array(dtype=wp.float64),     # DIFF
                     u: wp.array(dtype=wp.float64),        # frozen state
-                    kappa: wp.float64,
+                    beta: wp.float64, kappa: wp.float64,
                     r: wp.array(dtype=wp.float64)):
         fi = wp.tid()
         e = felem[fi]
@@ -140,8 +140,20 @@ def make_sbm_neumann_residual(nbf: int, nqf: int, dim: int):
                 gradun_surr += sgn * dNf[f, q, b, ax] * dscale * ub
             val = corr[gp] * sflux_u - gradun_surr - corr[gp] * qbar[gp]
             for a in range(nbf):
+                # beta penalty terms mirror the forward kernels exactly:
+                # bilinear beta*sfa*sfb*corr^2 (poisson sbm_neu_Ae) and
+                # load beta*sfa*corr^2*qbar (sbm_neu_be) — their residual
+                # sum is beta*sfa*corr*(corr*Sflux_u - qbar). Omitting
+                # them made the taped residual a DIFFERENT functional from
+                # the forward solve for beta_neumann != 0 (external
+                # evaluation finding 1, CONFIRMED — the old gate ran at
+                # the beta=0 default and masked it).
+                sfa = fluxshift_fn(dNf, d2Nf, f, q, a, gp, dvec, nvec,
+                                   dscale, dim)
                 wp.atomic_add(r, conn[e, a],
-                              kappa * Nf[f, q, a] * val * dS)
+                              kappa * (Nf[f, q, a] * val
+                                       + beta * sfa * corr[gp] * corr[gp]
+                                       * (sflux_u - qbar[gp])) * dS)
 
     _kernel_cache[key] = sbm_neu_res
     return sbm_neu_res
@@ -254,6 +266,7 @@ def shape_gradient(problem, u_all, lam_free, oracle, meta,
                       inputs=[fs.felem_d, fs.fface_d, b["conn"], b["h"],
                               fs.Nf_d, fs.dNf_d, fs.d2Nf_d, fs.wf_d,
                               dvec, nvec, corr, qbar, u_d,
+                              wp.float64(problem.beta_neumann),
                               wp.float64(problem.kappa), r],
                       device=d)
         tape.backward(grads={r: lam_full_d})
