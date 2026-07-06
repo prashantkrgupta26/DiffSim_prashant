@@ -28,7 +28,8 @@ from ..assembly.operators import _kernel_cache
 from ..physics.vms import tau_m_metric, tau_c_metric
 
 
-def make_lin_ns_residual(nbf: int, nqp: int, dim: int):
+def make_lin_ns_residual(nbf: int, nqp: int, dim: int,
+                         tau_frozen: bool = True):
     """Taped volume residual in RESIDUAL FORM: field quantities from the
     frozen state are accumulated ONCE per Gauss point at loop depth 1, then
     each test function only READS them — the m1a-proven taped shape.
@@ -37,7 +38,7 @@ def make_lin_ns_residual(nbf: int, nqp: int, dim: int):
     accumulators initialized inside second-level unrolled loops (the
     Ae-style a/b nesting) poison the ENTIRE tape with NaN — used or dead.
     Accumulators in taped kernels must live at nesting depth 1."""
-    key = ("lin_ns_res", nbf, nqp, dim)
+    key = ("lin_ns_res", nbf, nqp, dim, tau_frozen)
     if key in _kernel_cache:
         return _kernel_cache[key]
     ndof = dim + 1
@@ -116,9 +117,16 @@ def make_lin_ns_residual(nbf: int, nqp: int, dim: int):
             divu = g00 + g11
             a0 = aq[gp, 0]
             a1 = aq[gp, 1]
-            # tau INLINED from the frozen advecting copy (tau-frozen)
-            af0 = aq_frozen[gp, 0]
-            af1 = aq_frozen[gp, 1]
+            # tau source: frozen copy (production tau-frozen pattern) or
+            # the DIFFERENTIABLE aq (exactness for transient chains, where
+            # aq varies with earlier states and FD sees dtau/daq — measured
+            # as the 4e-4 chain leak in the N=2 isolation ladder)
+            if wp.static(tau_frozen):
+                af0 = aq_frozen[gp, 0]
+                af1 = aq_frozen[gp, 1]
+            else:
+                af0 = aq[gp, 0]
+                af1 = aq[gp, 1]
             uGu = wp.float64(4.0) * (af0 * af0 + af1 * af1) / (he * he)
             GG = wp.float64(2.0) * wp.pow(wp.float64(2.0) / he,
                                           wp.float64(4.0))
@@ -159,7 +167,8 @@ def make_lin_ns_residual(nbf: int, nqp: int, dim: int):
 
 
 def ns_volume_cotangents(dm, aq_by_bin, div_aq_by_bin, nu, sigma, s_skew,
-                         x_full, lam_full, timestab=True):
+                         x_full, lam_full, timestab=True,
+                         tau_frozen=True):
     """(-lam^T dR/daq per bin, -lam^T dR/dnu): the tape sweep. x_full and
     lam_full are FULL node-major vectors (ndof = dim+1)."""
     d = dm.device
@@ -171,7 +180,8 @@ def ns_volume_cotangents(dm, aq_by_bin, div_aq_by_bin, nu, sigma, s_skew,
     aq_bar = {}
     dnu = 0.0
     for pv, b in dm.bins.items():
-        k = make_lin_ns_residual(b["nbf"], b["nqp"], dim)
+        k = make_lin_ns_residual(b["nbf"], b["nqp"], dim,
+                                 tau_frozen=tau_frozen)
         tape = wp.Tape()
         aq = wp.array(np.ascontiguousarray(aq_by_bin[pv]), dtype=wp.float64,
                       device=d, requires_grad=True)

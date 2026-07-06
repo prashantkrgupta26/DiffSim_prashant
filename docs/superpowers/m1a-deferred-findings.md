@@ -175,3 +175,15 @@ FAMILY, measured by term-masked bisection:
   — use plain locals and direct table indexing (bug #3, the big one);
   wp.pow for jacobians. Upstream report: FEMElm minimal repro TODO (the
   struct + loop mutation pair), plus the bug #2 nan_micro2 repro.
+
+4d. **TAU-FROZEN adjoints: right for frozen-field partials, LEAKS in
+   transient chains (measured).** The production tau-frozen pattern
+   (stabilization parameter's advecting-field dependence not
+   differentiated) is exact for shape/parameter gradients at a FROZEN
+   advecting field. In the transient chain the advecting field varies
+   with earlier states, and FD sees dtau/daq: measured leak 3.8e-4 per
+   BDF1 chain link, 4.4e-3 under BDF2 coefficients. The volume residual
+   kernel now has both variants (tau_frozen flag); the transient chain
+   uses tau_frozen=False and lands at rel 4.4e-10 over 4 BDF2 steps.
+   Diagnosis path preserved in the N=1/2/3 isolation ladder — N=1 exact
+   at 1.9e-8 pinned the leak to the chains in one shot.
