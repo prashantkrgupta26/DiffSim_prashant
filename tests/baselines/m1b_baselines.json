@@ -16,6 +16,11 @@
       "monolithic_du": 0.0061,
       "monolithic_dv": 0.0034
     },
+    "cavity_re100_l8": {
+      "config": "level 8 (~790k dofs), cuDSS, BDF2, monolithic; overnight sweep 2026-07-05; du trend L6/L7/L8 = 0.0324/0.0061/0.0048 (approaching the Ghia-table interpolation floor)",
+      "monolithic_du": 0.0048,
+      "monolithic_dv": 0.0056
+    },
     "cavity_re100_leray_du": {
       "config": "level 5 p1, 200 fixed steps, dt=0.05",
       "rtol_note": "test_cavity leray lock du<0.02",
