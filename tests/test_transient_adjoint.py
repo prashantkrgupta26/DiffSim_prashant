@@ -104,3 +104,58 @@ def test_dim3_nu_gradient(device):
     print(f"dim-3 transient dJ/dnu: adj={g_adj:.6e} fd={fd:.6e} "
           f"rel={abs(g_adj-fd)/max(abs(fd),1e-14):.2e}")
     assert abs(fd - g_adj) < 5e-5 * max(abs(fd), 1e-12), (g_adj, fd)
+
+
+@pytest.mark.ad
+def test_transient_shape_gradient(device):
+    """Transient SHAPE gradient: d(sum_n 0.5|x_n|^2)/d(cylinder center)
+    over a 3-step BDF2 start-up flow — face cotangents accumulated over
+    the reverse sweep, composed through the oracle torch chain; vs FD."""
+    from diffsim.geometry.csg import Sphere
+    from diffsim.mesh.faces import face_tables
+    from diffsim.sbm.surrogate import (classify_lambda, extract_surrogate,
+                                       GeometryData)
+    from diffsim.sbm.transient_adjoint import TransientShapeAdjoint
+
+    R_, U_IN, NU = 0.07, 1.0, 0.014
+
+    def make(center):
+        oracle = Sphere(tuple(center), R_)
+        tree = build_uniform(5, dim=2)
+        ret, _ = classify_lambda(tree, oracle, 0.5, domain="outside")
+        sf = extract_surrogate(ret)
+        mesh = build_mesh(ret, p=1)
+        cons = build_constraints(mesh)
+        dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2),
+                                  device)
+        geo = GeometryData.evaluate(oracle, ret, sf, face_tables(1, 2),
+                                    domain="outside")
+        coords = mesh.node_coords[cons.free_nodes]
+        on = lambda v, c: np.abs(coords[:, c] - v) < 1e-12
+        strong = np.where(on(0.0, 0) | on(0.0, 1) | on(1.0, 1))[0]
+        g_strong = np.zeros((len(strong), 2))
+        g_strong[np.abs(coords[strong, 0]) < 1e-12, 0] = U_IN
+        return TransientShapeAdjoint(dm, sf, geo, oracle, NU, 0.05,
+                                     10.0, strong, g_strong), ret
+
+    c0 = np.array([0.3, 0.5])
+    tsa, ret0 = make(c0)
+    xs = tsa.run(3)
+    tsa.shape_gradient([x.copy() for x in xs])
+    g_adj = tsa.oracle.center.grad.numpy().copy()
+
+    eps = 1e-6
+    scale = max(np.abs(g_adj).max(), 1e-12)
+    for i in range(2):
+        Js = []
+        for s_ in (+eps, -eps):
+            c = c0.copy(); c[i] += s_
+            t2, ret2 = make(c)
+            assert np.array_equal(ret2.keys, ret0.keys)
+            xs2 = t2.run(3)
+            Js.append(0.5 * sum(float(x @ x) for x in xs2))
+        fd = (Js[0] - Js[1]) / (2 * eps)
+        print(f"transient shape grad c[{i}]: adj={g_adj[i]:+.6e} "
+              f"fd={fd:+.6e} rel={abs(g_adj[i]-fd)/max(abs(fd),1e-14):.2e}")
+        assert abs(fd - g_adj[i]) < 5e-4 * max(abs(fd), scale), (
+            i, fd, g_adj[i])

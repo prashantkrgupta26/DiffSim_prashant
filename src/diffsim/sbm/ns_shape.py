@@ -163,6 +163,36 @@ def _gp_field_transpose(dm, aq_bar_bins, dq_bar_bins, ndof):
     return out
 
 
+def face_dbar_sweep(dm, sf, geo, x_d, lam_d, nu, alpha, ndof):
+    """lam^T dR_face/dd for the momentum SBM Dirichlet block (no-slip):
+    per-component taped sweeps, cotangents add. x_d/lam_d: FULL node-major
+    wp arrays."""
+    from .poisson import _FaceSet
+    dim = dm.dim
+    d = dm.device
+    fs = _FaceSet(dm, sf, geo)
+    b = dm.bins[fs.pv]
+    dbar = np.zeros_like(geo.d)
+    for comp in range(dim):
+        k = make_sbm_vector_dirichlet_residual(fs.ftab.nbf, fs.ftab.nqf,
+                                               dim, comp, ndof)
+        tape = wp.Tape()
+        dvec = wp.array(np.ascontiguousarray(geo.d), dtype=wp.float64,
+                        device=d, requires_grad=True)
+        r = wp.zeros(dm.n_nodes * ndof, dtype=wp.float64, device=d,
+                     requires_grad=True)
+        with tape:
+            wp.launch(k, dim=len(sf.elem),
+                      inputs=[fs.felem_d, fs.fface_d, b["conn"], b["h"],
+                              fs.Nf_d, fs.dNf_d, fs.d2Nf_d, fs.wf_d,
+                              dvec, x_d, wp.float64(alpha),
+                              wp.float64(nu), r],
+                      device=d)
+        tape.backward(grads={r: lam_d})
+        dbar += tape.gradients[dvec].numpy()
+    return dbar
+
+
 def drag_shape_gradient(dm, sf, geo, oracle, A, x_full, nu, alpha,
                         strong_rows, ndof, direction=0,
                         fixed_point=False, sigma=0.0, s_skew=0.5,
@@ -221,28 +251,7 @@ def drag_shape_gradient(dm, sf, geo, oracle, A, x_full, nu, alpha,
     lam_d = wp.array(lam_full, dtype=wp.float64, device=d)
     x_d = wp.array(np.ascontiguousarray(x_full), dtype=wp.float64, device=d)
 
-    # ---- face-term d-cotangents (per component; tapes add) ------------
-    from .poisson import _FaceSet
-    fs = _FaceSet(dm, sf, geo)
-    b = dm.bins[fs.pv]
-    dbar = np.zeros_like(geo.d)
-    for comp in range(dim):
-        k = make_sbm_vector_dirichlet_residual(fs.ftab.nbf, fs.ftab.nqf,
-                                               dim, comp, ndof)
-        tape = wp.Tape()
-        dvec = wp.array(np.ascontiguousarray(geo.d), dtype=wp.float64,
-                        device=d, requires_grad=True)
-        r = wp.zeros(dm.n_nodes * ndof, dtype=wp.float64, device=d,
-                     requires_grad=True)
-        with tape:
-            wp.launch(k, dim=len(sf.elem),
-                      inputs=[fs.felem_d, fs.fface_d, b["conn"], b["h"],
-                              fs.Nf_d, fs.dNf_d, fs.d2Nf_d, fs.wf_d,
-                              dvec, x_d, wp.float64(alpha),
-                              wp.float64(nu), r],
-                      device=d)
-        tape.backward(grads={r: lam_d})
-        dbar += tape.gradients[dvec].numpy()
+    dbar = face_dbar_sweep(dm, sf, geo, x_d, lam_d, nu, alpha, ndof)
 
     # ---- torch geometry chain ------------------------------------------
     for p in oracle.params:
