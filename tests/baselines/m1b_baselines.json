@@ -9,6 +9,13 @@
       "rtol_note": "nightly driver",
       "value": 0.0727
     },
+    "cavity_re100_l7": {
+      "config": "level 7 (~200k dofs), cuDSS, BDF2; overnight sweep 2026-07-05; vs Ghia Re=100 (L6 mono du was 0.0324 \u2014 5x tighter at L7)",
+      "leray_du": 0.0049,
+      "leray_dv": 0.0094,
+      "monolithic_du": 0.0061,
+      "monolithic_dv": 0.0034
+    },
     "cavity_re100_leray_du": {
       "config": "level 5 p1, 200 fixed steps, dt=0.05",
       "rtol_note": "test_cavity leray lock du<0.02",
