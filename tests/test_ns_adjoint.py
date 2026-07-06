@@ -191,3 +191,62 @@ def test_nu_gradient_adjoint_vs_fd(device):
     Jm = 0.5 * float((xmn * vel_mask) @ xmn)
     fd = (Jp - Jm) / (2 * eps)
     assert abs(fd - dnu) < 1e-5 * max(abs(fd), 1e-12), (fd, dnu, J)
+
+
+def test_load_kernel_consistency_and_tape(device):
+    """4c contract for the taped LOAD kernel: (i) matches the assembled b
+    exactly; (ii) tape == kernel-FD for aq, fq, nu."""
+    dm, xq, aq, dq, x_full, lam_full = _setup(3, device)
+    nu, sigma = 0.05, 20.0
+    pv = list(dm.bins)[0]
+    rng = np.random.default_rng(5)
+    fqv = {pv: rng.standard_normal((len(xq[pv]), 2))}
+    from diffsim.sbm.ns_adjoint import make_lin_ns_load, ns_load_cotangents
+    d = dm.device
+    b = dm.bins[pv]
+    k = make_lin_ns_load(b["nbf"], b["nqp"], dm.dim)
+
+    def run_b(aqv, fv, nuv):
+        r = wp.zeros(dm.n_nodes * 3, dtype=wp.float64, device=d)
+        wp.launch(k, dim=len(b["eids"]),
+                  inputs=[b["conn"], b["h"], b["N"], b["dN"], b["w"],
+                          wp.array(np.ascontiguousarray(aqv),
+                                   dtype=wp.float64, device=d),
+                          wp.array(np.ascontiguousarray(fv),
+                                   dtype=wp.float64, device=d),
+                          wp.array(np.array([nuv]), dtype=wp.float64,
+                                   device=d),
+                          wp.float64((2 * sigma) ** 2), r], device=d)
+        return r.numpy()
+
+    # (i) consistency vs assemble_linear_ns's b
+    import scipy.sparse as sp
+    _, b_asm = assemble_linear_ns(dm, aq, dq, fqv, nu, sigma=sigma)
+    T = dm.constraints.T.tocsr()
+    T_vec = sp.kron(T, sp.identity(3, format="csr"), format="csr")
+    b_kernel = np.asarray(T_vec.T @ run_b(aq[pv], fqv[pv], nu))
+    scale = np.abs(b_asm).max()
+    assert np.abs(b_kernel - b_asm).max() < 1e-12 * scale
+
+    # (ii) tape vs kernel-FD
+    aq_bar, fq_bar, dnu = ns_load_cotangents(dm, aq, fqv, nu, sigma,
+                                             lam_full)
+    eps = 1e-6
+    for arrs, bar, probes in (
+            ((aq[pv],), aq_bar[pv], ((0, 0), (7, 1))),
+            ((fqv[pv],), fq_bar[pv], ((3, 0), (11, 1)))):
+        base = arrs[0]
+        for gp, c in probes:
+            ap = base.copy(); ap[gp, c] += eps
+            am = base.copy(); am[gp, c] -= eps
+            if base is aq[pv]:
+                fd = (lam_full @ run_b(ap, fqv[pv], nu)
+                      - lam_full @ run_b(am, fqv[pv], nu)) / (2 * eps)
+            else:
+                fd = (lam_full @ run_b(aq[pv], ap, nu)
+                      - lam_full @ run_b(aq[pv], am, nu)) / (2 * eps)
+            assert abs(fd - bar[gp, c]) < 1e-6 * max(abs(fd), 1e-10), (
+                (gp, c), fd, bar[gp, c])
+    fd_nu = (lam_full @ run_b(aq[pv], fqv[pv], nu + eps)
+             - lam_full @ run_b(aq[pv], fqv[pv], nu - eps)) / (2 * eps)
+    assert abs(fd_nu - dnu) < 1e-6 * max(abs(fd_nu), 1e-10), (fd_nu, dnu)

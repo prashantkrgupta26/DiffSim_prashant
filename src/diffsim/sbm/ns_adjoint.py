@@ -194,3 +194,96 @@ def ns_volume_cotangents(dm, aq_by_bin, div_aq_by_bin, nu, sigma, s_skew,
                       -tape.gradients[dq].numpy())
         dnu += -float(tape.gradients[nu_a].numpy()[0])
     return aq_bar, dnu
+
+
+def make_lin_ns_load(nbf: int, nqp: int, dim: int):
+    """Taped LOAD twin of ns_bricks.make_linear_ns_be: b contributions
+    r[node*ndof+c] += (N_a + tauM agw) fq_i + PSPG. Differentiable inputs
+    {aq (via tau + agw), fq, nu}; same 4c rules as the residual kernel
+    (plain locals, no struct, depth-1 accumulators). dim=2 first."""
+    key = ("lin_ns_load", nbf, nqp, dim)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+    if dim != 2:
+        raise NotImplementedError("taped NS load: dim=2 first")
+
+    @wp.kernel(module="unique", enable_backward=True,
+               module_options={"max_unroll": 1024})
+    def lin_ns_load(conn: wp.array2d(dtype=wp.int32),
+                    h: wp.array(dtype=wp.float64),
+                    Ntab: wp.array2d(dtype=wp.float64),
+                    dNtab: wp.array3d(dtype=wp.float64),
+                    wtab: wp.array(dtype=wp.float64),
+                    aq: wp.array2d(dtype=wp.float64),       # DIFF
+                    fq: wp.array2d(dtype=wp.float64),       # DIFF
+                    nu_arr: wp.array(dtype=wp.float64),     # DIFF len 1
+                    sig2tau: wp.float64,
+                    r: wp.array(dtype=wp.float64)):
+        e = wp.tid()
+        he = h[e]
+        jac = wp.pow(he * wp.float64(0.5), wp.float64(2.0))
+        dscale = wp.float64(2.0) / he
+        for q in range(nqp):
+            nu = nu_arr[0]
+            dJxW = wtab[q] * jac
+            gp = e * nqp + q
+            a0 = aq[gp, 0]
+            a1 = aq[gp, 1]
+            amag = wp.sqrt(a0 * a0 + a1 * a1)
+            uGu = wp.float64(4.0) * (a0 * a0 + a1 * a1) / (he * he)
+            GG = wp.float64(2.0) * wp.pow(wp.float64(2.0) / he,
+                                          wp.float64(4.0))
+            tauM = wp.float64(1.0) / wp.sqrt(
+                sig2tau + uGu + wp.float64(36.0) * nu * nu * GG)
+            f0 = fq[gp, 0]
+            f1 = fq[gp, 1]
+            for a in range(nbf):
+                Na = Ntab[q, a]
+                dna0 = dNtab[q, a, 0] * dscale
+                dna1 = dNtab[q, a, 1] * dscale
+                agw = a0 * dna0 + a1 * dna1
+                wp.atomic_add(r, conn[e, a] * 3 + 0,
+                              (Na + tauM * agw) * f0 * dJxW)
+                wp.atomic_add(r, conn[e, a] * 3 + 1,
+                              (Na + tauM * agw) * f1 * dJxW)
+                wp.atomic_add(r, conn[e, a] * 3 + 2,
+                              tauM * (dna0 * f0 + dna1 * f1) * dJxW)
+
+    _kernel_cache[key] = lin_ns_load
+    return lin_ns_load
+
+
+def ns_load_cotangents(dm, aq_by_bin, fq_by_bin, nu, sigma, lam_full,
+                       timestab=True):
+    """(lam^T db/daq per bin, lam^T db/dfq per bin, lam^T db/dnu): tape
+    sweep over the load. NOTE the sign convention differs from the
+    residual sweep: these are +lam^T d(b)/d(.) — the caller composes
+    R = A x - b itself."""
+    d = dm.device
+    dim = dm.dim
+    sig2tau = (2.0 * sigma) ** 2 if timestab else 0.0
+    lam_d = wp.array(np.ascontiguousarray(lam_full), dtype=wp.float64,
+                     device=d)
+    aq_bar, fq_bar = {}, {}
+    dnu = 0.0
+    for pv, b in dm.bins.items():
+        k = make_lin_ns_load(b["nbf"], b["nqp"], dim)
+        tape = wp.Tape()
+        aq = wp.array(np.ascontiguousarray(aq_by_bin[pv]), dtype=wp.float64,
+                      device=d, requires_grad=True)
+        fq = wp.array(np.ascontiguousarray(fq_by_bin[pv]), dtype=wp.float64,
+                      device=d, requires_grad=True)
+        nu_a = wp.array(np.array([nu]), dtype=wp.float64, device=d,
+                        requires_grad=True)
+        r = wp.zeros(dm.n_nodes * (dim + 1), dtype=wp.float64, device=d,
+                     requires_grad=True)
+        with tape:
+            wp.launch(k, dim=len(b["eids"]),
+                      inputs=[b["conn"], b["h"], b["N"], b["dN"], b["w"],
+                              aq, fq, nu_a, wp.float64(sig2tau), r],
+                      device=d)
+        tape.backward(grads={r: lam_d})
+        aq_bar[pv] = tape.gradients[aq].numpy()
+        fq_bar[pv] = tape.gradients[fq].numpy()
+        dnu += float(tape.gradients[nu_a].numpy()[0])
+    return aq_bar, fq_bar, dnu
