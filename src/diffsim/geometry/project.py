@@ -27,7 +27,13 @@ import numpy as np
 import torch
 
 _TOL = 1e-13     # |psi(y)| convergence target
-_OK_TOL = 1e-12  # per-point success threshold reported in the mask
+_OK_TOL = 1e-10  # per-point success threshold reported in the mask.
+# 1e-10, not 1e-12: INR-family fields converge the augmented residual to
+# ~1e-12 +- a batch-composition-dependent ulp wobble at isolated marginal
+# points (measured: the same point flipping ok across two calls in one
+# run, newton_ok_frac 1.0 vs 975/976). At |F| ~ 1e-10 the IFT gradient
+# error is O(1e-10) relative — far below every other tolerance in the
+# chain — while the flakiness disappears.
 _MAXIT = 50
 
 
@@ -102,6 +108,170 @@ def _newton_iterate(oracle, x):
         s = s - dz[:, dim]
     psi, g, H = _psi_grad_hess(oracle, y)
     ok = _augmented_residual(x, y, s, psi, g).norm(dim=1) <= _OK_TOL
+    if not bool(ok.all()):
+        # RESCUE (measured need: provided-INR fields — slight
+        # non-monotonicity defeats undamped Newton at a handful of points,
+        # e.g. 3/112 on the sphere checkpoint at L4 with c0=0.96). Damped
+        # Newton with backtracking on |F|, lstsq for near-singular Jz
+        # (also the evaluation's brittleness item). Subset-only: cost is
+        # per-failure, not per-batch.
+        idx = torch.where(~ok)[0]
+        yr = y[idx].clone()
+        sr = s[idx].clone()
+        xr = x[idx]
+        for _ in range(60):
+            psi_r, g_r, H_r = _psi_grad_hess(oracle, yr)
+            Fr = _augmented_residual(xr, yr, sr, psi_r, g_r)
+            fn = Fr.norm(dim=1)
+            if (fn <= _TOL).all():
+                break
+            Jz = _jz(sr, g_r, H_r)
+            dz = torch.linalg.lstsq(Jz, Fr.unsqueeze(2)).solution.squeeze(2)
+            # backtracking: accept the largest t in {1, 1/2, ..., 1/64}
+            # that reduces |F| per point
+            t = torch.ones(len(idx), dtype=torch.float64)
+            best_y, best_s, best_f = yr.clone(), sr.clone(), fn.clone()
+            for _bt in range(7):
+                y_t = yr - t.unsqueeze(1) * dz[:, :dim]
+                s_t = sr - t * dz[:, dim]
+                psi_t, g_t = _psi_grad(oracle, y_t)
+                f_t = _augmented_residual(xr, y_t, s_t, psi_t, g_t
+                                          ).norm(dim=1)
+                better = f_t < best_f
+                best_y[better] = y_t[better]
+                best_s[better] = s_t[better]
+                best_f[better] = f_t[better]
+                t = t * 0.5
+            yr, sr = best_y, best_s
+        y = y.clone()
+        s = s.clone()
+        y[idx] = yr
+        s[idx] = sr
+        psi, g, H = _psi_grad_hess(oracle, y)
+        ok = _augmented_residual(x, y, s, psi, g).norm(dim=1) <= _OK_TOL
+        if not bool(ok.all()):
+            # RESCUE STAGE 2: bracket + bisect the zero crossing along the
+            # gradient ray from x, then re-Newton from ON the zero set
+            # (a warm start Newton demonstrably converges from; the ray
+            # march is robust to the wiggle that defeats damped Newton at
+            # isolated points — measured 1/976 on the sphere checkpoint).
+            idx2 = torch.where(~ok)[0]
+            x2 = x[idx2]
+            psi0, g0 = _psi_grad(oracle, x2)
+            dhat = -torch.sign(psi0).unsqueeze(1) * g0 / g0.norm(
+                dim=1, keepdim=True).clamp_min(1e-300)
+            # bracket: march until sign change (up to 1 domain unit)
+            t_lo = torch.zeros(len(idx2), dtype=torch.float64)
+            t_hi = torch.full((len(idx2),), 1e-3, dtype=torch.float64)
+            # BOUNDED march: surrogate points sit within O(h) of the true
+            # surface by construction; an unbounded march on an INR field
+            # escapes the trained window and finds SPURIOUS periodic-sine
+            # zero sheets (measured: a foot point |d| = 44.65 domains away
+            # -> garbage FD). Cap the bracket at a domain-scale distance.
+            T_MAX = 0.25
+            for _ in range(40):
+                p_hi, _ = _psi_grad(oracle, x2 + t_hi.unsqueeze(1) * dhat)
+                need = ((p_hi * psi0) > 0) & (t_hi < T_MAX)
+                if not bool(need.any()):
+                    break
+                t_lo = torch.where(need, t_hi, t_lo)
+                t_hi = torch.where(need, torch.clamp(t_hi * 1.6, max=T_MAX),
+                                   t_hi)
+            for _ in range(60):                    # bisect
+                t_mid = 0.5 * (t_lo + t_hi)
+                p_mid, _ = _psi_grad(oracle, x2 + t_mid.unsqueeze(1) * dhat)
+                same = (p_mid * psi0) > 0
+                t_lo = torch.where(same, t_mid, t_lo)
+                t_hi = torch.where(same, t_hi, t_mid)
+            y2 = x2 + (0.5 * (t_lo + t_hi)).unsqueeze(1) * dhat
+            _, g2 = _psi_grad(oracle, y2)
+            s2_ = ((x2 - y2) * g2).sum(dim=1) / (g2 * g2).sum(
+                dim=1).clamp_min(1e-300)
+            for _ in range(_MAXIT):                # re-Newton from the set
+                psi_r, g_r, H_r = _psi_grad_hess(oracle, y2)
+                Fr = _augmented_residual(x2, y2, s2_, psi_r, g_r)
+                if (Fr.norm(dim=1) <= _TOL).all():
+                    break
+                dz = torch.linalg.lstsq(
+                    _jz(s2_, g_r, H_r), Fr.unsqueeze(2)).solution.squeeze(2)
+                y2 = y2 - dz[:, :dim]
+                s2_ = s2_ - dz[:, dim]
+            # accept stage-2 results only when they IMPROVED on stage 1
+            # and stayed domain-local (spurious far sheets are worse than
+            # an honestly-failed mask)
+            psi_n, g_n = _psi_grad(oracle, y2)
+            F_new = _augmented_residual(x2, y2, s2_, psi_n, g_n).norm(dim=1)
+            psi_o, g_o = _psi_grad(oracle, yr)
+            F_old = _augmented_residual(x2, yr, sr, psi_o, g_o).norm(dim=1)
+            take = (F_new < F_old) & ((y2 - x2).norm(dim=1) < 0.5)
+            y2 = torch.where(take.unsqueeze(1), y2, yr)
+            s2_ = torch.where(take, s2_, sr)
+            y[idx2] = y2
+            s[idx2] = s2_
+            psi, g, H = _psi_grad_hess(oracle, y)
+            ok = _augmented_residual(x, y, s, psi, g).norm(dim=1) <= _OK_TOL
+            # global domain-locality bound: any accepted foot point farther
+            # than half a domain is a spurious sheet, never a projection
+            ok = ok & ((y - x).norm(dim=1) < 0.5)
+        if not bool(ok.all()):
+            # RESCUE STAGE 3: multi-start damped Newton — robust to
+            # near-tangent gradient rays on surface wrinkles (measured:
+            # one GP whose ray misses the local sheet entirely). Fixed
+            # deterministic jitter stencil; best-|F| local result wins.
+            idx3 = torch.where(~ok)[0]
+            x3 = x[idx3]
+            n3 = len(idx3)
+            offs = torch.tensor(
+                [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0],
+                 [0, 0, 1], [0, 0, -1], [1, 1, 1], [-1, -1, -1]][:2 ** dim],
+                dtype=torch.float64)[:, :dim] * 0.04
+            best_y = y[idx3].clone()
+            best_s = s[idx3].clone()
+            psi_b, g_b = _psi_grad(oracle, best_y)
+            best_F = _augmented_residual(x3, best_y, best_s, psi_b, g_b
+                                         ).norm(dim=1)
+            for o_ in offs:
+                yj = x3 + o_.unsqueeze(0)
+                for _ in range(20):                     # gradient descent
+                    pj, gj = _psi_grad(oracle, yj)
+                    den = (gj * gj).sum(dim=1).clamp_min(1e-300)
+                    yj = yj - (pj / den).unsqueeze(1) * gj
+                pj, gj = _psi_grad(oracle, yj)
+                sj = ((x3 - yj) * gj).sum(dim=1) / (gj * gj).sum(
+                    dim=1).clamp_min(1e-300)
+                for _ in range(30):                     # damped Newton
+                    pj, gj, Hj = _psi_grad_hess(oracle, yj)
+                    Fj = _augmented_residual(x3, yj, sj, pj, gj)
+                    if (Fj.norm(dim=1) <= _TOL).all():
+                        break
+                    dz = torch.linalg.lstsq(
+                        _jz(sj, gj, Hj), Fj.unsqueeze(2)).solution.squeeze(2)
+                    t = torch.ones(n3, dtype=torch.float64)
+                    cy, cs, cf = yj.clone(), sj.clone(), Fj.norm(dim=1)
+                    for _bt in range(5):
+                        y_t = yj - t.unsqueeze(1) * dz[:, :dim]
+                        s_t = sj - t * dz[:, dim]
+                        p_t, g_t = _psi_grad(oracle, y_t)
+                        f_t = _augmented_residual(x3, y_t, s_t, p_t, g_t
+                                                  ).norm(dim=1)
+                        better = f_t < cf
+                        cy[better] = y_t[better]
+                        cs[better] = s_t[better]
+                        cf[better] = f_t[better]
+                        t = t * 0.5
+                    yj, sj = cy, cs
+                pj, gj = _psi_grad(oracle, yj)
+                Fj = _augmented_residual(x3, yj, sj, pj, gj).norm(dim=1)
+                local = (yj - x3).norm(dim=1) < 0.5
+                win = (Fj < best_F) & local
+                best_y[win] = yj[win]
+                best_s[win] = sj[win]
+                best_F[win] = Fj[win]
+            y[idx3] = best_y
+            s[idx3] = best_s
+            psi, g, H = _psi_grad_hess(oracle, y)
+            ok = _augmented_residual(x, y, s, psi, g).norm(dim=1) <= _OK_TOL
+            ok = ok & ((y - x).norm(dim=1) < 0.5)
     return y, s, ok
 
 
