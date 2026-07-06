@@ -60,15 +60,6 @@ def _r_dot_lam(dm, aq, dq, nu, sigma, s_skew, x_full, lam_full):
     return float(lam_full @ r.numpy())
 
 
-@pytest.mark.xfail(reason="warp backward NaN in the NS residual kernel — "
-                   "OPEN (m1a findings 4c amendment): confirmed-by-repro "
-                   "bugs = depth-2 body accumulators (used or dead) and "
-                   "the 4c loop-reassignment; FALSIFIED for this kernel = "
-                   "indexed vec/mat writes (fixed, still NaN), vec2d op "
-                   "adjoints (minimal repro passes), top-scope grad-array "
-                   "reads (moved, still NaN). Forward consistency is "
-                   "gated below. Next: bisect the whole-value kernel "
-                   "term-by-term in a fresh session.", strict=False)
 def test_tape_vs_kernel_fd(device):
     """THE findings-4c contract for every new taped kernel."""
     dm, xq, aq, dq, x_full, lam_full = _setup(3, device)

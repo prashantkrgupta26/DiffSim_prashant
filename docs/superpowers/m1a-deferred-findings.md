@@ -159,19 +159,19 @@ FAMILY, measured by term-masked bisection:
   inside SECOND-level unrolled loops poison the ENTIRE tape with NaN —
   whether the accumulator is used or dead. Depth-1 accumulators (the m1a
   kernel shape) are safe.
-  OPEN (deep): the linearized-NS residual kernel NaNs in EVERY
-  formulation — Ae-style, func-based, whole-value vec/mat algebra, and
-  finally the FULL-SCALAR m1a idiom — while EVERY individual construct
-  passes minimal repros (vec ops, mat-vec, loop-accumulated mat consumed,
-  tau-func + mat interaction: all clean; repros committed). The sharpest
-  reproducible boundary: the term-bisect kernels LEVEL 5 (clean) vs
-  LEVEL 6 (all-NaN) differ by three source lines (ns_term_bisect.py) —
-  THE upstream report artifact. Forward consistency is EXACT (1e-12) in
-  all versions; only the tape is poisoned, and only in this kernel's
-  context (m1a taped kernels pass the same night on the same box).
-  NEXT-SESSION ORDER: (1) bump warp 1.14 -> latest and rerun the 4c gate
-  (cheapest possible resolution); (2) if unfixed, file the LEVEL 5/6 pair
-  upstream. MEANWHILE M1c proceeds TAPE-FREE: dR/dnu via viscous-block
-  linearity (the m1a kappa meta-linearity trick), dR/d(aq) via the torch
-  dense twin at gate scale — the adjoint program is NOT blocked, only the
-  taped fast path is.
+  BUG #3 — RESOLVED, root cause found (the night's ten-falsification
+  hunt): THE FEMElm STRUCT. Mutating struct fields inside kernel loops
+  (fe.q = q per q-iteration) silently breaks warp 1.14's backward replay
+  and poisons the tape with NaN. Every NaN formulation tonight (Ae-style,
+  func-based, whole-value algebra, full-scalar) used FEMElm; the m1a
+  kernels predate it and pass; stripping FEMElm for direct table indexing
+  turned the 4c contract GREEN with the tape matching kernel-FD to 8
+  digits. Falsified along the way (all repro-clean, scripts committed):
+  vec/mat op adjoints, mat-vec, loop-accumulated mats, tau funcs,
+  max_unroll dynamic loops (the generated .cu was fully unrolled),
+  uninitialized grad buffers (verified zeroed). RULES FOR TAPED KERNELS
+  (4c final): (1) no loop-reassigned locals (bug #1); (2) no scalar
+  accumulators above loop depth 1 (bug #2); (3) NO STRUCT FIELD MUTATION
+  — use plain locals and direct table indexing (bug #3, the big one);
+  wp.pow for jacobians. Upstream report: FEMElm minimal repro TODO (the
+  struct + loop mutation pair), plus the bug #2 nan_micro2 repro.

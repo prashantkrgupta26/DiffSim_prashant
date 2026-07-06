@@ -24,7 +24,6 @@ unit test BEFORE any physics gate.
 import numpy as np
 import warp as wp
 
-from ..assembly.femelm import FEMElm, fe_N, fe_dN_s, fe_detJxW_s
 from ..assembly.operators import _kernel_cache
 from ..physics.vms import tau_m_metric, tau_c_metric
 
@@ -47,41 +46,20 @@ def make_lin_ns_residual(nbf: int, nqp: int, dim: int):
     vecT = wp.vec2d if dim == 2 else wp.vec3d
     matT = wp.mat22d if dim == 2 else wp.mat33d
 
-    # Inner accumulations live in wp.funcs — the m1a-proven pattern
-    # (shift_fn): kernel-BODY accumulators above depth 1 poison the tape
-    # (warp backward bug #2, measured both dead AND used), but the same
-    # accumulation inside a wp.func differentiates correctly.
-    @wp.func
-    def _grad_dot_vec(dNtab: wp.array3d(dtype=wp.float64), fe: FEMElm,
-                      a: int, dscale: wp.float64, v: vecT) -> wp.float64:
-        s = wp.float64(0.0)
-        for d in range(dim):
-            s += v[d] * fe_dN_s(dNtab, fe, a, d, dscale)
-        return s
-
-    @wp.func
-    def _grad_dot_gurow(dNtab: wp.array3d(dtype=wp.float64), fe: FEMElm,
-                        a: int, dscale: wp.float64, gu: matT,
-                        i: int) -> wp.float64:
-        s = wp.float64(0.0)
-        for d in range(dim):
-            s += fe_dN_s(dNtab, fe, a, d, dscale) * gu[i, d]
-        return s
-
-    @wp.func
-    def _vec_dot_gurow(av: vecT, gu: matT, i: int) -> wp.float64:
-        s = wp.float64(0.0)
-        for d in range(dim):
-            s += av[d] * gu[i, d]
-        return s
-
     if dim != 2:
         raise NotImplementedError(
             "taped NS residual: dim=2 only until the warp adjoint "
             "interaction bug is resolved upstream (findings 4c amendment); "
             "the dim-3 kernel follows the same scalar generator pattern")
 
-    @wp.kernel(module="unique", enable_backward=True)
+    # max_unroll HIGH: warp does NOT replay dynamic (non-unrolled) loops
+    # in the backward pass — intermediate values are missing and the tape
+    # NaNs (documented warp limitation; THE root cause of the overnight
+    # NaN hunt: the q x b x a nesting exceeds the default unroll budget of
+    # 16, so the loops silently went dynamic. Every "clean" micro-repro
+    # had a single small loop that stayed static.)
+    @wp.kernel(module="unique", enable_backward=True,
+               module_options={"max_unroll": 1024})
     def lin_ns_res(conn: wp.array2d(dtype=wp.int32),
                    h: wp.array(dtype=wp.float64),
                    Ntab: wp.array2d(dtype=wp.float64),
@@ -102,15 +80,12 @@ def make_lin_ns_residual(nbf: int, nqp: int, dim: int):
         # construct passing in isolation — an interaction bug, upstream
         # report with repros in docs/superpowers/warp_adjoint_repros/).
         e = wp.tid()
-        fe = FEMElm()
-        fe.e = e
-        fe.he = h[e]
-        jac = wp.pow(fe.he * wp.float64(0.5), wp.float64(2.0))
-        dscale = wp.float64(2.0) / fe.he
+        he = h[e]
+        jac = wp.pow(he * wp.float64(0.5), wp.float64(2.0))
+        dscale = wp.float64(2.0) / he
         for q in range(nqp):
-            fe.q = q
             nu = nu_arr[0]
-            dJxW = fe_detJxW_s(wtab, fe, jac)
+            dJxW = wtab[q] * jac
             gp = e * nqp + q
             # frozen-state fields: scalar accumulators at depth 1
             u0 = wp.float64(0.0)
@@ -123,9 +98,9 @@ def make_lin_ns_residual(nbf: int, nqp: int, dim: int):
             gp0 = wp.float64(0.0)
             gp1 = wp.float64(0.0)
             for b in range(nbf):
-                Nb = fe_N(Ntab, fe, b)
-                dnb0 = fe_dN_s(dNtab, fe, b, 0, dscale)
-                dnb1 = fe_dN_s(dNtab, fe, b, 1, dscale)
+                Nb = Ntab[q, b]
+                dnb0 = dNtab[q, b, 0] * dscale
+                dnb1 = dNtab[q, b, 1] * dscale
                 xb0 = x[conn[e, b] * 3 + 0]
                 xb1 = x[conn[e, b] * 3 + 1]
                 pb = x[conn[e, b] * 3 + 2]
@@ -144,15 +119,13 @@ def make_lin_ns_residual(nbf: int, nqp: int, dim: int):
             # tau INLINED from the frozen advecting copy (tau-frozen)
             af0 = aq_frozen[gp, 0]
             af1 = aq_frozen[gp, 1]
-            uGu = wp.float64(4.0) * (af0 * af0 + af1 * af1) \
-                / (fe.he * fe.he)
-            GG = wp.float64(2.0) * wp.pow(wp.float64(2.0) / fe.he,
+            uGu = wp.float64(4.0) * (af0 * af0 + af1 * af1) / (he * he)
+            GG = wp.float64(2.0) * wp.pow(wp.float64(2.0) / he,
                                           wp.float64(4.0))
             tauM = wp.float64(1.0) / wp.sqrt(
                 sig2tau + uGu + wp.float64(36.0) * nu * nu * GG)
             tauC = wp.float64(1.0) / (tauM * wp.float64(2.0)
-                                      * wp.float64(4.0)
-                                      / (fe.he * fe.he))
+                                      * wp.float64(4.0) / (he * he))
             diva = div_aq[gp]
             # strong linearized momentum residual (nu-lap dropped at p1)
             sfac = sigma + s_skew * diva
@@ -161,9 +134,9 @@ def make_lin_ns_residual(nbf: int, nqp: int, dim: int):
             conv0 = a0 * g00 + a1 * g01
             conv1 = a0 * g10 + a1 * g11
             for a in range(nbf):
-                Na = fe_N(Ntab, fe, a)
-                dna0 = fe_dN_s(dNtab, fe, a, 0, dscale)
-                dna1 = fe_dN_s(dNtab, fe, a, 1, dscale)
+                Na = Ntab[q, a]
+                dna0 = dNtab[q, a, 0] * dscale
+                dna1 = dNtab[q, a, 1] * dscale
                 agw = a0 * dna0 + a1 * dna1
                 v0 = (sigma * Na * u0
                       + Na * (conv0 + s_skew * diva * u0)
