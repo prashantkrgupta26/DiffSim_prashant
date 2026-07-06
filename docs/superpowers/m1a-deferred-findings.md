@@ -187,3 +187,12 @@ FAMILY, measured by term-masked bisection:
    uses tau_frozen=False and lands at rel 4.4e-10 over 4 BDF2 steps.
    Diagnosis path preserved in the N=1/2/3 isolation ladder — N=1 exact
    at 1.9e-8 pinned the leak to the chains in one shot.
+
+4e. **dim-3 taped kernels: RESIDUAL FORM resolves the unroll-vs-compile
+   conflict.** Taped kernels require unrolled loops (dynamic loops are
+   not replayed in backward); the 3-D forward Ae kernels need
+   max_unroll=0 to avoid a 79-minute compile (findings 6). Resolution
+   measured 2026-07-06: the residual-form taped kernel's unroll budget is
+   q*(b+a) (~128 bodies at p1/3-D), not the Ae form's a*b*dof explosion —
+   first call including full backward codegen: 107 s, cached thereafter.
+   All 4c gates green first run. No kernel splitting needed.

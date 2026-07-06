@@ -250,3 +250,117 @@ def test_load_kernel_consistency_and_tape(device):
     fd_nu = (lam_full @ run_b(aq[pv], fqv[pv], nu + eps)
              - lam_full @ run_b(aq[pv], fqv[pv], nu - eps)) / (2 * eps)
     assert abs(fd_nu - dnu) < 1e-6 * max(abs(fd_nu), 1e-10), (fd_nu, dnu)
+
+
+def _setup3d(level, device):
+    tree = build_uniform(level, dim=3)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3), device)
+    xq = gauss_points(mesh, dm.tables_by_p)
+    rng = np.random.default_rng(3)
+    pv = list(dm.bins)[0]
+    ngp = len(xq[pv])
+    aq = {pv: rng.standard_normal((ngp, 3)) * 0.5}
+    dq = {pv: rng.standard_normal(ngp) * 0.1}
+    x_full = rng.standard_normal(dm.n_nodes * 4)
+    lam_full = rng.standard_normal(dm.n_nodes * 4)
+    return dm, xq, aq, dq, x_full, lam_full
+
+
+def test_dim3_kernels_consistency_and_tape(device):
+    """dim-3 taped kernels (residual + load): the 4c ritual. Also the
+    COMPILE-TIME experiment: residual-form unrolling at dim 3 must stay
+    O(minute), not the forward-Ae 79-minute explosion (findings 6)."""
+    import time
+    from diffsim.sbm.ns_adjoint import ns_load_cotangents
+    dm, xq, aq, dq, x_full, lam_full = _setup3d(2, device)
+    nu, sigma, s = 0.05, 20.0, 0.5
+    pv = list(dm.bins)[0]
+
+    t0 = time.perf_counter()
+    aq_bar, dnu = ns_volume_cotangents(dm, aq, dq, nu, sigma, s,
+                                       x_full, lam_full)
+    t_compile = time.perf_counter() - t0
+    print(f"dim-3 residual kernel first call (incl. compile): "
+          f"{t_compile:.1f}s")
+    assert t_compile < 300, t_compile
+
+    # consistency vs assembled brick
+    import scipy.sparse as sp
+    d = dm.device
+    b = dm.bins[pv]
+    k = make_lin_ns_residual(b["nbf"], b["nqp"], 3)
+    r = wp.zeros(dm.n_nodes * 4, dtype=wp.float64, device=d)
+    wp.launch(k, dim=len(b["eids"]),
+              inputs=[b["conn"], b["h"], b["N"], b["dN"], b["w"],
+                      wp.array(np.ascontiguousarray(aq[pv]),
+                               dtype=wp.float64, device=d),
+                      wp.array(np.ascontiguousarray(dq[pv]),
+                               dtype=wp.float64, device=d),
+                      wp.array(np.ascontiguousarray(aq[pv]),
+                               dtype=wp.float64, device=d),
+                      wp.array(np.array([nu]), dtype=wp.float64, device=d),
+                      wp.float64(sigma), wp.float64((2 * sigma) ** 2),
+                      wp.float64(s),
+                      wp.array(x_full, dtype=wp.float64, device=d), r],
+              device=d)
+    fq0 = {pv: np.zeros((len(xq[pv]), 3))}
+    A_c, _ = assemble_linear_ns(dm, aq, dq, fq0, nu, sigma=sigma,
+                                s_skew=s)
+    T = dm.constraints.T.tocsr()
+    T_vec = sp.kron(T, sp.identity(4, format="csr"), format="csr")
+    r_asm = np.asarray(A_c @ (T_vec.T @ x_full))
+    r_ker = np.asarray(T_vec.T @ r.numpy())
+    scale = np.abs(r_asm).max()
+    assert np.abs(r_ker - r_asm).max() < 1e-12 * scale
+
+    # tape vs kernel-FD: two aq probes + nu (frozen-tau FD via base aq_f)
+    def rdot(afield, nuv):
+        rr = wp.zeros(dm.n_nodes * 4, dtype=wp.float64, device=d)
+        wp.launch(k, dim=len(b["eids"]),
+                  inputs=[b["conn"], b["h"], b["N"], b["dN"], b["w"],
+                          wp.array(np.ascontiguousarray(afield),
+                                   dtype=wp.float64, device=d),
+                          wp.array(np.ascontiguousarray(dq[pv]),
+                                   dtype=wp.float64, device=d),
+                          wp.array(np.ascontiguousarray(aq[pv]),
+                                   dtype=wp.float64, device=d),
+                          wp.array(np.array([nuv]), dtype=wp.float64,
+                                   device=d),
+                          wp.float64(sigma), wp.float64((2 * sigma) ** 2),
+                          wp.float64(s),
+                          wp.array(x_full, dtype=wp.float64, device=d),
+                          rr], device=d)
+        return float(lam_full @ rr.numpy())
+    g_aq = aq_bar[pv][0]
+    eps = 1e-6
+    for gp, c in ((0, 0), (5, 2)):
+        ap = aq[pv].copy(); ap[gp, c] += eps
+        am = aq[pv].copy(); am[gp, c] -= eps
+        fd = (rdot(ap, nu) - rdot(am, nu)) / (2 * eps)
+        assert abs(fd - (-g_aq[gp, c])) < 1e-6 * max(abs(fd), 1e-10), (
+            (gp, c), fd, -g_aq[gp, c])
+    fd_nu = (rdot(aq[pv], nu + eps) - rdot(aq[pv], nu - eps)) / (2 * eps)
+    assert abs(fd_nu - (-dnu)) < 1e-6 * max(abs(fd_nu), 1e-10)
+
+    # load kernel: consistency + one tape probe
+    rng = np.random.default_rng(7)
+    fqv = {pv: rng.standard_normal((len(xq[pv]), 3))}
+    aq_bl, fq_bl, dnu_l = ns_load_cotangents(dm, aq, fqv, nu, sigma,
+                                             lam_full)
+    _, b_asm = assemble_linear_ns(dm, aq, dq, fqv, nu, sigma=sigma,
+                                  s_skew=s)
+    from diffsim.sbm.ns_adjoint import make_lin_ns_load
+    kl = make_lin_ns_load(b["nbf"], b["nqp"], 3)
+    rl = wp.zeros(dm.n_nodes * 4, dtype=wp.float64, device=d)
+    wp.launch(kl, dim=len(b["eids"]),
+              inputs=[b["conn"], b["h"], b["N"], b["dN"], b["w"],
+                      wp.array(np.ascontiguousarray(aq[pv]),
+                               dtype=wp.float64, device=d),
+                      wp.array(np.ascontiguousarray(fqv[pv]),
+                               dtype=wp.float64, device=d),
+                      wp.array(np.array([nu]), dtype=wp.float64, device=d),
+                      wp.float64((2 * sigma) ** 2), rl], device=d)
+    b_ker = np.asarray(T_vec.T @ rl.numpy())
+    assert np.abs(b_ker - b_asm).max() < 1e-12 * np.abs(b_asm).max()

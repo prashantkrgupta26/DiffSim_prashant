@@ -41,6 +41,10 @@ def make_lin_ns_residual(nbf: int, nqp: int, dim: int,
     key = ("lin_ns_res", nbf, nqp, dim, tau_frozen)
     if key in _kernel_cache:
         return _kernel_cache[key]
+    if dim == 3:
+        k3 = _make_lin_ns_residual_3d(nbf, nqp, tau_frozen)
+        _kernel_cache[key] = k3
+        return k3
     ndof = dim + 1
     dim_pow = float(dim)
     dim_f = float(dim)
@@ -214,8 +218,10 @@ def make_lin_ns_load(nbf: int, nqp: int, dim: int):
     key = ("lin_ns_load", nbf, nqp, dim)
     if key in _kernel_cache:
         return _kernel_cache[key]
-    if dim != 2:
-        raise NotImplementedError("taped NS load: dim=2 first")
+    if dim == 3:
+        k3 = _make_lin_ns_load_3d(nbf, nqp)
+        _kernel_cache[key] = k3
+        return k3
 
     @wp.kernel(module="unique", enable_backward=True,
                module_options={"max_unroll": 1024})
@@ -297,3 +303,188 @@ def ns_load_cotangents(dm, aq_by_bin, fq_by_bin, nu, sigma, lam_full,
         fq_bar[pv] = tape.gradients[fq].numpy()
         dnu += float(tape.gradients[nu_a].numpy()[0])
     return aq_bar, fq_bar, dnu
+
+
+def _make_lin_ns_residual_3d(nbf: int, nqp: int, tau_frozen: bool):
+    """dim-3 taped volume residual — same 4c-rule scalar shape as dim-2.
+    RESIDUAL FORM keeps the unroll budget ~q*(b+a), NOT the a*b*dof
+    element-matrix explosion that forced max_unroll=0 on the 3-D forward
+    Ae kernels (79-min compile, findings 6): full unrolling here is
+    expected to compile in O(minute) — measured by its gate."""
+
+    @wp.kernel(module="unique", enable_backward=True,
+               module_options={"max_unroll": 4096})
+    def lin_ns_res3(conn: wp.array2d(dtype=wp.int32),
+                    h: wp.array(dtype=wp.float64),
+                    Ntab: wp.array2d(dtype=wp.float64),
+                    dNtab: wp.array3d(dtype=wp.float64),
+                    wtab: wp.array(dtype=wp.float64),
+                    aq: wp.array2d(dtype=wp.float64),       # DIFF
+                    div_aq: wp.array(dtype=wp.float64),     # DIFF
+                    aq_frozen: wp.array2d(dtype=wp.float64),
+                    nu_arr: wp.array(dtype=wp.float64),     # DIFF
+                    sigma: wp.float64, sig2tau: wp.float64,
+                    s_skew: wp.float64,
+                    x: wp.array(dtype=wp.float64),
+                    r: wp.array(dtype=wp.float64)):
+        e = wp.tid()
+        he = h[e]
+        jac = wp.pow(he * wp.float64(0.5), wp.float64(3.0))
+        dscale = wp.float64(2.0) / he
+        for q in range(nqp):
+            nu = nu_arr[0]
+            dJxW = wtab[q] * jac
+            gp = e * nqp + q
+            u0 = wp.float64(0.0)
+            u1 = wp.float64(0.0)
+            u2 = wp.float64(0.0)
+            g00 = wp.float64(0.0)
+            g01 = wp.float64(0.0)
+            g02 = wp.float64(0.0)
+            g10 = wp.float64(0.0)
+            g11 = wp.float64(0.0)
+            g12 = wp.float64(0.0)
+            g20 = wp.float64(0.0)
+            g21 = wp.float64(0.0)
+            g22 = wp.float64(0.0)
+            pv_ = wp.float64(0.0)
+            gp0 = wp.float64(0.0)
+            gp1 = wp.float64(0.0)
+            gp2 = wp.float64(0.0)
+            for b in range(nbf):
+                Nb = Ntab[q, b]
+                d0 = dNtab[q, b, 0] * dscale
+                d1 = dNtab[q, b, 1] * dscale
+                d2 = dNtab[q, b, 2] * dscale
+                xb0 = x[conn[e, b] * 4 + 0]
+                xb1 = x[conn[e, b] * 4 + 1]
+                xb2 = x[conn[e, b] * 4 + 2]
+                pb = x[conn[e, b] * 4 + 3]
+                u0 += Nb * xb0
+                u1 += Nb * xb1
+                u2 += Nb * xb2
+                g00 += d0 * xb0
+                g01 += d1 * xb0
+                g02 += d2 * xb0
+                g10 += d0 * xb1
+                g11 += d1 * xb1
+                g12 += d2 * xb1
+                g20 += d0 * xb2
+                g21 += d1 * xb2
+                g22 += d2 * xb2
+                pv_ += Nb * pb
+                gp0 += d0 * pb
+                gp1 += d1 * pb
+                gp2 += d2 * pb
+            divu = g00 + g11 + g22
+            a0 = aq[gp, 0]
+            a1 = aq[gp, 1]
+            a2 = aq[gp, 2]
+            if wp.static(tau_frozen):
+                af0 = aq_frozen[gp, 0]
+                af1 = aq_frozen[gp, 1]
+                af2 = aq_frozen[gp, 2]
+            else:
+                af0 = aq[gp, 0]
+                af1 = aq[gp, 1]
+                af2 = aq[gp, 2]
+            uGu = wp.float64(4.0) * (af0 * af0 + af1 * af1 + af2 * af2) \
+                / (he * he)
+            GG = wp.float64(3.0) * wp.pow(wp.float64(2.0) / he,
+                                          wp.float64(4.0))
+            tauM = wp.float64(1.0) / wp.sqrt(
+                sig2tau + uGu + wp.float64(36.0) * nu * nu * GG)
+            tauC = wp.float64(1.0) / (tauM * wp.float64(3.0)
+                                      * wp.float64(4.0) / (he * he))
+            diva = div_aq[gp]
+            sfac = sigma + s_skew * diva
+            rm0 = sfac * u0 + a0 * g00 + a1 * g01 + a2 * g02 + gp0
+            rm1 = sfac * u1 + a0 * g10 + a1 * g11 + a2 * g12 + gp1
+            rm2 = sfac * u2 + a0 * g20 + a1 * g21 + a2 * g22 + gp2
+            conv0 = a0 * g00 + a1 * g01 + a2 * g02
+            conv1 = a0 * g10 + a1 * g11 + a2 * g12
+            conv2 = a0 * g20 + a1 * g21 + a2 * g22
+            for a in range(nbf):
+                Na = Ntab[q, a]
+                dna0 = dNtab[q, a, 0] * dscale
+                dna1 = dNtab[q, a, 1] * dscale
+                dna2 = dNtab[q, a, 2] * dscale
+                agw = a0 * dna0 + a1 * dna1 + a2 * dna2
+                v0 = (sigma * Na * u0
+                      + Na * (conv0 + s_skew * diva * u0)
+                      + nu * (dna0 * g00 + dna1 * g01 + dna2 * g02)
+                      + tauM * agw * rm0
+                      + (tauC * divu - pv_) * dna0) * dJxW
+                v1 = (sigma * Na * u1
+                      + Na * (conv1 + s_skew * diva * u1)
+                      + nu * (dna0 * g10 + dna1 * g11 + dna2 * g12)
+                      + tauM * agw * rm1
+                      + (tauC * divu - pv_) * dna1) * dJxW
+                v2 = (sigma * Na * u2
+                      + Na * (conv2 + s_skew * diva * u2)
+                      + nu * (dna0 * g20 + dna1 * g21 + dna2 * g22)
+                      + tauM * agw * rm2
+                      + (tauC * divu - pv_) * dna2) * dJxW
+                qv = (Na * divu
+                      + tauM * (dna0 * rm0 + dna1 * rm1 + dna2 * rm2)) \
+                    * dJxW
+                wp.atomic_add(r, conn[e, a] * 4 + 0, v0)
+                wp.atomic_add(r, conn[e, a] * 4 + 1, v1)
+                wp.atomic_add(r, conn[e, a] * 4 + 2, v2)
+                wp.atomic_add(r, conn[e, a] * 4 + 3, qv)
+
+    return lin_ns_res3
+
+
+def _make_lin_ns_load_3d(nbf: int, nqp: int):
+    """dim-3 taped load twin (same shape rules)."""
+
+    @wp.kernel(module="unique", enable_backward=True,
+               module_options={"max_unroll": 4096})
+    def lin_ns_load3(conn: wp.array2d(dtype=wp.int32),
+                     h: wp.array(dtype=wp.float64),
+                     Ntab: wp.array2d(dtype=wp.float64),
+                     dNtab: wp.array3d(dtype=wp.float64),
+                     wtab: wp.array(dtype=wp.float64),
+                     aq: wp.array2d(dtype=wp.float64),      # DIFF
+                     fq: wp.array2d(dtype=wp.float64),      # DIFF
+                     nu_arr: wp.array(dtype=wp.float64),    # DIFF
+                     sig2tau: wp.float64,
+                     r: wp.array(dtype=wp.float64)):
+        e = wp.tid()
+        he = h[e]
+        jac = wp.pow(he * wp.float64(0.5), wp.float64(3.0))
+        dscale = wp.float64(2.0) / he
+        for q in range(nqp):
+            nu = nu_arr[0]
+            dJxW = wtab[q] * jac
+            gp = e * nqp + q
+            a0 = aq[gp, 0]
+            a1 = aq[gp, 1]
+            a2 = aq[gp, 2]
+            amag2 = a0 * a0 + a1 * a1 + a2 * a2
+            uGu = wp.float64(4.0) * amag2 / (he * he)
+            GG = wp.float64(3.0) * wp.pow(wp.float64(2.0) / he,
+                                          wp.float64(4.0))
+            tauM = wp.float64(1.0) / wp.sqrt(
+                sig2tau + uGu + wp.float64(36.0) * nu * nu * GG)
+            f0 = fq[gp, 0]
+            f1 = fq[gp, 1]
+            f2 = fq[gp, 2]
+            for a in range(nbf):
+                Na = Ntab[q, a]
+                dna0 = dNtab[q, a, 0] * dscale
+                dna1 = dNtab[q, a, 1] * dscale
+                dna2 = dNtab[q, a, 2] * dscale
+                agw = a0 * dna0 + a1 * dna1 + a2 * dna2
+                wp.atomic_add(r, conn[e, a] * 4 + 0,
+                              (Na + tauM * agw) * f0 * dJxW)
+                wp.atomic_add(r, conn[e, a] * 4 + 1,
+                              (Na + tauM * agw) * f1 * dJxW)
+                wp.atomic_add(r, conn[e, a] * 4 + 2,
+                              (Na + tauM * agw) * f2 * dJxW)
+                wp.atomic_add(r, conn[e, a] * 4 + 3,
+                              tauM * (dna0 * f0 + dna1 * f1
+                                      + dna2 * f2) * dJxW)
+
+    return lin_ns_load3
