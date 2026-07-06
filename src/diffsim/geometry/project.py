@@ -201,11 +201,14 @@ def _newton_iterate(oracle, x):
             # an honestly-failed mask)
             psi_n, g_n = _psi_grad(oracle, y2)
             F_new = _augmented_residual(x2, y2, s2_, psi_n, g_n).norm(dim=1)
-            psi_o, g_o = _psi_grad(oracle, yr)
-            F_old = _augmented_residual(x2, yr, sr, psi_o, g_o).norm(dim=1)
+            y_cur = y[idx2]
+            s_cur = s[idx2]
+            psi_o, g_o = _psi_grad(oracle, y_cur)
+            F_old = _augmented_residual(x2, y_cur, s_cur, psi_o, g_o
+                                        ).norm(dim=1)
             take = (F_new < F_old) & ((y2 - x2).norm(dim=1) < 0.5)
-            y2 = torch.where(take.unsqueeze(1), y2, yr)
-            s2_ = torch.where(take, s2_, sr)
+            y2 = torch.where(take.unsqueeze(1), y2, y_cur)
+            s2_ = torch.where(take, s2_, s_cur)
             y[idx2] = y2
             s[idx2] = s2_
             psi, g, H = _psi_grad_hess(oracle, y)
