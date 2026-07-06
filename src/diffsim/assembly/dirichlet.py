@@ -108,7 +108,8 @@ class DirichletPoisson:
         bc_op = _BCOperator(self.op, self.dir_free)
         u0, info = cg(bc_op, b, tol=tol, maxiter=5000)
         if not info["converged"]:
-        raise RuntimeError(f"Dirichlet lift solve did not converge: {info}")
+            raise RuntimeError(
+                f"Dirichlet lift solve did not converge: {info}")
 
         # --- Reconstruct: add lift, then expand to all nodes ---
         u_free = u0 + g
