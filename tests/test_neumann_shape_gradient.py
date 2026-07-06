@@ -80,3 +80,45 @@ def test_neumann_shape_gradient_adjoint_vs_fd(beta, device):
               - _forward(tm, beta, device)["J"]) / (2 * eps)
         assert abs(fd - g_adj[i]) < 1e-5 * max(abs(fd), scale), (
             beta, i, fd, g_adj[i])
+
+
+def test_homogeneous_dirichlet_shape_gradient(device):
+    """Evaluation finding 2 (CONFIRMED, fixed): g_fn=None (homogeneous
+    Dirichlet — valid in the forward path) used to crash shape_gradient
+    with NoneType. Gate: it runs, and matches FD."""
+    from diffsim.sbm.poisson import SBMPoisson as _P
+
+    def fwd(theta):
+        cx, cy, r = [float(v) for v in theta]
+        oracle = Sphere((cx, cy), r)
+        tree = build_uniform(4, dim=2)
+        ret, _ = classify_lambda(tree, oracle, 0.0)
+        sf = extract_surrogate(ret)
+        mesh = build_mesh(ret, p=1)
+        cons = build_constraints(mesh)
+        dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), device)
+        geo = GeometryData.evaluate(oracle, ret, sf, face_tables(1, 2))
+        prob = _P(dm, geo, sf, g_fn=None, kappa=1.0)   # homogeneous
+        from scipy.sparse.linalg import splu
+        A, b, meta = prob.assemble(lambda x: np.ones(len(x)))
+        u_free = splu(A.tocsc()).solve(b)
+        u_all = np.asarray(dm.constraints.T @ u_free)
+        pr = np.array([[0.5, 0.62], [0.4, 0.45], [0.58, 0.5]])  # interior
+        evalJ, dJdu_fn = probe_qoi(dm, pr, np.zeros(len(pr)))
+        return dict(J=evalJ(u_all), A=A, meta=meta, u_all=u_all,
+                    dJdu=dJdu_fn(u_all), prob=prob, oracle=oracle)
+
+    th0 = np.array([0.5, 0.5, 0.3])
+    fw = fwd(th0)
+    lam = solve_adjoint(fw["A"], fw["dJdu"])
+    shape_gradient(fw["prob"], fw["u_all"], lam, fw["oracle"], fw["meta"])
+    g_adj = np.concatenate([fw["oracle"].center.grad.numpy(),
+                            [float(fw["oracle"].radius.grad)]])
+    eps = 1e-6
+    scale = max(np.abs(g_adj).max(), 1e-12)
+    for i in range(3):
+        tp = th0.copy(); tp[i] += eps
+        tm = th0.copy(); tm[i] -= eps
+        fd = (fwd(tp)["J"] - fwd(tm)["J"]) / (2 * eps)
+        assert abs(fd - g_adj[i]) < 1e-5 * max(abs(fd), scale), (
+            i, fd, g_adj[i])
