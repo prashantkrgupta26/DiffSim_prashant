@@ -98,6 +98,7 @@ class LerayStepAdjoint:
         dq = {pv: np.einsum("gdd->g",
                             gaq[pv].reshape(-1, dim, dim)) for pv in aq}
         gvals = st.g_fn(st.free_coords[st.dir_nodes], self.t_new)
+        self._fq_cache = fq
         A, b = assemble_linear_ns(
             dm, aq, dq, fq, nu, sigma=sigma,
             sig2tau=((2.0 * sigma) ** 2 if st.timestab else 0.0))
@@ -195,12 +196,10 @@ class LerayStepAdjoint:
         _, dnu_A = ns_volume_cotangents(
             dm, aq, dq, st.nu, sigma, 0.5, x_full, lam_full,
             timestab=st.timestab)
-        # ns_volume_cotangents returns -lam^T dR/dnu with R = A x (no b):
-        # dJ/dnu += -lam^T (dA/dnu x) = dnu_A
-        # db/dnu via central FD on the assembled load (frozen aq)
-        eps = 1e-7 * max(st.nu, 1e-6)
-        _, b_p, _, _, _ = self._predictor_ops(st.nu + eps)
-        _, b_m, _, _, _ = self._predictor_ops(st.nu - eps)
-        db_dnu = (b_p - b_m) / (2 * eps)
-        dnu_b = float(lam_x @ db_dnu)          # +lam^T db/dnu
+        # db/dnu via the TAPED load kernel (replaced the interim central
+        # FD once make_lin_ns_load landed): + lam^T db/dnu
+        from .ns_adjoint import ns_load_cotangents
+        fq = self._fq_cache
+        _, _, dnu_b = ns_load_cotangents(dm, aq, fq, st.nu, sigma,
+                                         lam_full, timestab=st.timestab)
         return dnu_A + dnu_b
