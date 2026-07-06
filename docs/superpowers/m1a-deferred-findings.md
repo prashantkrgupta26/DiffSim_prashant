@@ -150,3 +150,21 @@ verify the sensitivity/observable it measures is NONZERO at the truth
    (dip-hypothesis verdict) awaits either a tuned AMGX config for the
    nonsym SBM system or multi-GPU AMGX — both queued. The band study
    record stands at L4-L6.
+
+4c-AMENDMENT (2026-07-05 overnight, M1c kernel work; repro scripts in
+docs/superpowers/warp_adjoint_repros/): the warp 1.14 taped-kernel bug
+FAMILY, measured by term-masked bisection:
+  BUG #1 (original 4c): loop-reassigned locals scale gradients 1/jacS.
+  BUG #2 (NEW, repro nan_micro2.py): scalar accumulators initialized
+  inside SECOND-level unrolled loops poison the ENTIRE tape with NaN —
+  whether the accumulator is used or dead. Depth-1 accumulators (the m1a
+  kernel shape) are safe.
+  OPEN: the linearized-NS residual kernel still NaNs after eliminating
+  depth-2 accumulators, indexed vec/mat writes, and top-scope grad-array
+  reads; vec2d op adjoints pass a minimal repro (vec_adjoint_repro.py).
+  Forward consistency vs the assembled brick is EXACT (1e-12 gated) — the
+  forward kernel is correct; only its tape is poisoned. Next session:
+  term-by-term bisection of the whole-value kernel; report bugs #1/#2
+  upstream with the repros. RULE UNTIL RESOLVED: new taped kernels copy
+  the m1a sbm_dir_res shape LITERALLY (scalars only, depth-1 accumulation,
+  grad-array reads at q-scope, funcs for inner sums).
