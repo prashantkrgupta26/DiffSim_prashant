@@ -1,115 +1,111 @@
-# NeuralSDF Oracle — Implementation Spec (M1c/M2)
+# NeuralSDF (Provided-INR) Oracle — Implementation Spec (M1c/M2)
 
-Status: DRAFT for review. Parent: `2026-07-02-diffsim-design.md` §4
-(oracle contract, epoch pipeline, shape gradients). Measured motivation:
-the L6 shape-optimization demo (`benchmarks/shape_opt_cylinder.py`) —
-exact within-epoch gradients are not descent-stable across
-reclassification epochs; a parameter-rich, smoothly deformable geometry
-representation is the prerequisite for every mitigation strategy below.
+Status: DRAFT v2 (revised after GENIE — Karki, Krishnamurthy &
+Ganapathysubramanian, MyPapers/2603.29860v1.pdf). Parent:
+`2026-07-02-diffsim-design.md` §4. Measured motivation: the L6
+shape-optimization demo (reclassification-jump finding).
 
-## N1. Scope and non-goals
+## N0. Program boundaries (directive, 2026-07-06)
 
-In scope: a `NeuralSDFOracle` implementing the S4.1 contract; fitting
-machinery with admissibility-gated training; the AD path to network
-weights θ; gates through Poisson → NS → drag gradient. NOT in scope
-(deferred, N6): relaxed/differentiable classification — NeuralSDF makes
-geometry *parameters* smooth; it does not by itself make the *retained
-set* smooth. The spec is explicit about this to avoid over-claiming.
+**DiffSim does not train INRs.** A trained INR is a PROVIDED input
+(SIREN-family checkpoint with a linear last layer, C² activations).
+All development and testing uses an ANALYTICAL PROXY with the same
+mathematical structure; real checkpoints drop in unchanged.
 
-## N2. The oracle class
+## N1. The GENIE structure is the design contract
+
+For linear-last-layer INRs, ψ(x) = h_φ(x)ᵀθ_L: with the feature
+extractor h_φ frozen, any last-layer edit Δθ changes the field by
+Δψ(x) = h_φ(x)ᵀΔθ — the geometry is AFFINE in the edit parameters.
+GENIE's results adopted here as load-bearing:
+
+1. **Design space = Gram deformation modes.** G = E_μ[h hᵀ] over a
+   THICK-BAND sampling distribution (thin bands give unstable modes —
+   the paper's Fig. 4a finding becomes our sampling rule). Top-k
+   eigenvectors v_k define the design variables α ∈ R^k (k ~ 10–40):
+   θ_L(α) = θ_L⁰ + Σ α_k v_k.
+2. **Well-posedness boundary**: edits are well-posed iff the target
+   deformation lies in the mode span — optimization in α-space stays
+   inside it BY CONSTRUCTION. (The optimizer never asks the INR for a
+   shape it cannot represent.)
+3. **Editing does not preserve eikonality**: post-edit ψ is a level-set
+   function, not an SDF. Our framework already assumes non-eikonal
+   (Newton+IFT projector, S4.1); the admissibility audit (ĉ₀, Newton
+   masks) is the per-epoch safety contract and RAISES on violation.
+
+## N2. Oracle classes
 
 ```
-class NeuralSDFOracle(SDFOracle):
-    near_eikonal = False          # promoted per-instance after audit
-    psi:   torch MLP, float64, host/GPU torch (geometry-epoch layer)
-    params: list(psi.parameters())   # thousands of theta
+class ProvidedINROracle(SDFOracle):     # wraps a checkpoint
+    near_eikonal = False
+    psi = frozen h_phi + editable linear head theta_L(alpha)
+    params = [alpha]                     # torch, the ONLY design vars
+    modes: (v_k) from thick-band Gram eigendecomposition (cached)
+
+class AnalyticINRProxy(SDFOracle):      # the TEST double
+    psi(x; alpha) = psi0(x) + sum_k alpha_k b_k(x)
+    psi0: analytic SDF (sphere/cylinder from geometry.csg)
+    b_k:  fixed analytic C-inf features (Gaussian bumps on a shell /
+          low-order spherical harmonics x radial envelope) — the same
+          affine structure, everything closed-form
 ```
 
-- **Architecture (baseline, locked until measured otherwise):** MLP
-  x → ψ, width 64 × depth 4, sine or softplus activations (C² needed —
-  the p2 shift consumes the Hessian through d's IFT derivative; ReLU is
-  inadmissible), fp64 weights. Fourier/positional encoding optional
-  behind a flag (helps sharp features; hurts c₀ if overdone — audit
-  decides).
-- `classify` = sign(ψ) batched; `distance_vector` = the framework
-  Newton+IFT projector (`geometry/project.py`) unchanged — GridSDF
-  already exercises the generic non-eikonal path, NeuralSDF reuses it
-  verbatim. `distance_torch` comes for free (ψ is torch end-to-end).
-- **Admissibility is a runtime contract, not a hope** (S4.1 diagnostics):
-  every epoch evaluates ĉ₀ = min‖∇ψ‖ over the band and the Newton
-  success mask; an epoch that violates (ĉ₀ < c₀_min or mask failures)
-  raises with the report attached — the neural-geometry paper's
-  Assumption 3.1/Lemma 3.4 as executable checks (findings 5c).
+Both implement classify = sign(ψ) and distance_vector via the existing
+generic Newton+IFT projector (`geometry/project.py`; GridSDF already
+exercises the non-eikonal path). `distance_torch` free (torch
+end-to-end). No new projection or adjoint code.
 
-## N3. Fitting (geometry → weights)
+## N3. Mode extraction (ProvidedINROracle only)
 
-`fit_neural_sdf(target, band_pts, h, order) -> NeuralSDFOracle`
+`extract_modes(inr, band_pts, k)` — one batched forward for H on
+thick-band ∪ ambient samples (paper's sampling rule), eigh(G), cache
+(v_k, spectrum). Diagnostics locked with the oracle: spectrum decay,
+mode-stability check vs a second independent sample draw (the paper's
+reproducibility criterion made a test).
 
-- Supervision: ψ-values (+ optional ∇ψ) from any existing oracle
-  (CSG/TriMesh/Grid) sampled in a tubular band ∪ ambient sprinkling —
-  fit-to-oracle first; point-cloud fitting later.
-- Loss: SDF regression + **eikonal regularizer** λ_e(‖∇ψ‖−1)² *in the
-  band only* (keeps ĉ₀ healthy where the projector works; global
-  eikonal fights expressiveness).
-- **Stopping rule = the spec's ε∞ ~ h^(k+1) tolerance** (S4.1): train
-  until the band sup-error clears the mesh's geometric-accuracy budget,
-  else surface the geometry-limited-refinement-plateau warning. The fit
-  gate LOCKS measured (ε̂∞, ĉ₀) for the reference shapes.
+## N4. Gradients and gates
 
-## N4. Gradients
+θ-chain: α enters through step-4 geometry data d(α), n(α), corr(α)
+only (S4.3); the m1a/m1c face-cotangent → torch pipeline is unchanged.
+Because ψ is affine in α, dψ/dα_k = b_k(x) (proxy) or h(x)ᵀv_k (INR) —
+smooth, closed-form, cheap.
 
-Within an epoch, θ enters only through step-4 geometry data (S4.3):
-d(θ), n(θ), corr(θ) at surrogate GPs. The chain is the m1a/m1c pipeline
-unchanged — face-residual cotangents (dbar, nbar, corrbar, gbar/qbar) →
-torch backward through the Newton IFT into ψ's autograd graph → θ.grads.
-Nothing new is taped; the only new code is ψ itself.
+Gates (all against the PROXY; measure-then-lock):
+1. **Admissibility gate**: proxy at α=0 and random small α — ĉ₀,
+   Newton masks, ε̂∞ report locked.
+2. **Forward equivalence**: SBM Poisson MMS through the proxy at α=0
+   matches the analytic-oracle solution to machine-level (same zero
+   level set); perturbed-α forward runs are regression-locked.
+3. **AD gate (4c ritual)**: d(probe-QoI)/dα three-way (adjoint vs
+   FD-on-α vs torch dense twin at L4), all k modes, β on/off.
+4. **NS composition**: Re=20 cylinder smoke with the proxy
+   (psi0 = cylinder); Cd within the locked baseline tolerance.
+5. **Drag gradient**: d(Cd)/dα vs FD — the hero-demo ingredient.
+6. **INR drop-in** (when a checkpoint is provided): gates 1-2-4 rerun
+   verbatim against the real INR; no code changes expected.
 
-Gates (measure-then-lock, in order):
-1. **Fit gate:** sphere + cylinder-2D fits meet ε∞(h) at L4-L6;
-   admissibility report locked.
-2. **Forward equivalence:** SBM Poisson MMS through NeuralSDF matches
-   the analytic-oracle solution to the geometry budget (the plateau rule
-   made a test).
-3. **AD gate (4c contract, oracle edition):** d(probe-QoI)/dθ_i for ~8
-   sampled weights, three-way (adjoint vs FD-on-θ_i vs torch dense twin
-   where feasible), β-on and β-off per the evaluation-response rule.
-4. **NS composition:** Re=20 cylinder smoke with the fitted-cylinder
-   NeuralSDF; Cd within the locked baseline's tolerance.
-5. **Drag gradient:** d(Cd)/dθ gate vs FD on a θ-subset — the hero-demo
-   ingredient.
+## N5. Shape optimization in mode space
 
-## N5. Shape optimization: what NeuralSDF changes, honestly
+Design variables α (tens). The L6 reclassification-jump finding still
+applies; mode-space mitigations, in order: (i) GENIE modes are GLOBAL
+smooth deformations — smaller interface displacement per unit
+objective change than rigid translation (measure on the L6 benchmark);
+(ii) epoch trust region with objective-accepted steps + h-continuation
+(the band-study feature-resolution rule applied to optimization);
+(iii) the N6 relaxations if (i)+(ii) measure insufficient.
 
-The L6 finding stands regardless of representation: the objective is
-piecewise-smooth in θ with jumps at reclassification. NeuralSDF changes
-three practical things: (i) thousands of θ instead of 2 — descent
-directions exist that deform the shape *without* moving the interface
-across cell boundaries as fast as rigid translation does; (ii) the
-deformation is global and smooth — epoch-transition jumps are typically
-smaller for equal ‖δθ‖; (iii) it enables N6's relaxations. The BASELINE
-optimizer spec'd here: epoch trust region (step accepted by OBJECTIVE
-decrease, not gradient faith), with re-carve per accepted step and
-h-continuation (refine when the epoch noise floor dominates the
-gradient signal — the band-study "elements across the feature" rule
-applied to optimization).
+## N6. Deferred research fork (unchanged from v1)
 
-## N6. Deferred: differentiable classification (research fork)
-
-Two candidate relaxations, spec'd as QUESTIONS with gates, not
-commitments: (a) λ-relaxation — retained-set weights w(ψ/h) smooth in a
-narrow band (changes assembly: per-element volume weights; conditioning
-audit required); (b) objective smoothing — expectation over dithered
-grid offsets (embarrassingly parallel; no formulation change; N×
-forward cost). Decision point AFTER the N4 gates exist, using the L6
-demo as the benchmark problem: whichever relaxation first turns its
-measured Cd-ascent into descent wins a milestone.
+(a) λ-relaxed retained-set weights (assembly + conditioning audit
+required) vs (b) grid-dither objective smoothing (no formulation
+change, N× forwards). Decide AFTER gates 1-5, on the L6 benchmark:
+first relaxation to turn the measured Cd-ascent into descent wins.
 
 ## N7. Order of work
 
-1. `NeuralSDFOracle` + fit-to-oracle + gates 1-2 (one session).
-2. AD gate 3 (the 4c ritual; expect the FD-on-θ trust region to need
-   the fit's ε∞ headroom — document the epsilon choice).
-3. Gates 4-5 (compose with the existing NS/drag machinery — no new
-   adjoint code expected).
-4. N5 baseline optimizer on the L6 demo problem; measure.
-5. N6 decision with data.
+1. AnalyticINRProxy + gates 1-2 (no training anywhere).
+2. AD gate 3 (α-space three-way).
+3. Gates 4-5 (compose with existing NS/drag machinery).
+4. ProvidedINROracle wrapper + mode extraction (ready for the first
+   real checkpoint; gate 6 awaits one).
+5. N5 optimizer on the L6 benchmark; measure; N6 decision with data.
