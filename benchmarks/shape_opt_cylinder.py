@@ -23,8 +23,17 @@ def main(n_steps=12, lr=0.02, level=5):
     (gate rel 1.25e-4) but Cd carries O(10%) reclassification noise —
     at L5 the cylinder spans only ~2.2 cells, so the surrogate staircase
     reshapes as the center crosses cell boundaries (the band-study
-    preasymptotic rule, in optimization form). Run at level>=6 for a
-    usable landscape."""
+    preasymptotic rule, in optimization form).
+
+    L6 MEASURED (15 epochs): within-epoch noise is much reduced, but the
+    honest headline is sharper — the within-epoch gradient (FD-gated to 4
+    digits) is NOT descent-stable across epochs: Cd RISES 2.63->3.74 along
+    the descent path because reclassification reshapes the surrogate
+    discontinuously between epochs, and those jumps dominate the smooth
+    local decrease. CONCLUSION (recorded for M1c): naive epoch-wise SBM
+    shape descent needs either feature-resolving resolution (band-study
+    rule), objective smoothing, or the differentiable-classification path
+    (NeuralSDF) — this demo is the measured motivation for the latter."""
     c = np.array([0.30, 0.42])          # start off-center: does it center?
     print(f"{'step':>4} {'c_x':>8} {'c_y':>8} {'Cd':>8} "
           f"{'dCd/dcx':>10} {'dCd/dcy':>10}")
