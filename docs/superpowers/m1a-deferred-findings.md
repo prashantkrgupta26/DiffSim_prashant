@@ -159,12 +159,19 @@ FAMILY, measured by term-masked bisection:
   inside SECOND-level unrolled loops poison the ENTIRE tape with NaN —
   whether the accumulator is used or dead. Depth-1 accumulators (the m1a
   kernel shape) are safe.
-  OPEN: the linearized-NS residual kernel still NaNs after eliminating
-  depth-2 accumulators, indexed vec/mat writes, and top-scope grad-array
-  reads; vec2d op adjoints pass a minimal repro (vec_adjoint_repro.py).
-  Forward consistency vs the assembled brick is EXACT (1e-12 gated) — the
-  forward kernel is correct; only its tape is poisoned. Next session:
-  term-by-term bisection of the whole-value kernel; report bugs #1/#2
-  upstream with the repros. RULE UNTIL RESOLVED: new taped kernels copy
-  the m1a sbm_dir_res shape LITERALLY (scalars only, depth-1 accumulation,
-  grad-array reads at q-scope, funcs for inner sums).
+  OPEN (deep): the linearized-NS residual kernel NaNs in EVERY
+  formulation — Ae-style, func-based, whole-value vec/mat algebra, and
+  finally the FULL-SCALAR m1a idiom — while EVERY individual construct
+  passes minimal repros (vec ops, mat-vec, loop-accumulated mat consumed,
+  tau-func + mat interaction: all clean; repros committed). The sharpest
+  reproducible boundary: the term-bisect kernels LEVEL 5 (clean) vs
+  LEVEL 6 (all-NaN) differ by three source lines (ns_term_bisect.py) —
+  THE upstream report artifact. Forward consistency is EXACT (1e-12) in
+  all versions; only the tape is poisoned, and only in this kernel's
+  context (m1a taped kernels pass the same night on the same box).
+  NEXT-SESSION ORDER: (1) bump warp 1.14 -> latest and rerun the 4c gate
+  (cheapest possible resolution); (2) if unfixed, file the LEVEL 5/6 pair
+  upstream. MEANWHILE M1c proceeds TAPE-FREE: dR/dnu via viscous-block
+  linearity (the m1a kappa meta-linearity trick), dR/d(aq) via the torch
+  dense twin at gate scale — the adjoint program is NOT blocked, only the
+  taped fast path is.

@@ -75,6 +75,12 @@ def make_lin_ns_residual(nbf: int, nqp: int, dim: int):
             s += av[d] * gu[i, d]
         return s
 
+    if dim != 2:
+        raise NotImplementedError(
+            "taped NS residual: dim=2 only until the warp adjoint "
+            "interaction bug is resolved upstream (findings 4c amendment); "
+            "the dim-3 kernel follows the same scalar generator pattern")
+
     @wp.kernel(module="unique", enable_backward=True)
     def lin_ns_res(conn: wp.array2d(dtype=wp.int32),
                    h: wp.array(dtype=wp.float64),
@@ -89,90 +95,91 @@ def make_lin_ns_residual(nbf: int, nqp: int, dim: int):
                    s_skew: wp.float64,
                    x: wp.array(dtype=wp.float64),           # frozen state
                    r: wp.array(dtype=wp.float64)):
+        # FULL-SCALAR SHAPE (m1a sbm_dir_res idiom): every accumulator is a
+        # depth-1 scalar; no vec/mat locals; tau inlined. This is the one
+        # taped shape with a green track record (findings 4c amendment: the
+        # NS kernel NaN'd in every vec/mat formulation despite each
+        # construct passing in isolation — an interaction bug, upstream
+        # report with repros in docs/superpowers/warp_adjoint_repros/).
         e = wp.tid()
         fe = FEMElm()
         fe.e = e
         fe.he = h[e]
-        jac = wp.pow(fe.he * wp.float64(0.5), wp.float64(dim_pow))
+        jac = wp.pow(fe.he * wp.float64(0.5), wp.float64(2.0))
         dscale = wp.float64(2.0) / fe.he
         for q in range(nqp):
-            nu = nu_arr[0]     # read at LOOP scope: a top-scope read from a
-            # grad-array, used inside unrolled loops, poisons the tape
-            # (hypothesis under test — every clean kernel reads grad arrays
-            # only inside loops)
             fe.q = q
+            nu = nu_arr[0]
             dJxW = fe_detJxW_s(wtab, fe, jac)
             gp = e * nqp + q
-            # ---- frozen-state fields via WHOLE-VALUE vec/mat algebra ----
-            # (warp backward bug family, measured tonight: kernel-body
-            # scalar accumulators above depth 1 AND indexed writes into
-            # vec/mat locals both poison the tape with NaN; constructors,
-            # +, wp.outer, mat-vec products differentiate correctly)
-            uval = vecT()
-            gu = matT()
-            pval = wp.float64(0.0)
-            gradp = vecT()
+            # frozen-state fields: scalar accumulators at depth 1
+            u0 = wp.float64(0.0)
+            u1 = wp.float64(0.0)
+            g00 = wp.float64(0.0)     # du0/dx
+            g01 = wp.float64(0.0)     # du0/dy
+            g10 = wp.float64(0.0)
+            g11 = wp.float64(0.0)
+            pv_ = wp.float64(0.0)
+            gp0 = wp.float64(0.0)
+            gp1 = wp.float64(0.0)
             for b in range(nbf):
                 Nb = fe_N(Ntab, fe, b)
-                if wp.static(dim == 2):
-                    xv = wp.vec2d(x[conn[e, b] * ndof + 0],
-                                  x[conn[e, b] * ndof + 1])
-                    dnb = wp.vec2d(fe_dN_s(dNtab, fe, b, 0, dscale),
-                                   fe_dN_s(dNtab, fe, b, 1, dscale))
-                else:
-                    xv = wp.vec3d(x[conn[e, b] * ndof + 0],
-                                  x[conn[e, b] * ndof + 1],
-                                  x[conn[e, b] * ndof + 2])
-                    dnb = wp.vec3d(fe_dN_s(dNtab, fe, b, 0, dscale),
-                                   fe_dN_s(dNtab, fe, b, 1, dscale),
-                                   fe_dN_s(dNtab, fe, b, 2, dscale))
-                pb = x[conn[e, b] * ndof + dim]
-                uval += Nb * xv
-                gu += wp.outer(xv, dnb)          # gu[i,d] = du_i/dx_d
-                pval += Nb * pb
-                gradp += pb * dnb
-            divu = wp.trace(gu)
-            if wp.static(dim == 2):
-                av = wp.vec2d(aq[gp, 0], aq[gp, 1])
-            else:
-                av = wp.vec3d(aq[gp, 0], aq[gp, 1], aq[gp, 2])
-            amag2 = wp.dot(
-                (wp.vec2d(aq_frozen[gp, 0], aq_frozen[gp, 1])
-                 if wp.static(dim == 2)
-                 else wp.vec3d(aq_frozen[gp, 0], aq_frozen[gp, 1],
-                               aq_frozen[gp, 2])),
-                (wp.vec2d(aq_frozen[gp, 0], aq_frozen[gp, 1])
-                 if wp.static(dim == 2)
-                 else wp.vec3d(aq_frozen[gp, 0], aq_frozen[gp, 1],
-                               aq_frozen[gp, 2])))
-            tauM = tau_m_metric(wp.sqrt(amag2), fe.he, nu, sig2tau,
-                                wp.float64(dim_f))
-            tauC = tau_c_metric(tauM, fe.he, wp.float64(dim_f))
+                dnb0 = fe_dN_s(dNtab, fe, b, 0, dscale)
+                dnb1 = fe_dN_s(dNtab, fe, b, 1, dscale)
+                xb0 = x[conn[e, b] * 3 + 0]
+                xb1 = x[conn[e, b] * 3 + 1]
+                pb = x[conn[e, b] * 3 + 2]
+                u0 += Nb * xb0
+                u1 += Nb * xb1
+                g00 += dnb0 * xb0
+                g01 += dnb1 * xb0
+                g10 += dnb0 * xb1
+                g11 += dnb1 * xb1
+                pv_ += Nb * pb
+                gp0 += dnb0 * pb
+                gp1 += dnb1 * pb
+            divu = g00 + g11
+            a0 = aq[gp, 0]
+            a1 = aq[gp, 1]
+            # tau INLINED from the frozen advecting copy (tau-frozen)
+            af0 = aq_frozen[gp, 0]
+            af1 = aq_frozen[gp, 1]
+            uGu = wp.float64(4.0) * (af0 * af0 + af1 * af1) \
+                / (fe.he * fe.he)
+            GG = wp.float64(2.0) * wp.pow(wp.float64(2.0) / fe.he,
+                                          wp.float64(4.0))
+            tauM = wp.float64(1.0) / wp.sqrt(
+                sig2tau + uGu + wp.float64(36.0) * nu * nu * GG)
+            tauC = wp.float64(1.0) / (tauM * wp.float64(2.0)
+                                      * wp.float64(4.0)
+                                      / (fe.he * fe.he))
             diva = div_aq[gp]
             # strong linearized momentum residual (nu-lap dropped at p1)
-            resm = (sigma + s_skew * diva) * uval + gu * av + gradp
-            # ---- per-test contributions (reads + whole-value ops) -------
-            conv_vec = gu * av                    # (a.grad u)_i
+            sfac = sigma + s_skew * diva
+            rm0 = sfac * u0 + a0 * g00 + a1 * g01 + gp0
+            rm1 = sfac * u1 + a0 * g10 + a1 * g11 + gp1
+            conv0 = a0 * g00 + a1 * g01
+            conv1 = a0 * g10 + a1 * g11
             for a in range(nbf):
                 Na = fe_N(Ntab, fe, a)
-                if wp.static(dim == 2):
-                    dna = wp.vec2d(fe_dN_s(dNtab, fe, a, 0, dscale),
-                                   fe_dN_s(dNtab, fe, a, 1, dscale))
-                else:
-                    dna = wp.vec3d(fe_dN_s(dNtab, fe, a, 0, dscale),
-                                   fe_dN_s(dNtab, fe, a, 1, dscale),
-                                   fe_dN_s(dNtab, fe, a, 2, dscale))
-                agw = wp.dot(av, dna)
-                visc_vec = gu * dna               # (grad w_a . grad u)_i
-                rvec = (sigma * Na * uval
-                        + Na * (conv_vec + s_skew * diva * uval)
-                        + nu * visc_vec
-                        + tauM * agw * resm
-                        + (tauC * divu - pval) * dna) * dJxW
-                q_contrib = (Na * divu + tauM * wp.dot(dna, resm)) * dJxW
-                for i in range(dim):
-                    wp.atomic_add(r, conn[e, a] * ndof + i, rvec[i])
-                wp.atomic_add(r, conn[e, a] * ndof + dim, q_contrib)
+                dna0 = fe_dN_s(dNtab, fe, a, 0, dscale)
+                dna1 = fe_dN_s(dNtab, fe, a, 1, dscale)
+                agw = a0 * dna0 + a1 * dna1
+                v0 = (sigma * Na * u0
+                      + Na * (conv0 + s_skew * diva * u0)
+                      + nu * (dna0 * g00 + dna1 * g01)
+                      + tauM * agw * rm0
+                      + (tauC * divu - pv_) * dna0) * dJxW
+                v1 = (sigma * Na * u1
+                      + Na * (conv1 + s_skew * diva * u1)
+                      + nu * (dna0 * g10 + dna1 * g11)
+                      + tauM * agw * rm1
+                      + (tauC * divu - pv_) * dna1) * dJxW
+                qv = (Na * divu
+                      + tauM * (dna0 * rm0 + dna1 * rm1)) * dJxW
+                wp.atomic_add(r, conn[e, a] * 3 + 0, v0)
+                wp.atomic_add(r, conn[e, a] * 3 + 1, v1)
+                wp.atomic_add(r, conn[e, a] * 3 + 2, qv)
 
     _kernel_cache[key] = lin_ns_res
     return lin_ns_res
