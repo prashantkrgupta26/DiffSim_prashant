@@ -162,3 +162,19 @@
    FULL SUITE dropped from ~50 min to 26:42. The m0.5 deferred item and
    P1's measured bottleneck-inversion are now historical; 3D at scale is
    unblocked (harvest: band L6/L7, sphere Re=300).
+   (g) PRECONDITIONER STUDY MATRIX (36 configs, overnight campaign (b);
+   full JSON in the study records): the block-AMG preconditioner WORKS IN
+   THE PRODUCTION TIME-STEPPING REGIME and fails in pseudo-time:
+   - dt=0.01 (sigma=150), L5: EVERY variant converges in 3-5 lgmres
+     iterations (best: CC Schur + 2 F-cycles, 3 its / 0.15 s); L6: diagC
+     Schur + 1 F-cycle = 13 its / 2.1 s, CC + 1 = 35 its.
+   - dt=0.05 (sigma=30): mostly no convergence; MORE F-cycles make L6
+     WORSE (f2/f3 diverge where f1 converges) — the nonsym classical-AMG
+     velocity cycle is an AMPLIFYING operator at convection-dominated
+     sigma; a single application per outer iteration stays tamed.
+   Reading: sigma-dominance is the regime switch (F mass-dominated = AMG's
+   home). For physical time stepping (small dt — the user's production
+   pattern) block-AMG is VIABLE NOW (13 its at L6); steady-state
+   pseudo-time needs a stronger F-smoother (ILU-type / Krylov-wrapped
+   cycle) — the remaining research edge for task #6. Success gate (<=50
+   its) MET at L6/dt0.01; L7 verification queued.
