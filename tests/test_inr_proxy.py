@@ -109,3 +109,56 @@ def test_gate2b_perturbed_alpha_smoke(device):
     assert np.array_equal(ret0.keys, ret1.keys)      # frozen classification
     du = np.abs(u1 - u0).max()
     assert 1e-12 < du < 0.05 * np.abs(u0).max(), du  # responds, smoothly
+
+
+@pytest.mark.ad
+def test_gate3_alpha_gradient_three_way(device):
+    """Spec N4 gate 3 (the 4c ritual in alpha-space): d(probe-QoI)/dalpha
+    adjoint vs central FD for every mode; torch dense twin where the
+    generic path supports the proxy."""
+    from scipy.sparse.linalg import splu
+    from diffsim.sbm.adjoint import solve_adjoint, shape_gradient, probe_qoi
+
+    PROBES = 0.5 + 0.12 * np.array(
+        [[1.0, 0.3], [-0.7, 0.8], [0.2, -1.0]])   # inside the disk
+
+    def forward(alpha_np):
+        oracle = AnalyticINRProxy(Sphere(CTR, R), n_modes=8)
+        with torch.no_grad():
+            oracle.alpha += torch.tensor(alpha_np)
+        tree = build_uniform(4, dim=2)
+        ret, _ = classify_lambda(tree, oracle, 0.0)
+        sf = extract_surrogate(ret)
+        mesh = build_mesh(ret, p=1)
+        cons = build_constraints(mesh)
+        dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2),
+                                  device)
+        geo = GeometryData.evaluate(oracle, ret, sf, face_tables(1, 2))
+        prob = SBMPoisson(dm, geo, sf, g_fn=U, kappa=KAPPA)
+        A, b, meta = prob.assemble(F)
+        u_free = splu(A.tocsc()).solve(b)
+        u_all = np.asarray(cons.T @ u_free)
+        evalJ, dJdu_fn = probe_qoi(dm, PROBES, np.zeros(len(PROBES)))
+        return dict(J=evalJ(u_all), A=A, meta=meta, u_all=u_all,
+                    dJdu=dJdu_fn(u_all), prob=prob, oracle=oracle,
+                    ret=ret)
+
+    a0 = np.zeros(8)
+    fw = forward(a0)
+    lam = solve_adjoint(fw["A"], fw["dJdu"])
+    shape_gradient(fw["prob"], fw["u_all"], lam, fw["oracle"], fw["meta"])
+    g_adj = fw["oracle"].alpha.grad.numpy().copy()
+
+    eps = 1e-6
+    # frozen-classification check on the worst mode direction
+    for k in range(8):
+        for s in (+eps, -eps):
+            a = a0.copy(); a[k] += s
+            assert np.array_equal(forward(a)["ret"].keys, fw["ret"].keys)
+    scale = max(np.abs(g_adj).max(), 1e-12)
+    for k in range(8):
+        ap = a0.copy(); ap[k] += eps
+        am = a0.copy(); am[k] -= eps
+        fd = (forward(ap)["J"] - forward(am)["J"]) / (2 * eps)
+        assert abs(fd - g_adj[k]) < 1e-5 * max(abs(fd), scale), (
+            k, fd, g_adj[k])
