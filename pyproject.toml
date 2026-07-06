@@ -2,10 +2,14 @@
 name = "diffsim"
 version = "0.0.1"
 requires-python = ">=3.10"
-dependencies = ["warp-lang>=1.7", "numpy>=1.26", "scipy>=1.11", "torch>=2.4"]
+dependencies = ["warp-lang>=1.7,<2", "numpy>=1.26,<3", "scipy>=1.11,<2", "torch>=2.4,<3"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# cuDSS GPU direct solver (measured stepping default at 200k+ dofs)
+cudss = ["nvmath-python[cu12]>=0.2"]
+# AMGX has no PyPI package: build github.com/NVIDIA/AMGX, then
+# pip install pyamgx --no-build-isolation with AMGX_DIR set (see README)
 
 [build-system]
 requires = ["setuptools>=68"]

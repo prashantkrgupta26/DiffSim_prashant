@@ -96,7 +96,15 @@ class TriMeshOracle(SDFOracle):
     near_eikonal = False
 
     def __init__(self, verts: np.ndarray, tris: np.ndarray, device="cuda:0"):
-        self.verts = torch.tensor(np.asarray(verts, np.float64))
+        verts = np.asarray(verts, np.float64)
+        tris = np.asarray(tris)
+        if verts.ndim != 2 or verts.shape[1] != 3:
+            raise ValueError(f"verts must be [Nv, 3], got {verts.shape}")
+        if tris.ndim != 2 or tris.shape[1] != 3 or len(tris) == 0:
+            raise ValueError(f"tris must be non-empty [Nt, 3], got {tris.shape}")
+        if tris.min() < 0 or tris.max() >= len(verts):
+            raise ValueError("triangle indices out of vertex range")
+        self.verts = torch.tensor(verts)
         self.tris = np.ascontiguousarray(tris, np.int32)
         self.dim = 3
         self._device = device

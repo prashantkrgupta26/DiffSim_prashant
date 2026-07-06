@@ -71,6 +71,12 @@ class Box(SDFOracle):
         if self.dim == 2:
             c, s = torch.cos(self.rotation), torch.sin(self.rotation)
             return torch.stack([torch.stack([c, -s]), torch.stack([s, c])])
+        if self.dim != 3:
+            raise NotImplementedError(
+                f"rotated Box only supports dim 2/3 (got dim={self.dim}); "
+                "axis-angle Rodrigues below is 3-D-specific (evaluation "
+                "geometry-review item — dim=4 rotations need a proper "
+                "SO(4) parametrization)")
         # dim = 3: Rodrigues from axis-angle vector; safe at theta -> 0
         th = torch.linalg.norm(self.rotation)
         k = self.rotation / th.clamp_min(1e-300)

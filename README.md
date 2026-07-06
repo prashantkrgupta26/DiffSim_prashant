@@ -32,7 +32,7 @@ design, inference, and discovery:
 - **Shape optimization**: gradients with respect to geometry parameters flow
   through the mesh-generation → assembly → solve → observable chain
   (demonstrated today: recovering a circle's center and radius from nine probe
-  readings, `tutorials/02_shape_optimization.py`).
+  readings, `tutorials/E_differentiable/E1_shape_optimization.py`).
 - **Inverse problems**: unknown conductivities, viscosities, boundary data.
 - **Hybrid ML–physics**: neural SDF geometries and neural constitutive
   closures dropped into the weak form, trained end-to-end against simulation
@@ -178,7 +178,7 @@ pip install -e .            # warp-lang, torch, numpy, scipy
 pytest -q -m "not tier5"    # fast tiers (~minutes)
 pytest -q                   # everything (~1 h; first-ever run pays one-time
                             # kernel compiles, cached on disk afterwards)
-python tutorials/01_poisson_immersed_disk.py
+python tutorials/A_foundations/A1_mms_convergence.py
 ```
 
 Requires an NVIDIA GPU (FP64-capable), CUDA 12+, Python 3.12.

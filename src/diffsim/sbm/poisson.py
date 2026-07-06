@@ -818,7 +818,8 @@ class SBMPoisson:
             op = CSROperator(A, self.dm.device)
             x, info = bicgstab(op, rhs, tol=tol, maxiter=maxiter,
                                diag=np.asarray(A.diagonal()))
-            assert info["converged"], info
+            if not info["converged"]:
+                raise RuntimeError(f"SBM solve did not converge: {info}")
         else:
             raise ValueError(f"unknown solver {solver!r}")
         return np.asarray(self.dm.constraints.T @ x)

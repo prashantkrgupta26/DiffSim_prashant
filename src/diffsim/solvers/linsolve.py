@@ -31,6 +31,20 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
     sym=True routes to CG/SPD paths. cache/cache_key: reuse device uploads
     or factorizations for constant matrices across steps."""
     A = A.tocsr()
+    if cache is not None and cache_key is not None:
+        # cheap staleness guard (evaluation solver-review item): cached
+        # factorizations are for CONSTANT matrices — catch reuse of a key
+        # after the matrix changed shape/pattern (values are the caller's
+        # contract; a full value check would defeat the cache's purpose)
+        fp = (A.shape, A.nnz, str(A.dtype))
+        old = cache.get(("fingerprint", cache_key))
+        if old is None:
+            cache[("fingerprint", cache_key)] = fp
+        elif old != fp:
+            raise ValueError(
+                f"solve_linear cache_key={cache_key!r} reused with a "
+                f"different matrix (was {old}, now {fp}) — cached "
+                f"factorizations are for constant matrices")
     if solver == "splu":
         from scipy.sparse.linalg import splu
         if cache is not None and cache_key is not None:
@@ -61,8 +75,8 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
 
     if solver == "amgx":
         from .amgx import amgx_solve
-        return amgx_solve(A, b, sym=sym, tol=tol, cache=cache,
-                          cache_key=cache_key)
+        return amgx_solve(A, b, sym=sym, tol=tol, maxiter=maxiter,
+                          cache=cache, cache_key=cache_key)
 
     if solver == "cudss":
         # constant-matrix reuse: keep the factorized DirectSolver per key

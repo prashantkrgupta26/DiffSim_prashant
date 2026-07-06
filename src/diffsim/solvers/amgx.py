@@ -48,7 +48,7 @@ def _ensure_init():
         # process death; finalize is optional at exit.
 
 
-def _config(sym: bool, tol: float):
+def _config(sym: bool, tol: float, maxiter: int = 2000):
     """Load AMGX's own validated example configs (bundled with the AMGX
     source; copies staged in extern/amgx_configs) and override tolerance.
     Hand-rolled config dicts are a trap: AMGX rejects malformed configs at
@@ -64,7 +64,7 @@ def _config(sym: bool, tol: float):
     with open(os.path.join(here, fname)) as fh:
         cfg = json.load(fh)
     cfg["solver"]["tolerance"] = tol
-    cfg["solver"]["max_iters"] = 2000
+    cfg["solver"]["max_iters"] = int(maxiter)
     cfg["solver"]["monitor_residual"] = 1
     cfg["solver"].setdefault("convergence", "RELATIVE_INI_CORE")
     cfg["solver"]["print_solve_stats"] = 0
@@ -72,7 +72,8 @@ def _config(sym: bool, tol: float):
     return pyamgx.Config().create(json.dumps(cfg))
 
 
-def amgx_solve(A, b, sym=False, tol=1e-10, cache=None, cache_key=None):
+def amgx_solve(A, b, sym=False, tol=1e-10, maxiter=2000,
+               cache=None, cache_key=None):
     """Solve on the GPU via AMGX. A: scipy CSR (FP64), b: host vector.
 
     LIFETIME RULE (measured the hard way): AMGX objects are process-global
@@ -85,10 +86,15 @@ def amgx_solve(A, b, sym=False, tol=1e-10, cache=None, cache_key=None):
     import pyamgx
     A = A.tocsr()
     A.sort_indices()
-    key = ("singleton", bool(sym))
+    # tol/maxiter are BAKED into the AMGX config at solver creation, so
+    # they are part of the singleton key: a later call with different
+    # settings gets a matching solver instead of silently inheriting the
+    # first call's (evaluation solver-review item, CONFIRMED). Resources
+    # remain shared per the lifetime rule via the first-created state.
+    key = ("singleton", bool(sym), float(tol), int(maxiter))
     state = _ctx.get(key)
     if state is None:
-        cfg = _config(sym, tol)
+        cfg = _config(sym, tol, maxiter)
         rsc = pyamgx.Resources().create_simple(cfg)
         state = {"cfg": cfg, "rsc": rsc,
                  "M": pyamgx.Matrix().create(rsc),
