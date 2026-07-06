@@ -77,11 +77,14 @@ class LerayStepAdjoint:
         self.p_star = st.p_star.copy()
         self.t_new = st.t + st.dt
 
-    def _predictor_ops(self, nu):
+    def _predictor_chain(self, nu):
+        """Replicate the stepper's Picard loop from the frozen inputs,
+        recording every iterate: list of dicts(A, b, x, aq, dq, fq)."""
         st = self.st
         dm = st.dm
         dim = dm.dim
         ndof = st.ndof
+        from scipy.sparse.linalg import splu
         from ..solvers.timestepping import bdf_order_now, bdf_coeffs
         o = bdf_order_now(self.t_new, st.dt, st.order,
                           have_history=self.u2 is not None)
@@ -92,79 +95,84 @@ class LerayStepAdjoint:
                                   else 0.0)) / st.dt
         hq = st._gp_vals(h_node)
         fq = {pv: st.f_fn(st.xq[pv], self.t_new) - hq[pv] for pv in st.xq}
+        gvals = st.g_fn(st.free_coords[st.dir_nodes], self.t_new)
         a_node = (2.0 * self.u1 - self.u2 if self.u2 is not None
                   else self.u1.copy())
-        aq, gaq = st._gp_vals(a_node, grad=True)
-        dq = {pv: np.einsum("gdd->g",
-                            gaq[pv].reshape(-1, dim, dim)) for pv in aq}
-        gvals = st.g_fn(st.free_coords[st.dir_nodes], self.t_new)
-        self._fq_cache = fq
-        A, b = assemble_linear_ns(
-            dm, aq, dq, fq, nu, sigma=sigma,
-            sig2tau=((2.0 * sigma) ** 2 if st.timestab else 0.0))
-        A = A.tolil()
-        for k, i in enumerate(st.dir_nodes):
-            for c in range(dim):
-                r = i * ndof + c
+        chain = []
+        for _ in range(st.picard_iters):
+            aq, gaq = st._gp_vals(a_node, grad=True)
+            dq = {pv: np.einsum("gdd->g",
+                                gaq[pv].reshape(-1, dim, dim)) for pv in aq}
+            A, b = assemble_linear_ns(
+                dm, aq, dq, fq, nu, sigma=sigma,
+                sig2tau=((2.0 * sigma) ** 2 if st.timestab else 0.0))
+            A = A.tolil()
+            for k, i in enumerate(st.dir_nodes):
+                for c in range(dim):
+                    r = i * ndof + c
+                    A.rows[r] = [int(r)]
+                    A.data[r] = [1.0]
+                    b[r] = gvals[k, c]
+            for i in range(st.n_free):
+                r = i * ndof + dim
                 A.rows[r] = [int(r)]
                 A.data[r] = [1.0]
-                b[r] = gvals[k, c]
-        for i in range(st.n_free):
-            r = i * ndof + dim
-            A.rows[r] = [int(r)]
-            A.data[r] = [1.0]
-            b[r] = self.p_star[i]
-        return A.tocsr(), b, aq, dq, sigma
+                b[r] = self.p_star[i]
+            A = A.tocsr()
+            x = splu(A.tocsc()).solve(b)
+            chain.append(dict(A=A, x=x, aq=aq, dq=dq, fq=fq, sigma=sigma))
+            a_node = x.reshape(st.n_free, ndof)[:, :dim]
+        return chain
 
     def nu_gradient(self, dJdu_new):
-        """dJ/dnu with strong-row and pin handling; dJdu_new [n_free,dim]."""
+        """dJ/dnu; dJdu_new [n_free, dim]. Supports picard_iters >= 1
+        (recorded-iterate composition; inter-iterate chain uses the
+        transient-chain-proven convention at tau_frozen=False)."""
         st = self.st
         dm = st.dm
         dim = dm.dim
         ndof = st.ndof
-        assert st.picard_iters == 1 and not st.ppe_finescale, (
-            "gate-1 scope: picard_iters=1, ppe_finescale=False")
+        assert not st.ppe_finescale, "finescale branch: item (c)"
         from scipy.sparse.linalg import splu
-        A, b, aq, dq, sigma = self._predictor_ops(st.nu)
-        x = splu(A.tocsc()).solve(b)
-        uhat = x.reshape(st.n_free, ndof)[:, :dim]
+        from .ns_adjoint import ns_load_cotangents
+        from .ns_shape import _gp_field_transpose
+        chain = self._predictor_chain(st.nu)
+        last = chain[-1]
+        aq, sigma = last["aq"], last["sigma"]
+        uhat = last["x"].reshape(st.n_free, ndof)[:, :dim]
 
         # ---- stage 3 transpose: mass updates + strong overwrite --------
         lam_u = np.asarray(dJdu_new, np.float64).copy()
-        lam_u[st.dir_nodes] = 0.0            # overwritten rows: J sees gvals
+        lam_u[st.dir_nodes] = 0.0
         M_lu = splu(st.M.tocsc())
         uq_cot = {pv: np.zeros((len(aq[pv]), dim)) for pv in aq}
         phi_cot_gp = {pv: np.zeros((len(aq[pv]), dim)) for pv in aq}
         for c in range(dim):
-            lam_Mc = M_lu.solve(lam_u[:, c])     # M sym
-            # rhs_c = quadrature(N_a * [uq_c - dphi_c/sigma])
+            lam_Mc = M_lu.solve(lam_u[:, c])
             lam_full = np.asarray(dm.constraints.T @ lam_Mc)
             for pv in dm.bins:
                 tb = dm.tables_by_p[pv]
                 conn = dm.mesh.conn_of[pv]
                 h = dm.mesh.tree.h()[dm.mesh.bins[pv]]
-                ne, nqp = len(conn), tb.nqp
                 jac = (h / 2.0) ** dim
-                lam_e = lam_full[conn]                       # [ne, nbf]
+                lam_e = lam_full[conn]
                 w_e = np.einsum("qa,ea,q,e->eq", tb.N, lam_e, tb.w, jac)
                 uq_cot[pv][:, c] += w_e.reshape(-1)
                 phi_cot_gp[pv][:, c] += -w_e.reshape(-1) / sigma
 
-        # ---- stage 2 transpose: PPE ------------------------------------
+        # ---- stage 2 transpose: PPE -------------------------------------
         phi_cot = _grad_interp_transpose_scalar(st, phi_cot_gp)
         Kp = st.K_p.tolil()
         Kp.rows[0] = [0]
         Kp.data[0] = [1.0]
-        phi_cot[0] = 0.0                       # pin row
+        phi_cot[0] = 0.0
         lam_p = splu(Kp.tocsr().tocsc().T).solve(phi_cot)
         lam_p[0] = 0.0
-        # rhs(uhat) = quadrature(grad N . sigma*uq): cotangent to uq
         lam_p_full = np.asarray(dm.constraints.T @ lam_p)
         for pv in dm.bins:
             tb = dm.tables_by_p[pv]
             conn = dm.mesh.conn_of[pv]
             h = dm.mesh.tree.h()[dm.mesh.bins[pv]]
-            ne, nqp = len(conn), tb.nqp
             jac = (h / 2.0) ** dim
             dsc = 2.0 / h
             lam_e = lam_p_full[conn]
@@ -172,34 +180,42 @@ class LerayStepAdjoint:
                              jac * dsc)
             uq_cot[pv] += sigma * w_ed.reshape(-1, dim)
 
-        # ---- uq cotangent -> uhat node cotangent ------------------------
+        # uq cotangent -> uhat (final iterate x) rhs
         uhat_cot = np.zeros((st.n_free, dim))
         for c in range(dim):
             uhat_cot[:, c] = _interp_transpose_scalar(
                 st, {pv: uq_cot[pv][:, c] for pv in aq})
-
-        # ---- stage 1 transpose: predictor -------------------------------
         rhs_adj = np.zeros(st.n_free * ndof)
         for c in range(dim):
             rhs_adj[c::ndof] = uhat_cot[:, c]
-        lam_x = splu(A.tocsc().T).solve(rhs_adj)
-        # strong + pinned rows are nu-independent
-        for i in st.dir_nodes:
-            for c in range(dim):
-                lam_x[i * ndof + c] = 0.0
-        lam_x[dim::ndof] = 0.0
-        # (dA/dnu x): taped volume kernel (exact incl. tau(nu))
+
+        # ---- reversed sweep over Picard iterates ------------------------
         T = dm.constraints.T.tocsr()
         T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
-        x_full = np.asarray(T_vec @ x)
-        lam_full = np.asarray(T_vec @ lam_x)
-        _, dnu_A = ns_volume_cotangents(
-            dm, aq, dq, st.nu, sigma, 0.5, x_full, lam_full,
-            timestab=st.timestab)
-        # db/dnu via the TAPED load kernel (replaced the interim central
-        # FD once make_lin_ns_load landed): + lam^T db/dnu
-        from .ns_adjoint import ns_load_cotangents
-        fq = self._fq_cache
-        _, _, dnu_b = ns_load_cotangents(dm, aq, fq, st.nu, sigma,
-                                         lam_full, timestab=st.timestab)
-        return dnu_A + dnu_b
+        dnu_total = 0.0
+        for it in range(len(chain) - 1, -1, -1):
+            rec = chain[it]
+            lam_x = splu(rec["A"].tocsc().T).solve(rhs_adj)
+            for i in st.dir_nodes:
+                for c in range(dim):
+                    lam_x[i * ndof + c] = 0.0
+            lam_x[dim::ndof] = 0.0
+            x_full = np.asarray(T_vec @ rec["x"])
+            lam_full = np.asarray(T_vec @ lam_x)
+            aqb_v, dnu_v = ns_volume_cotangents(
+                dm, rec["aq"], rec["dq"], st.nu, rec["sigma"], 0.5,
+                x_full, lam_full, timestab=st.timestab,
+                tau_frozen=False)
+            aqb_l, fqb_l, dnu_l = ns_load_cotangents(
+                dm, rec["aq"], rec["fq"], st.nu, rec["sigma"], lam_full,
+                timestab=st.timestab)
+            dnu_total += dnu_v + dnu_l
+            if it > 0:
+                # inter-iterate chain: a_node(it) = uhat(it-1); the
+                # transient-proven convention: rhs += interp^T(aqb_v.aq
+                # + aqb_l, aqb_v.dq)
+                G = _gp_field_transpose(
+                    dm, {pv: aqb_v[pv][0] + aqb_l[pv] for pv in dm.bins},
+                    {pv: aqb_v[pv][1] for pv in dm.bins}, ndof)
+                rhs_adj = np.asarray(T_vec.T @ G)
+        return dnu_total
