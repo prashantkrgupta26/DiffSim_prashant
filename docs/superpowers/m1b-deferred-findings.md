@@ -178,3 +178,10 @@
    pseudo-time needs a stronger F-smoother (ILU-type / Krylov-wrapped
    cycle) — the remaining research edge for task #6. Success gate (<=50
    its) MET at L6/dt0.01; L7 verification queued.
+   (h) TUNED-AMGX sweep on the saved nonsym SBM L6 system (356k, overnight
+   phase 2): AGG+DILU/BiCGStab relres 2.8e+5 at 4000 its; classical
+   W-cycle L1-Jacobi 1.19e-1 at 4000 its; classical+ILU config errored.
+   VERDICT: the nonsym SBM Poisson system at 356k defeats stock AMG
+   configurations — the 3D L7 order pair stays blocked pending multi-GPU
+   direct (AMGX-distributed cuDSS-class memory) or a bespoke
+   preconditioner. System saved for future sweeps.
