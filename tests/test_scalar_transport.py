@@ -121,3 +121,79 @@ def test_advection_dominated_stability(device):
 
     err = _solve(2, 5, 1, _a_rot, kappa, u, f_fn, 0.0, device)
     assert np.isfinite(err) and err < 0.05, err
+
+
+def test_species_brick_genericity(device):
+    """A2: two scalars (T, C) from the SAME factory with different
+    coefficient sets, independently correct (one assembly module, two
+    physics)."""
+    u, gu, lap = _case(2)
+    for name, kap, sig in (("temperature", 0.7, 0.4),
+                           ("species", 0.013, 0.0)):
+        def f_fn(x, kap=kap, sig=sig):
+            a = _a_rot(x)
+            return sig * u(x) + (a * gu(x)).sum(1) - kap * lap(x)
+        err = _solve(2, 5, 1, _a_rot, kap, u, f_fn, sig, device)
+        assert err < 2e-3, (name, err)
+
+
+def test_coupled_transient_mms(device):
+    """A3 gate: transient forced convection over a frozen flow —
+    BDF2 space-time MMS. T* = sin(pi x)cos(pi y) cos(t); the advecting
+    field is the rotating a(x). Verifies the coupler's history/BDF
+    wiring + brick composition."""
+    from diffsim.steppers.coupled import ScalarTransportStepper
+    from diffsim.mesh.basis import basis_tables as bt
+
+    dim, level, kappa = 2, 5, 0.7
+    u_sp, gu_sp, lap_sp = _case(2)
+
+    def T_star(x, t):
+        return u_sp(x) * np.cos(t)
+
+    tree = build_uniform(level, dim=dim)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, bt(1, dim=dim), device)
+    xq = gauss_points(mesh, dm.tables_by_p)
+    aq = {pv: _a_rot(xq[pv]) for pv in xq}
+
+    def f_fn(x, t):
+        a = _a_rot(x)
+        return (-u_sp(x) * np.sin(t)
+                + np.cos(t) * (a * gu_sp(x)).sum(1)
+                - kappa * np.cos(t) * lap_sp(x))
+
+    coords = mesh.node_coords[cons.free_nodes]
+    bdry = np.zeros(len(coords), bool)
+    for c in range(dim):
+        bdry |= (np.abs(coords[:, c]) < 1e-12) | \
+                (np.abs(coords[:, c] - 1.0) < 1e-12)
+    dir_nodes = np.where(bdry)[0]
+
+    T_END = 0.5
+
+    def run(dt):
+        st = ScalarTransportStepper(
+            dm, kappa, dt,
+            g_fn=lambda x, t: T_star(x, t),
+            dirichlet_nodes=dir_nodes, order=2, f_fn=f_fn)
+        st.set_initial(lambda x: T_star(x, 0.0))
+        for _ in range(int(round(T_END / dt))):
+            Tn = st.step(aq)
+        return Tn
+
+    # accuracy vs exact: on the spatial floor (~6e-4 at L5)
+    Tn = run(0.05)
+    u_all = np.asarray(cons.T @ Tn)
+    e_abs = l2_error(dm, u_all, lambda x: T_star(x, T_END))
+    assert e_abs < 1.5e-3, e_abs
+    # TEMPORAL order isolated against a fine-dt reference run (the
+    # exact-solution comparison measures SPACE at these dt — measured
+    # 6e-4 floor; first gate version failed on that)
+    ref = run(0.0125)
+    errs = [np.linalg.norm(run(dt) - ref) for dt in (0.1, 0.05, 0.025)]
+    orders = [np.log2(errs[i] / errs[i + 1]) for i in range(2)]
+    print(f"coupled BDF2 temporal: errs {[f'{e:.2e}' for e in errs]} "
+          f"orders {[f'{o:.2f}' for o in orders]}")
+    assert orders[-1] > 1.7, (errs, orders)
