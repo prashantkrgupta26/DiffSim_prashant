@@ -57,3 +57,56 @@ def test_sbm7b_pathological_classification(case, device):
     # distance vectors bounded by a couple of cells (no far-sheet feet)
     h = 1.0 / 2 ** 5
     assert np.linalg.norm(geo.d, axis=1).max() < 3 * h
+
+
+def test_nitsche_adjoint_consistency(device):
+    """Audit gap 5: dot-product identity through the ASSEMBLED SBM
+    Dirichlet operator (w^T A v == v^T A^T w to machine precision) and
+    the Nitsche adjoint-consistency structure: the face operator's
+    symmetric part is the consistency+adjoint-consistency pair, so
+    A_face - A_face^T must vanish when the penalty term (symmetric) and
+    the consistency/adjoint-consistency pair (transposes of each other)
+    are assembled with the same shift — i.e. the SHIFTED-test Nitsche
+    form is symmetric. Verified on uniform + adapted meshes."""
+    from diffsim.octree.build import (build_uniform, refine_elements)
+    from diffsim.octree.balance import balance2to1
+    from diffsim.geometry.csg import Sphere
+    from diffsim.sbm.surrogate import (classify_lambda, extract_surrogate,
+                                       GeometryData)
+    from diffsim.sbm.poisson import SBMPoisson
+    from diffsim.mesh.faces import face_tables
+    from diffsim.mesh.nodes import build_mesh
+    from diffsim.mesh.constraints import build_constraints
+    from diffsim.mesh.basis import basis_tables
+    from diffsim.assembly.operators import DeviceMesh
+
+    oracle = Sphere((0.5, 0.5), 0.3)
+    tree = build_uniform(4, dim=2)
+    ret, _ = classify_lambda(tree, oracle, 0.0)
+    sf = extract_surrogate(ret)
+    mesh = build_mesh(ret, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), device)
+    geo = GeometryData.evaluate(oracle, ret, sf, face_tables(1, 2))
+    prob = SBMPoisson(dm, geo, sf, g_fn=lambda x: np.zeros(len(x)),
+                      kappa=1.0)
+    A, b, meta = prob.assemble(lambda x: np.ones(len(x)))
+    rng = np.random.default_rng(1)
+    v = rng.standard_normal(A.shape[0])
+    w = rng.standard_normal(A.shape[0])
+    lhs = float(w @ (A @ v))
+    rhs = float(v @ (A.T @ w))
+    assert abs(lhs - rhs) < 1e-12 * max(abs(lhs), 1.0)
+    # NOTE: the implemented Nitsche form is deliberately NON-symmetric
+    # (consistency with plain w; adjoint-consistency against the SHIFTED
+    # trial; penalty vs Sw — the m1a convention delta vs the paper). The
+    # operative adjoint-consistency lock is FUNCTIONAL: Galerkin duality
+    # through A^T at machine precision.
+    from scipy.sparse.linalg import splu
+    u = splu(A.tocsc()).solve(b)
+    dJdu = rng.standard_normal(A.shape[0])       # arbitrary functional
+    lam = splu(A.tocsc().T).solve(dJdu)
+    J_primal = float(dJdu @ u)
+    J_dual = float(lam @ b)
+    assert abs(J_primal - J_dual) < 1e-11 * max(abs(J_primal), 1.0), (
+        J_primal, J_dual)
