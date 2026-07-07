@@ -265,3 +265,9 @@ FAMILY, measured by term-masked bisection:
    band(3) dominates both alternatives. (4) Wrinkle recorded: 2-D
    p2-everywhere is non-monotone at L6 (3.96e-5 -> 9.26e-5 -> 1.46e-5)
    — small alignment-parity artifact class, not chased.
+   4f-ADDENDUM (H3 bunny steady, 2026-07-07): plateau CONFIRMS the
+   steady-observability diagnosis on a second geometry — wake probes at
+   L4 see J0 ~ 1e-3 for quarter-cell bunny edits (vs 3.4 for the sphere
+   whose edits were global); GN stalls at alpha ~ 1e-4, adjcos
+   incoherent. Steady + diffuse signal + 4f micro-structure = stall;
+   TRANSIENT converges (H2). H4 is the bunny's correct formulation.
