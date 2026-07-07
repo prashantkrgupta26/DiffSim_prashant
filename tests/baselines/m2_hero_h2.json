@@ -1,0 +1,27 @@
+{
+  "hero_h2_sphere_transient": {
+    "alpha_star": [
+      0.01,
+      -0.008,
+      0.006,
+      -0.007
+    ],
+    "recovered": [
+      0.00994,
+      -0.00799,
+      0.00589,
+      -0.00722
+    ],
+    "recovery_err": 0.0002561,
+    "J_trajectory": [
+      0.4591,
+      0.09322,
+      0.04407,
+      0.03368,
+      0.02765,
+      0.004995
+    ],
+    "adj_jacobian_cos_at_converged": 0.9998,
+    "config": "sphere INR (w0=1.0, window 0.03/0.5), L4, 8 BDF2 steps dt=0.05, Re~100 confined, 16-probe plane x=0.78, k=4 displacement-normalized Gram modes, frozen epoch + anchored feet, Gauss-Newton (FD Jacobian) with adjoint consistency check"
+  }
+}

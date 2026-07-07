@@ -81,7 +81,9 @@ def run_case(dim, level, band_layers, solver):
     tree = build_uniform(level, dim=dim)
     ret, _ = classify_lambda(tree, oracle, 1.0, domain="outside")
     sf = extract_surrogate(ret)
-    if band_layers > 0:
+    if band_layers == -1:              # p2 EVERYWHERE (comparison mode)
+        p_elem, p_face = 2, 2
+    elif band_layers > 0:
         p_elem = p2_band(ret, sf, n_layers=band_layers)
         p_face = int(np.asarray(p_elem)[sf.elem].max())
     else:
