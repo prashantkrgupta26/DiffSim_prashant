@@ -168,3 +168,57 @@ def test_assemble_device_resident(device):
     res = np.linalg.norm(A_h @ x_t - b_h) / max(
         np.linalg.norm(b_h), 1e-30)
     assert res < 1e-11, res
+
+
+def test_device_assembly_p2(device):
+    """Pure-p2 framework: DeviceNSAssembler parity at p=2 (nbf-generic
+    slot maps)."""
+    tree = build_uniform(4, dim=2)
+    mesh = build_mesh(tree, p=2)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(2, dim=2), device)
+    from diffsim.physics.poisson import gauss_points
+    xq = gauss_points(mesh, dm.tables_by_p)
+    rng = np.random.default_rng(4)
+    pv = 2
+    ngp = len(xq[pv])
+    aq = {pv: rng.standard_normal((ngp, 2)) * 0.4}
+    dq = {pv: rng.standard_normal(ngp) * 0.1}
+    fq = {pv: rng.standard_normal((ngp, 2))}
+    A_h, b_h = assemble_linear_ns(dm, aq, dq, fq, 0.05, sigma=20.0)
+    asm = DeviceNSAssembler(dm)
+    A_d, b_d = asm.assemble(aq, dq, fq, 0.05, 20.0)
+    diff = (A_h - A_d)
+    scale = np.abs(A_h.data).max()
+    assert (np.abs(diff.data).max() / scale if diff.nnz else 0) < 1e-12
+    assert np.abs(b_h - b_d).max() / max(np.abs(b_h).max(), 1e-30) < 1e-12
+
+
+def test_stepper_p2_sanity(device):
+    """Pure-p2 framework: LinearizedMonolithicStepper at p=2 — 10 cavity
+    steps finite + device-assembly parity."""
+    from diffsim.steppers.linearized import LinearizedMonolithicStepper
+
+    def lid(x, t):
+        g = np.zeros((len(x), 2))
+        g[np.abs(x[:, 1] - 1.0) < 1e-12, 0] = 1.0
+        return g
+
+    def run(dev):
+        tree = build_uniform(4, dim=2)
+        mesh = build_mesh(tree, p=2)
+        cons = build_constraints(mesh)
+        dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(2, dim=2),
+                                  device)
+        st = LinearizedMonolithicStepper(
+            dm, 0.01, 0.05, f_fn=lambda x, t: np.zeros((len(x), 2)),
+            g_fn=lid, order=2, use_device_assembly=dev)
+        st.set_initial(lambda x: np.zeros((len(x), 2)))
+        for _ in range(10):
+            x = st.step()
+        return x.copy()
+
+    x_h = run(False)
+    assert np.isfinite(x_h).all() and np.abs(x_h).max() < 10
+    x_d = run(True)
+    assert np.abs(x_h - x_d).max() / max(np.abs(x_h).max(), 1e-30) < 1e-11

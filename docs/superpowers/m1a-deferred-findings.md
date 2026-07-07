@@ -335,3 +335,13 @@ M2-C PENALTY LAW (2026-07-07): Nitsche alpha must scale with BOTH the
    boundary p2 freedom for the NS Dirichlet case; the NS band-design
    study (thickness/interface treatment) is a RECORDED research item
    (the scalar Neumann band rules do not transfer verbatim).
+
+PURE-P2 FRAMEWORK LIVE (2026-07-07, Baskar directive): every stack
+   layer gated at p=2 — NS volume (rolled loops 1.8s; cavity monotone-
+   to-Ghia, cylinder Cd 1.334 w/ p^2 penalty), scalar brick (order
+   3.00 SUPG w/ VMS-complete residual), SBM faces (Dirichlet P4-p2 +
+   order-3 MMS pre-existing; Neumann via band work; vector generic),
+   taped adjoints (NS tape 75s compile, dnu FD-gated; scalar tape),
+   DeviceNSAssembler parity 1e-12, production stepper (10-step cavity +
+   device-assembly parity 1e-11). NOT included by design: the p1-p2
+   BAND for NS (recorded research item).
