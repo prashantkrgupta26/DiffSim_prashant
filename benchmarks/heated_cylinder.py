@@ -1,10 +1,12 @@
 """M2-A3 composition (WIP — advective Nitsche faces pending): heated
-immersed cylinder. STATUS: field solves (T in [0,1.22]); flux functional
-on the traction convention; measured Q ~ 1e-3 vs ~1 expected with
-per-face gradient wiggle -> DIAGNOSIS: the reused POISSON Nitsche faces
-lack the advective boundary term ((a.n)-weighted inflow treatment; the
-vector SBM has the backflow analogue). That term is the remaining A3
-composition physics — see the overnight runbook.
+immersed cylinder. STATUS 2 (advective upwind faces IN): T [0,1.16], Q = 0.032 — the
+advective term lifted Q 30x but it remains ~10x under the correlation
+estimate (Nu_D ~ 2 -> Q ~ Nu*pi*kappa ~ 0.3). NEXT SUSPECT: flux
+EXTRACTION — direct gradient at surrogate faces is the naive method;
+implement CONSISTENT-FLUX (residual-based) extraction (Q from the
+discrete residual paired with the boundary indicator function — the
+standard Nitsche/immersed-flux recovery, typically +1 order) and
+compare; then the L5/L6/L7 flux-convergence ladder decides.
 
 Original doc: heated immersed cylinder (SBM Dirichlet T=1) in a
 frozen uniform stream — the SBM+thermal smoke, plus the Nu surface-flux
@@ -59,6 +61,50 @@ def heat_flux_functional(dm, sf, geo, kappa):
     return w_vec
 
 
+def advective_faces(dm, sf, geo, a_fn, g_fn):
+    """Weak-Dirichlet ADVECTIVE term on surrogate faces (the diagnosed
+    A3 gap; Bazilevs-style upwind): -(w, (a.n)^- (T - g)) with
+    (a.n)^- = min(a.n, 0), n = surrogate outward normal. Returns
+    (A_adv csr constrained, b_adv)."""
+    import scipy.sparse as sp
+    from diffsim.mesh.faces import face_tables as _ft
+    dim = dm.dim
+    mesh = dm.mesh
+    pv = int(np.unique(np.asarray(mesh.p_elem)[sf.elem])[0])
+    ftab = _ft(pv, dim)
+    nqf, nbf = ftab.nqf, ftab.nbf
+    conn = mesh.conn_of[pv][np.searchsorted(mesh.bins[pv], sf.elem)]
+    h = mesh.tree.h()[sf.elem]
+    jacS = (h / 2.0) ** (dim - 1)
+    rows, cols, vals = [], [], []
+    b_full = np.zeros(dm.n_nodes)
+    for fi in range(len(sf.elem)):
+        f = int(sf.face[fi])
+        ax, side = f // 2, f % 2
+        n_s = np.zeros(dim)
+        n_s[ax] = -1.0 if side == 0 else 1.0
+        N = ftab.N[f]
+        for q in range(nqf):
+            gp = fi * nqf + q
+            xq_ = geo.xq[gp] if hasattr(geo, "xq") else None
+            a_q = a_fn(gp)
+            an = float(a_q @ n_s)
+            an_m = min(an, 0.0)
+            if an_m == 0.0:
+                continue
+            wq = ftab.w[q] * jacS[fi]
+            g_q = g_fn(gp)
+            for a_ in range(nbf):
+                for b_ in range(nbf):
+                    rows.append(conn[fi, a_]); cols.append(conn[fi, b_])
+                    vals.append(-an_m * N[q, a_] * N[q, b_] * wq)
+                b_full[conn[fi, a_]] += -an_m * N[q, a_] * g_q * wq
+    K = sp.coo_matrix((vals, (rows, cols)),
+                      shape=(dm.n_nodes, dm.n_nodes)).tocsr()
+    T = dm.constraints.T.tocsr()
+    return (T.T @ K @ T).tocsr(), np.asarray(T.T @ b_full)
+
+
 def run(level=6, kappa=0.05, device="cuda:0"):
     tree = build_uniform(level, dim=2)
     oracle = Sphere(CTR, R)
@@ -79,8 +125,11 @@ def run(level=6, kappa=0.05, device="cuda:0"):
                       g_fn=lambda x: np.ones(len(x)), kappa=kappa,
                       alpha=20.0)
     A_f, b_f = prob.face_system()
-    A = (A_v + A_f).tolil()
-    b = b_v + b_f
+    A_a, b_a = advective_faces(dm, sf, geo,
+                               a_fn=lambda gp: np.array([1.0, 0.0]),
+                               g_fn=lambda gp: 1.0)
+    A = (A_v + A_f + A_a).tolil()
+    b = b_v + b_f + b_a
     coords = mesh.node_coords[cons.free_nodes]
     inflow = np.abs(coords[:, 0]) < 1e-12
     for i in np.where(inflow)[0]:
