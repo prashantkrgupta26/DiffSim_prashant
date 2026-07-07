@@ -33,6 +33,7 @@ class Tables:
     N: np.ndarray    # [nqp, nbf]
     dN: np.ndarray   # [nqp, nbf, dim] (reference derivatives)
     w: np.ndarray    # [nqp]
+    lapN: np.ndarray = None  # [nqp, nbf] reference Laplacian (VMS p2)
 
 def basis_tables(p: int, dim: int = 3) -> Tables:
     from itertools import product as iproduct
@@ -44,9 +45,12 @@ def basis_tables(p: int, dim: int = 3) -> Tables:
     qidx = np.array(list(iproduct(*[range(nq1)] * dim)), np.int64)[:, ::-1]
     aidx = np.array(list(iproduct(*[range(npe)] * dim)), np.int64)[:, ::-1]
     N = np.zeros((nqp, nbf)); dN = np.zeros((nqp, nbf, dim)); w = np.zeros(nqp)
+    lapN = np.zeros((nqp, nbf))
     N1 = np.zeros((nq1, npe)); dN1 = np.zeros((nq1, npe))
+    d2N1 = np.zeros((nq1, npe))
     for q in range(nq1):
         N1[q], dN1[q] = lagrange_1d(p, pts[q])
+        d2N1[q] = lagrange_1d_d2(p, pts[q])
     for q in range(nqp):
         w[q] = np.prod(wts[qidx[q]])
         for a in range(nbf):
@@ -56,4 +60,7 @@ def basis_tables(p: int, dim: int = 3) -> Tables:
                 terms = vals.copy()
                 terms[d] = dN1[qidx[q, d], aidx[a, d]]
                 dN[q, a, d] = np.prod(terms)
-    return Tables(p, dim, nbf, nqp, N, dN, w)
+                terms2 = vals.copy()
+                terms2[d] = d2N1[qidx[q, d], aidx[a, d]]
+                lapN[q, a] += np.prod(terms2)
+    return Tables(p, dim, nbf, nqp, N, dN, w, lapN)

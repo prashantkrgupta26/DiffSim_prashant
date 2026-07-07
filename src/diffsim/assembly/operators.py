@@ -162,6 +162,9 @@ class DeviceMesh:
                            dtype=wp.float64, device=device),
                 N=wp.array(np.ascontiguousarray(tb.N.astype(np.float64)),
                            dtype=wp.float64, device=device),
+                lapN=wp.array(np.ascontiguousarray(
+                    tb.lapN.astype(np.float64)), dtype=wp.float64,
+                    device=device),
                 dN=wp.array(np.ascontiguousarray(tb.dN.astype(np.float64)),
                             dtype=wp.float64, device=device),
                 w=wp.array(np.ascontiguousarray(tb.w.astype(np.float64)),

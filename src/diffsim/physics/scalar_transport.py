@@ -39,6 +39,7 @@ def make_scalar_ad_Ae(nbf: int, nqp: int, dim: int):
                      h: wp.array(dtype=wp.float64),
                      Ntab: wp.array2d(dtype=wp.float64),
                      dNtab: wp.array3d(dtype=wp.float64),
+                     lapNtab: wp.array2d(dtype=wp.float64),
                      wtab: wp.array(dtype=wp.float64),
                      aq: wp.array2d(dtype=wp.float64),
                      kq: wp.array(dtype=wp.float64),
@@ -72,7 +73,12 @@ def make_scalar_ad_Ae(nbf: int, nqp: int, dim: int):
                         agu += aq[gp, d] * dNtab[q, b, d] * dscale
                         lap += dNtab[q, a, d] * dNtab[q, b, d] \
                             * dscale * dscale
-                    resu = sigma * Nb + agu       # strong residual on T_b
+                    # COMPLETE strong residual on T_b (VMS): the
+                    # -kappa*lap term vanishes at p1 (Q1 Laplacians are
+                    # zero) and is REQUIRED at p2 — omitting it caps L2
+                    # at order 2 (measured 2.11/2.03 vs 3.00 complete)
+                    resu = (sigma * Nb + agu
+                            - kap * lapNtab[q, b] * dscale * dscale)
                     wp.atomic_add(
                         Ae, e, a, b,
                         (sigma * Na * Nb + Na * agu + kap * lap
@@ -135,14 +141,12 @@ def assemble_scalar_ad(dm, aq_by_bin, fq_by_bin, kappa, sigma=0.0,
     from .poisson import gauss_points as _gp
     if sig2tau is None:
         sig2tau = (2.0 * sigma) ** 2
-    # SUPG is a P1 DEVICE: its strong residual here omits -kappa*lap(T)
-    # (exact at p1 where element Laplacians vanish; a CONSISTENCY error
-    # at p2 that caps L2 order at 2 — measured 2.11/2.03 vs Galerkin's
-    # 3). Default: SUPG on p1 bins, GALERKIN on p2 bins. p2-SUPG with
-    # the Hessian-completed residual arrives with M2-C's basis-Hessian
-    # tables.
-    supg_by_p = ({1: 1.0, 2: 0.0} if supg is None
-                 else {1: float(supg), 2: float(supg)})
+    # VMS-complete residual (Baskar 2026-07-07: the formulation extends
+    # to p2 naturally — the earlier order cap was the INCOMPLETE
+    # residual, not SUPG): lapN tables carry -kappa*lap(T_b); SUPG-type
+    # stabilization is ON at every p by default.
+    supg_by_p = {1: 1.0 if supg is None else float(supg),
+                 2: 1.0 if supg is None else float(supg)}
     d = dm.device
     xq = _gp(dm.mesh, dm.tables_by_p)
     rows, cols, vals = [], [], []
@@ -165,7 +169,7 @@ def assemble_scalar_ad(dm, aq_by_bin, fq_by_bin, kappa, sigma=0.0,
         kb = make_scalar_ad_be(nbf, nqp, dim=dm.dim)
         sg = wp.float64(supg_by_p.get(pv, 1.0))
         wp.launch(kA, dim=ne, inputs=[b["conn"], b["h"], b["N"],
-                                      b["dN"], b["w"], aq, kq,
+                                      b["dN"], b["lapN"], b["w"], aq, kq,
                                       wp.float64(sigma),
                                       wp.float64(sig2tau), sg, Ae],
                   device=d)

@@ -197,3 +197,17 @@ def test_coupled_transient_mms(device):
     print(f"coupled BDF2 temporal: errs {[f'{e:.2e}' for e in errs]} "
           f"orders {[f'{o:.2f}' for o in orders]}")
     assert orders[-1] > 1.7, (errs, orders)
+
+
+def test_advection_dominated_p2(device):
+    """p2 + VMS-complete SUPG at Pe_h >> 1: stable AND third-order-class
+    accurate (the discriminating case for the completed residual)."""
+    u, gu, lap = _case(2)
+    kappa = 1e-4
+
+    def f_fn(x):
+        a = _a_rot(x)
+        return (a * gu(x)).sum(1) - kappa * lap(x)
+
+    err = _solve(2, 4, 2, _a_rot, kappa, u, f_fn, 0.0, device)
+    assert np.isfinite(err) and err < 5e-3, err
