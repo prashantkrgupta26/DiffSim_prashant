@@ -212,14 +212,23 @@ test that needs it is opt-in via `DIFFSIM_RUN_3D_NS=1`.
 
 ## Roadmap
 
-- **M1c (next)**: NS adjoints (the s=½ operator is self-adjoint by
-  construction — the identity is already locked), neural-SDF geometry
-  backend, and the hero demo: shape-optimizing an obstacle in flow.
-- **M2**: material/closure fields as first-class differentiable inputs
-  (field-κ gradients, learned viscosity models).
-- **Further**: thermal + scalar transport coupling, electrokinetics (PNP —
-  the production DendrIon physics), space-time (k = 4) formulations,
-  multi-GPU.
+- **M1c (COMPLETE, 2026-07-06)**: NS adjoints (transient chains,
+  Leray + monolithic, shape + constitutive), neural-SDF geometry
+  backend on PROVIDED checkpoints (GENIE edit modes), and the hero
+  demos — **both converged**: steady sphere-INR edit recovery
+  (err 1.8e-3, `tests/baselines/m1_hero_h1.json`) and transient
+  recovery (2.6e-4, `m2_hero_h2.json`).
+- **M1d (in progress)**: full device-side migration — measured so far:
+  cuDSS 300x over host splu at 3-D L5; device CSR assembly 4-40x
+  (uniform + hanging meshes, strong rows folded); zero-copy
+  assemble->solve chain; steppers take `use_device_assembly=True`.
+  One codebase, two runtime profiles (pure-device / coherent).
+- **M2**: Heat/Mass bricks + block coupler + neural closures; p2-NS;
+  the bunny hero ladder (H3/H4).
+- **M3 (proposed)**: differentiable dynamic adaptivity (transfer-op
+  adjoints -> event-branch differentiation -> relaxed classification),
+  with adjoint-readiness requirements feeding the cuFEM blueprint.
+- **Further**: electrokinetics (PNP), space-time (k = 4), multi-GPU.
 
 ## Development culture
 
