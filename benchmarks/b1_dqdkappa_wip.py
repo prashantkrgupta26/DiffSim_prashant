@@ -81,6 +81,7 @@ dm, cons = st["dm"], st["cons"]
 rhs = st["A_v"].T @ st["chi"]
 rhs[st["dirn"]] = 0.0                     # QoI has no BC-node dependence
 lam = splu(st["A"].tocsc().T).solve(rhs)
+lam[st["dirn"]] = 0.0  # replaced rows carry no dA/dk (identity rows)
 # volume kappa-derivative via taped cotangents: T and lam in FULL space
 T_full = np.asarray(cons.T @ st["T_free"])
 lam_full = np.asarray(cons.T @ lam)
