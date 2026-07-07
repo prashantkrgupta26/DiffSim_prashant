@@ -615,3 +615,15 @@ Design synthesized from the group's papers (octree-SBM NS; SBM thermal; INR-SBM 
    memory ceiling; AMGX for SPD subsystems at scale (natively multi-GPU);
    the fused single-sync Krylov for SPD subsolves; block preconditioning
    of the monolithic system is a tracked research item (findings 8f).
+
+## AMENDMENT (M1 scope rulings, Baskar 2026-07-06)
+
+- **p2-NS deferred to M2**: M1 delivers p1 NS + p2 Poisson/band (the
+  band machinery is validated; NS p2 bricks + Hessian-carrying taped
+  kernels move to the physics M2 alongside Heat/Mass).
+- **M1 hero bar = converged H1-sphere** (steady 3-D NS around the
+  provided sphere INR with validated d(J)/d(alpha) + dJ/dnu). The
+  H2/H3/H4 ladder (transient sphere; bunny steady; bunny transient
+  headline) slots into M2 as its opening demos.
+- M1d (device migration) and task #6 (NS preconditioner) proceed as
+  performance tracks in parallel with M1 closure.
