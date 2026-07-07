@@ -62,26 +62,18 @@ class DeviceNSAssembler:
         self.indptr = K.indptr.copy()
         self.indices = K.indices.copy()
         self.nnz = K.nnz
-        # slot index per (element-pair entry): position in the CSR values
+        # slot index per (element-pair entry): position in the CSR
+        # values array. FULLY VECTORIZED via sparse fancy indexing: give
+        # the pattern matrix data = arange(nnz), then K2[rr, cc] returns
+        # each entry's slot directly (replaced a per-entry Python loop
+        # measured at 56 s for 3-D L5; now milliseconds).
+        K2 = K.copy()
+        K2.data = np.arange(self.nnz, dtype=np.float64)
         slot_bins = []
         for pv, b, ne, nbf, gdof in self._bins:
             rr = np.repeat(gdof, nbf * ndof, axis=1).ravel()
             cc = np.tile(gdof, (1, nbf * ndof)).ravel()
-            starts = self.indptr[rr]
-            ends = self.indptr[rr + 1]
-            # searchsorted within each row's index range
-            slots = np.empty(len(rr), np.int64)
-            # vectorized per-row search: indices is globally sorted per row
-            for chunk in range(0, len(rr), 2_000_000):
-                sl = slice(chunk, min(chunk + 2_000_000, len(rr)))
-                s0 = starts[sl]
-                e0 = ends[sl]
-                tgt = cc[sl]
-                # positions via searchsorted on the concatenated row spans
-                pos = np.array([np.searchsorted(
-                    self.indices[s:e], t) + s
-                    for s, e, t in zip(s0, e0, tgt)], np.int64)
-                slots[sl] = pos
+            slots = np.asarray(K2[rr, cc]).ravel().astype(np.int64)
             slot_bins.append(slots.reshape(ne, (nbf * ndof) ** 2))
         self._slot_bins = slot_bins
         # device uploads
