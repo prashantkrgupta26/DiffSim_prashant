@@ -44,8 +44,9 @@ PROBES = np.column_stack([np.full(16, 0.90), _py.ravel(), _pz.ravel()])
 _EPOCH = {}
 
 
-def build_epoch(V):
-    o0 = make_oracle(np.zeros(K), V)
+def build_epoch(V, alpha_np=None):
+    o0 = make_oracle(alpha_np if alpha_np is not None
+                     else np.zeros(K), V)
     tree = build_uniform(LEVEL, dim=3)
     ret, _ = classify_lambda(tree, o0, 1.0, domain="outside")
     sf = extract_surrogate(ret)
@@ -66,13 +67,27 @@ def build_epoch(V):
 def run_transient(alpha_np, V, n_steps=N_STEPS):
     """Forward N-step run; returns (tsa, xs, DRAG series [n])."""
     if not _EPOCH:
-        build_epoch(V)
+        build_epoch(V, alpha_np)
     E = _EPOCH
     o = make_oracle(alpha_np, V)
     geo = GeometryData.evaluate(o, E["ret"], E["sf"], face_tables(1, 3),
                                 domain="outside",
                                 warm_feet=E.get("feet"),
                                 max_fail_frac=0.005)
+    # EPOCH HOMOTOPY (M3 rung 2 preview): per-alpha re-carve when the
+    # surface drifts past the trust region — cell-scale edits become
+    # representable; each alpha gets a deterministic carve + cold
+    # anchored feet (objective well-defined per-alpha; cross-epoch
+    # J-jumps are part of the landscape, guarded GN absorbs them)
+    DRIFT = 0.35 / 2 ** LEVEL
+    if np.linalg.norm(geo.d, axis=1).max() > DRIFT:
+        _EPOCH.clear()
+        build_epoch(V, alpha_np)
+        E = _EPOCH
+        geo = GeometryData.evaluate(o, E["ret"], E["sf"],
+                                    face_tables(1, 3),
+                                    domain="outside",
+                                    max_fail_frac=0.005)
     if "feet" not in E:
         E["feet"] = geo.d.copy()
     _EPOCH["_geo_last"] = geo
@@ -107,7 +122,7 @@ def main(n_steps=N_STEPS, n_epochs=6):
     # the ear-movement direction this checkpoint was trained for —
     # semantically large geometry, hence an observable wake signature
     # (distributed small-ripple edits measured sub-grid at L4: v2/v3)
-    alpha_star = np.array([0.012, -0.002, 0.0, 0.0])
+    alpha_star = np.array([0.03, -0.005, 0.0, 0.0])
     _, _, target = run_transient(alpha_star, V, n_steps)
     print(f"[setup] hidden alpha* = {alpha_star}", flush=True)
 

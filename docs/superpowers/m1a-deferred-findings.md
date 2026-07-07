@@ -345,3 +345,8 @@ PURE-P2 FRAMEWORK LIVE (2026-07-07, Baskar directive): every stack
    DeviceNSAssembler parity 1e-12, production stepper (10-step cavity +
    device-assembly parity 1e-11). NOT included by design: the p1-p2
    BAND for NS (recorded research item).
+   M2-D v1 (2026-07-07): drag-history at SUB-CELL edits plateaus like
+   velocity probes (J0 1.5e-4; alpha unmoved) — the signal ladder rule
+   is now observable-independent: EDIT SCALE vs h decides, not the
+   QoI type. v2 = cell-scale edit (0.03 ~ 1 cell at L5) + per-alpha
+   epoch re-carve (M3 rung 2 preview) — running.
