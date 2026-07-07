@@ -292,3 +292,17 @@ FAMILY, measured by term-masked bisection:
    END-TO-END; parity 2.6e-15). The remaining 69 ms is ~solver — the
    step is solver-bound, as designed. (Assembly alone was 40x; step
    speedup is bounded by the solve share.)
+   H4 FINAL (bunny transient, 3 attempts, 2026-07-07): plateau at L4
+   with 16 velocity probes — recorded honestly. Signal ladder measured:
+   sphere transient J0=0.46 (CONVERGED 2.6e-4) >> bunny ear-dominant
+   4.5e-3 >> bunny ripple edits 1e-4. At weak signal the FD-GN Jacobian
+   is 4f-micro-noise-driven (adj-vs-GN cos consistently NEGATIVE); the
+   guarded-GN machinery (LM + trust-region step cap 0.004) prevents the
+   null-space escape measured in v2 (J->5e-15 at |alpha|=6.6, a
+   spurious exact match). M2 RECOMMENDATION for the bunny headline:
+   (1) L5 flow (resolve the geometry the edits act on), (2) replace
+   sparse velocity probes with SURFACE-INTEGRATED observables — the
+   transient DRAG HISTORY via traction_functional + face_dbar_sweep
+   (machinery exists and is gated) integrates the whole-body signal
+   instead of sampling the wake at 16 points, (3) ear-dominant edits
+   (the checkpoint's own semantics; 45x the ripple signal).
