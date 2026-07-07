@@ -238,3 +238,12 @@ FAMILY, measured by term-masked bisection:
    lines at 4 isolated points (measure-zero), while a sphere's dyadic
    tangent planes create tangent CIRCLES (1-D degenerate-contact sets).
    The artifact is intrinsically 3-D.
+
+8j. Mixed-precision cuDSS probe (Horizon prep): fp32-factor + FP64
+   iterative refinement converges in 2-8 refinements to ~1e-13 across
+   2D L7-L8 / 3D L4-L5 — but is SLOWER than native fp64 on the Ada
+   workstation (0.52 vs 0.32 s at 2D L7): at prototype scales the
+   factorization is structure/memory-bound, so weak FP64 silicon loses
+   nothing and fp32 gains nothing. The hook matters only where factors
+   are FLOP-bound (Blackwell at scale); refinement-count (cheap) is the
+   transferable datum. Spec D0 hook stays, priority low.

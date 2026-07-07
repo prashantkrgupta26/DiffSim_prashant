@@ -228,6 +228,17 @@ class GeometryData:
         xq = face_gauss_points(tree, sf, ftab)
         d, n_grad, ok = oracle.distance_vector(
             xq, y0=(xq + warm_feet) if warm_feet is not None else None)
+        if not ok.all() and 0.0 < max_fail_frac >= (~ok).mean():
+            # isolated marginal GPs (<< 1%): borrow the nearest valid
+            # foot on the batch — O(h)-accurate, opt-in (hero runs);
+            # strict mode (max_fail_frac=0) raises below.
+            bad = np.where(~ok)[0]
+            good = np.where(ok)[0]
+            for i in bad:
+                j = good[np.argmin(((xq[good] - xq[i]) ** 2).sum(1))]
+                d[i] = d[j]
+                n_grad[i] = n_grad[j]
+            ok = np.ones_like(ok)
         if not ok.all():
             from ..geometry.oracle import admissibility
             raise RuntimeError(

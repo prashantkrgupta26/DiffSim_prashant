@@ -19,8 +19,8 @@ import torch
 sys.path.insert(0, "tests")
 sys.path.insert(0, "benchmarks")
 from diffsim.geometry.provided_inr import ProvidedINROracle, extract_modes
-from hero_h1_sphere_steady import (steady, alpha_gradient, probe_series,
-                                   build_epoch, _EPOCH, U_IN, NU, K)
+from hero_h1_sphere_steady import (steady, alpha_gradient,
+                                   probe_values, K)
 import hero_h1_sphere_steady as h1
 
 BUNNY_JSON = os.path.join("SDF examples",
@@ -37,8 +37,16 @@ def make_bunny_oracle(alpha_np, V):
 
 
 def main(level=4, n_epochs=8):
-    h1.LEVEL = level
     h1.make_oracle = make_bunny_oracle          # swap the geometry source
+    # WAKE probes (measured fix): the bunny bbox is [0.28,0.79]^ish and
+    # the sphere-inherited plane x=0.78 sat ON the body's rear edge
+    # (no-slip vicinity -> J ~600x weaker than the sphere case, GN
+    # plateaued flat). Mode activity spans the whole body, so a
+    # downstream wake plane sees every mode through the flow.
+    _py, _pz = np.meshgrid(np.linspace(0.35, 0.65, 4),
+                           np.linspace(0.35, 0.65, 4))
+    h1.PROBES = np.column_stack([np.full(16, 0.90), _py.ravel(),
+                                 _pz.ravel()])
 
     o0 = ProvidedINROracle.from_genie_json(BUNNY_JSON, head=0)
     # near-surface band by rejection sampling (the bunny has no closed
@@ -59,22 +67,25 @@ def main(level=4, n_epochs=8):
     Vpack = (V, o0._Vscale.numpy())
 
     alpha_star = np.array([0.008, -0.006, 0.005, -0.006])
-    target = probe_series(alpha_star, Vpack)
+    st_star = steady(alpha_star, Vpack, level)
+    u_target = probe_values(st_star)
     print(f"[setup] hidden alpha* = {alpha_star} (displacement units)",
           flush=True)
 
     alpha = np.zeros(K)
     print(f"{'ep':>3} {'J':>13} {'|a-a*|':>13} {'adjcos':>9}", flush=True)
     for ep in range(n_epochs):
-        series = probe_series(alpha, Vpack)
-        r0 = series - target
+        st = steady(alpha, Vpack, level)
+        r0 = (probe_values(st) - u_target).reshape(-1)
         J = 0.5 * float(r0 @ r0)
+        _, g_adj = alpha_gradient(st, u_target)
         eps_j = 1e-5
         Jac = np.zeros((len(r0), K))
         for k_ in range(K):
             a2 = alpha.copy(); a2[k_] += eps_j
-            Jac[:, k_] = (probe_series(a2, Vpack) - target - r0) / eps_j
-        g_adj = alpha_gradient(alpha, Vpack, r0)
+            st2 = steady(a2, Vpack, level)
+            Jac[:, k_] = ((probe_values(st2) - u_target).reshape(-1)
+                          - r0) / eps_j
         g_jac = Jac.T @ r0
         cos = float(g_adj @ g_jac / max(
             np.linalg.norm(g_adj) * np.linalg.norm(g_jac), 1e-30))
