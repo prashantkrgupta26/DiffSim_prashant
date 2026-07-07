@@ -140,11 +140,25 @@ def run(level=6, kappa=0.05, device="cuda:0"):
     T_all = np.asarray(cons.T @ T_free)
     w_q = heat_flux_functional(dm, sf, geo, kappa)
     nu_val = float(w_q @ T_all)
-    print(f"L{level}: T range [{T_all.min():.3f}, {T_all.max():.3f}], "
-          f"surface heat flux Q = {nu_val:.4f} "
-          f"(Nu = {nu_val / (kappa * 1.0):.2f} vs 2D conduction-limit "
-          f"~O(1-10 at Pe={1.0 * 2 * R / kappa:.0f}))", flush=True)
-    return nu_val
+    # CONSISTENT-FLUX extraction: pair the RAW interior residual (volume
+    # operator only, no face blocks/strong rows) with the boundary
+    # indicator chi (1 at surrogate-face nodes). For the exact solution
+    # the interior residual vanishes on interior test functions; against
+    # chi it equals the TOTAL boundary flux (diffusive + advective) —
+    # the standard Nitsche/immersed flux recovery (typically +1 order
+    # vs direct gradients). NOTE: with the frozen penetrating stream the
+    # advective part is nonzero; in the COUPLED (no-slip) run
+    # Q_consistent ~ the diffusive Nu.
+    fnodes = np.unique(dm.mesh.conn_of[1][
+        np.searchsorted(dm.mesh.bins[1], sf.elem)].ravel())
+    chi_full = np.zeros(dm.n_nodes)
+    chi_full[fnodes] = 1.0
+    chi = np.asarray(cons.T.T @ chi_full)
+    q_cons = float(chi @ (A_v @ T_free - b_v))
+    print(f"L{level}: T [{T_all.min():.3f},{T_all.max():.3f}] "
+          f"Q_direct={nu_val:.4f} Q_consistent={q_cons:.4f} "
+          f"(corr est ~{2.0 * np.pi * kappa:.2f})", flush=True)
+    return nu_val, q_cons
 
 
 if __name__ == "__main__":
