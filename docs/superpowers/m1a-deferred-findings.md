@@ -327,3 +327,11 @@ M2-C PENALTY LAW (2026-07-07): Nitsche alpha must scale with BOTH the
    trace-inverse constant grows ~p^2 -> alpha_p2 = p^2 * alpha_p1
    (cylinder Cd 3.087 at alpha=10 [leaky boundary = fat body] -> 1.334
    at alpha=40 vs lit 1.33; over-penalizing to 90 drifts to 1.290).
+   M2-C CLOSERS: (i) the p2 TAPED kernel compiles in 75 s (residual
+   form — the 4e shape) where the forward Ae needed rolled loops (75-min
+   unrolled): the tape is AVAILABLE at p2. (ii) p2-band NS composition:
+   machinery composes (mixed-p constraints + dual-bin assembly + p2
+   faces) but Cd=4.146 — the p1/p2 interface at 3 layers cripples the
+   boundary p2 freedom for the NS Dirichlet case; the NS band-design
+   study (thickness/interface treatment) is a RECORDED research item
+   (the scalar Neumann band rules do not transfer verbatim).
