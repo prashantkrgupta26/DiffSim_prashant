@@ -31,17 +31,24 @@ class DeviceNSAssembler:
         self.coloring = coloring
         ndof = dm.dim + 1
         self.ndof = ndof
-        T = dm.constraints.T
+        T = dm.constraints.T.tocsr()
         n_free = T.shape[1]
-        if (T.shape[0] != T.shape[1]) or (T != sp.identity(
-                T.shape[0], format="csr")).nnz != 0:
-            raise NotImplementedError(
-                "DeviceNSAssembler: hanging-constrained meshes are D1 "
-                "item 3 (constraint-aware scatter); this epoch has a "
-                "non-identity T")
-        self.Nfull = dm.n_nodes * ndof
+        self.n_free = n_free
+        identity_T = (T.shape[0] == T.shape[1]) and (
+            T != sp.identity(T.shape[0], format="csr")).nnz == 0
+        self._identity_T = identity_T
+        # CONSTRAINT-AWARE (D1 item 3, cuFEM design): element entries are
+        # expanded THROUGH the constraint weights host-once — full dof
+        # (node n, comp c) -> masters (m_i, c) with weights w_i; each
+        # element pair contributes w_r*w_c at (master_r, master_c) in the
+        # CONSTRAINED pattern. The device scatter is the same kernel with
+        # a weights array + a source-index array.
+        self.Nfull = (dm.n_nodes if identity_T else n_free) * ndof
+        # masters per NODE from T (row n: free masters + weights)
+        Tind, Tptr, Tdat = T.indices, T.indptr, T.data
         # ---- symbolic pattern + slot maps (host, once) -----------------
         rows_all, cols_all = [], []
+        exp_bins = []            # per bin: (src_idx, weights, rows, cols)
         self._bins = []
         for pv, b in dm.bins.items():
             conn = dm.mesh.conn_of[pv].astype(np.int64)
@@ -49,11 +56,60 @@ class DeviceNSAssembler:
             gdof = (conn[:, :, None] * ndof
                     + np.arange(ndof)[None, None, :]).reshape(ne,
                                                               nbf * ndof)
-            r = np.repeat(gdof, nbf * ndof, axis=1).ravel()
-            c = np.tile(gdof, (1, nbf * ndof)).ravel()
-            rows_all.append(r)
-            cols_all.append(c)
             self._bins.append((pv, b, ne, nbf, gdof))
+            if identity_T:
+                r = np.repeat(gdof, nbf * ndof, axis=1).ravel()
+                c = np.tile(gdof, (1, nbf * ndof)).ravel()
+                rows_all.append(r)
+                cols_all.append(c)
+                exp_bins.append(None)
+                continue
+            # expand each local dof through its node's masters
+            nodes = np.repeat(conn, ndof, axis=1)          # [ne, nbf*ndof]
+            comps = np.tile(np.tile(np.arange(ndof), nbf), (ne, 1))
+            cnt = (Tptr[nodes.ravel() + 1]
+                   - Tptr[nodes.ravel()])                  # masters/dof
+            # flatten per-dof master lists
+            m_idx, m_w, dof_of = [], [], []
+            for j, n_ in enumerate(nodes.ravel()):
+                s_, e_ = Tptr[n_], Tptr[n_ + 1]
+                m_idx.append(Tind[s_:e_])
+                m_w.append(Tdat[s_:e_])
+                dof_of.append(np.full(e_ - s_, j))
+            m_idx = np.concatenate(m_idx)
+            m_w = np.concatenate(m_w)
+            dof_of = np.concatenate(dof_of)
+            free_dof = m_idx * ndof + comps.ravel()[dof_of]
+            # per element: cross the row-expansions with col-expansions
+            nl = nbf * ndof
+            e_of = dof_of // nl
+            l_of = dof_of % nl
+            src_r, src_c, w_rc, rows_e, cols_e = [], [], [], [], []
+            # group by element via sorted order (dof_of already grouped)
+            # build per-element index lists
+            order = np.argsort(e_of, kind="stable")
+            eb = np.searchsorted(e_of[order], np.arange(ne + 1))
+            for e_ in range(ne):
+                sl = order[eb[e_]:eb[e_ + 1]]
+                li = l_of[sl]
+                fd = free_dof[sl]
+                ww = m_w[sl]
+                # cross product of expansions within the element
+                A_, B_ = np.meshgrid(np.arange(len(sl)),
+                                     np.arange(len(sl)), indexing="ij")
+                a_, b2 = A_.ravel(), B_.ravel()
+                src_r.append(e_ * nl * nl + li[a_] * nl + li[b2])
+                rows_e.append(fd[a_])
+                cols_e.append(fd[b2])
+                w_rc.append(ww[a_] * ww[b2])
+            exp_bins.append((np.concatenate(src_r),
+                             np.concatenate(w_rc),
+                             np.concatenate(rows_e),
+                             np.concatenate(cols_e),
+                             free_dof, m_w, dof_of))
+            rows_all.append(np.concatenate(rows_e))
+            cols_all.append(np.concatenate(cols_e))
+        self._exp_bins = exp_bins
         r = np.concatenate(rows_all)
         c = np.concatenate(cols_all)
         K = sp.coo_matrix((np.ones(len(r)), (r, c)),
@@ -70,23 +126,59 @@ class DeviceNSAssembler:
         K2 = K.copy()
         K2.data = np.arange(self.nnz, dtype=np.float64)
         slot_bins = []
-        for pv, b, ne, nbf, gdof in self._bins:
-            rr = np.repeat(gdof, nbf * ndof, axis=1).ravel()
-            cc = np.tile(gdof, (1, nbf * ndof)).ravel()
-            slots = np.asarray(K2[rr, cc]).ravel().astype(np.int64)
-            slot_bins.append(slots.reshape(ne, (nbf * ndof) ** 2))
+        self._weight_bins = []
+        self._src_bins = []
+        for k_bin, (pv, b, ne, nbf, gdof) in enumerate(self._bins):
+            if identity_T:
+                rr = np.repeat(gdof, nbf * ndof, axis=1).ravel()
+                cc = np.tile(gdof, (1, nbf * ndof)).ravel()
+                slots = np.asarray(K2[rr, cc]).ravel().astype(np.int64)
+                slot_bins.append(slots)
+                self._weight_bins.append(None)
+                self._src_bins.append(None)
+            else:
+                src, w, rr, cc, fd, mw, dof_of = self._exp_bins[k_bin]
+                slots = np.asarray(K2[rr, cc]).ravel().astype(np.int64)
+                slot_bins.append(slots)
+                self._weight_bins.append(w)
+                self._src_bins.append(src)
         self._slot_bins = slot_bins
         # device uploads
-        self._slots_d = [wp.array(s.astype(np.int32).ravel(),
-                                  dtype=wp.int32, device=dm.device)
-                         for s in slot_bins]
+        self._slots_d = [wp.array(np.ascontiguousarray(
+            s.astype(np.int32).ravel()), dtype=wp.int32, device=dm.device)
+            for s in slot_bins]
+        self._w_d = [None if w is None else wp.array(
+            np.ascontiguousarray(w), dtype=wp.float64, device=dm.device)
+            for w in self._weight_bins]
+        self._src_d = [None if s2 is None else wp.array(
+            np.ascontiguousarray(s2.astype(np.int32)), dtype=wp.int32,
+            device=dm.device) for s2 in self._src_bins]
         self.vals_d = wp.zeros(self.nnz, dtype=wp.float64,
                                device=dm.device)
         self.F_d = wp.zeros(self.Nfull, dtype=wp.float64,
                             device=dm.device)
-        self._gdof_d = [wp.array(g.astype(np.int32).ravel(),
-                                 dtype=wp.int32, device=dm.device)
-                        for _, _, _, _, g in self._bins]
+        gdof_bins = []
+        self._bw_d = []
+        self._bsrc_d = []
+        for k_bin, (pv, b, ne, nbf, g) in enumerate(self._bins):
+            if identity_T:
+                gdof_bins.append(wp.array(g.astype(np.int32).ravel(),
+                                          dtype=wp.int32,
+                                          device=dm.device))
+                self._bw_d.append(None)
+                self._bsrc_d.append(None)
+            else:
+                src, w, rr, cc, fd, mw, dof_of = self._exp_bins[k_bin]
+                gdof_bins.append(wp.array(fd.astype(np.int32),
+                                          dtype=wp.int32,
+                                          device=dm.device))
+                self._bw_d.append(wp.array(np.ascontiguousarray(mw),
+                                           dtype=wp.float64,
+                                           device=dm.device))
+                self._bsrc_d.append(wp.array(
+                    dof_of.astype(np.int32), dtype=wp.int32,
+                    device=dm.device))
+        self._gdof_d = gdof_bins
         # coloring (variant b): greedy on node sharing
         if coloring:
             self._colors = []
@@ -173,7 +265,13 @@ class DeviceNSAssembler:
                               be], device=d)
             npair = (nbf * ndof) ** 2
             scat = _scatter_kernel()
-            if not self.coloring:
+            if not self._identity_T:
+                scw = _scatter_weighted_kernel()
+                wp.launch(scw, dim=len(self._slot_bins[k_bin]),
+                          inputs=[Ae.reshape((-1,)), self._src_d[k_bin],
+                                  self._w_d[k_bin], self._slots_d[k_bin],
+                                  self.vals_d], device=d)
+            elif not self.coloring:
                 wp.launch(scat, dim=ne * npair,
                           inputs=[Ae.reshape((-1,)), self._slots_d[k_bin],
                                   self.vals_d], device=d)
@@ -189,10 +287,17 @@ class DeviceNSAssembler:
                                           self._slots_d[k_bin], order_d,
                                           wp.int32(lo), wp.int32(npair),
                                           self.vals_d], device=d)
-            scat_b = _scatter_vec_kernel()
-            wp.launch(scat_b, dim=ne * nbf * ndof,
-                      inputs=[be.reshape((-1,)), self._gdof_d[k_bin],
-                              self.F_d], device=d)
+            if self._identity_T:
+                scat_b = _scatter_vec_kernel()
+                wp.launch(scat_b, dim=ne * nbf * ndof,
+                          inputs=[be.reshape((-1,)), self._gdof_d[k_bin],
+                                  self.F_d], device=d)
+            else:
+                scat_bw = _scatter_vec_weighted_kernel()
+                wp.launch(scat_bw, dim=len(self._exp_bins[k_bin][4]),
+                          inputs=[be.reshape((-1,)), self._bsrc_d[k_bin],
+                                  self._bw_d[k_bin], self._gdof_d[k_bin],
+                                  self.F_d], device=d)
         if getattr(self, "_strong", None) is not None:
             st = self._strong
             zk = _zero_slots_kernel()
@@ -298,3 +403,39 @@ def _diag_one_kernel():
 
     _kernel_cache[key] = dk
     return dk
+
+
+def _scatter_weighted_kernel():
+    key = ("dev_scatter_w",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique")
+    def scw(vals_e: wp.array(dtype=wp.float64),
+            src: wp.array(dtype=wp.int32),
+            w: wp.array(dtype=wp.float64),
+            slots: wp.array(dtype=wp.int32),
+            out: wp.array(dtype=wp.float64)):
+        i = wp.tid()
+        wp.atomic_add(out, slots[i], w[i] * vals_e[src[i]])
+
+    _kernel_cache[key] = scw
+    return scw
+
+
+def _scatter_vec_weighted_kernel():
+    key = ("dev_scatter_vw",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique")
+    def scvw(vals_e: wp.array(dtype=wp.float64),
+             src: wp.array(dtype=wp.int32),
+             w: wp.array(dtype=wp.float64),
+             gdof: wp.array(dtype=wp.int32),
+             out: wp.array(dtype=wp.float64)):
+        i = wp.tid()
+        wp.atomic_add(out, gdof[i], w[i] * vals_e[src[i]])
+
+    _kernel_cache[key] = scvw
+    return scvw

@@ -89,3 +89,37 @@ def test_strong_rows_fold_in(device):
     scale = np.abs(A_ref.data).max()
     assert (np.abs(diff.data).max() / scale if diff.nnz else 0) < 1e-12
     assert np.abs(b_h - b_d).max() / max(np.abs(b_h).max(), 1e-30) < 1e-12
+
+
+def test_constraint_aware_scatter(device):
+    """D1 item 3 gate: adapted mesh (hanging constraints, non-identity T)
+    — device constrained assembly == host T^T K T at 1e-12."""
+    from diffsim.octree.build import refine_elements
+    from diffsim.octree.balance import balance2to1
+    from diffsim.octree.build import build_uniform as bu
+    from diffsim.physics.poisson import gauss_points
+    tree = bu(4, dim=2)
+    mask = np.zeros(len(tree), bool)
+    mask[0] = True
+    mask[len(tree) // 2] = True
+    tree = balance2to1(refine_elements(tree, mask))
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), device)
+    xq = gauss_points(mesh, dm.tables_by_p)
+    rng = np.random.default_rng(3)
+    aq, dq, fq = {}, {}, {}
+    for pv in dm.bins:
+        ngp = len(xq[pv])
+        aq[pv] = rng.standard_normal((ngp, 2)) * 0.5
+        dq[pv] = rng.standard_normal(ngp) * 0.1
+        fq[pv] = rng.standard_normal((ngp, 2))
+    nu, sigma = 0.05, 20.0
+    A_h, b_h = assemble_linear_ns(dm, aq, dq, fq, nu, sigma=sigma)
+    asm = DeviceNSAssembler(dm)
+    A_d, b_d = asm.assemble(aq, dq, fq, nu, sigma)
+    assert A_d.shape == A_h.shape
+    diff = (A_h - A_d)
+    scale = np.abs(A_h.data).max()
+    assert (np.abs(diff.data).max() / scale if diff.nnz else 0) < 1e-12
+    assert np.abs(b_h - b_d).max() / max(np.abs(b_h).max(), 1e-30) < 1e-12
