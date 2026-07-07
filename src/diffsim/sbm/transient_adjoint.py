@@ -17,6 +17,16 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.linalg import splu
 
+
+def _dsolve(A_csc, b):
+    """cuDSS-first direct solve (M2-D: L5-3D makes splu ~600s/solve);
+    exact like splu — transient gates unchanged."""
+    try:
+        from ..solvers.linsolve import solve_linear
+        return solve_linear(A_csc.tocsr(), b, solver="cudss")
+    except Exception:
+        return splu(A_csc).solve(b)
+
 from .ns_adjoint import ns_volume_cotangents, ns_load_cotangents
 from .ns_shape import _gp_field_transpose
 
@@ -107,7 +117,7 @@ class TransientAdjoint:
             for extra in pending[n]:
                 rhs += extra
             A = self._rebuild_A(rec)
-            lam = splu(A.tocsc().T).solve(rhs)
+            lam = _dsolve(A.tocsc().T, rhs)
             lam[st.dir_rows] = 0.0
             lam[st.pin_row] = 0.0
             lam_full = np.asarray(T_vec @ lam)
@@ -256,7 +266,7 @@ class TransientShapeAdjoint(TransientAdjoint):
             fq = {pv: -hq[pv] for pv in hq}
             A, b = self._assemble_step(aq, dq, fq, sigma)
             x2 = x1
-            x1 = splu(A.tocsc()).solve(b)
+            x1 = _dsolve(A.tocsc(), b)
             rec = dict(aq=aq, dq=dq, fq=fq, sigma=sigma, b1=b1, b2=b2,
                        c1=c1, c2=c2, x_free=x1.copy())
             self.steps.append(rec)
@@ -295,7 +305,7 @@ class TransientShapeAdjoint(TransientAdjoint):
             for extra in pending[n]:
                 rhs += extra
             A = self._rebuild_A(rec)
-            lam = splu(A.tocsc().T).solve(rhs)
+            lam = _dsolve(A.tocsc().T, rhs)
             lam[strong_rows] = 0.0
             lam_full = np.asarray(self.T_vec @ lam)
             x_full = np.asarray(self.T_vec @ rec["x_free"])
