@@ -211,3 +211,80 @@ def test_advection_dominated_p2(device):
 
     err = _solve(2, 4, 2, _a_rot, kappa, u, f_fn, 0.0, device)
     assert np.isfinite(err) and err < 5e-3, err
+
+
+def test_scalar_cotangents_fd(device):
+    """A5 gate: taped scalar cotangents vs FD — scalar-kappa bump (sum of
+    per-GP dkappa) and per-GP aq bumps."""
+    from diffsim.sbm.scalar_adjoint import scalar_volume_cotangents
+    from diffsim.mesh.basis import basis_tables as bt
+    dim, level, kappa, sigma = 2, 4, 0.7, 0.4
+    tree = build_uniform(level, dim=dim)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, bt(1, dim=dim), device)
+    xq = gauss_points(mesh, dm.tables_by_p)
+    rng = np.random.default_rng(5)
+    pv = 1
+    ngp = len(xq[pv])
+    aq = {pv: rng.standard_normal((ngp, 2)) * 0.4}
+    kq = {pv: np.full(ngp, kappa)}
+    fq = {pv: np.zeros(ngp)}
+    nfull = dm.n_nodes
+    T_full = rng.standard_normal(nfull)
+    lam_full = rng.standard_normal(nfull)
+
+    def J_of(kq_np, aq_np):
+        A, _ = assemble_scalar_ad(dm, {pv: aq_np},
+                                  fq, lambda x_, k=kq_np: np.interp(
+                                      np.zeros(1), [0], [0]) * 0 + k[
+                                      :len(x_)] if False else None,
+                                  sigma=sigma)
+        return 0.0  # placeholder (assembly path uses callable kappa)
+
+    # residual-based J: lam . R(T; kq, aq) via the taped kernel forward
+    from diffsim.sbm.scalar_adjoint import make_scalar_residual
+    import warp as wp
+
+    def resid(kq_np, aq_np):
+        b = dm.bins[pv]
+        k = make_scalar_residual(b["nbf"], b["nqp"])
+        r = wp.zeros(nfull, dtype=wp.float64, device=device)
+        wp.launch(k, dim=len(b["eids"]),
+                  inputs=[b["conn"], b["h"], b["N"], b["dN"], b["lapN"],
+                          b["w"],
+                          wp.array(np.ascontiguousarray(aq_np),
+                                   dtype=wp.float64, device=device),
+                          wp.array(np.ascontiguousarray(kq_np),
+                                   dtype=wp.float64, device=device),
+                          wp.float64(sigma),
+                          wp.float64((2 * sigma) ** 2), wp.float64(1.0),
+                          wp.array(T_full, dtype=wp.float64,
+                                   device=device), r], device=device)
+        return float(lam_full @ r.numpy())
+
+    cot = scalar_volume_cotangents(dm, aq, kq, sigma, T_full, lam_full)
+    dk_gp, da_gp = cot[pv]
+    # scalar-kappa: dJ/dkappa = -sum(dk_gp)  (cotangent = -lam dR/dk)
+    eps = 1e-6
+    fd_k = (resid(kq[pv] + eps, aq[pv]) - resid(kq[pv] - eps,
+                                                aq[pv])) / (2 * eps)
+    rel_k = abs(-dk_gp.sum() - fd_k) / max(abs(fd_k), 1e-30)
+    assert rel_k < 1e-6, (rel_k, fd_k, dk_gp.sum())
+    # per-GP aq bumps
+    for gpi in rng.integers(0, ngp, 3):
+        for c in range(2):
+            ap = aq[pv].copy(); ap[gpi, c] += eps
+            am = aq[pv].copy(); am[gpi, c] -= eps
+            fd = (resid(kq[pv], ap) - resid(kq[pv], am)) / (2 * eps)
+            rel = abs(-da_gp[gpi, c] - fd) / max(abs(fd), 1e-12)
+            assert rel < 1e-5, (gpi, c, rel)
+    # consistency: taped forward == assembled A@T (volume, same config)
+    A_v, _ = assemble_scalar_ad(dm, aq, fq, kappa, sigma=sigma)
+    r_tape = resid(kq[pv], aq[pv])
+    lam_free = np.asarray(cons.T.T @ lam_full)
+    T_free_c = np.asarray(cons.T.T @ T_full)  # NOTE: only valid T=I mesh
+    r_asm = float(lam_free @ (A_v @ np.asarray(
+        np.linalg.lstsq(cons.T.toarray(), T_full, rcond=None)[0])))
+    assert abs(r_tape - r_asm) / max(abs(r_asm), 1e-30) < 1e-10, (
+        r_tape, r_asm)
