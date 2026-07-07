@@ -123,3 +123,32 @@ def test_constraint_aware_scatter(device):
     scale = np.abs(A_h.data).max()
     assert (np.abs(diff.data).max() / scale if diff.nnz else 0) < 1e-12
     assert np.abs(b_h - b_d).max() / max(np.abs(b_h).max(), 1e-30) < 1e-12
+
+
+def test_stepper_device_assembly_parity(device):
+    """M1d stepper wiring gate: use_device_assembly=True produces the
+    same trajectory as the host path (uniform cavity, 3 steps)."""
+    from diffsim.steppers.linearized import LinearizedMonolithicStepper
+
+    def lid(x, t):
+        g = np.zeros((len(x), 2))
+        g[np.abs(x[:, 1] - 1.0) < 1e-12, 0] = 1.0
+        return g
+
+    def run(dev_asm):
+        tree = build_uniform(5, dim=2)
+        mesh = build_mesh(tree, p=1)
+        cons = build_constraints(mesh)
+        dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2),
+                                  device)
+        st = LinearizedMonolithicStepper(
+            dm, 0.01, 0.05, f_fn=lambda x, t: np.zeros((len(x), 2)),
+            g_fn=lid, order=2, use_device_assembly=dev_asm)
+        st.set_initial(lambda x: np.zeros((len(x), 2)))
+        return [st.step().copy() for _ in range(3)]
+
+    xs_h = run(False)
+    xs_d = run(True)
+    for a, b_ in zip(xs_h, xs_d):
+        scale = max(np.abs(a).max(), 1e-30)
+        assert np.abs(a - b_).max() / scale < 1e-11

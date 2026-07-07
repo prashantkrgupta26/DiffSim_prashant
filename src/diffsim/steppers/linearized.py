@@ -29,6 +29,7 @@ from ..solvers.timestepping import (bdf_coeffs, bdf_order_now,
 
 class LinearizedMonolithicStepper:
     def __init__(self, dm, nu, dt, f_fn, g_fn, order=2, p_pin_value_fn=None,
+                 use_device_assembly=False,
                  timestab=True, s_skew=0.5, finescale_extrap=True,
                  solver="splu"):
         """f_fn(x, t) -> [N, dim] body force; g_fn(x, t) -> [N, dim] boundary
@@ -55,6 +56,12 @@ class LinearizedMonolithicStepper:
         self.p_pin_value_fn = p_pin_value_fn or (lambda x0, t: 0.0)
         self.ndof = dm.dim + 1
         self.hist = History()
+        # M1d: device-side assembly + strong rows (4-40x measured); the
+        # symbolic pattern + strong-row plan build once here
+        self._dev_asm = None
+        if use_device_assembly:
+            from ..assembly.device_assembly import DeviceNSAssembler
+            self._dev_asm = DeviceNSAssembler(dm)
         self.t = 0.0
         mesh = dm.mesh
         self.free_coords = mesh.node_coords[dm.constraints.free_nodes]
@@ -66,6 +73,9 @@ class LinearizedMonolithicStepper:
         self.dir_rows = np.array(rows, np.int64)
         self.dir_nodes = np.where(bdry)[0]
         self.pin_row = 0 * self.ndof + dm.dim
+        if self._dev_asm is not None:
+            self._dev_asm.set_strong_rows(
+                np.concatenate([self.dir_rows, [self.pin_row]]))
         self.xq = gauss_points(mesh, dm.tables_by_p)
 
     def set_initial(self, u0_fn):
@@ -155,21 +165,33 @@ class LinearizedMonolithicStepper:
                             else 0.0)
         hq, _ = self._gp_eval(np.asarray(h_node) / self.dt)
         fq = {pv: self.f_fn(self.xq[pv], t_new) - hq[pv] for pv in self.xq}
-        A, b = assemble_linear_ns(dm, aq, dq, fq, self.nu, sigma=sigma,
-                                  sig2tau=((2.0 * sigma) ** 2
-                                           if self.timestab else 0.0),
-                                  s_skew=self.s_skew)
-        A = A.tolil()
         gvals = self.g_fn(self.free_coords[self.dir_nodes], t_new)
-        for k, r in enumerate(self.dir_rows):
-            A.rows[r] = [int(r)]
-            A.data[r] = [1.0]
-            b[r] = gvals[k // dm.dim, k % dm.dim]
-        A.rows[self.pin_row] = [self.pin_row]
-        A.data[self.pin_row] = [1.0]
-        b[self.pin_row] = self.p_pin_value_fn(self.free_coords[0], t_new)
+        if self._dev_asm is not None:
+            sbv = np.concatenate(
+                [gvals.reshape(-1),
+                 [self.p_pin_value_fn(self.free_coords[0], t_new)]])
+            A, b = self._dev_asm.assemble(
+                aq, dq, fq, self.nu, sigma,
+                sig2tau=((2.0 * sigma) ** 2 if self.timestab else 0.0),
+                s_skew=self.s_skew, strong_b_vals=sbv)
+            A = A.tocsr()
+        else:
+            A, b = assemble_linear_ns(dm, aq, dq, fq, self.nu, sigma=sigma,
+                                      sig2tau=((2.0 * sigma) ** 2
+                                               if self.timestab else 0.0),
+                                      s_skew=self.s_skew)
+            A = A.tolil()
+            for k, r in enumerate(self.dir_rows):
+                A.rows[r] = [int(r)]
+                A.data[r] = [1.0]
+                b[r] = gvals[k // dm.dim, k % dm.dim]
+            A.rows[self.pin_row] = [self.pin_row]
+            A.data[self.pin_row] = [1.0]
+            b[self.pin_row] = self.p_pin_value_fn(self.free_coords[0],
+                                                  t_new)
+            A = A.tocsr()
         from ..solvers.linsolve import solve_linear
-        x = solve_linear(A.tocsr(), b, solver=self.solver, sym=False,
+        x = solve_linear(A, b, solver=self.solver, sym=False,
                          device=self.dm.device, cache=self._solver_cache)
         self.hist.rotate(x, dt=self.dt)
         self.t = t_new
