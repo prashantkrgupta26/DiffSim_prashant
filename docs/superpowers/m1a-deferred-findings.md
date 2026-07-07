@@ -231,3 +231,10 @@ FAMILY, measured by term-masked bisection:
    CORRECTED radius). RULE: immersed convergence benchmarks must avoid
    feature dimensions that are dyadic multiples of h (surface tangencies
    on mesh planes) — r=0.25 in a unit box is the worst possible choice.
+   ADDENDUM (2-D control): the 2-D ladder at r=0.27 (6.52e-4/1.85e-4/
+   4.24e-5/1.05e-5, orders 1.82/2.13/2.01) is statistically identical to
+   the locked r=0.25 table — 2-D is INSENSITIVE to the dyadic alignment,
+   confirming the contact-dimension mechanism: a circle touches mesh
+   lines at 4 isolated points (measure-zero), while a sphere's dyadic
+   tangent planes create tangent CIRCLES (1-D degenerate-contact sets).
+   The artifact is intrinsically 3-D.
