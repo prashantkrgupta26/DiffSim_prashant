@@ -58,3 +58,21 @@ Profiling pass (per-stage timing table across {2D L6-L8, 3D L4-L5} for
 forward + adjoint paths) THEN the dual assembly prototypes (slot-map vs
 coloring) gated per D2. Commit-per-green; findings entries for measured
 surprises.
+
+## D5. VERDICT (night one, 2026-07-06) + correction
+
+- Per-step hot loop: DEVICE-ONLY ACHIEVED — assemble_device closes the
+  zero-copy chain into cuDSS (agree 1e-15; the host round-trip was ~25%
+  of solve time at 2D L7). Remaining host: GP-field einsums (ms),
+  orchestration (negligible), epoch setup (once per epoch).
+- Baskar's correction (2026-07-06 night): cuFEM performs DYNAMIC
+  ADAPTIVITY PURE-DEVICE — so moving-geometry workloads do NOT motivate
+  the coherent profile either. Coherent (GH200/GB200) interest reduces
+  to CAPACITY ONLY (state > HBM); the Nova GH200 stage measures that.
+  Pure-device is the profile for the entire roadmap otherwise.
+- cuFEM has NO differentiability: differentiating THROUGH device
+  adaptivity is DiffSim's contribution — proposed milestone M3
+  (transfer-operator adjoints -> event-branch differentiation -> relaxed
+  classification), plus an adjoint-readiness requirements memo to cuFEM
+  (explicit transfer ops, event logs, deterministic tie-breaks,
+  threshold parameters) BEFORE its adaptivity design freezes. Task #15.
