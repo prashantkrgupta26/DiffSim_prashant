@@ -75,6 +75,10 @@ def f_star(dim):
 
 
 def run_case(dim, level, band_layers, solver):
+    # solver in {direct, cudss, krylov}; 'direct'=host splu (exact),
+    # 'cudss'=GPU direct (exact; the branch HISTORICALLY mislabeled
+    # 'krylov' in the driver), 'krylov'=fused bicgstab_dev (iterative,
+    # reports iters/res). Diagnostics are OBSERVATIONAL ONLY.
     t0 = time.time()
     ctr = (0.5,) * dim
     oracle = Sphere(ctr, R)
@@ -106,41 +110,75 @@ def run_case(dim, level, band_layers, solver):
 
     prob = SBMPoisson(dm, geo=None, sf=None, neumann=(sf, geo, q_fn))
     us = u_star(dim)
+    A, b, meta = prob.assemble(f_star(dim), g_outer_fn=us)
+    sinfo = {"solver": solver, "tol": None, "iters": None,
+             "cap": None}
     if solver == "direct":
-        u = prob.solve(f_fn=f_star(dim), g_outer_fn=us)
-    else:
-        # 3D large levels: AMGX (scalar elliptic = its wheelhouse; the
-        # fused Jacobi-BiCGStab diverges on the nonsym SBM system at 356k
-        # DOFs — measured), cuDSS fallback (GPU direct, 48 GB budget)
-        A, b, meta = prob.assemble(f_star(dim), g_outer_fn=us)
-        # cuDSS first (exact; AMGX classical measured not_converged on
-        # the nonsym SBM system at 356k DOFs — needs a tuned config, queued)
+        from scipy.sparse.linalg import splu
+        x = splu(A.tocsc()).solve(b)
+    elif solver == "cudss":
         from diffsim.solvers.linsolve import solve_linear
         x = solve_linear(A, b, solver="cudss")
-        u = np.asarray(dm.constraints.T @ x)
+    elif solver == "krylov":
+        from diffsim.assembly.operators import CSROperator
+        from diffsim.solvers.krylov_dev import bicgstab_dev
+        KTOL, KCAP = 1e-10, 40000
+        op = CSROperator(A.tocsr(), dm.device)
+        x, kinfo = bicgstab_dev(op, b, tol=KTOL, atol=1e-14,
+                                maxiter=KCAP,
+                                diag=np.asarray(A.diagonal()),
+                                check_every=200)
+        sinfo.update(tol=KTOL, cap=KCAP,
+                     iters=int(kinfo.get("iters", -1)))
+    else:
+        raise ValueError(f"unknown solver {solver!r}")
+    # TRUE relative residual — observational, every solver
+    sinfo["res"] = float(np.linalg.norm(A @ x - b)
+                         / max(np.linalg.norm(b), 1e-300))
+    u = np.asarray(dm.constraints.T @ x)
     err = l2_error_masked(dm, u, us, lambda x: oracle.classify(x) > 0)
     n_free = dm.constraints.T.shape[1]
     n_band = (0 if isinstance(p_elem, int)
               else int((np.asarray(p_elem) == 2).sum()))
-    return err, time.time() - t0, n_free, n_band, len(sf.elem)
+    return err, time.time() - t0, n_free, n_band, len(sf.elem), sinfo
+
+
+def _fmt(sinfo, dt):
+    parts = [f"{dt:.0f}s", sinfo["solver"]]
+    if sinfo["iters"] is not None:
+        parts.append(f"iters={sinfo['iters']}/{sinfo['cap']}")
+    parts.append(f"res={sinfo['res']:.1e}")
+    if sinfo["tol"] is not None:
+        parts.append(f"tol={sinfo['tol']:.0e}")
+    return ", ".join(parts)
 
 
 if __name__ == "__main__":
-    dim = int(sys.argv[1])
-    levels = [int(v) for v in sys.argv[2:]]
+    args = [a for a in sys.argv[1:] if not a.startswith("--solver")]
+    forced = None
+    for a in sys.argv[1:]:
+        if a.startswith("--solver"):
+            forced = a.split("=", 1)[1] if "=" in a else None
+    if forced is None and "--solver" in sys.argv:
+        forced = sys.argv[sys.argv.index("--solver") + 1]
+        args = [a for a in args
+                if a != forced or args.count(forced) > 1]
+    dim = int(args[0])
+    levels = [int(v) for v in args[1:]]
     log(f"\n===== dim={dim}  (r={R}, lambda=1.0 keep-all, exterior, "
         f"node-band(3) vs p1) =====")
     errs_band, errs_p1 = {}, {}
     for lv in levels:
-        solver = "direct" if (dim == 2 or lv <= 5) else "krylov"
-        e, dt, nf, nb, nsf = run_case(dim, lv, 3, solver)
+        auto = "direct" if (dim == 2 or lv <= 5) else "cudss"
+        solver = forced if forced not in (None, "auto") else auto
+        e, dt, nf, nb, nsf, si = run_case(dim, lv, 3, solver)
         errs_band[lv] = e
         log(f"  band(3) L{lv}: err={e:.4e}  dofs={nf}  band_elems={nb}  "
-            f"surrfaces={nsf}  [{dt:.0f}s, {solver}]")
+            f"surrfaces={nsf}  [{_fmt(si, dt)}]")
         if dim == 2 or lv <= 5:
-            e1, dt1, _, _, _ = run_case(dim, lv, 0, solver)
+            e1, dt1, _, _, _, si1 = run_case(dim, lv, 0, solver)
             errs_p1[lv] = e1
-            log(f"  p1-only L{lv}: err={e1:.4e}  [{dt1:.0f}s]")
+            log(f"  p1-only L{lv}: err={e1:.4e}  [{_fmt(si1, dt1)}]")
     log(f"  orders band(3): " + "  ".join(
         f"L{a}->L{b}: {np.log2(errs_band[a] / errs_band[b]):.2f}"
         for a, b in zip(levels, levels[1:]) if b in errs_band))
