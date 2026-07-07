@@ -79,7 +79,7 @@ def run_transient(alpha_np, V, n_steps=N_STEPS):
     # representable; each alpha gets a deterministic carve + cold
     # anchored feet (objective well-defined per-alpha; cross-epoch
     # J-jumps are part of the landscape, guarded GN absorbs them)
-    DRIFT = 0.35 / 2 ** LEVEL
+    DRIFT = float('inf')  # M3 continuation owns re-anchoring
     if np.linalg.norm(geo.d, axis=1).max() > DRIFT:
         _EPOCH.clear()
         build_epoch(V, alpha_np)
