@@ -94,3 +94,57 @@ def test_monolithic_solver_parity(solver, device):
 @pytest.mark.parametrize("solver", SOLVERS[1:])
 def test_leray_solver_parity(solver, device):
     _parity("_run_leray", solver, device, 1e-6)
+
+
+def test_blocktri_solver_sigma0(device):
+    """Task-#6 production recipe as a solve_linear backend: steady NS
+    system solved by FGMRES + exact-F block preconditioner."""
+    import numpy as np
+    import sys, os
+    sys.path.insert(0, os.path.dirname(__file__))
+    from test_transient_adjoint import _lid
+    from diffsim.octree.build import build_uniform
+    from diffsim.mesh.nodes import build_mesh
+    from diffsim.mesh.constraints import build_constraints
+    from diffsim.mesh.basis import basis_tables
+    from diffsim.assembly.operators import DeviceMesh
+    from diffsim.api.ns_bricks import assemble_linear_ns
+    from diffsim.physics.poisson import gauss_points
+    from diffsim.solvers.linsolve import solve_linear
+    from scipy.sparse.linalg import splu
+
+    tree = build_uniform(5, dim=2)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), device)
+    xq = gauss_points(mesh, dm.tables_by_p)
+    rng = np.random.default_rng(0)
+    pv = list(dm.bins)[0]
+    ngp = len(xq[pv])
+    aq = {pv: rng.standard_normal((ngp, 2)) * 0.3}
+    dq = {pv: np.zeros(ngp)}
+    fq = {pv: np.zeros((ngp, 2))}
+    A, b = assemble_linear_ns(dm, aq, dq, fq, 0.01, sigma=0.0,
+                              sig2tau=0.0)
+    A = A.tolil()
+    # velocity Dirichlet on the box boundary (without it the sigma=0
+    # velocity block carries rigid modes -> singular F, FGMRES stalls)
+    coords = mesh.node_coords[cons.free_nodes]
+    bdry = np.zeros(len(coords), bool)
+    for c in range(2):
+        bdry |= (np.abs(coords[:, c]) < 1e-12) | \
+                (np.abs(coords[:, c] - 1) < 1e-12)
+    for i in np.where(bdry)[0]:
+        for c in range(2):
+            r = i * 3 + c
+            A.rows[r] = [int(r)]
+            A.data[r] = [1.0]
+    A.rows[2] = [2]; A.data[2] = [1.0]
+    A = A.tocsr()
+    b = rng.standard_normal(A.shape[0])
+    cache = {("blocktri_meta", "t"): {"ndof": 3}}
+    x = solve_linear(A, b, solver="blocktri", tol=1e-10, cache=cache,
+                     cache_key="t")
+    x_ref = splu(A.tocsc()).solve(b)
+    rel = np.linalg.norm(x - x_ref) / np.linalg.norm(x_ref)
+    assert rel < 1e-8, rel

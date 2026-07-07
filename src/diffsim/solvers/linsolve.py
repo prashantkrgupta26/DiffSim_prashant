@@ -78,6 +78,48 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         return amgx_solve(A, b, sym=sym, tol=tol, maxiter=maxiter,
                           cache=cache, cache_key=cache_key)
 
+    if solver == "blocktri":
+        # task-#6 production recipe (findings 8f-i): FGMRES + block-
+        # triangular preconditioner with EXACT F (cuDSS velocity block)
+        # + diagC Schur — 2-3 iterations at sigma=0 where AMG diverged.
+        # kwargs via cache: caller stores {"ndof": d+1} under
+        # ("blocktri_meta", cache_key).
+        import scipy.sparse as _sp
+        from scipy.sparse.linalg import LinearOperator, lgmres
+        meta = (cache or {}).get(("blocktri_meta", cache_key), {})
+        ndof = meta.get("ndof", 3)
+        n = A.shape[0] // ndof
+        dim = ndof - 1
+        u_ids = (np.arange(n)[:, None] * ndof
+                 + np.arange(dim)[None, :]).ravel()
+        p_ids = np.arange(n) * ndof + dim
+        F = A[u_ids][:, u_ids].tocsr()
+        G = A[u_ids][:, p_ids].tocsr()
+        Cd = np.asarray(A[p_ids][:, p_ids].diagonal())
+        Cd[Cd == 0] = 1.0
+        from nvmath.sparse.advanced import DirectSolver
+        slvF = DirectSolver(F, np.zeros(F.shape[0]))
+        slvF.plan()
+        slvF.factorize()
+
+        def apply(r):
+            r_u, r_p = r[u_ids], r[p_ids]
+            z_p = r_p / np.abs(Cd)
+            slvF.reset_operands(b=np.ascontiguousarray(r_u - G @ z_p))
+            z_u = np.asarray(slvF.solve())
+            z = np.empty_like(r)
+            z[u_ids] = z_u
+            z[p_ids] = z_p
+            return z
+
+        it = [0]
+        x, info = lgmres(A, b, M=LinearOperator(A.shape, apply),
+                         rtol=tol, atol=1e-13, maxiter=100,
+                         callback=lambda _: it.__setitem__(0, it[0] + 1))
+        if info != 0:
+            raise RuntimeError(f"blocktri FGMRES not converged: {info}")
+        return x
+
     if solver == "cudss":
         # constant-matrix reuse: keep the factorized DirectSolver per key
         from nvmath.sparse.advanced import DirectSolver, direct_solver
