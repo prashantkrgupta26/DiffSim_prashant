@@ -43,7 +43,8 @@ def make_linear_ns_Ae(nbf: int, nqp: int, dim: int):
     # >79-min one-time nvrtc compile; rolled loops (max_unroll=0) trade a
     # few %% runtime for a compile measured in minutes (finding-1b pattern).
     @wp.kernel(module="unique", enable_backward=False,
-               module_options=({"max_unroll": 0} if dim >= 3 else {}))
+               module_options=({"max_unroll": 0}
+                               if (dim >= 3 or nbf > 4) else {}))
     def lin_ns_Ae(conn: wp.array2d(dtype=wp.int32),
                   h: wp.array(dtype=wp.float64),
                   Ntab: wp.array2d(dtype=wp.float64),
@@ -146,7 +147,8 @@ def make_linear_ns_be(nbf: int, nqp: int, dim: int):
     # >79-min one-time nvrtc compile; rolled loops (max_unroll=0) trade a
     # few %% runtime for a compile measured in minutes (finding-1b pattern).
     @wp.kernel(module="unique", enable_backward=False,
-               module_options=({"max_unroll": 0} if dim >= 3 else {}))
+               module_options=({"max_unroll": 0}
+                               if (dim >= 3 or nbf > 4) else {}))
     def lin_ns_be(conn: wp.array2d(dtype=wp.int32),
                   h: wp.array(dtype=wp.float64),
                   Ntab: wp.array2d(dtype=wp.float64),
