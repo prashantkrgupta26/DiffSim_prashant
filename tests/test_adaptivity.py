@@ -120,3 +120,89 @@ def test_rung1_exit_adjoint_across_recarve(device):
         fd = (forward(Tp)[0] - forward(Tm)[0]) / (2 * eps)
         rel = abs(g[i] - fd) / max(abs(fd), 1e-12)
         assert rel < 1e-7, (int(i), rel, g[i], fd)
+
+
+def test_rung2_beyond_trust_region(device):
+    """RUNG 2 GATE: recover alpha* at ~2.3x the epoch trust region on
+    the analytic-proxy sphere Poisson config — plain single-epoch GN
+    must stall/fail; continuation must converge (<20% |alpha*|)."""
+    from diffsim.geometry.inr_proxy import AnalyticINRProxy
+    from diffsim.sbm.surrogate import (classify_lambda, extract_surrogate,
+                                       GeometryData)
+    from diffsim.sbm.poisson import SBMPoisson
+    from diffsim.mesh.faces import face_tables
+    from diffsim.mesh.pointeval import point_eval_weights
+    from diffsim.adaptivity.continuation import continuation_recover
+
+    LEVEL, K = 4, 2
+    H = 1.0 / 2 ** LEVEL
+    TRUST = 0.35 * H                                 # 0.0219
+
+    import torch
+
+    def epoch_fn(alpha):
+        o = AnalyticINRProxy(Sphere((0.5, 0.5), 0.27), n_modes=K)
+        o.alpha = torch.tensor(np.asarray(alpha, float))
+        tree = build_uniform(LEVEL, dim=2)
+        ret, _ = classify_lambda(tree, o, 1.0, domain="outside")
+        sf = extract_surrogate(ret)
+        mesh = build_mesh(ret, p=1)
+        cons = build_constraints(mesh)
+        dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2),
+                                  device)
+        py, px = np.meshgrid(np.linspace(0.15, 0.85, 4),
+                             np.linspace(0.15, 0.85, 4))
+        pts = np.column_stack([px.ravel(), py.ravel()])
+        keep = np.linalg.norm(pts - 0.5, axis=1) > 0.42
+        W = point_eval_weights(mesh, pts[keep])
+        return dict(o=o, ret=ret, sf=sf, mesh=mesh, cons=cons, dm=dm,
+                    W=W)
+
+    def solve_probes(E, alpha):
+        import torch as _t
+        E["o"].alpha = _t.tensor(np.asarray(alpha, float))
+        geo = GeometryData.evaluate(E["o"], E["ret"], E["sf"],
+                                    face_tables(1, 2), domain="outside")
+        prob = SBMPoisson(E["dm"], geo=geo, sf=E["sf"],
+                          g_fn=lambda x: np.ones(len(x)), kappa=1.0,
+                          alpha=20.0)
+        u = prob.solve(f_fn=lambda x: np.zeros(len(x)),
+                       g_outer_fn=lambda x: np.zeros(len(x)))
+        return E["W"] @ u
+
+    # fixed target DATA from alpha* (its own carve — data, not epochs)
+    astar = np.array([0.05, -0.03])                  # |a*| = 2.7x TRUST
+    tgt_E = epoch_fn(astar)
+    target = solve_probes(tgt_E, astar)
+
+    def resid_fn(E, alpha):
+        return solve_probes(E, alpha) - target
+
+    def jac_fn(E, alpha, r0):
+        eps = 1e-6
+        Jc = np.zeros((len(r0), K))
+        for k in range(K):
+            a2 = np.asarray(alpha, float).copy(); a2[k] += eps
+            Jc[:, k] = (solve_probes(E, a2) - target - r0) / eps
+        return Jc
+
+    # PLAIN single-epoch GN (the M2-D failure mode): epoch fixed at 0
+    E0 = epoch_fn(np.zeros(K))
+    a = np.zeros(K)
+    for _ in range(6):
+        r = resid_fn(E0, a)
+        Jc = jac_fn(E0, a, r)
+        lamb = 1e-3 * np.trace(Jc.T @ Jc) / K
+        a = a + np.linalg.solve(Jc.T @ Jc + lamb * np.eye(K),
+                                -(Jc.T @ r))
+    err_plain = np.linalg.norm(a - astar)
+
+    # CONTINUATION
+    a_c, hist = continuation_recover(epoch_fn, resid_fn, jac_fn,
+                                     np.zeros(K), TRUST, n_epochs=8,
+                                     inner_iters=4, verbose=False)
+    err_cont = np.linalg.norm(a_c - astar)
+    print(f"beyond-trust: plain err={err_plain:.4f} "
+          f"continuation err={err_cont:.4f} (|a*|={np.linalg.norm(astar):.4f})")
+    assert err_cont < 0.2 * np.linalg.norm(astar), (err_cont, err_plain)
+    assert err_cont < err_plain * 0.5                # continuation wins
