@@ -317,3 +317,17 @@ exact q at true foot points; L2(Ω) masked to the true exterior; band =
 for band and p1-only. The 2-D level-8 case is ~58k DOFs (workstation
 scale); 3-D level 6 is ~356k DOFs (needs a direct solver or a working
 preconditioner, per Q6).
+
+## POSTSCRIPT (2026-07-06): §4.5's anomaly resolved — benchmark degeneracy
+
+The non-monotone L4–L6 sequence was an **alignment artifact of r = 0.25**:
+the sphere's cardinal tangent planes coincide with mesh face planes at
+every refinement level (dyadic radius in a unit box), producing
+knife-edge classifications whose error impact varies erratically with
+level. A radius sweep at fixed L6 (the Q5 experiment) exposed it: errors
+are a clean ~1.6–2.2e-4 for r ∈ [0.15, 0.27] and the degenerate r = 0.25
+sits at 1.38e-3. The corrected ladder at **r = 0.27** is monotone —
+1.95e-3 / 5.68e-4 / 1.91e-4, orders 1.78 / 1.57 — with L7 as the
+asymptotic confirmation. **Add to §6's trap list: never choose feature
+dimensions that are dyadic multiples of the mesh spacing.** Q5 is hereby
+answered; the other open questions stand.

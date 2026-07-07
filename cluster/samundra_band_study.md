@@ -5,7 +5,16 @@ and `docs/p2_band_problem_statement.md` (the self-contained research
 brief — read §4–5 first). This runbook is the operational side: exactly
 what to run on Nova, what it costs, and what the numbers decide.*
 
-## The question you are answering
+## IMPORTANT UPDATE (2026-07-06 night): the dip is RESOLVED
+
+The L4-L6 non-monotonicity was a benchmark DEGENERACY: r=0.25 aligns the
+sphere's tangent planes with mesh faces at every level (findings 4b(h)).
+The corrected canonical radius is r=0.27 (now the driver default), whose
+ladder is MONOTONE: 1.95e-3 / 5.68e-4 / 1.91e-4 (orders 1.78, 1.57).
+Your L7 run is now the ASYMPTOTIC CONFIRMATION (expect order -> 2), not
+the dip verdict. The verdict table below is updated accordingly.
+
+## The question you are answering (superseded framing kept for context)
 
 The 3-D band errors are **non-monotone**: L4 1.99e-2 → L5 5.70e-4 →
 L6 1.38e-3. Our hypothesis: an error-cancellation **dip at L5** (the
@@ -43,7 +52,7 @@ Compute consecutive orders: order = log2(err_k / err_{k+1}).
 
 | Outcome at L6→L7 | Verdict |
 |---|---|
-| order ≈ 2 (1.7–2.3) | **Dip hypothesis confirmed** — L5 was fortuitous; the band is clean second-order in 3-D. Write it up. |
+| order ≈ 2 (1.7–2.3) | **Asymptotic second order confirmed** in 3-D at the corrected radius. Write it up. |
 | order ≈ 1 | The 3-D band has a REAL problem the 2-D study missed — check band thickness vs the adjacency rules (problem statement §2, §4.1) at 3-D; escalate. |
 | non-monotone again | Sample a **radius sweep** at fixed L6 (r ∈ 0.15…0.35) — the cheap dip-probe (problem statement Q5); the error-vs-resolution curve shape will say. |
 

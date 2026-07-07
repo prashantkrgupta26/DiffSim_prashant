@@ -213,3 +213,21 @@ FAMILY, measured by term-masked bisection:
    (re-carve on |d| > 0.35h), and FOOT CONTINUATION (anchored per-epoch
    warm starts -> deterministic objectives + continuous branch
    selection).
+
+4b(h). **THE 3-D "L5 DIP" RESOLVED: benchmark degeneracy, not physics
+   (radius sweep + exact reproduction, 2026-07-06 night).** The
+   non-monotone L4-L6 sequence at r=0.25 reproduces EXACTLY under the
+   hardened projector (1.9922e-2 / 5.6954e-4 / 1.3781e-3) — real, but an
+   ALIGNMENT ARTIFACT: at r=0.25 the sphere's cardinal tangent planes
+   (x,y,z = 0.25, 0.75) lie exactly on mesh face planes at EVERY level —
+   knife-edge classifications and tangent surrogate faces whose error
+   impact varies erratically with level (degenerate r=0.25 L4 is 10x
+   worse than r=0.27 L4). The L6 radius sweep (r=0.15..0.35, each ~25 s
+   post-optimizations) shows clean ~1.6-2.2e-4 errors away from
+   alignment (r >= 0.31 elevated by outer-wall proximity — separate,
+   geometric). NON-DEGENERATE ladder at r=0.27: 1.9471e-3 / 5.6772e-4 /
+   1.9056e-4, orders 1.78 / 1.57 — MONOTONE, trending to 2; the
+   asymptotic confirmation needs L7 (Samundra's cluster run, at the
+   CORRECTED radius). RULE: immersed convergence benchmarks must avoid
+   feature dimensions that are dyadic multiples of h (surface tangencies
+   on mesh planes) — r=0.25 in a unit box is the worst possible choice.

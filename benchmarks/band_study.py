@@ -35,7 +35,7 @@ from diffsim.physics.poisson import l2_error_masked
 
 OUT = "band_study_results.txt"      # appended in the cwd
 DEV = "cuda:0"
-R = 0.25
+R = 0.27   # NOT 0.25: dyadic-aligned tangent planes = degenerate benchmark (findings 4b(h))
 
 
 def log(msg):
