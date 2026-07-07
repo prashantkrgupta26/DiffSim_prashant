@@ -320,3 +320,10 @@ M2-B1 HUNT NOTES (2026-07-07): (i) consistent-flux chi must sit at rows
    kernel's tau(kappa) SUPG weight (needs a taped be kernel; zero when
    fq=0, so NOT the cylinder's 1.1e-3); (iii) alpha(kappa) freezing =
    the solver-parameter gradient contract (66x term).
+
+M2-C PENALTY LAW (2026-07-07): Nitsche alpha must scale with BOTH the
+   physics and the discretization. Measured: (i) advection consumes
+   coercivity -> alpha ~ (1 + Pe/4) (the L7 scalar blowup); (ii) the
+   trace-inverse constant grows ~p^2 -> alpha_p2 = p^2 * alpha_p1
+   (cylinder Cd 3.087 at alpha=10 [leaky boundary = fat body] -> 1.334
+   at alpha=40 vs lit 1.33; over-penalizing to 90 drifts to 1.290).
