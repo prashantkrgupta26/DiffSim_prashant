@@ -280,3 +280,53 @@ def test_shape_inverse_recovers_circle(device):
     assert abs(th[2] - truth[2]) < 5e-3, (th, truth, J_hist[-1])
     assert np.linalg.norm(th[:2] - truth[:2]) < 5e-3, (th, truth)
     assert J_hist[-1] < 1e-3 * max(J_hist[0], 1e-12), J_hist[::10]
+
+
+def test_p2_ns_tape_fd(device):
+    """M2-C/B4: the p2 NS taped kernel (nbf=9) vs FD — dnu cotangent on
+    a small p=2 config (the pure-p2 framework's adjoint gate)."""
+    import numpy as np
+    from diffsim.octree.build import build_uniform
+    from diffsim.mesh.nodes import build_mesh
+    from diffsim.mesh.constraints import build_constraints
+    from diffsim.mesh.basis import basis_tables
+    from diffsim.assembly.operators import DeviceMesh
+    from diffsim.sbm.ns_adjoint import ns_volume_cotangents
+    from diffsim.api.ns_bricks import assemble_linear_ns
+    from diffsim.physics.poisson import gauss_points
+
+    tree = build_uniform(3, dim=2)
+    mesh = build_mesh(tree, p=2)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(2, dim=2),
+                              device)
+    xq = gauss_points(mesh, dm.tables_by_p)
+    pv = 2
+    ngp = len(xq[pv])
+    rng = np.random.default_rng(3)
+    aq = {pv: rng.standard_normal((ngp, 2)) * 0.3}
+    dq = {pv: rng.standard_normal(ngp) * 0.05}
+    nfull = dm.n_nodes * 3
+    x_full = rng.standard_normal(nfull)
+    lam = rng.standard_normal(nfull)
+    nu, sigma = 0.05, 20.0
+
+    def resid_dot(nu_):
+        fq = {pv: np.zeros((ngp, 2))}
+        A, b = assemble_linear_ns(dm, aq, dq, fq, nu_, sigma=sigma)
+        T_vec = None
+        import scipy.sparse as sp
+        T = cons.T.tocsr()
+        T_vec = sp.kron(T, sp.identity(3, format="csr"), format="csr")
+        xf = np.asarray(np.linalg.lstsq(T_vec.toarray(), x_full,
+                                        rcond=None)[0])
+        return float((np.asarray(cons.T @ 0) if False else
+                      (T_vec @ (A @ xf))) @ lam * 0 +
+                     lam @ np.asarray(T_vec @ (A @ xf)))
+
+    _, dnu = ns_volume_cotangents(dm, aq, dq, nu, sigma, 0.5, x_full,
+                                  lam, tau_frozen=False)
+    eps = 1e-6
+    fd = (resid_dot(nu + eps) - resid_dot(nu - eps)) / (2 * eps)
+    rel = abs(-dnu - fd) / max(abs(fd), 1e-30)
+    assert rel < 1e-5, (rel, dnu, fd)
