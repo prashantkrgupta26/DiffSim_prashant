@@ -247,3 +247,21 @@ FAMILY, measured by term-masked bisection:
    nothing and fp32 gains nothing. The hook matters only where factors
    are FLOP-bound (Blackwell at scale); refinement-count (cheap) is the
    transferable datum. Spec D0 hook stays, priority low.
+
+4b(i). **The band value proposition MEASURED (three-way sweep, r=0.27,
+   2026-07-07 night).** p1-only vs node-band(3) vs p2-everywhere:
+
+   3-D L6: p1 2.49e-3 @ 258k dofs [15s] | band 1.91e-4 @ 370k [25s] |
+   p2-every 5.31e-5 @ 2.00M [25,499 s = 7.1 HOURS]
+   2-D L8: p1 1.26e-3 @ 52k | band 1.05e-5 @ 56k [1s] | p2-every
+   1.53e-6 @ 205k [7s]
+
+   Readings: (1) p1-only is order-capped ~0.85 (the SBM boundary
+   consistency limit) — 13x worse than the band at 3-D L6. (2) The band
+   restores second order at +8-43% dofs and near-p1 solve cost — its
+   design target, hit. (3) p2-everywhere buys a further 3.6-6.9x (the
+   interior rides Q2's higher order) at 4-5.4x dofs and, in 3-D
+   direct-solve, ~1000x solve time. Error-per-dof AND error-per-second:
+   band(3) dominates both alternatives. (4) Wrinkle recorded: 2-D
+   p2-everywhere is non-monotone at L6 (3.96e-5 -> 9.26e-5 -> 1.46e-5)
+   — small alignment-parity artifact class, not chased.

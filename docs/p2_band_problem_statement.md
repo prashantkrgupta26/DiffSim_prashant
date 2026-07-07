@@ -331,3 +331,13 @@ sits at 1.38e-3. The corrected ladder at **r = 0.27** is monotone —
 asymptotic confirmation. **Add to §6's trap list: never choose feature
 dimensions that are dyadic multiples of the mesh spacing.** Q5 is hereby
 answered; the other open questions stand.
+
+## POSTSCRIPT 2 (2026-07-07): the three-way comparison, measured
+
+p1-only vs node-band(3) vs p2-everywhere at r=0.27 (see findings 4b(i)
+for the full table). Headline, 3-D L6: p1 gives 2.49e-3 at 258k DOFs;
+the band gives 1.91e-4 (13x) at +43% DOFs and 25 s; p2-everywhere gives
+5.31e-5 (another 3.6x — the interior rides Q2's order) at 2.0M DOFs and
+7.1 HOURS of direct solve. The band dominates error-per-DOF and
+error-per-second against both alternatives — which is the whole claim
+of local p-refinement, now measured in one table.
