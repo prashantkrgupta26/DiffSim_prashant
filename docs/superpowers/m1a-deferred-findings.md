@@ -306,3 +306,9 @@ FAMILY, measured by term-masked bisection:
    (machinery exists and is gated) integrates the whole-body signal
    instead of sampling the wake at 16 points, (3) ear-dominant edits
    (the checkpoint's own semantics; 45x the ripple signal).
+
+M2-A4 GATES (2026-07-07): de Vahl Davis L6 Pr=0.71 — Ra=1e3
+   Nu=1.1174 (bench 1.118, 0.05%); Ra=1e4 Nu=2.2426 (bench 2.243,
+   0.02%). Both essentially exact, first shot. The coupled system =
+   NS brick + scalar brick + lagged Boussinesq + consistent-flux Nu.
+   Baseline locked (tests/baselines/m2_devahl_davis.json).

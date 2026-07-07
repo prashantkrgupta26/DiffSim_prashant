@@ -1,0 +1,15 @@
+{
+  "devahl_davis_L6_Pr0.71": {
+    "Ra1e3": {
+      "Nu_avg": 1.1174,
+      "benchmark": 1.118,
+      "steps": 26
+    },
+    "Ra1e4": {
+      "Nu_avg": 2.2426,
+      "benchmark": 2.243,
+      "steps": 48
+    },
+    "config": "L6, BDF2 dt=0.05, one-way-lagged Boussinesq, consistent-flux Nu at hot wall"
+  }
+}
