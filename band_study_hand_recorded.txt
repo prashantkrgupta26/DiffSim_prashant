@@ -1,0 +1,9 @@
+Hand-recorded band(3) results, A100, r=0.27, 2026-07-07
+L4: err=1.9471e-03  dofs=14448    [direct]
+L5: err=5.6772e-04  dofs=65428    [direct]
+L6: err=1.9056e-04  dofs=369758   [krylov]
+L7: err=4.0320e-04  dofs=2416960  [krylov]
+orders: L4->L5=1.78, L5->L6=1.57, L6->L7=-1.08 (non-monotone; L7 error rose)
+Open Qs: (1) L7 krylov convergence unverified, benchmark prints no residual;
+         (2) 3D L>=6 uses provisional build_constraints path per benchmark header;
+         (3) no CLI to force direct solve at L7.
