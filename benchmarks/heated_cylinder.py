@@ -123,7 +123,12 @@ def run(level=6, kappa=0.05, device="cuda:0"):
 
     prob = SBMPoisson(dm, geo=geo, sf=sf,
                       g_fn=lambda x: np.ones(len(x)), kappa=kappa,
-                      alpha=20.0)
+                      # Peclet-aware Nitsche penalty (L7 isolation,
+                      # 2026-07-07: alpha=20 blew up at L7 WITHOUT the
+                      # advective faces — under-penalization once
+                      # advection consumes coercivity margin; 50 is
+                      # bounded at L5-L7): alpha ~ 20*(1 + Pe_face)
+                      alpha=20.0 * (1.0 + 1.0 * 2 * R / kappa / 4.0))
     A_f, b_f = prob.face_system()
     A_a, b_a = advective_faces(dm, sf, geo,
                                a_fn=lambda gp: np.array([1.0, 0.0]),
