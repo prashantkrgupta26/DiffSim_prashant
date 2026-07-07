@@ -101,7 +101,11 @@ def main(n_steps=N_STEPS, n_epochs=6):
                                    check_pts01=band[::-1].copy())
     print(f"[modes] stability {stab:.3f}", flush=True)
 
-    alpha_star = np.array([0.008, -0.006, 0.005, -0.006])
+    # EAR-DOMINANT edit: mode 0 (Gram eigenvalue 107k, 200x the rest) IS
+    # the ear-movement direction this checkpoint was trained for —
+    # semantically large geometry, hence an observable wake signature
+    # (distributed small-ripple edits measured sub-grid at L4: v2/v3)
+    alpha_star = np.array([0.012, -0.002, 0.0, 0.0])
     _, _, target = run_transient(alpha_star, V, n_steps)
     print(f"[setup] hidden alpha* = {alpha_star}", flush=True)
 
@@ -138,9 +142,17 @@ def main(n_steps=N_STEPS, n_epochs=6):
         print(f"{ep:>3} {J:12.6e} {err:15.6e} {cos:10.5f}", flush=True)
         if J < 1e-14:
             break
-        lamb = 1e-8 * np.trace(Jac.T @ Jac) / K
+        # GUARDED step (H4 lesson: weak signal -> near-singular Jac ->
+        # unguarded GN escaped along a null direction to a spurious
+        # J=0 at |alpha|~6.6). LM damping scaled to the gradient + a
+        # trust-region cap at the epoch's own displacement bound.
+        lamb = 1e-3 * np.trace(Jac.T @ Jac) / K
         step = np.linalg.solve(Jac.T @ Jac + lamb * np.eye(K),
                                -(Jac.T @ r0))
+        MAX_STEP = 0.004               # displacement units << 0.35 h
+        n_ = np.linalg.norm(step)
+        if n_ > MAX_STEP:
+            step *= MAX_STEP / n_
         alpha = alpha + step
     print(f"[result] recovered {np.round(alpha, 5)} vs {alpha_star}",
           flush=True)

@@ -287,3 +287,8 @@ FAMILY, measured by term-masked bisection:
    wobble-amplitude-vs-h, not feature-size-vs-h; (3) redirects
    EXPLORE-6/N6: study wobble/h, not penalty weight. The tutorial's L5
    plateau and H1-L4's success are both explained.
+   M1d STEP-LEVEL CLOSING NUMBER: cavity L6, 30 BDF2 steps, cuDSS:
+   host path 152 ms/step -> device-assembly path 69 ms/step (2.2x
+   END-TO-END; parity 2.6e-15). The remaining 69 ms is ~solver — the
+   step is solver-bound, as designed. (Assembly alone was 40x; step
+   speedup is bounded by the solve share.)
