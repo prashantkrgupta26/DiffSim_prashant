@@ -117,9 +117,33 @@ class DeviceNSAssembler:
                                          np.arange(color.max() + 2))
                 self._colors.append((order.astype(np.int32), bounds))
 
+    def set_strong_rows(self, rows, diag_vals=None):
+        """D1 item 2: per-epoch strong-row plan. rows: global dof ids
+        whose equations become identity rows. Precomputes slot spans and
+        diagonal slots; assemble() applies them ON DEVICE after scatter
+        (replaces the host LIL surgery — measured 0.8-1.4 s/step)."""
+        rows = np.asarray(rows, np.int64)
+        starts = self.indptr[rows]
+        ends = self.indptr[rows + 1]
+        # diagonal slot per row (column == row)
+        diag = np.empty(len(rows), np.int64)
+        for i, (r_, s_, e_) in enumerate(zip(rows, starts, ends)):
+            diag[i] = s_ + np.searchsorted(self.indices[s_:e_], r_)
+        # flat list of ALL slots in the strong rows (to zero)
+        spans = np.concatenate([np.arange(s_, e_)
+                                for s_, e_ in zip(starts, ends)])
+        self._strong = dict(
+            rows_d=wp.array(rows.astype(np.int32), dtype=wp.int32,
+                            device=self.dm.device),
+            spans_d=wp.array(spans.astype(np.int32), dtype=wp.int32,
+                             device=self.dm.device),
+            diag_d=wp.array(diag.astype(np.int32), dtype=wp.int32,
+                            device=self.dm.device),
+            n_spans=len(spans), n_rows=len(rows))
+
     # ------------------------------------------------------------------
     def assemble(self, aq_by_bin, div_aq_by_bin, fq_by_bin, nu, sigma,
-                 sig2tau=None, s_skew=0.5):
+                 sig2tau=None, s_skew=0.5, strong_b_vals=None):
         """Numeric fill on device; returns (csr, F) with HOST copies for
         now (the solver interface); vals stay resident in self.vals_d."""
         from ..api.ns_bricks import make_linear_ns_Ae, make_linear_ns_be
@@ -177,6 +201,21 @@ class DeviceNSAssembler:
             wp.launch(scat_b, dim=ne * nbf * ndof,
                       inputs=[be.reshape((-1,)), self._gdof_d[k_bin],
                               self.F_d], device=d)
+        if getattr(self, "_strong", None) is not None:
+            st = self._strong
+            zk = _zero_slots_kernel()
+            wp.launch(zk, dim=st["n_spans"],
+                      inputs=[st["spans_d"], self.vals_d],
+                      device=self.dm.device)
+            dk = _diag_one_kernel()
+            bv = wp.array(np.ascontiguousarray(
+                strong_b_vals if strong_b_vals is not None
+                else np.zeros(st["n_rows"])), dtype=wp.float64,
+                device=self.dm.device)
+            wp.launch(dk, dim=st["n_rows"],
+                      inputs=[st["diag_d"], st["rows_d"], bv,
+                              self.vals_d, self.F_d],
+                      device=self.dm.device)
         A = sp.csr_matrix((self.vals_d.numpy(), self.indices,
                            self.indptr), shape=(self.Nfull, self.Nfull))
         return A, self.F_d.numpy()
@@ -233,3 +272,37 @@ def _scatter_vec_kernel():
 
     _kernel_cache[key] = scatv
     return scatv
+
+
+def _zero_slots_kernel():
+    key = ("dev_zero_slots",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique")
+    def zk(slots: wp.array(dtype=wp.int32),
+           vals: wp.array(dtype=wp.float64)):
+        i = wp.tid()
+        vals[slots[i]] = wp.float64(0.0)
+
+    _kernel_cache[key] = zk
+    return zk
+
+
+def _diag_one_kernel():
+    key = ("dev_diag_one",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique")
+    def dk(diag: wp.array(dtype=wp.int32),
+           rows: wp.array(dtype=wp.int32),
+           bvals: wp.array(dtype=wp.float64),
+           vals: wp.array(dtype=wp.float64),
+           F: wp.array(dtype=wp.float64)):
+        i = wp.tid()
+        vals[diag[i]] = wp.float64(1.0)
+        F[rows[i]] = bvals[i]
+
+    _kernel_cache[key] = dk
+    return dk

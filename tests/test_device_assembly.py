@@ -65,3 +65,27 @@ def test_device_assembly_speed(device):
     print(f"assembly 2D L7: host {t_host*1e3:.0f} ms vs "
           f"device-scatter {t_dev*1e3:.0f} ms ({t_host/t_dev:.1f}x)")
     assert t_dev < t_host, (t_dev, t_host)
+
+
+def test_strong_rows_fold_in(device):
+    """D1 item 2 gate: device strong rows == host LIL surgery, 1e-12."""
+    dm, aq, dq, fq = _setup(2, 5, device)
+    nu, sigma = 0.05, 20.0
+    ndof = 3
+    A_h, b_h = assemble_linear_ns(dm, aq, dq, fq, nu, sigma=sigma)
+    rng = np.random.default_rng(4)
+    rows = np.unique(rng.integers(0, A_h.shape[0], 200))
+    bvals = rng.standard_normal(len(rows))
+    Al = A_h.tolil()
+    for k, r in enumerate(rows):
+        Al.rows[r] = [int(r)]
+        Al.data[r] = [1.0]
+        b_h[r] = bvals[k]
+    A_ref = Al.tocsr()
+    asm = DeviceNSAssembler(dm)
+    asm.set_strong_rows(rows)
+    A_d, b_d = asm.assemble(aq, dq, fq, nu, sigma, strong_b_vals=bvals)
+    diff = (A_ref - A_d)
+    scale = np.abs(A_ref.data).max()
+    assert (np.abs(diff.data).max() / scale if diff.nnz else 0) < 1e-12
+    assert np.abs(b_h - b_d).max() / max(np.abs(b_h).max(), 1e-30) < 1e-12
