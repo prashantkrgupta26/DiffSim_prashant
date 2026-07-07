@@ -79,3 +79,10 @@ Bunny hero ladder (H3 running tonight: wake-probe configuration; H4
 next), p2-NS, Heat/Mass bricks + closures, the 4f landscape question
 (with tonight's dataset), SBM5/SBM6 gap tests, M1d finishing touches
 (GP-field kernels; coherent-profile verdict from Nova).
+
+## Decisions taken (2026-07-07 morning)
+
+1. M3 RATIFIED (M2 -> M3 -> ... -> THB). 2. cuFEM memo held for
+Baskar's review (spec file, second half). 3. License: Apache-2.0 +
+CITATION.cff (added). 4. Nova: all three cards to be requested
+(kits ready; partitions need sinfo on arrival).

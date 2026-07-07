@@ -225,7 +225,7 @@ test that needs it is opt-in via `DIFFSIM_RUN_3D_NS=1`.
   One codebase, two runtime profiles (pure-device / coherent).
 - **M2**: Heat/Mass bricks + block coupler + neural closures; p2-NS;
   the bunny hero ladder (H3/H4).
-- **M3 (proposed)**: differentiable dynamic adaptivity (transfer-op
+- **M3 (ratified)**: differentiable dynamic adaptivity (transfer-op
   adjoints -> event-branch differentiation -> relaxed classification),
   with adjoint-readiness requirements feeding the cuFEM blueprint.
 - **Further**: electrokinetics (PNP), space-time (k = 4), multi-GPU.

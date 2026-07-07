@@ -1,6 +1,8 @@
-# M3 — Differentiable Dynamic Adaptivity (PROPOSED; placement for Baskar)
+# M3 — Differentiable Dynamic Adaptivity (RATIFIED 2026-07-07: M2 -> M3, before THB)
 
-Proposed 2026-07-06 night (conversation: cuFEM performs dynamic
+RATIFIED by Baskar 2026-07-07 (placement: after M2, before THB/M7).
+The adjoint-readiness MEMO below is HELD for Baskar's review before it
+goes to the cuFEM team. Proposed 2026-07-06 night (conversation: cuFEM performs dynamic
 adaptivity pure-device but has NO differentiability — differentiating
 THROUGH adaptivity is DiffSim's contribution). Recommended slot: after
 the physics M2, before THB (M7). M2's optimization demos will generate
