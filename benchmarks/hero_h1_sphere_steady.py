@@ -80,7 +80,14 @@ def steady(alpha_np, V, level, picard=60, tol=1e-11):
     ret, sf, mesh, cons, dm = (_EPOCH["ret"], _EPOCH["sf"], _EPOCH["mesh"],
                                _EPOCH["cons"], _EPOCH["dm"])
     geo = GeometryData.evaluate(o, ret, sf, face_tables(1, 3),
-                                domain="outside")
+                                domain="outside",
+                                warm_feet=_EPOCH.get("feet"))
+    if "feet" not in _EPOCH:
+        # anchored foot continuation (framework, findings 4f): same warm
+        # start for every alpha -> deterministic objective, continuous
+        # branch selection, and marginal points start near the right
+        # branch (v3/v4 died at cold-start marginal projections)
+        _EPOCH["feet"] = geo.d.copy()
     T = cons.T.tocsr()
     T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
     nfree = T.shape[1]
@@ -131,7 +138,8 @@ def steady(alpha_np, V, level, picard=60, tol=1e-11):
         A.data[rp] = [1.0]
         b[rp] = 0.0
         A = A.tocsr()
-        x = splu(A.tocsc()).solve(b)
+        from diffsim.solvers.linsolve import solve_linear
+        x = solve_linear(A, b, solver="cudss")
         u_new = x.reshape(nfree, ndof)[:, :dim]
         if prev is not None and np.abs(u_new - prev).max() < tol:
             break
