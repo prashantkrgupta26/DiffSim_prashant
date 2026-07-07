@@ -312,3 +312,11 @@ M2-A4 GATES (2026-07-07): de Vahl Davis L6 Pr=0.71 — Ra=1e3
    0.02%). Both essentially exact, first shot. The coupled system =
    NS brick + scalar brick + lagged Boussinesq + consistent-flux Nu.
    Baseline locked (tests/baselines/m2_devahl_davis.json).
+
+M2-B1 HUNT NOTES (2026-07-07): (i) consistent-flux chi must sit at rows
+   CARRYING boundary/face contributions (interior volume rows are
+   exactly satisfied -> Q=0 identically; the box discriminator proved
+   it); (ii) the adjoint chain misses lam.(db_v/dkappa) — the LOAD
+   kernel's tau(kappa) SUPG weight (needs a taped be kernel; zero when
+   fq=0, so NOT the cylinder's 1.1e-3); (iii) alpha(kappa) freezing =
+   the solver-parameter gradient contract (66x term).
