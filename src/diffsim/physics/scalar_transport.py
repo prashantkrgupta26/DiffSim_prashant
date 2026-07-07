@@ -187,3 +187,11 @@ def assemble_scalar_ad(dm, aq_by_bin, fq_by_bin, kappa, sigma=0.0,
                       shape=(dm.n_nodes, dm.n_nodes)).tocsr()
     T = dm.constraints.T.tocsr()
     return (T.T @ K @ T).tocsr(), np.asarray(T.T @ F_full)
+
+# FORMULATION NOTE (Baskar, 2026-07-07): the full VMS fine-scale
+# substitution yields three terms: (1) +tau(a.grad w, Res) [SUPG-type —
+# CRUCIAL, implemented, with the COMPLETE residual incl. -kappa*lapN];
+# (2) +tau((div a) w, Res) [plain-w; zero for solenoidal a, small for
+# discrete NS velocities — omitted, minor for convergence];
+# (3) +kappa*tau(lap w, Res) [adjoint-diffusion; zero at p1 — omitted,
+# minor; lapN tables make it ~3 lines when p2 VMS-exactness is wanted].

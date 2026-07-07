@@ -796,6 +796,23 @@ class SBMPoisson:
                 meta["dir_rows"] = idx
         return A, rhs, meta
 
+    def face_system(self):
+        """M2-A3: the SBM FACE block alone (constrained A_face, b_face),
+        kappa applied — composes linearly with any volume operator
+        (e.g. the advection-diffusion brick for heated-immersed cases).
+        Scalar kappa only (field kappa: bake at the composition site)."""
+        import scipy.sparse as sp
+        dm = self.dm
+        frows, fcols, fvals = self._face_triplets_kappa1(None)
+        K = sp.coo_matrix(
+            (np.concatenate(fvals) if fvals else np.zeros(0),
+             (np.concatenate(frows) if frows else np.zeros(0, np.int64),
+              np.concatenate(fcols) if fcols else np.zeros(0, np.int64))),
+            shape=(dm.n_nodes, dm.n_nodes)).tocsr()
+        T = dm.constraints.T.tocsr()
+        bg1 = self._dirichlet_rhs_kappa1() + self._neumann_rhs_kappa1()
+        return (self.kappa * (T.T @ K @ T)).tocsr(), self.kappa * bg1
+
     def solve(self, f_fn, g_outer_fn=None, tol=1e-12, maxiter=20000,
               solver="direct"):
         """Assemble + solve + expand: returns u at ALL nodes.
