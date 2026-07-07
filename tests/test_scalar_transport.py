@@ -288,3 +288,60 @@ def test_scalar_cotangents_fd(device):
         np.linalg.lstsq(cons.T.toarray(), T_full, rcond=None)[0])))
     assert abs(r_tape - r_asm) / max(abs(r_asm), 1e-30) < 1e-10, (
         r_tape, r_asm)
+
+
+def test_field_kappa_gradient_fd(device):
+    """B1 gate: per-GP field-kappa gradient vs FD (3 random GPs) on the
+    box config with wall-flux QoI."""
+    from diffsim.sbm.scalar_adjoint import field_kappa_gradient
+    from scipy.sparse.linalg import splu as _splu
+    from diffsim.mesh.basis import basis_tables as bt
+    tree = build_uniform(4, dim=2)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, bt(1, dim=2), device)
+    xq = gauss_points(mesh, dm.tables_by_p)
+    pv, ngp = 1, len(xq[1])
+    aq = {pv: np.tile([1.0, 0.3], (ngp, 1))}
+    fq = {pv: np.zeros(ngp)}
+    coords = mesh.node_coords[cons.free_nodes]
+    bdry = np.zeros(len(coords), bool)
+    for c in range(2):
+        bdry |= (np.abs(coords[:, c]) < 1e-12) | \
+                (np.abs(coords[:, c] - 1) < 1e-12)
+    dirn = np.where(bdry)[0]
+    hot = np.where(np.abs(coords[:, 0]) < 1e-12)[0]
+    chi = np.zeros(len(coords)); chi[hot] = 1.0
+
+    def solve_Q(kq_np):
+        A, b = assemble_scalar_ad(dm, aq, fq,
+                                  lambda x_: kq_np[:len(x_)], sigma=0.0)
+        Av, bv = A.copy(), b.copy()
+        A = A.tolil()
+        hs = set(hot)
+        for i in dirn:
+            A.rows[i] = [int(i)]; A.data[i] = [1.0]
+            b[i] = 1.0 if i in hs else 0.0
+        T = _splu(A.tocsr().tocsc()).solve(b)
+        return float(chi @ (Av @ T - bv)), A.tocsr(), Av, T
+
+    kq0 = np.full(ngp, 0.05)
+    Q0, A, Av, T = solve_Q(kq0)
+    rhs = Av.T @ chi
+    rhs[dirn] = 0.0
+    lam = _splu(A.tocsc().T).solve(rhs)
+    lam[dirn] = 0.0
+    g = field_kappa_gradient(dm, aq, {pv: kq0}, 0.0,
+                             np.asarray(cons.T @ T),
+                             np.asarray(cons.T @ lam),
+                             np.asarray(cons.T @ chi))[pv]
+    rng = np.random.default_rng(9)
+    eps = 1e-6
+    for gpi in rng.integers(0, ngp, 3):
+        kp = kq0.copy(); kp[gpi] += eps
+        km = kq0.copy(); km[gpi] -= eps
+        fd = (solve_Q(kp)[0] - solve_Q(km)[0]) / (2 * eps)
+        err = abs(g[gpi] - fd)
+        rel = err / max(abs(fd), 1e-12)
+        # low-sensitivity GPs: FD noise dominates rel — absolute backstop
+        assert rel < 1e-5 or err < 1e-10, (int(gpi), rel, g[gpi], fd)

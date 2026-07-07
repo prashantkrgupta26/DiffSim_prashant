@@ -106,3 +106,18 @@ def scalar_volume_cotangents(dm, aq_by_bin, kq_by_bin, sigma, x_full,
         out[pv] = (-tape.gradients[kq].numpy(),
                    -tape.gradients[aq].numpy())
     return out
+
+
+def field_kappa_gradient(dm, aq_by_bin, kq_by_bin, sigma, T_full,
+                         lam_full, chi_full, supg=1.0):
+    """B1 INTERFACE: per-GP dQ/dkq for Q = chi.(A_v(kq) T - b_v), given
+    the SOLVED adjoint lam (caller contract, from the B1 hunt rules:
+    (1) chi sits at rows CARRYING boundary/face contributions;
+    (2) lam[replaced_rows] = 0 BEFORE calling (identity rows carry no
+    dA/dk); (3) any kappa-dependent solver parameters (Nitsche alpha)
+    frozen). Returns {pv: dQ/dkq [ngp]}."""
+    cc = scalar_volume_cotangents(dm, aq_by_bin, kq_by_bin, sigma,
+                                  T_full, chi_full, supg=supg)
+    cl = scalar_volume_cotangents(dm, aq_by_bin, kq_by_bin, sigma,
+                                  T_full, lam_full, supg=supg)
+    return {pv: (-cc[pv][0]) - (-cl[pv][0]) for pv in cc}
