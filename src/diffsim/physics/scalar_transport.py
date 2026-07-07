@@ -188,6 +188,15 @@ def assemble_scalar_ad(dm, aq_by_bin, fq_by_bin, kappa, sigma=0.0,
     T = dm.constraints.T.tocsr()
     return (T.T @ K @ T).tocsr(), np.asarray(T.T @ F_full)
 
+# PROVENANCE (CMAME_NSPNP_WeakBC.pdf, Def. 3 Eq. 28 + Remark 4, p.7 —
+# the group's published scalar form): ONE stabilization term,
+# +sum_K (tau (a.grad q), Res)_K — SUPG-type test, NO plain-w term;
+# residual truncated to dc/dt + a.grad c at p1 (second-order terms
+# dropped by Remark 4's H1 argument; body force joins the residual in
+# the NS analogue Eq. 30). THIS module implements that form PLUS the
+# -kappa*lapN residual term — identical at p1 (lapN=0), and the
+# measured requirement for order 3 at p2 (Remark 4's truncation is a
+# p1 statement, not a formulation limit).
 # FORMULATION NOTE (Baskar, 2026-07-07): the full VMS fine-scale
 # substitution yields three terms: (1) +tau(a.grad w, Res) [SUPG-type —
 # CRUCIAL, implemented, with the COMPLETE residual incl. -kappa*lapN];
