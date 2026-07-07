@@ -70,7 +70,8 @@ def run_transient(alpha_np, V, n_steps=N_STEPS):
     o = make_oracle(alpha_np, V)
     geo = GeometryData.evaluate(o, E["ret"], E["sf"], face_tables(1, 3),
                                 domain="outside",
-                                warm_feet=E.get("feet"))
+                                warm_feet=E.get("feet"),
+                                max_fail_frac=0.005)
     if "feet" not in E:
         E["feet"] = geo.d.copy()
     tsa = TransientShapeAdjoint(E["dm"], E["sf"], geo, o, NU, DT,

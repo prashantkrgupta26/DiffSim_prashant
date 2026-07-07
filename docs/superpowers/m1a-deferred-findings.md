@@ -271,3 +271,19 @@ FAMILY, measured by term-masked bisection:
    whose edits were global); GN stalls at alpha ~ 1e-4, adjcos
    incoherent. Steady + diffuse signal + 4f micro-structure = stall;
    TRANSIENT converges (H2). H4 is the bunny's correct formulation.
+
+4f-DATA (landscape probe, 2026-07-07 night; benchmarks/data/
+   landscape_4f.txt, 72 rays x scales 1e-5..1e-2, L4 vs L5, sphere INR
+   Poisson probes): the steep sub-edit-scale structure TRACKS h RELATIVE
+   TO SURFACE WOBBLE, not the Nitsche penalty. L4: J quadratic in alpha
+   down to 1e-5 (smooth; matches its 1e-6 gradient checks; roughness
+   0.12). L5: J(1e-5) is SIX ORDERS above quadratic scaling; J
+   non-monotone in scale (J(1e-4)=6.98 > J(1e-2)=0.67); roughness 0.47.
+   Mechanism: the checkpoint's 7% wobble is ~0.3h at L4 but ~0.6h at L5
+   — near-tangent surrogate faces + foot bistability densify as wobble
+   -> h/2. IMPLICATIONS: (1) for wobbly provided INRs, coarser meshes
+   give SMOOTHER inverse landscapes (L4 was the right hero resolution
+   all along); (2) the resolution rule for INR optimization is
+   wobble-amplitude-vs-h, not feature-size-vs-h; (3) redirects
+   EXPLORE-6/N6: study wobble/h, not penalty weight. The tutorial's L5
+   plateau and H1-L4's success are both explained.

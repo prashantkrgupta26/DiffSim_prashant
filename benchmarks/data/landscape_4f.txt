@@ -1,0 +1,85 @@
+[modes] top-4 eigenvalues [11277.26  6719.27  5193.58  3638.48], subspace stability 1.000
+Warp 1.14.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.2
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA RTX 6000 Ada Generation" (48 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/bglab/.cache/warp/1.14.0
+Module make_poisson_element_matrices__locals__poisson_Ke_3dca1c12 3dca1c1 load on device 'cuda:0' took 2.40 ms  (cached)
+Module make_sbm_dirichlet_Ae__locals__sbm_dir_Ae_c5f0e1ab c5f0e1a load on device 'cuda:0' took 1.54 ms  (cached)
+Module make_load_kernel__locals__load_951f6381 951f638 load on device 'cuda:0' took 0.80 ms  (cached)
+Module make_sbm_dirichlet_be__locals__sbm_dir_be_fe49e1e8 fe49e1e load on device 'cuda:0' took 0.92 ms  (cached)
+L4 sc=1e-05 t=-1.00 J=1.991962e-09
+L4 sc=1e-05 t=-0.75 J=1.120783e-09
+L4 sc=1e-05 t=-0.50 J=4.982610e-10
+L4 sc=1e-05 t=-0.25 J=1.245991e-10
+L4 sc=1e-05 t=+0.00 J=4.276302e-31
+L4 sc=1e-05 t=+0.25 J=1.246669e-10
+L4 sc=1e-05 t=+0.50 J=4.988034e-10
+L4 sc=1e-05 t=+0.75 J=1.122613e-09
+L4 sc=1e-05 t=+1.00 J=1.996301e-09
+L4 sc=1e-04 t=-1.00 J=1.972769e-07
+L4 sc=1e-04 t=-0.75 J=1.112651e-07
+L4 sc=1e-04 t=-0.50 J=4.958412e-08
+L4 sc=1e-04 t=-0.25 J=1.242953e-08
+L4 sc=1e-04 t=+0.00 J=7.269423e-31
+L4 sc=1e-04 t=+0.25 J=1.249733e-08
+L4 sc=1e-04 t=+0.50 J=5.012655e-08
+L4 sc=1e-04 t=+0.75 J=1.130959e-07
+L4 sc=1e-04 t=+1.00 J=2.016170e-07
+L4 sc=1e-03 t=-1.00 J=6.267603e-05
+L4 sc=1e-03 t=-0.75 J=7.766166e-05
+L4 sc=1e-03 t=-0.50 J=6.330562e-05
+L4 sc=1e-03 t=-0.25 J=1.213722e-06
+L4 sc=1e-03 t=+0.00 J=6.232369e-31
+L4 sc=1e-03 t=+0.25 J=1.281608e-06
+L4 sc=1e-03 t=+0.50 J=5.279279e-06
+L4 sc=1e-03 t=+0.75 J=2.594219e-03
+L4 sc=1e-03 t=+1.00 J=2.820860e-03
+L4 sc=1e-02 t=-1.00 J=6.068766e-04
+L4 sc=1e-02 t=-0.75 J=3.547768e-04
+L4 sc=1e-02 t=-0.50 J=2.113244e-04
+L4 sc=1e-02 t=-0.25 J=1.258066e-04
+L4 sc=1e-02 t=+0.00 J=2.579326e-30
+L4 sc=1e-02 t=+0.25 J=2.302352e-03
+L4 sc=1e-02 t=+0.50 J=1.825616e-03
+L4 sc=1e-02 t=+0.75 J=6.342258e-03
+L4 sc=1e-02 t=+1.00 J=1.951681e-02
+[modes] top-4 eigenvalues [11277.26  6719.27  5193.58  3638.48], subspace stability 1.000
+L5 sc=1e-05 t=-1.00 J=2.138606e-03
+L5 sc=1e-05 t=-0.75 J=1.149213e-03
+L5 sc=1e-05 t=-0.50 J=4.884266e-04
+L5 sc=1e-05 t=-0.25 J=1.168788e-04
+L5 sc=1e-05 t=+0.00 J=1.919882e-28
+L5 sc=1e-05 t=+0.25 J=1.073755e-04
+L5 sc=1e-05 t=+0.50 J=4.121979e-04
+L5 sc=1e-05 t=+0.75 J=8.907997e-04
+L5 sc=1e-05 t=+1.00 J=1.522252e-03
+L5 sc=1e-04 t=-1.00 J=6.979232e+00
+L5 sc=1e-04 t=-0.75 J=7.413825e-01
+L5 sc=1e-04 t=-0.50 J=1.340141e-01
+L5 sc=1e-04 t=-0.25 J=1.800846e-02
+L5 sc=1e-04 t=+0.00 J=2.084140e-27
+L5 sc=1e-04 t=+0.25 J=7.616351e-03
+L5 sc=1e-04 t=+0.50 J=2.202154e-02
+L5 sc=1e-04 t=+0.75 J=3.742573e-02
+L5 sc=1e-04 t=+1.00 J=2.254527e-01
+L5 sc=1e-03 t=-1.00 J=3.519048e-01
+L5 sc=1e-03 t=-0.75 J=3.839862e-01
+L5 sc=1e-03 t=-0.50 J=1.278090e+00
+L5 sc=1e-03 t=-0.25 J=3.026739e-01
+L5 sc=1e-03 t=+0.00 J=5.552336e-29
+L5 sc=1e-03 t=+0.25 J=2.361904e-01
+L5 sc=1e-03 t=+0.50 J=3.305031e-01
+L5 sc=1e-03 t=+0.75 J=3.331632e-01
+L5 sc=1e-03 t=+1.00 J=3.250184e-01
+L5 sc=1e-02 t=-1.00 J=3.364025e-01
+L5 sc=1e-02 t=-0.75 J=2.731503e-01
+L5 sc=1e-02 t=-0.50 J=3.200685e-01
+L5 sc=1e-02 t=-0.25 J=3.628062e-01
+L5 sc=1e-02 t=+0.00 J=7.128291e-28
+L5 sc=1e-02 t=+0.25 J=3.520170e-01
+L5 sc=1e-02 t=+0.50 J=6.681579e-01
+L5 sc=1e-02 t=+0.75 J=3.566431e-01
+L5 sc=1e-02 t=+1.00 J=3.558926e-01
