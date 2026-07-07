@@ -185,3 +185,12 @@
    configurations — the 3D L7 order pair stays blocked pending multi-GPU
    direct (AMGX-distributed cuDSS-class memory) or a bespoke
    preconditioner. System saved for future sweeps.
+   (i) TASK #6 RESOLVED IN PRINCIPLE (sigma=0 probe, 2026-07-06 night):
+   the block-triangular preconditioner is IDEAL when the F-block solve is
+   exact — FGMRES converges in 2 its (diagC Schur) / 3 its (CC) on the
+   steady cavity-L6 system where every AMG-F variant previously diverged.
+   The earlier failures were the WEAK F-cycle, not the block structure.
+   Production recipe: F = cuDSS-factorized velocity block (smaller than
+   A; refactor per Picard step) + diagC Schur; the AMG-F path remains the
+   research edge only for scales beyond direct-F feasibility. Krylov-F
+   (bicgstab 1e-2) converges (10 its) but is uncompetitive host-side.
