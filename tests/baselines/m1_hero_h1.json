@@ -1,0 +1,30 @@
+{
+  "hero_h1_sphere_steady": {
+    "alpha_star": [
+      0.015,
+      -0.01,
+      0.008,
+      -0.012
+    ],
+    "recovered": [
+      0.0143,
+      -0.0093,
+      0.00659,
+      -0.01238
+    ],
+    "recovery_err": 0.001769,
+    "bar": 0.002,
+    "err_trajectory": [
+      0.02309,
+      0.01439,
+      0.01119,
+      0.009001,
+      0.005061,
+      0.003044,
+      0.002302,
+      0.002292,
+      0.001769
+    ],
+    "config": "sphere INR (w0=1.0, window 0.03/0.5), L4, steady 3-D NS sigma=0 Picard + cuDSS, 16-probe plane, k=4 displacement-normalized Gram modes, frozen epoch + anchored feet + marginal-GP borrow (0.5%), GN 8 epochs, adjoint-Picard consistency cos up to 0.995"
+  }
+}
