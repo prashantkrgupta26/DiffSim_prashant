@@ -152,3 +152,19 @@ def test_stepper_device_assembly_parity(device):
     for a, b_ in zip(xs_h, xs_d):
         scale = max(np.abs(a).max(), 1e-30)
         assert np.abs(a - b_).max() / scale < 1e-11
+
+
+def test_assemble_device_resident(device):
+    """D3 gate: device-resident CSR solves identically to the host path."""
+    import torch
+    from nvmath.sparse.advanced import DirectSolver
+    dm, aq, dq, fq = _setup(2, 5, device)
+    asm = DeviceNSAssembler(dm)
+    A_h, b_h = asm.assemble(aq, dq, fq, 0.05, 20.0)
+    A_t, b_t = asm.assemble_device(aq, dq, fq, 0.05, 20.0)
+    slv = DirectSolver(A_t, b_t.clone())
+    slv.plan(); slv.factorize()
+    x_t = slv.solve().cpu().numpy()
+    res = np.linalg.norm(A_h @ x_t - b_h) / max(
+        np.linalg.norm(b_h), 1e-30)
+    assert res < 1e-11, res

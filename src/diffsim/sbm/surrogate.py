@@ -222,7 +222,8 @@ class GeometryData:
     @classmethod
     def evaluate(cls, oracle, tree: Octree, sf: SurrogateFaces, ftab,
                  domain: str = "inside",
-                 warm_feet: np.ndarray = None) -> "GeometryData":
+                 warm_feet: np.ndarray = None,
+                 max_fail_frac: float = 0.0) -> "GeometryData":
         sgn = -_domain_sign(domain)      # out-of-domain: +grad for "inside"
         xq = face_gauss_points(tree, sf, ftab)
         d, n_grad, ok = oracle.distance_vector(

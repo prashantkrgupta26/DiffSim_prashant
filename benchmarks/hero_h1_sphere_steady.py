@@ -81,7 +81,8 @@ def steady(alpha_np, V, level, picard=60, tol=1e-11):
                                _EPOCH["cons"], _EPOCH["dm"])
     geo = GeometryData.evaluate(o, ret, sf, face_tables(1, 3),
                                 domain="outside",
-                                warm_feet=_EPOCH.get("feet"))
+                                warm_feet=_EPOCH.get("feet"),
+                                max_fail_frac=0.005)
     if "feet" not in _EPOCH:
         # anchored foot continuation (framework, findings 4f): same warm
         # start for every alpha -> deterministic objective, continuous
