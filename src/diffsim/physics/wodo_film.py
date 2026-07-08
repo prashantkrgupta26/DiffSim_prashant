@@ -111,6 +111,22 @@ before the solve. Host path stays the default. Requires identity
 constraints (uniform strips — true for every Wodo mesh). Parity gate:
 trajectory agreement < 1e-11 vs the host path (tests/test_wodo_film).
 
+v1.3 LEARNABLE f_mix PERTURBATION (M4-e): optional Chebyshev correction
+to the polymer exchange potential, delta-f'(phi_p) =
+sum_{k=2..4} c_k T_k(s), s = 2 phi_p - 1, added to mu_1 with its
+consistent d/dphi_p in the Jacobian (d11). T0 AND T1 are EXCLUDED by
+construction (gauge anchoring): T0 is a constant shift of mu — the
+dynamics only see grad(mu) and the phi-valued top flux, so it is
+exactly invisible; T1 is linear in phi_p, i.e. integrates to a
+QUADRATIC free energy, which the FH chi terms already span — the map
+(chi_pf, chi_ps, c_1) -> (chi_pf + t, chi_ps + t, c_1 + t) cancels
+identically in mu_1, mu_2, d11, d12, d22 (MEASURED: trajectory
+difference 5e-15 at t = 0.1; an M4-e recovery with T1 learnable slid
+along exactly this gauge direction, recovered-minus-truth =
+(0.210, 0.209, 0.147) on (chi_pf, chi_ps, c_1)). Beyond-FH content
+starts at CUBIC f, i.e. T2 of f'. Defaults (0, 0, 0) reproduce v1.2
+bit-for-bit (adds literal zeros).
+
 v1.1 CONSERVED LANGEVIN NOISE (their CHC term, Sec. 5.3): stochastic
 flux q_i per GP, residual += Int grad~(w) . q_i dV, q_i ~ N(0,1) *
 noise * sqrt(2 M_ii / dt) (FDT shape; the absolute nondimensional
@@ -185,6 +201,7 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
                c12: wp.float64, c1s: wp.float64, c2s: wp.float64,
                n1i: wp.float64, n2i: wp.float64, nsi: wp.float64,
                breg: wp.float64,
+               ch2: wp.float64, ch3: wp.float64, ch4: wp.float64,
                kap1: wp.float64, kap2: wp.float64,
                sigma: wp.float64,
                mlat: wp.float64, mvert: wp.float64,
@@ -217,6 +234,17 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
                 + wp.float64(2.0) * breg * (_binv3(p2) + _binv3(ps))
             d12 = nsi * _rinv(ps) + c12 - c1s - c2s \
                 + wp.float64(2.0) * breg * _binv3(ps)
+            # v1.3 Chebyshev delta-f'(phi_p) on s = 2 phi_p - 1
+            # (T2..T4; T0 AND T1 gauge-excluded, see module docstring)
+            sc = wp.float64(2.0) * p1 - wp.float64(1.0)
+            s2 = sc * sc
+            mu1b += ch2 * (wp.float64(2.0) * s2 - wp.float64(1.0)) \
+                + ch3 * (wp.float64(4.0) * s2 - wp.float64(3.0)) * sc \
+                + ch4 * (wp.float64(8.0) * s2 * (s2 - wp.float64(1.0))
+                         + wp.float64(1.0))
+            d11 += wp.float64(8.0) * ch2 * sc \
+                + ch3 * (wp.float64(24.0) * s2 - wp.float64(6.0)) \
+                + ch4 * (wp.float64(64.0) * s2 - wp.float64(32.0)) * sc
             # mobility: constant (Dr < 0) or their local
             # M_ii = D(phi)/f''_ideal,i (v2; Picard-frozen in Jacobian)
             M11l = M11
@@ -318,7 +346,7 @@ class WodoFilmStepper(TernaryCHStepper):
                  dt=1e-4, newton_tol=1e-9, newton_max=50,
                  lat_scale=1.0, linsolver="splu", noise=0.0,
                  noise_seed=0, var_mob=False, D_ratio=1e-3, b_reg=0.0,
-                 use_device_assembly=False):
+                 f_cheb=(0.0, 0.0, 0.0), use_device_assembly=False):
         super().__init__(dm, chi=chi, M=M, kappa=kappa, dt=dt, order=1,
                          newton_tol=newton_tol, newton_max=newton_max)
         assert dm.mesh.p == 1, "Wodo film v1: linear elements only"
@@ -337,6 +365,8 @@ class WodoFilmStepper(TernaryCHStepper):
         self.var_mob = bool(var_mob)
         self.D_ratio = float(D_ratio)
         self.b_reg = float(b_reg)
+        # v1.3 Chebyshev delta-f'(phi_p) coefficients (T2..T4)
+        self.ch2, self.ch3, self.ch4 = (float(c) for c in f_cheb)
         # skip the T4 congruence product when constraints are identity
         # (uniform strips: no hanging nodes, natural BCs only)
         n = self.Tc.shape[0]
@@ -502,6 +532,8 @@ class WodoFilmStepper(TernaryCHStepper):
                     wp.float64(1.0 / self.N1), wp.float64(1.0 / self.N2),
                     wp.float64(1.0 / self.Ns),
                     wp.float64(self.b_reg),
+                    wp.float64(self.ch2), wp.float64(self.ch3),
+                    wp.float64(self.ch4),
                     wp.float64(self.kap1), wp.float64(self.kap2),
                     wp.float64(sigma), wp.float64(mlat),
                     wp.float64(mvert), wp.float64(minv), wp.float64(K),
@@ -633,6 +665,8 @@ class WodoFilmStepper(TernaryCHStepper):
                     wp.float64(1.0 / self.N1), wp.float64(1.0 / self.N2),
                     wp.float64(1.0 / self.Ns),
                     wp.float64(self.b_reg),
+                    wp.float64(self.ch2), wp.float64(self.ch3),
+                    wp.float64(self.ch4),
                     wp.float64(self.kap1), wp.float64(self.kap2),
                     wp.float64(sigma), wp.float64(mlat),
                     wp.float64(mvert), wp.float64(minv), wp.float64(K),

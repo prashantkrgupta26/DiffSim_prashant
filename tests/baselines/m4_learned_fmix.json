@@ -1,0 +1,34 @@
+{
+  "m4_learned_fmix": {
+    "config": "Wodo film Bi=1, 4x128 strip (level 7), blend 0.2/0.2/0.6 + 1% IC noise seed 7, v1 frozen mobility M0=0.2251, kappa=2e-4, N=(5,5,1); data = laterally averaged phi_p+phi_f profiles (129 rows) at h = linspace(0.97, 0.62, 6), h-interpolated; device-bound march (use_device_assembly), ~2.5 s/march; recovery = staged GN (snap prefixes 1,2,4,6), forward-FD Jacobian (step 1e-2), absolute Levenberg + lam floor 1e-2 on non-final stages, geometric step extension",
+    "fh4": {
+      "names": ["chi_pf", "chi_ps", "chi_fs", "k_e"],
+      "truth": [1.35, 0.45, 0.3, 1.0],
+      "base": [1.0, 0.3, 0.3, 1.0],
+      "recovered": [1.34999996, 0.44999987, 0.29999999, 0.99999968],
+      "rel_err": [3.1e-08, 2.9e-07, 3.6e-08, 3.2e-07],
+      "J0": 52.671,
+      "J_final": 1.53e-12,
+      "gate_5pct": "PASS",
+      "n_marches": 112,
+      "wall_s": 147,
+      "final_sv": [21.8, 10.2, 3.51, 1.43],
+      "note": "plain GN on a saturated-pattern window (h in [0.55, 0.90]) stalls at J=61 in a wrong well with a WELL-CONDITIONED Gramian (nonconvexity, not rank deficiency); the chi signal lives in the onset/growth phase — snap 1 at h=0.97 + h-continuation recovers EXACTLY"
+    },
+    "cheb7_stretch": {
+      "names": ["chi_pf", "chi_ps", "chi_fs", "k_e", "cheb_c2", "cheb_c3", "cheb_c4"],
+      "truth": [1.35, 0.45, 0.3, 1.0, -0.06, 0.04, 0.03],
+      "base": [1.0, 0.3, 0.3, 1.0, 0.0, 0.0, 0.0],
+      "recovered": [1.38524, 0.43681, 0.29146, 1.04152, -0.2322, -0.01528, -0.05756],
+      "rel_err": [0.0261, 0.0293, 0.0285, 0.0415, 2.87, 1.38, 2.92],
+      "J0": 43.193,
+      "J_final": 0.2277,
+      "gate_5pct": "FAIL (FH block 4/4 PASS; functional coefficients FAIL)",
+      "n_marches": 228,
+      "wall_s": 261,
+      "final_sv": [312.0, 76.5, 16.7, 6.68, 4.03, 2.52, 0.875],
+      "verdict": "three independent protocols (staged / staged+acceleration / FH-first ladder restart) landed in three DISTINCT genuine local minima (J = 0.195 / 0.228 / 0.051; the last re-verified with FD step 1e-3 — gradient zero, not an FD artifact) while truth sits at J = 0. Mechanism: (chi_pf, chi_ps) += t injects exactly a T1 term into mu_1 and over the narrow composition range the film visits T2..T4 combinations approximate it (smallest Gramian eig ~1e-5 of top) — near-degenerate AND multi-basin functional subspace. Beyond-FH recovery needs instrument-space observables (S(q,t), h(t)) or broader composition coverage — track-(e) next rung"
+    },
+    "gauge_finding": "T1 of delta-f'(phi_p) is an EXACT gauge mode, not just T0: (chi_pf, chi_ps, c_1) += t cancels identically in mu_1, mu_2, d11, d12, d22 (T1 integrates to a quadratic free energy, already inside the FH chi span). Verified: trajectory difference 5e-15 at t = 0.1; a recovery with T1 learnable slid along exactly this direction (recovered-minus-truth = (0.210, 0.209, 0.147), chi offsets equal to 3 digits). Learnable Chebyshev basis is therefore T2..T4 (wodo_film v1.3)"
+  }
+}
