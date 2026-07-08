@@ -99,8 +99,8 @@ def run_transient(alpha_np, V, n_steps=N_STEPS):
     for x in xs:
         x_full = np.asarray(tsa.T_vec @ x)
         F = surrogate_traction(E["dm"], E["sf"], geo, x_full, NU, 4)
-        series.append(F[0])
-    return tsa, xs, np.array(series)
+        series.append(F[:3].copy())      # drag+lift+side: 3x samples
+    return tsa, xs, np.array(series).reshape(-1)
 
 
 def main(n_steps=N_STEPS, n_epochs=6):

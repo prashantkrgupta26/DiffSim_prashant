@@ -122,17 +122,33 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
 
     if solver == "cudss":
         # constant-matrix reuse: keep the factorized DirectSolver per key
-        from nvmath.sparse.advanced import DirectSolver, direct_solver
+        from nvmath.sparse.advanced import (DirectSolver, direct_solver,
+                                            DirectSolverOptions)
+        import glob as _glob
+        global _CUDSS_OPTS
+        try:
+            _CUDSS_OPTS
+        except NameError:
+            _mt = _glob.glob(
+                "/home/bglab/Baskar/DiffSim/.venv/lib/python3.12/"
+                "site-packages/nvidia/cu12/lib/libcudss_mtlayer_gomp.so*")
+            # multithreaded host planning: measured NECESSARY for
+            # per-step refactorization loops (M3 bunny v2: plan() was
+            # single-threaded -> 3.5h of mostly-idle planning)
+            _CUDSS_OPTS = (DirectSolverOptions(multithreading_lib=_mt[0])
+                           if _mt else None)
         if cache is not None and cache_key is not None:
             slv = cache.get(("cudss", cache_key))
             if slv is None:
-                slv = DirectSolver(A, np.ascontiguousarray(b, np.float64))
+                slv = DirectSolver(A, np.ascontiguousarray(b, np.float64),
+                                   options=_CUDSS_OPTS)
                 slv.plan()
                 slv.factorize()
                 cache[("cudss", cache_key)] = slv
             slv.reset_operands(b=np.ascontiguousarray(b, np.float64))
             return np.asarray(slv.solve())
         return np.asarray(direct_solver(
-            A, np.ascontiguousarray(b, np.float64)))
+            A, np.ascontiguousarray(b, np.float64),
+            options=_CUDSS_OPTS))
 
     raise ValueError(f"unknown solver '{solver}'")
