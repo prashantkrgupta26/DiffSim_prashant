@@ -46,7 +46,6 @@ import os
 import time
 
 import numpy as np
-import scipy.optimize as sopt
 import warp as wp
 
 from diffsim.octree.build import build_uniform, Octree
@@ -94,29 +93,45 @@ def mobility_of(Np, Nf):
 # ---------------------------------------------------------------------
 # interface-width check (their d = dphi_e * sqrt(eps^2 / Df_max))
 # ---------------------------------------------------------------------
+def _clip01(u):
+    return np.clip(u, 1e-12, 1.0 - 1e-12)
+
+
 def _binary_f(u, Np, Nf, chi):
+    u = _clip01(u)
     return (u / Np * np.log(u) + (1.0 - u) / Nf * np.log(1.0 - u)
             + chi * u * (1.0 - u))
 
 
 def interface_width(Np, Nf, chi_pf, kap):
     """Common-tangent construction on the fully-evaporated binary
-    p/f system (smallest interface, their Sec. 7)."""
-    def fp(u):
-        return (np.log(u) + 1.0) / Np - (np.log(1.0 - u) + 1.0) / Nf \
-            + chi_pf * (1.0 - 2.0 * u)
-
-    def eqs(v):
-        a, b = v
-        fa, fb = _binary_f(a, Np, Nf, chi_pf), _binary_f(b, Np, Nf, chi_pf)
-        s = (fb - fa) / (b - a)
-        return [fp(a) - s, fp(b) - s]
-
-    a, b = sopt.fsolve(eqs, [1e-3, 1.0 - 1e-3], full_output=False)
+    p/f system (smallest interface, their Sec. 7). Binodal via the
+    lower convex hull of f (robust for deep quenches where the
+    equilibrium compositions are e^-N-close to the simplex edge)."""
+    uu = np.unique(np.concatenate([
+        np.linspace(1e-9, 1 - 1e-9, 4001),
+        np.geomspace(1e-9, 0.5, 2001),
+        1.0 - np.geomspace(1e-9, 0.5, 2001)]))
+    ff = _binary_f(uu, Np, Nf, chi_pf)
+    # lower convex hull (monotone chain on the sorted grid)
+    hull = []
+    for i in range(len(uu)):
+        while len(hull) > 1:
+            i0, i1 = hull[-2], hull[-1]
+            if ((ff[i1] - ff[i0]) * (uu[i] - uu[i1])
+                    >= (ff[i] - ff[i1]) * (uu[i1] - uu[i0])):
+                hull.pop()
+            else:
+                break
+        hull.append(i)
+    # widest hull gap = the miscibility gap
+    gaps = np.diff(uu[hull])
+    j = int(np.argmax(gaps))
+    a, b = uu[hull[j]], uu[hull[j + 1]]
     fa = _binary_f(a, Np, Nf, chi_pf)
     s = (_binary_f(b, Np, Nf, chi_pf) - fa) / (b - a)
-    uu = np.linspace(a, b, 2001)[1:-1]
-    barrier = np.max(_binary_f(uu, Np, Nf, chi_pf) - (fa + s * (uu - a)))
+    um = np.linspace(a, b, 2001)[1:-1]
+    barrier = np.max(_binary_f(um, Np, Nf, chi_pf) - (fa + s * (um - a)))
     return (b - a) * np.sqrt(kap / barrier)
 
 
@@ -127,35 +142,39 @@ def interface_width_ternary(Np, Nf, chi, kap, phis):
     c = 1.0 - phis
 
     def g(u):
-        p1, p2 = c * u, c * (1.0 - u)
+        p1, p2 = _clip01(c * u), _clip01(c * (1.0 - u))
         return (p1 / Np * np.log(p1) + p2 / Nf * np.log(p2)
                 + phis / NS * np.log(phis) + c12 * p1 * p2
                 + c1s * p1 * phis + c2s * p2 * phis)
 
-    def gp(u):
-        p1, p2 = c * u, c * (1.0 - u)
-        return c * ((np.log(p1) + 1.0) / Np - (np.log(p2) + 1.0) / Nf
-                    + c12 * (p2 - p1) + (c1s - c2s) * phis)
-
-    def eqs(v):
-        a, b = v
-        s = (g(b) - g(a)) / (b - a)
-        return [gp(a) - s, gp(b) - s]
-
-    try:
-        a, b = sopt.fsolve(eqs, [1e-3, 1.0 - 1e-3], full_output=False)
-        if not (0 < a < b < 1):
-            return np.nan
-        ga = g(a)
-        s = (g(b) - ga) / (b - a)
-        uu = np.linspace(a, b, 2001)[1:-1]
-        barrier = np.max(g(uu) - (ga + s * (uu - a)))
-        if barrier <= 0:
-            return np.nan
-        # composition span in phi_p units = c*(b-a)
-        return c * (b - a) * np.sqrt(kap / barrier)
-    except Exception:
+    uu = np.unique(np.concatenate([
+        np.linspace(1e-9, 1 - 1e-9, 4001),
+        np.geomspace(1e-9, 0.5, 2001),
+        1.0 - np.geomspace(1e-9, 0.5, 2001)]))
+    gg = g(uu)
+    hull = []
+    for i in range(len(uu)):
+        while len(hull) > 1:
+            i0, i1 = hull[-2], hull[-1]
+            if ((gg[i1] - gg[i0]) * (uu[i] - uu[i1])
+                    >= (gg[i] - gg[i1]) * (uu[i1] - uu[i0])):
+                hull.pop()
+            else:
+                break
+        hull.append(i)
+    gaps = np.diff(uu[hull])
+    j = int(np.argmax(gaps))
+    a, b = uu[hull[j]], uu[hull[j + 1]]
+    if b - a < 1e-3:
+        return np.nan                      # single phase at this phi_s
+    ga = g(a)
+    s = (g(b) - ga) / (b - a)
+    um = np.linspace(a, b, 2001)[1:-1]
+    barrier = np.max(g(um) - (ga + s * (um - a)))
+    if barrier <= 0:
         return np.nan
+    # composition span in phi_p units = c*(b-a)
+    return c * (b - a) * np.sqrt(kap / barrier)
 
 
 # ---------------------------------------------------------------------
@@ -292,7 +311,7 @@ def run_case(case, mesh, cons, hc, device, quick=False, wall_cap=2400,
     st = WodoFilmStepper(dm, chi=chi, N=(Np, Nf, NS),
                          M=(M11, 0.0, M22), kappa=(kap, kap), k_e=Bi,
                          dt=1e-4, lat_scale=LX / 0.75, linsolver=linsolver,
-                         noise=noise,
+                         noise=noise, var_mob=True, b_reg=1e-3,
                          noise_seed=abs(hash(case + "q")) % 2**31)
     rng = np.random.default_rng(abs(hash(case)) % 2**31)
     st.set_initial(
@@ -303,13 +322,14 @@ def run_case(case, mesh, cons, hc, device, quick=False, wall_cap=2400,
           f"kappa={kap:.3e} M=({M11:.3f},{M22:.3f}) =====", flush=True)
     d_bin = interface_width(Np, Nf, chi[0], kap)
     d_t3 = interface_width_ternary(Np, Nf, chi, kap, 0.3)
-    dx_lat = LX / 96.0
+    dx_lat = hc * LX / 0.75            # physical lateral cell
+    ny_c = round(0.375 / hc)           # vertical cells over theta [0,1]
     print(f"  interface check: delta(binary,final)={d_bin:.4f} "
           f"({d_bin / dx_lat:.1f} lat elems, "
-          f"{d_bin / (0.30 / 48):.1f} vert elems @h=0.30) | "
+          f"{d_bin / (0.30 / ny_c):.1f} vert elems @h=0.30) | "
           f"delta(ternary,phi_s=0.3)={d_t3:.4f} "
           f"({d_t3 / dx_lat:.1f} lat elems, "
-          f"{d_t3 / (0.55 / 48):.1f} vert elems @h=0.55)", flush=True)
+          f"{d_t3 / (0.55 / ny_c):.1f} vert elems @h=0.55)", flush=True)
     t0 = time.time()
     reason = st.march(h_min=0.27, phis_stop=0.10,
                       max_steps=60 if quick else 20000,

@@ -36,6 +36,17 @@ C1-regularized log kept from the base (linear extension below 1e-4).
 Their b*sum(1/phi_i) simplex regularizer (b = 1e-3) is SKIPPED in v1 —
 the regularized log already supplies a growing restoring force.
 
+v2 (b_reg > 0) RESTORES their footnote-2 term  f += b sum_i 1/phi_i:
+  mu_i += b (1/phi_s^2 - 1/phi_i^2)
+  d11  += 2b (1/phi_1^3 + 1/phi_s^3),  d12 += 2b / phi_s^3
+(inverses floored at 1e-3 — C0, monotone restoring). NOT just
+numerics for the DILUTE initial states of the 2-D campaign: at
+phi_p = phi_f = 0.125 the term adds +2b/phi^3 ~= +2.05 to the p-f
+exchange curvature, so the Np = 100 blend is STABLE at t = 0 (pure FH:
+-0.32, i.e. instant bulk spinodal). With b = 1e-3 (their value) the
+bulk quenches only upon enrichment — which arrives top-first =>
+surface-directed layering, the paper's Fig 6/7 multilayer mechanism.
+
 MOBILITY v1: constant SPD M (M12 = 0). Their composition-dependent
 M_i = D(phi)/f''_ideal(phi_i) with D = sum D_i phi_i, D_p = D_f =
 1e-3 D_s is v2. v1 mapping (documented, used by the Fig-3 benchmark):
@@ -45,6 +56,19 @@ exactly (their Eq. 33). At the 1D blend (0.2, 0.2, 0.6) this gives
 M0 ~= 0.225 and an effective solvent-gradient relaxation diffusivity
 M0*(d11 + d12) ~= 0.93 ~ D_s — self-consistent. v1 has no mobility
 freeze-out as phi_s -> 0 (their D drops to 1e-3 D_s; noted, v2).
+
+MOBILITY v2 (var_mob=True; M4-c Fig 6/7): their local
+M_ii(phi) = D(phi) / f''_ideal,i,  D = phi_s + D_ratio (1 - phi_s),
+f''_ideal,i = 1/(N_i phi_i) + 1/(N_s phi_s)  (regularized inverses),
+evaluated per GP at the current Newton iterate; the Jacobian keeps M
+PICARD-FROZEN (no dM/dphi blocks) — same converged solution, the
+Appendix-A heuristic absorbs the odd extra iteration. MEASURED
+NECESSITY: without freeze-out the frozen-M film keeps coarsening at
+D ~ D0 ~ 0.75 after the solvent is gone (their D -> 0.1 at
+phi_s = 0.1) and every 2-D morphology collapses to the equilibrium
+bilayer before the stop criterion; the paper's 'morphology frozen'
+regime needs D(phi). Langevin noise is scaled by sqrt(M_ii(phi))
+in-kernel (local FDT), so fluctuations freeze out with the mobility.
 
 TIME STEPPING: BDF1 + their Appendix-A heuristic (iters < 20 =>
 dt *= 1.25; no convergence in 50 (or divergence) => dt *= 0.25, retry).
@@ -94,11 +118,27 @@ from ..mesh.nodes import _local_offsets
 from .ternary_ch import TernaryCHStepper, _rlog, _rinv
 
 
+@wp.func
+def _binv2(x: wp.float64) -> wp.float64:
+    # floored 1/x^2 for the b-regularizer (their footnote-2 term)
+    y = wp.max(x, wp.float64(1e-3))
+    return wp.float64(1.0) / (y * y)
+
+
+@wp.func
+def _binv3(x: wp.float64) -> wp.float64:
+    y = wp.max(x, wp.float64(1e-3))
+    return wp.float64(1.0) / (y * y * y)
+
+
 def make_wodo_newton(nbf: int, nqp: int, dim: int):
-    """tch_newton + (a) chain-length FH, (b) anisotropic Landau metric
-    (vertical gradients scaled by minv = 1/h_curr), (c) mapped-frame
-    advection +K theta/h d(phi)/dtheta (rows 4a+0 / 4a+2 and their
-    diagonal Jacobian blocks). Vertical axis = dim-1."""
+    """tch_newton + (a) chain-length FH (+ optional b-regularizer),
+    (b) anisotropic metric: vertical gradients scaled by mvert =
+    Ycomp/h_curr, lateral by mlat = 1/lat_scale, (c) mapped-frame
+    advection +K xi_y (1/h) d(phi)/dxi_y (rows 4a+0 / 4a+2 and their
+    diagonal Jacobian blocks), (d) optional local mobility
+    M_ii = D(phi)/f''_ideal,i (Dr >= 0), (e) conserved Langevin flux
+    q_i (load only, scaled by local sqrt(M_ii)). Vertical = dim-1."""
     key = ("wodo_newton", nbf, nqp, dim)
     if key in _kernel_cache:
         return _kernel_cache[key]
@@ -126,8 +166,10 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
                q2: wp.array2d(dtype=wp.float64),
                theta: wp.array(dtype=wp.float64),
                M11: wp.float64, M12: wp.float64, M22: wp.float64,
+               Dr: wp.float64,
                c12: wp.float64, c1s: wp.float64, c2s: wp.float64,
                n1i: wp.float64, n2i: wp.float64, nsi: wp.float64,
+               breg: wp.float64,
                kap1: wp.float64, kap2: wp.float64,
                sigma: wp.float64,
                mlat: wp.float64, mvert: wp.float64,
@@ -146,13 +188,30 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
             ps = wp.float64(1.0) - p1 - p2
             mu1b = n1i * (_rlog(p1) + wp.float64(1.0)) \
                 - nsi * (_rlog(ps) + wp.float64(1.0)) \
-                + c12 * p2 + c1s * (ps - p1) - c2s * p2
+                + c12 * p2 + c1s * (ps - p1) - c2s * p2 \
+                + breg * (_binv2(ps) - _binv2(p1))
             mu2b = n2i * (_rlog(p2) + wp.float64(1.0)) \
                 - nsi * (_rlog(ps) + wp.float64(1.0)) \
-                + c12 * p1 + c2s * (ps - p2) - c1s * p1
-            d11 = n1i * _rinv(p1) + nsi * _rinv(ps) - wp.float64(2.0) * c1s
-            d22 = n2i * _rinv(p2) + nsi * _rinv(ps) - wp.float64(2.0) * c2s
-            d12 = nsi * _rinv(ps) + c12 - c1s - c2s
+                + c12 * p1 + c2s * (ps - p2) - c1s * p1 \
+                + breg * (_binv2(ps) - _binv2(p2))
+            d11 = n1i * _rinv(p1) + nsi * _rinv(ps) \
+                - wp.float64(2.0) * c1s \
+                + wp.float64(2.0) * breg * (_binv3(p1) + _binv3(ps))
+            d22 = n2i * _rinv(p2) + nsi * _rinv(ps) \
+                - wp.float64(2.0) * c2s \
+                + wp.float64(2.0) * breg * (_binv3(p2) + _binv3(ps))
+            d12 = nsi * _rinv(ps) + c12 - c1s - c2s \
+                + wp.float64(2.0) * breg * _binv3(ps)
+            # mobility: constant (Dr < 0) or their local
+            # M_ii = D(phi)/f''_ideal,i (v2; Picard-frozen in Jacobian)
+            M11l = M11
+            M22l = M22
+            if Dr >= wp.float64(0.0):
+                Dloc = wp.max(ps + Dr * (p1 + p2), Dr)
+                M11l = Dloc / (n1i * _rinv(p1) + nsi * _rinv(ps))
+                M22l = Dloc / (n2i * _rinv(p2) + nsi * _rinv(ps))
+            s1 = wp.sqrt(M11l)
+            s2 = wp.sqrt(M22l)
             # advection coefficient on the RAW xi_y-derivative:
             # K * xi_y * (1/h_curr)  (Ycomp cancels; see docstring)
             adv = kadv * theta[gp] * madv
@@ -169,14 +228,14 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
                     if dd == vax:
                         ms = mvert
                     gNa = dNtab[q, a, dd] * dscale * ms
-                    gM1 += gNa * (M11 * gm1k[gp, dd]
+                    gM1 += gNa * (M11l * gm1k[gp, dd]
                                   + M12 * gm2k[gp, dd]) * ms
                     gM2 += gNa * (M12 * gm1k[gp, dd]
-                                  + M22 * gm2k[gp, dd]) * ms
+                                  + M22l * gm2k[gp, dd]) * ms
                     gP1 += gNa * gp1k[gp, dd] * ms
                     gP2 += gNa * gp2k[gp, dd] * ms
-                    gQ1 += gNa * q1[gp, dd]
-                    gQ2 += gNa * q2[gp, dd]
+                    gQ1 += gNa * q1[gp, dd] * s1
+                    gQ2 += gNa * q2[gp, dd] * s2
                 r1 = (Na * (sigma * p1k[gp] - h1[gp]
                             + adv * gp1k[gp, vax]) + gM1 + gQ1) * dJxW
                 rm1 = (Na * (m1k[gp] - mu1b)) * dJxW - kap1 * gP1 * dJxW
@@ -203,7 +262,7 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
                     wp.atomic_add(Ae, e, 4 * a + 0, 4 * b + 0,
                                   sigma * NN + advw)
                     wp.atomic_add(Ae, e, 4 * a + 0, 4 * b + 1,
-                                  M11 * lapw)
+                                  M11l * lapw)
                     wp.atomic_add(Ae, e, 4 * a + 0, 4 * b + 3,
                                   M12 * lapw)
                     # mu1 row
@@ -216,7 +275,7 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
                     wp.atomic_add(Ae, e, 4 * a + 2, 4 * b + 2,
                                   sigma * NN + advw)
                     wp.atomic_add(Ae, e, 4 * a + 2, 4 * b + 3,
-                                  M22 * lapw)
+                                  M22l * lapw)
                     wp.atomic_add(Ae, e, 4 * a + 2, 4 * b + 1,
                                   M12 * lapw)
                     # mu2 row
@@ -243,7 +302,7 @@ class WodoFilmStepper(TernaryCHStepper):
                  M=(0.225, 0.0, 0.225), kappa=(2e-4, 2e-4), k_e=1.0,
                  dt=1e-4, newton_tol=1e-9, newton_max=50,
                  lat_scale=1.0, linsolver="splu", noise=0.0,
-                 noise_seed=0):
+                 noise_seed=0, var_mob=False, D_ratio=1e-3, b_reg=0.0):
         super().__init__(dm, chi=chi, M=M, kappa=kappa, dt=dt, order=1,
                          newton_tol=newton_tol, newton_max=newton_max)
         assert dm.mesh.p == 1, "Wodo film v1: linear elements only"
@@ -256,6 +315,9 @@ class WodoFilmStepper(TernaryCHStepper):
         self._cudss = None
         self.noise = float(noise)
         self._nrng = np.random.default_rng(noise_seed)
+        self.var_mob = bool(var_mob)
+        self.D_ratio = float(D_ratio)
+        self.b_reg = float(b_reg)
         # skip the T4 congruence product when constraints are identity
         # (uniform strips: no hanging nodes, natural BCs only)
         n = self.Tc.shape[0]
@@ -339,15 +401,16 @@ class WodoFilmStepper(TernaryCHStepper):
         # surface flux K*(1/h), mapped measure; Ycomp = boundary/volume
         # computational-measure ratio (docstring v1.1)
         coef = K * minv * self.y_comp
-        # conserved Langevin flux (FDT shape), frozen over this attempt
-        rho1 = self.noise * np.sqrt(2.0 * abs(self.M11) / dt)
-        rho2 = self.noise * np.sqrt(2.0 * abs(self.M22) / dt)
+        # conserved Langevin flux (FDT shape), frozen over this attempt;
+        # kernel multiplies by the LOCAL sqrt(M_ii)
+        rho = self.noise * np.sqrt(2.0 / dt)
         q_gp = {}
         for pv, b in self.dm.bins.items():
             ngp = len(self.mesh.conn_of[pv]) * b["nqp"]
             q_gp[pv] = (
-                rho1 * self._nrng.standard_normal((ngp, self.dm.dim)),
-                rho2 * self._nrng.standard_normal((ngp, self.dm.dim)))
+                rho * self._nrng.standard_normal((ngp, self.dm.dim)),
+                rho * self._nrng.standard_normal((ngp, self.dm.dim)))
+        Dr = self.D_ratio if self.var_mob else -1.0
         n0, n1 = self.top_edge_n[:, 0], self.top_edge_n[:, 1]
         le = self.top_edge_len
         x = self.x.copy()
@@ -375,10 +438,12 @@ class WodoFilmStepper(TernaryCHStepper):
                     arr(q_gp[pv][0]), arr(q_gp[pv][1]),
                     self.theta_wp[pv],
                     wp.float64(self.M11), wp.float64(self.M12),
-                    wp.float64(self.M22), wp.float64(self.c12),
+                    wp.float64(self.M22), wp.float64(Dr),
+                    wp.float64(self.c12),
                     wp.float64(self.c1s), wp.float64(self.c2s),
                     wp.float64(1.0 / self.N1), wp.float64(1.0 / self.N2),
                     wp.float64(1.0 / self.Ns),
+                    wp.float64(self.b_reg),
                     wp.float64(self.kap1), wp.float64(self.kap2),
                     wp.float64(sigma), wp.float64(mlat),
                     wp.float64(mvert), wp.float64(minv), wp.float64(K),
