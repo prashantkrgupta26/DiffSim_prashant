@@ -210,25 +210,58 @@ test that needs it is opt-in via `DIFFSIM_RUN_3D_NS=1`.
                      notebook (compiler bugs, convergence traps, and the
                      test-design lessons we paid for)
 
-## Roadmap
+## Roadmap (checkmarks = gated + committed)
 
-- **M1c (COMPLETE, 2026-07-06)**: NS adjoints (transient chains,
-  Leray + monolithic, shape + constitutive), neural-SDF geometry
-  backend on PROVIDED checkpoints (GENIE edit modes), and the hero
-  demos — **both converged**: steady sphere-INR edit recovery
-  (err 1.8e-3, `tests/baselines/m1_hero_h1.json`) and transient
-  recovery (2.6e-4, `m2_hero_h2.json`).
-- **M1d (in progress)**: full device-side migration — measured so far:
-  cuDSS 300x over host splu at 3-D L5; device CSR assembly 4-40x
-  (uniform + hanging meshes, strong rows folded); zero-copy
-  assemble->solve chain; steppers take `use_device_assembly=True`.
-  One codebase, two runtime profiles (pure-device / coherent).
-- **M2**: Heat/Mass bricks + block coupler + neural closures; p2-NS;
-  the bunny hero ladder (H3/H4).
-- **M3 (ratified)**: differentiable dynamic adaptivity (transfer-op
-  adjoints -> event-branch differentiation -> relaxed classification),
-  with adjoint-readiness requirements feeding the cuFEM blueprint.
-- **Further**: electrokinetics (PNP), space-time (k = 4), multi-GPU.
+- ✅ **M0 — octree foundations**: SFC build, 2:1 balance, node dedup,
+  hanging constraints, k-generic kernels (k = 2,3,4).
+- ✅ **M0.5 — k-generic refactor**: per-axis periodic topology, mixed
+  p1/p2 constraints (one-knob rule), machine-precision patch/trace/fuzz
+  batteries.
+- ✅ **M1a — SBM foundations**: surrogate boundary + Taylor shift,
+  Nitsche Dirichlet, Eq.-21 Neumann w/ area correction (π/4 locks),
+  P4 rotated-patch keystone (k = 2/3/4), the p2 Neumann band
+  (node-band(3): 2-D orders 1.9–2.1; **3-D asymptotic 2nd order to L7
+  on Nova — 1.97/1.94/2.03**; dyadic-radius halo rule, canonical
+  r = 0.19).
+- ✅ **M1b — incompressible NS**: VMS-stabilized p1, both steppers
+  (Leray + monolithic), BDF1/2; cavity Re 100/1000, cylinder Re 20
+  (C_d = 1.352) + Re 100 Strouhal, sphere Re 300; GPU solves (fused
+  Krylov, cuDSS, AMGX).
+- ✅ **M1c — adjoints + neural-SDF geometry**: taped kernels
+  (findings-4c rules), transient chains (1e-8-class), Leray adjoint,
+  shape + constitutive gradients; PROVIDED INR checkpoints (GENIE edit
+  modes, window contract, projection hardening); heroes: **sphere
+  steady 1.8e-3 ✅, sphere transient 2.6e-4 ✅**.
+- ✅ **M1d — device migration** (capacity verdicts pending Nova):
+  cuDSS 300× over host splu; device CSR assembly 4–40× (uniform +
+  hanging; strong rows folded; ndof-generic); zero-copy
+  assemble→solve; steppers `use_device_assembly=True` (2.2× end-to-end,
+  solver-bound); cuDSS mtlayer (~40× on refactorization loops).
+  Verdict: pure-device is THE profile; coherent = capacity-only.
+- ✅ **M2 — Heat/Mass + closures + p2-NS**: scalar brick (orders
+  2.00/3.00 EXACT, VMS-complete residual), coupler (de Vahl Davis Nu
+  **0.05% / 0.02%**), SBM-thermal composition (Péclet-aware Nitsche,
+  consistent-flux extraction), closures-in-the-loop (S2 retrain demo,
+  RMSE 0.049), pure-p2 framework (cylinder C_d = 1.334; **unified
+  penalty law α ~ Pe × p²**).
+- ✅ **M3 rungs 1–2 — differentiable adaptivity**: explicit transfer
+  operators (adjoint EXACT across a re-carve), epoch continuation
+  (exact at 2.7× trust region where plain GN stalls); **THE BUNNY
+  HEADLINE: cell-scale GENIE ear-edit recovered from transient flow,
+  err 1.23e-3** (six-run mechanism ladder). Rung 3 (relaxed
+  classification) = research brief `docs/n6_relaxed_classification_brief.md`.
+- 🔶 **M4 — differentiable phase-field & learned thermodynamics**
+  (in progress): AC + CH bricks ✅ (orders exact; mass 1.9e-15),
+  spatial adaptivity ✅ (zero-drift nested transfer), temporal
+  adaptivity ✅ (178× Δt growth; evaporation dt-cap), ternary
+  Onsager CH ✅, **Wodo CMS-2012 evaporating film: Fig-3 replicated
+  first-run** (Landau frame; solute conserved 4e-16) ✅; F-series
+  tutorial + LaTeX course doc ✅. Remaining: 2-D figure campaign
+  (local sweep + Nova kit), device-bound film marches, the learning
+  arc (basis/MLP f_mix — the milestone's title).
+- **Forward**: PNP electrokinetics (production DendrIon physics),
+  CH block preconditioner (full-res 3-D films), space-time (k = 4),
+  multi-GPU, THB.
 
 ## Development culture
 

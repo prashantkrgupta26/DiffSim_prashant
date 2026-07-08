@@ -46,3 +46,21 @@ All drivers accept `--solver {splu, fused, cudss, amgx}`:
 
 Measured per-step timings: see the table in m1b findings 8 / the commit that
 introduced this section.
+
+## Current inventory (2026-07-08)
+
+| Script | What it demonstrates | Status |
+|---|---|---|
+| `band_study.py` | p2-band Neumann sphere ladder (`--solver`, `--radius`) | 3-D asymptotic 2nd order (Nova, L7) |
+| `cavity_ghia.py`, `cavity_p2.py` | cavity vs Ghia at p1/p2 | p2-L4 beats p1-L5 |
+| `cylinder_forces.py`, `cylinder_p2.py` | cylinder C_d | 1.352 (p1) / 1.334 (p2, α~p²) |
+| `coupled_nu.py`, `heated_cylinder.py`, `devahl_davis.py` | SBM-thermal + Boussinesq | Nu 0.05%/0.02% (de Vahl Davis) |
+| `b1_dqdkappa_wip.py`, `b2_closure_recovery.py`, `b3_retrain_demo.py` | field-κ adjoints; closures-in-loop | dQ/dκ 3e-9; S2 demo RMSE 0.049 |
+| `hero_h1/h2/h3/h4`, `hero_d_bunny_drag.py`, `hero_m3_bunny_continuation.py` | the inverse-design hero ladder | sphere ✅✅; **bunny headline 1.23e-3** |
+| `adaptive_ch_opener.py` | re-mesh + transfer (zero drift) | M4 |
+| `wodo_fig3.py`, `wodo_fig67.py` | evaporating-film replication (CMS-2012) | Fig-3 ✅ first-run; Fig 6/7 campaign |
+| `profile_stages.py` | the M1d migration profiler | the 300× finding |
+| `p2band_ns_wip.py`, `shape_opt_cylinder.py` | recorded WIP / research items | honest markers |
+
+Baselines lock in `tests/baselines/*.json`; the findings logs
+(`docs/superpowers/*findings*.md`) carry every number's provenance.
