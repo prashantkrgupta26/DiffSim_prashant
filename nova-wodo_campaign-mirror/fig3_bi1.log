@@ -1,0 +1,29 @@
+Warp 1.14.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA A100-SXM4-80GB" (79 GiB, sm_80, mempool enabled)
+   Kernel cache:
+     /home/baskarg/.cache/warp/1.14.0
+fig3/bi1: strip 1024 elements (4 x 256), Bi=1.0, device_bound=True
+/home/baskarg/DiffSim/src/diffsim/assembly/device_assembly.py:411: UserWarning: Sparse invariant checks are implicitly disabled. Memory errors (e.g. SEGFAULT) will occur when operating on a sparse tensor which violates the invariants, but checks incur performance overhead. To silence this warning, explicitly opt in or out. See `torch.sparse.check_sparse_tensor_invariants.__doc__` for guidance.  (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:760.)
+  A_t = torch.sparse_csr_tensor(
+/home/baskarg/DiffSim/src/diffsim/assembly/device_assembly.py:411: UserWarning: Sparse CSR tensor support is in beta state. If you miss a functionality in the sparse tensor support, please submit a feature request to https://github.com/pytorch/pytorch/issues. (Triggered internally at /pytorch/aten/src/ATen/SparseCsrTensorImpl.cpp:49.)
+  A_t = torch.sparse_csr_tensor(
+No multithreading interface library was specified using the DirectSolverOptions. The performance of CPU operations like planning will be significantly lower than if you provide a multithreading library.
+Module make_wodo_newton__locals__wodo_k_ffd5bf99 ffd5bf9 load on device 'cuda:0' took 1.64 ms  (cached)
+Module _scatter_kernel__locals__scat_772b6487 772b648 load on device 'cuda:0' took 1.30 ms  (cached)
+Module _scatter_vec_kernel__locals__scatv_e6753018 e675301 load on device 'cuda:0' took 0.96 ms  (cached)
+
+===== Bi = 1.0 =====
+steps=161 rejects=0 reason=phis_stop wall=3s
+t_final=2.228  h: 1.0 -> 0.416  h monotone: YES (n_increase=0)
+gate(iv) solute content h*Phi_i: max rel drift 4.18e-16; mapped means Phi_p 0.199 -> 0.479, Phi_f 0.200 -> 0.480 (enrichment)
+solvent stratification pre-onset: max[phis(bot)-phis(top)] = +0.0987
+separation onset (row |phi_p-phi_f| > 0.1): t=0.3673, theta=1.00; rows already seeded (>0.05): theta in [0.85,1.00] (10% of rows)
+propagation: 257/257 rows crossed; corr(theta, t_cross) = -0.80 (negative => top first, propagating down); spread(t_cross)/t_final = 0.24
+  phi_p(theta) @ h=0.90 t=0.1968: [0.21 0.21 0.21 0.21 0.21 0.21 0.22 0.22 0.23 0.23 0.24 0.25 0.25] (theta=0 -> 1); phis top=0.489 bot=0.585
+  phi_p(theta) @ h=0.75 t=0.5269: [0.25 0.25 0.25 0.26 0.27 0.22 0.24 0.36 0.27 0.13 0.37 0.41 0.11] (theta=0 -> 1); phis top=0.401 bot=0.496
+  phi_p(theta) @ h=0.60 t=0.964: [0.03 0.11 0.54 0.65 0.48 0.07 0.04 0.34 0.66 0.57 0.11 0.15 0.54] (theta=0 -> 1); phis top=0.314 bot=0.320
+  phi_p(theta) @ h=0.45 t=1.731: [0.01 0.02 0.45 0.88 0.89 0.84 0.26 0.01 0.01 0.04 0.56 0.89 0.90] (theta=0 -> 1); phis top=0.093 bot=0.099
+RESULT fig=3 case=bi1 res=full Bi=1.0 reason=phis_stop steps=161 t_final=2.228 h_end=0.416 strat=+0.0987 onset_theta=1.00 mass_drift=4.18e-16 wall=3s

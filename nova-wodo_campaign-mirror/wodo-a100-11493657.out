@@ -1,0 +1,85 @@
+== DiffSim bootstrap on x86_64 ==
+Warp 1.14.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA A100-SXM4-80GB" (79 GiB, sm_80, mempool enabled)
+   Kernel cache:
+     /home/baskarg/.cache/warp/1.14.0
+torch 2.12.1+cu126 cuda True
+warp 1.14.0
+nvmath OK (cuDSS available)
+== bootstrap done: .venv-nova ==
+== Wodo Nova campaign (full res, device-bound) Wed Jul  8 02:41:58 PM CDT 2026 ==
+NVIDIA A100-SXM4-80GB, 81920 MiB
+===== fig6 / n5 (full) Wed Jul  8 02:41:58 PM CDT 2026 =====
+  snap h=0.50: A_p=2766.46 A_d=2.04 layers=0 top=(0.260,0.260)
+  snap h=0.40: A_p=4.15 A_d=4.07 layers=0 top=(0.318,0.331)
+  snap h=final: A_p=2.18 A_d=2.17 layers=2 top=(0.465,0.504)
+RESULT fig=6 case=n5 res=full reason=phis_stop steps=203 rejects=0 h_end=0.260 phis_end=0.041 A_p=2.175 A_d=2.172 layers=2 top_p=0.465 top_f=0.504 mass_drift=1.02e-15 phi_range=[+0.0269,0.9410] wall=43s
+===== fig6 / n100 (full) Wed Jul  8 02:42:42 PM CDT 2026 =====
+  snap h=0.50: A_p=451697.53 A_d=466042.37 layers=5 top=(0.094,0.412)
+  snap h=0.40: A_p=236.69 A_d=185.20 layers=3 top=(0.096,0.521)
+  snap h=final: A_p=1463474.50 A_d=1466748.78 layers=3 top=(0.034,0.932)
+RESULT fig=6 case=n100 res=full reason=phis_stop steps=230 rejects=6 h_end=0.261 phis_end=0.043 A_p=1.463e+06 A_d=1.467e+06 layers=3 top_p=0.034 top_f=0.932 mass_drift=1.02e-15 phi_range=[+0.0301,0.9383] wall=62s
+===== fig7 / chifs (full) Wed Jul  8 02:43:46 PM CDT 2026 =====
+  snap h=0.50: A_p=351641.86 A_d=353631.28 layers=4 top=(0.060,0.489)
+  snap h=0.40: A_p=1337563.46 A_d=1318980.99 layers=4 top=(0.057,0.612)
+  snap h=final: A_p=932097.52 A_d=939361.54 layers=2 top=(0.029,0.941)
+RESULT fig=7 case=chifs res=full reason=phis_stop steps=245 rejects=8 h_end=0.260 phis_end=0.039 A_p=9.321e+05 A_d=9.394e+05 layers=2 top_p=0.029 top_f=0.941 mass_drift=1.31e-15 phi_range=[+0.0277,0.9439] wall=70s
+===== fig7 / chips (full) Wed Jul  8 02:44:58 PM CDT 2026 =====
+  snap h=0.50: A_p=1.06 A_d=1.02 layers=4 top=(0.438,0.147)
+  snap h=0.40: A_p=1.87 A_d=1.86 layers=2 top=(0.461,0.222)
+  snap h=final: A_p=3.23 A_d=3.21 layers=2 top=(0.682,0.280)
+RESULT fig=7 case=chips res=full reason=phis_stop steps=288 rejects=19 h_end=0.262 phis_end=0.048 A_p=3.228 A_d=3.212 layers=2 top_p=0.682 top_f=0.280 mass_drift=1.16e-15 phi_range=[+0.0295,0.9409] wall=107s
+===== fig6 / n20 (full) Wed Jul  8 02:46:47 PM CDT 2026 =====
+  snap h=0.50: A_p=145454.40 A_d=145936.31 layers=4 top=(0.088,0.426)
+  snap h=0.40: A_p=687507.21 A_d=670871.22 layers=4 top=(0.166,0.460)
+  snap h=final: A_p=108086.72 A_d=104048.88 layers=2 top=(0.032,0.933)
+RESULT fig=6 case=n20 res=full reason=phis_stop steps=217 rejects=3 h_end=0.262 phis_end=0.045 A_p=1.081e+05 A_d=1.04e+05 layers=2 top_p=0.032 top_f=0.933 mass_drift=1.31e-15 phi_range=[+0.0300,0.9372] wall=52s
+===== fig7 / sym (full) Wed Jul  8 02:47:41 PM CDT 2026 =====
+  snap h=0.50: A_p=13384.90 A_d=14521.96 layers=5 top=(0.090,0.411)
+  snap h=0.40: A_p=40.37 A_d=36.26 layers=3 top=(0.189,0.430)
+  snap h=final: A_p=15438.26 A_d=15492.68 layers=3 top=(0.033,0.937)
+RESULT fig=7 case=sym res=full reason=phis_stop steps=257 rejects=10 h_end=0.260 phis_end=0.037 A_p=1.544e+04 A_d=1.549e+04 layers=3 top_p=0.033 top_f=0.937 mass_drift=1.60e-15 phi_range=[+0.0287,0.9411] wall=76s
+===== fig4 / bi0.03 (full) Wed Jul  8 02:48:59 PM CDT 2026 =====
+  snap h=0.50: A_p=6.75 A_d=2.35 layers=0 top=(0.251,0.251)
+  snap h=0.40: A_p=0.40 A_d=0.40 layers=2 top=(0.348,0.284)
+  snap h=final: A_p=0.00 A_d=0.00 layers=0 top=(0.487,0.477)
+RESULT fig=4 case=bi0.03 res=full reason=phis_stop steps=218 rejects=1 h_end=0.260 phis_end=0.038 A_p=0.001673 A_d=0.001666 layers=0 top_p=0.487 top_f=0.477 mass_drift=1.02e-15 phi_range=[+0.0356,0.9107] wall=42s
+===== fig4 / bi0.3 (full) Wed Jul  8 02:49:42 PM CDT 2026 =====
+  snap h=0.50: A_p=693.85 A_d=1.22 layers=0 top=(0.257,0.258)
+  snap h=0.40: A_p=2.43 A_d=2.43 layers=3 top=(0.255,0.392)
+  snap h=final: A_p=4.41 A_d=4.40 layers=2 top=(0.712,0.249)
+RESULT fig=4 case=bi0.3 res=full reason=phis_stop steps=208 rejects=1 h_end=0.262 phis_end=0.047 A_p=4.407 A_d=4.395 layers=2 top_p=0.712 top_f=0.249 mass_drift=1.02e-15 phi_range=[+0.0340,0.9285] wall=45s
+===== fig4 / bi3 (full) Wed Jul  8 02:50:28 PM CDT 2026 =====
+  snap h=0.50: A_p=13337.42 A_d=29.47 layers=1 top=(0.311,0.307)
+  snap h=0.40: A_p=469.90 A_d=28.35 layers=1 top=(0.372,0.359)
+  snap h=final: A_p=27.13 A_d=26.99 layers=3 top=(0.459,0.519)
+RESULT fig=4 case=bi3 res=full reason=phis_stop steps=194 rejects=0 h_end=0.263 phis_end=0.050 A_p=27.13 A_d=26.99 layers=3 top_p=0.459 top_f=0.519 mass_drift=1.02e-15 phi_range=[+0.0168,0.9471] wall=55s
+===== fig5 / blend11 (full) Wed Jul  8 02:51:25 PM CDT 2026 =====
+  snap h=0.50: A_p=1231.57 A_d=1.13 layers=0 top=(0.258,0.258)
+  snap h=0.40: A_p=2.86 A_d=2.85 layers=0 top=(0.318,0.329)
+  snap h=final: A_p=3.00 A_d=3.00 layers=2 top=(0.423,0.547)
+RESULT fig=5 case=blend11 res=full reason=phis_stop steps=208 rejects=1 h_end=0.260 phis_end=0.037 A_p=2.999 A_d=2.997 layers=2 top_p=0.423 top_f=0.547 mass_drift=1.31e-15 phi_range=[+0.0266,0.9385] wall=44s
+===== fig5 / blend108 (full) Wed Jul  8 02:52:10 PM CDT 2026 =====
+  snap h=0.50: A_p=70797.23 A_d=50519.77 layers=1 top=(0.327,0.192)
+  snap h=0.40: A_p=50776.47 A_d=47680.54 layers=3 top=(0.574,0.092)
+  snap h=final: A_p=164417.24 A_d=163781.55 layers=3 top=(0.883,0.081)
+RESULT fig=5 case=blend108 res=full reason=phis_stop steps=204 rejects=0 h_end=0.261 phis_end=0.043 A_p=1.644e+05 A_d=1.638e+05 layers=3 top_p=0.883 top_f=0.081 mass_drift=1.31e-15 phi_range=[+0.0329,0.9194] wall=40s
+===== fig3 / bi0.1 (full) Wed Jul  8 02:52:52 PM CDT 2026 =====
+  phi_p(theta) @ h=0.75 t=4.776: [0.47 0.32 0.08 0.10 0.37 0.49 0.37 0.09 0.06 0.23 0.46 0.35 0.12] (theta=0 -> 1); phis top=0.467 bot=0.457
+  phi_p(theta) @ h=0.60 t=8.795: [0.66 0.53 0.09 0.03 0.09 0.54 0.66 0.64 0.26 0.03 0.05 0.42 0.66] (theta=0 -> 1); phis top=0.310 bot=0.311
+  phi_p(theta) @ h=0.45 t=16.54: [0.90 0.87 0.41 0.02 0.01 0.02 0.39 0.87 0.90 0.89 0.54 0.03 0.01] (theta=0 -> 1); phis top=0.093 bot=0.094
+RESULT fig=3 case=bi0.1 res=full Bi=0.1 reason=phis_stop steps=174 t_final=20.69 h_end=0.418 strat=+0.0140 onset_theta=0.98 mass_drift=8.35e-16 wall=3s
+===== fig3 / bi1 (full) Wed Jul  8 02:52:57 PM CDT 2026 =====
+  phi_p(theta) @ h=0.75 t=0.5269: [0.25 0.25 0.25 0.26 0.27 0.22 0.24 0.36 0.27 0.13 0.37 0.41 0.11] (theta=0 -> 1); phis top=0.401 bot=0.496
+  phi_p(theta) @ h=0.60 t=0.964: [0.03 0.11 0.54 0.65 0.48 0.07 0.04 0.34 0.66 0.57 0.11 0.15 0.54] (theta=0 -> 1); phis top=0.314 bot=0.320
+  phi_p(theta) @ h=0.45 t=1.731: [0.01 0.02 0.45 0.88 0.89 0.84 0.26 0.01 0.01 0.04 0.56 0.89 0.90] (theta=0 -> 1); phis top=0.093 bot=0.099
+RESULT fig=3 case=bi1 res=full Bi=1.0 reason=phis_stop steps=161 t_final=2.228 h_end=0.416 strat=+0.0987 onset_theta=1.00 mass_drift=4.18e-16 wall=3s
+===== fig3 / bi10 (full) Wed Jul  8 02:53:01 PM CDT 2026 =====
+  phi_p(theta) @ h=0.75 t=0.0859: [0.21 0.21 0.21 0.21 0.22 0.23 0.25 0.26 0.29 0.32 0.33 0.39 0.36] (theta=0 -> 1); phis top=0.216 bot=0.585
+  phi_p(theta) @ h=0.60 t=0.1633: [0.28 0.28 0.28 0.29 0.30 0.31 0.34 0.35 0.33 0.35 0.43 0.44 0.32] (theta=0 -> 1); phis top=0.169 bot=0.444
+  phi_p(theta) @ h=0.45 t=0.2855: [0.01 0.16 0.77 0.88 0.56 0.04 0.04 0.56 0.90 0.72 0.11 0.22 0.72] (theta=0 -> 1); phis top=0.085 bot=0.105
+RESULT fig=3 case=bi10 res=full Bi=10.0 reason=phis_stop steps=151 t_final=0.3318 h_end=0.419 strat=+0.3694 onset_theta=0.99 mass_drift=4.18e-16 wall=3s
+== campaign done Wed Jul  8 02:53:06 PM CDT 2026 ==

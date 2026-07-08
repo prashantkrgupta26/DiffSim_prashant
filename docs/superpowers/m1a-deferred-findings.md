@@ -372,3 +372,19 @@ M4 ADAPTIVITY OPENER (2026-07-08 night): spinodal CH through 2
    halos). REVISED RULE: benchmark radii small AND far from dyadics at
    ALL ladder levels — canonical radius moves r=0.27 -> r=0.19 (clean
    at L4-L7; roomier band than 0.15). r>=0.29 additionally wall-bound.
+
+M4-c NOVA FULL-RES VERDICT (Baskar's A100 campaign, 2026-07-08;
+   nova-wodo_campaign-mirror/): ALL 14 cases at the paper's own 250x100
+   mesh to phi_s ~ 0.04, device-bound — THE WHOLE CAMPAIGN IN ~11 MIN
+   WALL (3-107 s/case; mass drift 1e-15/16 everywhere). Regimes at
+   full resolution: Fig 6 A_p = 2.2 / 1.1e5 / 1.5e6 (N=5/20/100 —
+   percolated -> multilayer, SHARPER than the local sweep's 3.7e5);
+   Fig 7 opposite-component surface wetting (top_f 0.941 vs top_p
+   0.682) + the broken-multilayer chips regime; Fig 4 (NEW) Bi ladder
+   A = 0.0017 / 4.4 / 27 (homogeneous -> layered w/ Bi); Fig 5 (NEW)
+   blend 1:1 A=3.0 percolated vs 1:0.8 A=1.6e5 with 3 layers + top_p
+   0.883 — the paper's SPONTANEOUS STRATIFICATION AT OFF-CRITICAL
+   BLEND, reproduced. Fig 3 full-res strat +0.3694 matches the local
+   run to 4 digits (cross-machine device consistency). Wodo CMS-2012
+   Figs 3-7: REPLICATED AT FULL RESOLUTION. (H200 3-D stretch not in
+   this mirror — pending or queued separately.)

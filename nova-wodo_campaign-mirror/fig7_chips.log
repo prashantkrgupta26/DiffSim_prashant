@@ -1,0 +1,30 @@
+Warp 1.14.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA A100-SXM4-80GB" (79 GiB, sm_80, mempool enabled)
+   Kernel cache:
+     /home/baskarg/.cache/warp/1.14.0
+
+===== fig7/chips [full 250x100]: Np=100 Nf=5 chi=(1.0, 0.6, 0.3) Bi=0.3 blend 1:1 (phi_p0=0.1250, phi_f0=0.1250) kappa=1.148e-04 M=(0.531,0.256) device_bound=True =====
+  interface check: delta(binary,final)=0.0253 = 2.5 lateral elems
+/home/baskarg/DiffSim/src/diffsim/assembly/device_assembly.py:411: UserWarning: Sparse invariant checks are implicitly disabled. Memory errors (e.g. SEGFAULT) will occur when operating on a sparse tensor which violates the invariants, but checks incur performance overhead. To silence this warning, explicitly opt in or out. See `torch.sparse.check_sparse_tensor_invariants.__doc__` for guidance.  (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:760.)
+  A_t = torch.sparse_csr_tensor(
+/home/baskarg/DiffSim/src/diffsim/assembly/device_assembly.py:411: UserWarning: Sparse CSR tensor support is in beta state. If you miss a functionality in the sparse tensor support, please submit a feature request to https://github.com/pytorch/pytorch/issues. (Triggered internally at /pytorch/aten/src/ATen/SparseCsrTensorImpl.cpp:49.)
+  A_t = torch.sparse_csr_tensor(
+No multithreading interface library was specified using the DirectSolverOptions. The performance of CPU operations like planning will be significantly lower than if you provide a multithreading library.
+Module make_wodo_newton__locals__wodo_k_ffd5bf99 ffd5bf9 load on device 'cuda:0' took 1.78 ms  (cached)
+Module _scatter_kernel__locals__scat_772b6487 772b648 load on device 'cuda:0' took 1.58 ms  (cached)
+Module _scatter_vec_kernel__locals__scatv_e6753018 e675301 load on device 'cuda:0' took 1.11 ms  (cached)
+  [f7_chips_full] step    50 t=  0.5672 h=0.877 phi_s=0.715 dt=1.90e-02 it= 4 A=  712.69 lay=0 wall=   10s
+  [f7_chips_full] step   100 t=  1.5557 h=0.677 phi_s=0.631 dt=2.11e-02 it= 7 A=    0.98 lay=5 wall=   20s
+  [f7_chips_full] step   150 t=  2.7463 h=0.504 phi_s=0.503 dt=3.24e-02 it= 6 A=    1.07 lay=4 wall=   38s
+  [f7_chips_full] step   200 t=  3.6826 h=0.401 phi_s=0.377 dt=1.45e-02 it= 6 A=    1.86 lay=2 wall=   62s
+  [f7_chips_full] step   250 t=  4.5275 h=0.335 phi_s=0.254 dt=6.15e-03 it= 6 A=    2.95 lay=2 wall=   89s
+  snap h=0.90: A_p=1010.40 A_d=269.33 layers=0 top=(0.143,0.148)
+  snap h=0.70: A_p=1.45 A_d=1.44 layers=5 top=(0.154,0.210)
+  snap h=0.60: A_p=1.20 A_d=1.16 layers=4 top=(0.372,0.132)
+  snap h=0.50: A_p=1.06 A_d=1.02 layers=4 top=(0.438,0.147)
+  snap h=0.40: A_p=1.87 A_d=1.86 layers=2 top=(0.461,0.222)
+  snap h=final: A_p=3.23 A_d=3.21 layers=2 top=(0.682,0.280)
+RESULT fig=7 case=chips res=full reason=phis_stop steps=288 rejects=19 h_end=0.262 phis_end=0.048 A_p=3.228 A_d=3.212 layers=2 top_p=0.682 top_f=0.280 mass_drift=1.16e-15 phi_range=[+0.0295,0.9409] wall=107s

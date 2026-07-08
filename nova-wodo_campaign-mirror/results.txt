@@ -1,0 +1,31 @@
+== Wodo Nova campaign (full res, device-bound) Wed Jul  8 02:41:58 PM CDT 2026 ==
+NVIDIA A100-SXM4-80GB, 81920 MiB
+===== fig6 / n5 (full) Wed Jul  8 02:41:58 PM CDT 2026 =====
+RESULT fig=6 case=n5 res=full reason=phis_stop steps=203 rejects=0 h_end=0.260 phis_end=0.041 A_p=2.175 A_d=2.172 layers=2 top_p=0.465 top_f=0.504 mass_drift=1.02e-15 phi_range=[+0.0269,0.9410] wall=43s
+===== fig6 / n100 (full) Wed Jul  8 02:42:42 PM CDT 2026 =====
+RESULT fig=6 case=n100 res=full reason=phis_stop steps=230 rejects=6 h_end=0.261 phis_end=0.043 A_p=1.463e+06 A_d=1.467e+06 layers=3 top_p=0.034 top_f=0.932 mass_drift=1.02e-15 phi_range=[+0.0301,0.9383] wall=62s
+===== fig7 / chifs (full) Wed Jul  8 02:43:46 PM CDT 2026 =====
+RESULT fig=7 case=chifs res=full reason=phis_stop steps=245 rejects=8 h_end=0.260 phis_end=0.039 A_p=9.321e+05 A_d=9.394e+05 layers=2 top_p=0.029 top_f=0.941 mass_drift=1.31e-15 phi_range=[+0.0277,0.9439] wall=70s
+===== fig7 / chips (full) Wed Jul  8 02:44:58 PM CDT 2026 =====
+RESULT fig=7 case=chips res=full reason=phis_stop steps=288 rejects=19 h_end=0.262 phis_end=0.048 A_p=3.228 A_d=3.212 layers=2 top_p=0.682 top_f=0.280 mass_drift=1.16e-15 phi_range=[+0.0295,0.9409] wall=107s
+===== fig6 / n20 (full) Wed Jul  8 02:46:47 PM CDT 2026 =====
+RESULT fig=6 case=n20 res=full reason=phis_stop steps=217 rejects=3 h_end=0.262 phis_end=0.045 A_p=1.081e+05 A_d=1.04e+05 layers=2 top_p=0.032 top_f=0.933 mass_drift=1.31e-15 phi_range=[+0.0300,0.9372] wall=52s
+===== fig7 / sym (full) Wed Jul  8 02:47:41 PM CDT 2026 =====
+RESULT fig=7 case=sym res=full reason=phis_stop steps=257 rejects=10 h_end=0.260 phis_end=0.037 A_p=1.544e+04 A_d=1.549e+04 layers=3 top_p=0.033 top_f=0.937 mass_drift=1.60e-15 phi_range=[+0.0287,0.9411] wall=76s
+===== fig4 / bi0.03 (full) Wed Jul  8 02:48:59 PM CDT 2026 =====
+RESULT fig=4 case=bi0.03 res=full reason=phis_stop steps=218 rejects=1 h_end=0.260 phis_end=0.038 A_p=0.001673 A_d=0.001666 layers=0 top_p=0.487 top_f=0.477 mass_drift=1.02e-15 phi_range=[+0.0356,0.9107] wall=42s
+===== fig4 / bi0.3 (full) Wed Jul  8 02:49:42 PM CDT 2026 =====
+RESULT fig=4 case=bi0.3 res=full reason=phis_stop steps=208 rejects=1 h_end=0.262 phis_end=0.047 A_p=4.407 A_d=4.395 layers=2 top_p=0.712 top_f=0.249 mass_drift=1.02e-15 phi_range=[+0.0340,0.9285] wall=45s
+===== fig4 / bi3 (full) Wed Jul  8 02:50:28 PM CDT 2026 =====
+RESULT fig=4 case=bi3 res=full reason=phis_stop steps=194 rejects=0 h_end=0.263 phis_end=0.050 A_p=27.13 A_d=26.99 layers=3 top_p=0.459 top_f=0.519 mass_drift=1.02e-15 phi_range=[+0.0168,0.9471] wall=55s
+===== fig5 / blend11 (full) Wed Jul  8 02:51:25 PM CDT 2026 =====
+RESULT fig=5 case=blend11 res=full reason=phis_stop steps=208 rejects=1 h_end=0.260 phis_end=0.037 A_p=2.999 A_d=2.997 layers=2 top_p=0.423 top_f=0.547 mass_drift=1.31e-15 phi_range=[+0.0266,0.9385] wall=44s
+===== fig5 / blend108 (full) Wed Jul  8 02:52:10 PM CDT 2026 =====
+RESULT fig=5 case=blend108 res=full reason=phis_stop steps=204 rejects=0 h_end=0.261 phis_end=0.043 A_p=1.644e+05 A_d=1.638e+05 layers=3 top_p=0.883 top_f=0.081 mass_drift=1.31e-15 phi_range=[+0.0329,0.9194] wall=40s
+===== fig3 / bi0.1 (full) Wed Jul  8 02:52:52 PM CDT 2026 =====
+RESULT fig=3 case=bi0.1 res=full Bi=0.1 reason=phis_stop steps=174 t_final=20.69 h_end=0.418 strat=+0.0140 onset_theta=0.98 mass_drift=8.35e-16 wall=3s
+===== fig3 / bi1 (full) Wed Jul  8 02:52:57 PM CDT 2026 =====
+RESULT fig=3 case=bi1 res=full Bi=1.0 reason=phis_stop steps=161 t_final=2.228 h_end=0.416 strat=+0.0987 onset_theta=1.00 mass_drift=4.18e-16 wall=3s
+===== fig3 / bi10 (full) Wed Jul  8 02:53:01 PM CDT 2026 =====
+RESULT fig=3 case=bi10 res=full Bi=10.0 reason=phis_stop steps=151 t_final=0.3318 h_end=0.419 strat=+0.3694 onset_theta=0.99 mass_drift=4.18e-16 wall=3s
+== campaign done Wed Jul  8 02:53:06 PM CDT 2026 ==

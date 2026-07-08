@@ -1,0 +1,30 @@
+Warp 1.14.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA A100-SXM4-80GB" (79 GiB, sm_80, mempool enabled)
+   Kernel cache:
+     /home/baskarg/.cache/warp/1.14.0
+
+===== fig7/sym [full 250x100]: Np=100 Nf=5 chi=(1.0, 0.3, 0.3) Bi=0.3 blend 1:1 (phi_p0=0.1250, phi_f0=0.1250) kappa=1.148e-04 M=(0.531,0.256) device_bound=True =====
+  interface check: delta(binary,final)=0.0253 = 2.5 lateral elems
+/home/baskarg/DiffSim/src/diffsim/assembly/device_assembly.py:411: UserWarning: Sparse invariant checks are implicitly disabled. Memory errors (e.g. SEGFAULT) will occur when operating on a sparse tensor which violates the invariants, but checks incur performance overhead. To silence this warning, explicitly opt in or out. See `torch.sparse.check_sparse_tensor_invariants.__doc__` for guidance.  (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:760.)
+  A_t = torch.sparse_csr_tensor(
+/home/baskarg/DiffSim/src/diffsim/assembly/device_assembly.py:411: UserWarning: Sparse CSR tensor support is in beta state. If you miss a functionality in the sparse tensor support, please submit a feature request to https://github.com/pytorch/pytorch/issues. (Triggered internally at /pytorch/aten/src/ATen/SparseCsrTensorImpl.cpp:49.)
+  A_t = torch.sparse_csr_tensor(
+No multithreading interface library was specified using the DirectSolverOptions. The performance of CPU operations like planning will be significantly lower than if you provide a multithreading library.
+Module make_wodo_newton__locals__wodo_k_ffd5bf99 ffd5bf9 load on device 'cuda:0' took 1.56 ms  (cached)
+Module _scatter_kernel__locals__scat_772b6487 772b648 load on device 'cuda:0' took 1.18 ms  (cached)
+Module _scatter_vec_kernel__locals__scatv_e6753018 e675301 load on device 'cuda:0' took 1.08 ms  (cached)
+  [f7_sym_full] step    50 t=  0.5655 h=0.877 phi_s=0.715 dt=1.89e-02 it= 4 A=  260.21 lay=0 wall=   10s
+  [f7_sym_full] step   100 t=  1.5622 h=0.677 phi_s=0.631 dt=2.13e-02 it= 5 A= 7132.51 lay=5 wall=   18s
+  [f7_sym_full] step   150 t=  2.7767 h=0.477 phi_s=0.476 dt=2.87e-02 it= 6 A=13403.17 lay=5 wall=   28s
+  [f7_sym_full] step   200 t=  3.3967 h=0.399 phi_s=0.374 dt=4.95e-03 it= 6 A=   43.45 lay=3 wall=   54s
+  [f7_sym_full] step   250 t=  5.0621 h=0.288 phi_s=0.130 dt=1.12e-01 it= 8 A=14772.57 lay=3 wall=   74s
+  snap h=0.90: A_p=137.33 A_d=1538.13 layers=0 top=(0.137,0.151)
+  snap h=0.70: A_p=10564.51 A_d=12403.31 layers=3 top=(0.106,0.255)
+  snap h=0.60: A_p=15305.50 A_d=16243.67 layers=5 top=(0.080,0.342)
+  snap h=0.50: A_p=13384.90 A_d=14521.96 layers=5 top=(0.090,0.411)
+  snap h=0.40: A_p=40.37 A_d=36.26 layers=3 top=(0.189,0.430)
+  snap h=final: A_p=15438.26 A_d=15492.68 layers=3 top=(0.033,0.937)
+RESULT fig=7 case=sym res=full reason=phis_stop steps=257 rejects=10 h_end=0.260 phis_end=0.037 A_p=1.544e+04 A_d=1.549e+04 layers=3 top_p=0.033 top_f=0.937 mass_drift=1.60e-15 phi_range=[+0.0287,0.9411] wall=76s
