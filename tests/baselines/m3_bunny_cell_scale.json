@@ -1,0 +1,25 @@
+{
+  "m3_bunny_cell_scale": {
+    "best": "v3b",
+    "alpha_star": [
+      0.03,
+      -0.005,
+      0,
+      0
+    ],
+    "recovered_v3b": [
+      0.02162,
+      -0.00498,
+      -0.0061,
+      0.00154
+    ],
+    "err_v3b": 0.010473,
+    "bar": 0.009,
+    "ladder": "v1 subcell-invisible; v2 rank-2 aliasing (Gramian cond 80); v3 probes 94% descent, admissibility trip; v3b correct structure 72% amplitude (out of epochs); v4 +4 epochs WANDERED (shallow degenerate valley) -> more epochs is NOT the finisher",
+    "finishing_options": [
+      "LM damping schedule (increase near solution)",
+      "mode-2/3 sparsity penalty",
+      "denser probe grid (identifiability margin)"
+    ]
+  }
+}
