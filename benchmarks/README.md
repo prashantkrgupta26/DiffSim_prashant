@@ -59,6 +59,7 @@ introduced this section.
 | `hero_h1/h2/h3/h4`, `hero_d_bunny_drag.py`, `hero_m3_bunny_continuation.py` | the inverse-design hero ladder | sphere ✅✅; **bunny headline 1.23e-3** |
 | `adaptive_ch_opener.py` | re-mesh + transfer (zero drift) | M4 |
 | `wodo_fig3.py`, `wodo_fig67.py` | evaporating-film replication (CMS-2012) | Fig-3 ✅ first-run; Fig 6/7 campaign |
+| `wodo_nova.py` | Wodo figs 3-7 Nova runner (cluster/wodo_campaign/) | device-bound 56×/8×; 250×100 full res |
 | `profile_stages.py` | the M1d migration profiler | the 300× finding |
 | `p2band_ns_wip.py`, `shape_opt_cylinder.py` | recorded WIP / research items | honest markers |
 
