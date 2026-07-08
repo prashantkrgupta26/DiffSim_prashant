@@ -61,3 +61,10 @@ made observable-independent · epoch-homotopy requirements (for M3).
    requirements — recommend it as M3's opening build.
 3. Deferred: NS band-design study; fully-coupled closure retrain;
    taped-load tau(kappa) kernel; higher-Re bunny attempt.
+
+## ADDENDUM (2026-07-08): THE FRONTIER CROSSED
+D's measured frontier is now a converged demo: the cell-scale bunny
+edit recovered to err 1.23e-3 (7x inside the bar) via M3 epoch
+continuation + dense wake observation + mode-sparsity guarding
+(baseline m3_bunny_headline.json; the six-run ladder = the methods
+story). M2-D and M3 rung 2 close together.

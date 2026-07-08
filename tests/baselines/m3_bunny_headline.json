@@ -1,0 +1,20 @@
+{
+  "m3_bunny_headline": {
+    "alpha_star": [
+      0.03,
+      -0.005,
+      0.0,
+      0.0
+    ],
+    "recovered": [
+      0.0301,
+      -0.00623,
+      -2e-05,
+      0.0
+    ],
+    "err": 0.0012307,
+    "bar": 0.009,
+    "config": "L5 bunny (GENIE two-head json, head 0, ear-dominant edit ~1 cell), 8 BDF2 steps dt=0.05, observables = drag/lift/side + 25 wake pts x (ux,uy) per step (424 samples), epoch continuation (trust 0.35h) + mode-2/3 sparsity 0.3 + anchored feet + borrow 1.2% + cuDSS mtlayer",
+    "ladder": "v1 subcell-invisible -> v2 rank-2 force aliasing (Gramian) -> v3 probes 94% descent -> v3b structure@72% -> v4/v5 escape modes mapped -> v6 CONVERGED 1.23e-3"
+  }
+}
