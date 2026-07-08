@@ -316,19 +316,7 @@ class DeviceNSAssembler:
                               self.vals_d, self.F_d],
                       device=self.dm.device)
         if getattr(self, "_return_device", False):
-            import torch
-            vals_t = torch.from_dlpack(self.vals_d.__dlpack__())
-            if not hasattr(self, "_indptr_t"):
-                self._indptr_t = torch.tensor(self.indptr,
-                                              dtype=torch.int64,
-                                              device="cuda")
-                self._indices_t = torch.tensor(self.indices,
-                                               dtype=torch.int64,
-                                               device="cuda")
-            A_t = torch.sparse_csr_tensor(
-                self._indptr_t, self._indices_t, vals_t,
-                size=(self.Nfull, self.Nfull))
-            return A_t, torch.from_dlpack(self.F_d.__dlpack__())
+            return self.device_csr()
         A = sp.csr_matrix((self.vals_d.numpy(), self.indices,
                            self.indptr), shape=(self.Nfull, self.Nfull))
         return A, self.F_d.numpy()
@@ -343,6 +331,87 @@ class DeviceNSAssembler:
             return self.assemble(*a, **k)
         finally:
             self._return_device = False
+
+    # ------------------------------------------------------------------
+    # M4 generic fill API (physics-agnostic): a stepper whose element
+    # blocks come from its OWN kernel (e.g. the Wodo film's 4-dof CH
+    # Newton) reuses the slot maps directly — zero_fill() once per
+    # iterate, scatter_bin() per bin, optional add_matrix_values()/
+    # add_rhs_values() for small host-side extras (boundary fluxes),
+    # then device_csr() for the zero-copy torch CSR -> cuDSS.
+    # ------------------------------------------------------------------
+    def zero_fill(self):
+        """Begin a numeric fill: zero device CSR values + rhs."""
+        self.vals_d.zero_()
+        self.F_d.zero_()
+
+    def scatter_bin(self, k_bin, Ae_d, be_d):
+        """Scatter one bin's device element blocks (Ae [ne, nl, nl],
+        be [ne, nl]; nl = nbf*ndof, dof-major layout node*ndof + comp)
+        into vals_d / F_d via the precomputed slot maps."""
+        d = self.dm.device
+        pv, b, ne, nbf, gdof = self._bins[k_bin]
+        npair = (nbf * self.ndof) ** 2
+        if not self._identity_T:
+            wp.launch(_scatter_weighted_kernel(),
+                      dim=len(self._slot_bins[k_bin]),
+                      inputs=[Ae_d.reshape((-1,)), self._src_d[k_bin],
+                              self._w_d[k_bin], self._slots_d[k_bin],
+                              self.vals_d], device=d)
+            wp.launch(_scatter_vec_weighted_kernel(),
+                      dim=len(self._exp_bins[k_bin][4]),
+                      inputs=[be_d.reshape((-1,)), self._bsrc_d[k_bin],
+                              self._bw_d[k_bin], self._gdof_d[k_bin],
+                              self.F_d], device=d)
+        else:
+            wp.launch(_scatter_kernel(), dim=ne * npair,
+                      inputs=[Ae_d.reshape((-1,)), self._slots_d[k_bin],
+                              self.vals_d], device=d)
+            wp.launch(_scatter_vec_kernel(), dim=ne * nbf * self.ndof,
+                      inputs=[be_d.reshape((-1,)), self._gdof_d[k_bin],
+                              self.F_d], device=d)
+
+    def csr_slots(self, rows, cols):
+        """CSR value index per (row, col) pair. Entries MUST exist in
+        the symbolic pattern (dof pairs sharing an element — true for
+        boundary-face pairs). Identity-T dof numbering."""
+        rows = np.asarray(rows, np.int64)
+        cols = np.asarray(cols, np.int64)
+        slots = np.empty(len(rows), np.int64)
+        for i in range(len(rows)):
+            s_, e_ = self.indptr[rows[i]], self.indptr[rows[i] + 1]
+            k = s_ + np.searchsorted(self.indices[s_:e_], cols[i])
+            assert k < e_ and self.indices[k] == cols[i], \
+                (rows[i], cols[i])
+            slots[i] = k
+        return slots
+
+    def add_matrix_values(self, slots_d, vals_d):
+        """Atomic-add values (device array) at CSR slots (device)."""
+        wp.launch(_scatter_kernel(), dim=len(vals_d),
+                  inputs=[vals_d, slots_d, self.vals_d],
+                  device=self.dm.device)
+
+    def add_rhs_values(self, dofs_d, vals_d):
+        """Atomic-add values (device array) into F_d at dof rows."""
+        wp.launch(_scatter_vec_kernel(), dim=len(vals_d),
+                  inputs=[vals_d, dofs_d, self.F_d],
+                  device=self.dm.device)
+
+    def device_csr(self):
+        """Zero-copy torch CSR over vals_d + device rhs (dlpack)."""
+        import torch
+        vals_t = torch.from_dlpack(self.vals_d.__dlpack__())
+        if not hasattr(self, "_indptr_t"):
+            self._indptr_t = torch.tensor(self.indptr, dtype=torch.int64,
+                                          device="cuda")
+            self._indices_t = torch.tensor(self.indices,
+                                           dtype=torch.int64,
+                                           device="cuda")
+        A_t = torch.sparse_csr_tensor(
+            self._indptr_t, self._indices_t, vals_t,
+            size=(self.Nfull, self.Nfull))
+        return A_t, torch.from_dlpack(self.F_d.__dlpack__())
 
 
 def _scatter_kernel():

@@ -121,11 +121,12 @@ class Recorder:
             self.snap_h.pop(0)
 
 
-def run_case(Bi, mesh, cons, device, quick=False):
+def run_case(Bi, mesh, cons, device, quick=False, device_bound=False):
     dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), device)
     M0 = m0_from_params()
     st = WodoFilmStepper(dm, chi=CHI, N=NCHAIN, M=(M0, 0.0, M0),
-                         kappa=KAPPA, k_e=Bi, dt=1e-4)
+                         kappa=KAPPA, k_e=Bi, dt=1e-4,
+                         use_device_assembly=device_bound)
     rng = np.random.default_rng(7)
     st.set_initial(
         lambda x: PHI_P0 + 0.01 * rng.standard_normal(len(x)),
@@ -183,16 +184,21 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--level", type=int, default=7)
+    ap.add_argument("--device-bound", action="store_true",
+                    help="use_device_assembly=True (slot-map scatter "
+                         "+ zero-copy cuDSS; M4 v1.2)")
     args = ap.parse_args()
     wp.init()
     device = "cuda:0" if wp.get_cuda_device_count() > 0 else "cpu"
     mesh, cons = build_strip(level=args.level)
     print(f"strip: {len(mesh.tree)} elements, {len(mesh.node_coords)} "
-          f"nodes, device={device}, M0={m0_from_params():.4f}")
+          f"nodes, device={device}, M0={m0_from_params():.4f}, "
+          f"device_bound={args.device_bound}")
     results = {}
     for Bi in (10.0, 0.1):
         st, rec, reason, wall, M0 = run_case(Bi, mesh, cons, device,
-                                             quick=args.quick)
+                                             quick=args.quick,
+                                             device_bound=args.device_bound)
         results[Bi] = (st, rec, reason, wall)
     tf = {}
     for Bi in (10.0, 0.1):

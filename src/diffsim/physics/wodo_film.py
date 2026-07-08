@@ -96,6 +96,21 @@ Linear solve: linsolver = "splu" (v1 default) or "cudss" — nvmath
 DirectSolver, plan once on the first Newton iterate, then
 reset_operands(a=..) + refactorize per iterate (fixed sparsity).
 
+v1.2 DEVICE-BOUND MARCH (use_device_assembly=True; M4): the host
+COO + scipy assembly is replaced by DeviceNSAssembler(ndof=4) — the
+slot-map CSR pattern is built ONCE per mesh; each Newton iterate
+launches the CH kernel into Ae/be blocks and scatters them into the
+device CSR values via the slot maps, then solves the zero-copy
+torch-CSR through nvmath cuDSS (plan once, reset_operands +
+refactorize per iterate). TOP-FACE FLUX CHOICE (documented): the
+enrichment fluxes are natural-BC (Neumann) ENRICHMENTS of interior
+equations, NOT strong rows, so set_strong_rows does not apply; their
+O(n_topface) values are computed on host (tiny, closed-form face-mass
+products) and folded into asm.vals_d / asm.F_d by a slot scatter-add
+before the solve. Host path stays the default. Requires identity
+constraints (uniform strips — true for every Wodo mesh). Parity gate:
+trajectory agreement < 1e-11 vs the host path (tests/test_wodo_film).
+
 v1.1 CONSERVED LANGEVIN NOISE (their CHC term, Sec. 5.3): stochastic
 flux q_i per GP, residual += Int grad~(w) . q_i dV, q_i ~ N(0,1) *
 noise * sqrt(2 M_ii / dt) (FDT shape; the absolute nondimensional
@@ -302,7 +317,8 @@ class WodoFilmStepper(TernaryCHStepper):
                  M=(0.225, 0.0, 0.225), kappa=(2e-4, 2e-4), k_e=1.0,
                  dt=1e-4, newton_tol=1e-9, newton_max=50,
                  lat_scale=1.0, linsolver="splu", noise=0.0,
-                 noise_seed=0, var_mob=False, D_ratio=1e-3, b_reg=0.0):
+                 noise_seed=0, var_mob=False, D_ratio=1e-3, b_reg=0.0,
+                 use_device_assembly=False):
         super().__init__(dm, chi=chi, M=M, kappa=kappa, dt=dt, order=1,
                          newton_tol=newton_tol, newton_max=newton_max)
         assert dm.mesh.p == 1, "Wodo film v1: linear elements only"
@@ -313,6 +329,9 @@ class WodoFilmStepper(TernaryCHStepper):
         self.lat_scale = float(lat_scale)
         self.linsolver = linsolver
         self._cudss = None
+        self.use_device_assembly = bool(use_device_assembly)
+        self._asm = None            # DeviceNSAssembler (lazy, per mesh)
+        self._cudss_dev = None      # device-CSR DirectSolver plan
         self.noise = float(noise)
         self._nrng = np.random.default_rng(noise_seed)
         self.var_mob = bool(var_mob)
@@ -333,6 +352,10 @@ class WodoFilmStepper(TernaryCHStepper):
 
     # -- top-surface topology -------------------------------------------
     def _build_top_faces(self):
+        """Top-face node lists + CONSISTENT P1 face mass matrices:
+        tensor product of the 1-D edge mass le * [[1/3,1/6],[1/6,1/3]]
+        over the lateral dims (dim=2: 2-node edges, the historical
+        le/6 [[2,1],[1,2]]; dim=3: 4-node quad faces)."""
         coords = self.mesh.node_coords
         vax = self.dm.dim - 1
         ymax = coords[:, vax].max()
@@ -340,18 +363,24 @@ class WodoFilmStepper(TernaryCHStepper):
         self.y_comp = float(ymax)     # computational vertical extent
         self.top_nodes = np.where(coords[:, vax] > ymax - tol)[0]
         assert len(self.top_nodes) > 0
-        edges, elens = [], []
+        m1 = np.array([[1.0 / 3.0, 1.0 / 6.0],
+                       [1.0 / 6.0, 1.0 / 3.0]])
+        faces, fmass = [], []
         for pv, conn in self.mesh.conn_of.items():
             offs = _local_offsets(pv, self.dm.dim)
-            top_loc = np.where(offs[:, vax] == pv)[0]     # p=1: 2 nodes
-            nn = conn[:, top_loc]                          # [ne, 2]
+            top_loc = np.where(offs[:, vax] == pv)[0]   # p=1: 2^(d-1)
+            of = offs[top_loc][:, :vax]                 # in-face offsets
+            Mu = np.ones((len(top_loc), len(top_loc)))
+            for dd in range(vax):
+                Mu *= m1[of[:, None, dd], of[None, :, dd]]
+            nn = conn[:, top_loc]                       # [ne, nfn]
             on_top = np.all(coords[nn, vax] > ymax - tol, axis=1)
             h_el = self.mesh.tree.h()[self.mesh.bins[pv]]
             for e in np.where(on_top)[0]:
-                edges.append(nn[e])
-                elens.append(h_el[e])
-        self.top_edge_n = np.asarray(edges, np.int64)      # [nte, 2]
-        self.top_edge_len = np.asarray(elens, np.float64)  # [nte]
+                faces.append(nn[e])
+                fmass.append(h_el[e] ** vax * Mu)
+        self.top_faces = np.asarray(faces, np.int64)     # [ntf, nfn]
+        self.top_face_M = np.asarray(fmass, np.float64)  # [ntf,nfn,nfn]
 
     def _top_phis_avg(self, p1_free, p2_free):
         f1 = np.asarray(self.Tc @ p1_free)
@@ -359,21 +388,24 @@ class WodoFilmStepper(TernaryCHStepper):
         return float(np.mean(1.0 - f1[self.top_nodes] - f2[self.top_nodes]))
 
     # -- linear solve (per-Newton-iterate matrix; fixed sparsity) --------
+    @staticmethod
+    def _cudss_opts():
+        from nvmath.sparse.advanced import DirectSolverOptions
+        import glob as _glob
+        mt = _glob.glob(
+            "/home/bglab/Baskar/DiffSim/.venv/lib/python3.12/"
+            "site-packages/nvidia/cu12/lib/libcudss_mtlayer_gomp.so*")
+        return DirectSolverOptions(multithreading_lib=mt[0]) if mt \
+            else None
+
     def _solve(self, A, r):
         if self.linsolver == "cudss":
-            from nvmath.sparse.advanced import (DirectSolver,
-                                                DirectSolverOptions)
-            import glob as _glob
+            from nvmath.sparse.advanced import DirectSolver
             b = np.ascontiguousarray(r, np.float64)
             try:
                 if self._cudss is None:
-                    mt = _glob.glob(
-                        "/home/bglab/Baskar/DiffSim/.venv/lib/python3.12/"
-                        "site-packages/nvidia/cu12/lib/"
-                        "libcudss_mtlayer_gomp.so*")
-                    opts = (DirectSolverOptions(multithreading_lib=mt[0])
-                            if mt else None)
-                    self._cudss = DirectSolver(A, b, options=opts)
+                    self._cudss = DirectSolver(A, b,
+                                               options=self._cudss_opts())
                     self._cudss.plan()
                 else:
                     self._cudss.reset_operands(a=A, b=b)
@@ -387,8 +419,36 @@ class WodoFilmStepper(TernaryCHStepper):
         from scipy.sparse.linalg import splu
         return splu(A.tocsc()).solve(r)
 
+    def _solve_device(self, asm):
+        """cuDSS on the device-resident torch CSR. STABLE operands:
+        the CSR values tensor is a zero-copy dlpack view of
+        asm.vals_d and b a persistent device buffer refreshed from
+        asm.F_d — the scatter updates values IN PLACE, so the plan is
+        made once (fixed sparsity) and each iterate only refactorizes
+        (nvmath invalidates the plan if operand buffers change)."""
+        import torch
+        from nvmath.sparse.advanced import DirectSolver
+        try:
+            if self._cudss_dev is None:
+                A_t, F_t = asm.device_csr()
+                self._F_view = F_t              # zero-copy over asm.F_d
+                self._b_t = torch.empty_like(F_t)
+                self._b_t.copy_(self._F_view)
+                self._cudss_dev = DirectSolver(A_t, self._b_t,
+                                               options=self._cudss_opts())
+                self._cudss_dev.plan()
+            else:
+                self._b_t.copy_(self._F_view)
+            self._cudss_dev.factorize()
+            return np.asarray(self._cudss_dev.solve().cpu())
+        except Exception:
+            self._cudss_dev = None
+            return np.full(asm.Nfull, np.nan)
+
     # -- one implicit solve at frozen (h_curr, K); does NOT commit ------
     def _attempt(self, dt, K):
+        if self.use_device_assembly:
+            return self._attempt_device(dt, K)
         d = self.dm.device
         sigma = 1.0 / dt
         v1, _ = self._gp(self.hist[0][0])
@@ -411,8 +471,6 @@ class WodoFilmStepper(TernaryCHStepper):
                 rho * self._nrng.standard_normal((ngp, self.dm.dim)),
                 rho * self._nrng.standard_normal((ngp, self.dm.dim)))
         Dr = self.D_ratio if self.var_mob else -1.0
-        n0, n1 = self.top_edge_n[:, 0], self.top_edge_n[:, 1]
-        le = self.top_edge_len
         x = self.x.copy()
         for it in range(self.newton_max):
             fields = [self._gp(x[i::4]) for i in range(4)]
@@ -456,23 +514,20 @@ class WodoFilmStepper(TernaryCHStepper):
                 vals.append(Aeh.ravel())
                 np.add.at(F_full, gdof.ravel(), beh.ravel())
             # -- top-surface enrichment load: R_i -= (K/h) Int w phi_i dS
-            # (consistent P1 face mass matrix le/6 [[2,1],[1,2]]).
+            # (consistent P1 face mass Mf, _build_top_faces).
             # be = -R => F += +(K/h) Mf phi ; Jacobian dR/dphi = -(K/h) Mf.
             f1 = np.asarray(self.Tc @ x[0::4])
             f2 = np.asarray(self.Tc @ x[2::4])
+            Mf = coef * self.top_face_M              # [ntf, nfn, nfn]
+            nfn = self.top_faces.shape[1]
             for comp, fv in ((0, f1), (2, f2)):
-                np.add.at(F_full, 4 * n0 + comp,
-                          coef * le / 6.0 * (2.0 * fv[n0] + fv[n1]))
-                np.add.at(F_full, 4 * n1 + comp,
-                          coef * le / 6.0 * (fv[n0] + 2.0 * fv[n1]))
-                rows.append(np.concatenate([4 * n0 + comp, 4 * n0 + comp,
-                                            4 * n1 + comp, 4 * n1 + comp]))
-                cols.append(np.concatenate([4 * n0 + comp, 4 * n1 + comp,
-                                            4 * n0 + comp, 4 * n1 + comp]))
-                vals.append(np.concatenate([-coef * le / 3.0,
-                                            -coef * le / 6.0,
-                                            -coef * le / 6.0,
-                                            -coef * le / 3.0]))
+                gd = 4 * self.top_faces + comp       # [ntf, nfn]
+                np.add.at(F_full, gd.ravel(),
+                          np.einsum("fab,fb->fa", Mf,
+                                    fv[self.top_faces]).ravel())
+                rows.append(np.repeat(gd, nfn, axis=1).ravel())
+                cols.append(np.tile(gd, (1, nfn)).ravel())
+                vals.append(-Mf.ravel())
             Kmat = sp.coo_matrix(
                 (np.concatenate(vals),
                  (np.concatenate(rows), np.concatenate(cols))),
@@ -483,6 +538,119 @@ class WodoFilmStepper(TernaryCHStepper):
                 A = (self.T4.T @ Kmat @ self.T4).tocsr()
                 r = np.asarray(self.T4.T @ F_full)
             dx = self._solve(A, r)
+            if not np.isfinite(dx).all() or np.abs(dx).max() > 1e6:
+                return None, it + 1, False               # diverged
+            x = x + dx
+            if np.abs(dx).max() < self.newton_tol:
+                return x, it + 1, True
+        return x, self.newton_max, False                 # no convergence
+
+    # -- device-bound attempt (v1.2): slot-map scatter + cuDSS -----------
+    def _init_device_assembly(self):
+        """Once per mesh: slot-map CSR pattern (DeviceNSAssembler,
+        ndof=4) + top-face flux slot/dof arrays. The flux entries live
+        inside top-element blocks, so every (row, col) pair exists in
+        the element-pattern CSR."""
+        from ..assembly.device_assembly import DeviceNSAssembler
+        assert self._proj_identity, (
+            "device-bound film v1.2: identity constraints only "
+            "(uniform strips; no hanging nodes)")
+        self._asm = DeviceNSAssembler(self.dm, ndof=4)
+        d = self.dm.device
+        ntf, nfn = self.top_faces.shape
+        rows, cols, gdofs = [], [], []
+        for comp in (0, 2):
+            gd = 4 * self.top_faces + comp
+            rows.append(np.repeat(gd, nfn, axis=1).ravel())
+            cols.append(np.tile(gd, (1, nfn)).ravel())
+            gdofs.append(gd.ravel())
+        slots = self._asm.csr_slots(np.concatenate(rows),
+                                    np.concatenate(cols))
+        self._flux_slots_d = wp.array(slots.astype(np.int32),
+                                      dtype=wp.int32, device=d)
+        self._flux_gdof_d = wp.array(
+            np.concatenate(gdofs).astype(np.int32), dtype=wp.int32,
+            device=d)
+        # per-comp identical base values; scaled by -coef per attempt
+        self._flux_base = np.concatenate([self.top_face_M.ravel()] * 2)
+
+    def _attempt_device(self, dt, K):
+        """One implicit solve, fully device-bound (v1.2 docstring):
+        CH-kernel Ae/be blocks scatter into the device CSR via the
+        slot maps; the natural-BC top-face flux (NOT strong rows —
+        set_strong_rows does not apply) is a tiny host-values add into
+        asm.vals_d / asm.F_d; solve = zero-copy torch CSR -> cuDSS."""
+        if self._asm is None:
+            self._init_device_assembly()
+        asm = self._asm
+        d = self.dm.device
+        sigma = 1.0 / dt
+        v1, _ = self._gp(self.hist[0][0])
+        v2, _ = self._gp(self.hist[0][1])
+        h1_gp = {pv: sigma * v1[pv] for pv in v1}
+        h2_gp = {pv: sigma * v2[pv] for pv in v2}
+        minv = 1.0 / self.h_curr
+        mlat = 1.0 / self.lat_scale
+        mvert = self.y_comp * minv
+        coef = K * minv * self.y_comp
+        rho = self.noise * np.sqrt(2.0 / dt)
+        q_gp = {}
+        for pv, b in self.dm.bins.items():
+            ngp = len(self.mesh.conn_of[pv]) * b["nqp"]
+            q_gp[pv] = (
+                rho * self._nrng.standard_normal((ngp, self.dm.dim)),
+                rho * self._nrng.standard_normal((ngp, self.dm.dim)))
+        Dr = self.D_ratio if self.var_mob else -1.0
+        # flux Jacobian values: frozen over the attempt (coef frozen)
+        flux_vals_d = wp.array(
+            np.ascontiguousarray(-coef * self._flux_base),
+            dtype=wp.float64, device=d)
+        x = self.x.copy()
+        for it in range(self.newton_max):
+            fields = [self._gp(x[i::4]) for i in range(4)]
+            asm.zero_fill()
+            for k_bin, (pv, b, ne, nbf, gdof) in enumerate(asm._bins):
+                nqp = b["nqp"]
+                arr = lambda a_: wp.array(np.ascontiguousarray(a_),
+                                          dtype=wp.float64, device=d)
+                Ae = wp.zeros((ne, 4 * nbf, 4 * nbf), dtype=wp.float64,
+                              device=d)
+                be = wp.zeros((ne, 4 * nbf), dtype=wp.float64, device=d)
+                kk = make_wodo_newton(nbf, nqp, self.dm.dim)
+                wp.launch(kk, dim=ne, inputs=[
+                    b["conn"], b["h"], b["N"], b["dN"], b["w"],
+                    arr(fields[0][0][pv]), arr(fields[0][1][pv]),
+                    arr(fields[1][0][pv]), arr(fields[1][1][pv]),
+                    arr(fields[2][0][pv]), arr(fields[2][1][pv]),
+                    arr(fields[3][0][pv]), arr(fields[3][1][pv]),
+                    arr(h1_gp[pv]), arr(h2_gp[pv]),
+                    arr(q_gp[pv][0]), arr(q_gp[pv][1]),
+                    self.theta_wp[pv],
+                    wp.float64(self.M11), wp.float64(self.M12),
+                    wp.float64(self.M22), wp.float64(Dr),
+                    wp.float64(self.c12),
+                    wp.float64(self.c1s), wp.float64(self.c2s),
+                    wp.float64(1.0 / self.N1), wp.float64(1.0 / self.N2),
+                    wp.float64(1.0 / self.Ns),
+                    wp.float64(self.b_reg),
+                    wp.float64(self.kap1), wp.float64(self.kap2),
+                    wp.float64(sigma), wp.float64(mlat),
+                    wp.float64(mvert), wp.float64(minv), wp.float64(K),
+                    Ae, be], device=d)
+                asm.scatter_bin(k_bin, Ae, be)
+            # top-face enrichment flux (host values -> device add)
+            asm.add_matrix_values(self._flux_slots_d, flux_vals_d)
+            f1 = np.asarray(self.Tc @ x[0::4])
+            f2 = np.asarray(self.Tc @ x[2::4])
+            Mf = coef * self.top_face_M
+            load = np.concatenate(
+                [np.einsum("fab,fb->fa", Mf, fv[self.top_faces]).ravel()
+                 for fv in (f1, f2)])
+            asm.add_rhs_values(
+                self._flux_gdof_d,
+                wp.array(np.ascontiguousarray(load), dtype=wp.float64,
+                         device=d))
+            dx = self._solve_device(asm)
             if not np.isfinite(dx).all() or np.abs(dx).max() > 1e6:
                 return None, it + 1, False               # diverged
             x = x + dx
