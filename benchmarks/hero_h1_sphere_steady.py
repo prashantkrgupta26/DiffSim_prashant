@@ -22,12 +22,10 @@ from diffsim.assembly.operators import DeviceMesh
 from diffsim.geometry.provided_inr import ProvidedINROracle, extract_modes
 from diffsim.sbm.surrogate import (classify_lambda, extract_surrogate,
                                    GeometryData)
-from diffsim.api.ns_bricks import assemble_linear_ns
 from diffsim.sbm.vector import sbm_vector_dirichlet
 from diffsim.sbm.ns_shape import face_dbar_sweep, _gp_field_transpose
 from diffsim.sbm.ns_adjoint import ns_volume_cotangents, ns_load_cotangents
 from diffsim.sbm.adjoint import distance_torch
-from diffsim.physics.poisson import gauss_points
 from diffsim.mesh.pointeval import point_eval_weights
 import warp as wp
 
@@ -72,7 +70,16 @@ def build_epoch(V, level):
 
 def steady(alpha_np, V, level, picard=60, tol=1e-11):
     """Steady confined flow past the alpha-edited sphere INR on the
-    FROZEN epoch. Returns the pieces the adjoint needs."""
+    FROZEN epoch. Returns the pieces the adjoint needs.
+
+    M1d closure upgrade (2026-07-08): the Picard loop runs on the
+    device stack — DeviceNSAssembler (symbolic once per epoch; face
+    system added on the fixed pattern via cached slots; strong rows
+    folded in-kernel) + gp_field device kernels + plan-once cuDSS
+    refactorization. Replaced per-iterate host assemble_linear_ns
+    (12.2 s/steady) + LIL surgery (10 s) + per-iterate cuDSS plan
+    (6.6 s) — measured cProfile 2026-07-08; assembly parity is the
+    1e-12 test_device_assembly gate."""
     dim, ndof = 3, 4
     if not _EPOCH:
         build_epoch(V, level)
@@ -93,7 +100,6 @@ def steady(alpha_np, V, level, picard=60, tol=1e-11):
     T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
     nfree = T.shape[1]
     coords = mesh.node_coords[cons.free_nodes]
-    xq = gauss_points(mesh, dm.tables_by_p)
     on = lambda v, c: np.abs(coords[:, c] - v) < 1e-12
     strong = np.where(on(0.0, 0) | on(0.0, 1) | on(1.0, 1)
                       | on(0.0, 2) | on(1.0, 2))[0]
@@ -105,49 +111,68 @@ def steady(alpha_np, V, level, picard=60, tol=1e-11):
         alpha=ALPHA_F)
     Af_c = (T_vec.T @ Af @ T_vec).tocsr()
     bf_c = np.asarray(T_vec.T @ bf)
+    strong_rows = np.concatenate(
+        [np.array([i * ndof + c for i in strong for c in range(3)],
+                  np.int64), np.array([pin * ndof + 3], np.int64)])
 
-    def gp_field(node_vec):
-        full = np.asarray(T @ node_vec)
-        aq, dq = {}, {}
-        for pv in dm.bins:
-            tb = dm.tables_by_p[pv]
-            conn = mesh.conn_of[pv]
-            vals = full[conn]
-            aq[pv] = np.einsum("qa,ead->eqd", tb.N, vals).reshape(-1, dim)
-            h = mesh.tree.h()[mesh.bins[pv]]
-            dq[pv] = (np.einsum("qad,ead->eq", tb.dN, vals)
-                      * (2.0 / h)[:, None]).reshape(-1)
-        return aq, dq
+    # ---- M1d device Picard machinery (symbolic + slots + plan: once
+    # per FROZEN epoch; only VALUES move per alpha/iterate) ------------
+    if "asm" not in _EPOCH:
+        from diffsim.assembly.device_assembly import DeviceNSAssembler
+        from diffsim.assembly.gp_field import DeviceGPField
+        asm_ = DeviceNSAssembler(dm)
+        asm_.set_strong_rows(strong_rows)
+        _EPOCH.update(asm=asm_, gpf=DeviceGPField(dm),
+                      rhs_dofs_d=wp.array(
+                          np.arange(asm_.Nfull, dtype=np.int32),
+                          dtype=wp.int32, device=dm.device))
+    asm, gpf = _EPOCH["asm"], _EPOCH["gpf"]
+    Afc = Af_c.tocoo()          # face pattern is epoch-frozen; the
+    if "af_slots_d" not in _EPOCH:      # VALUES follow alpha
+        _EPOCH["af_slots_d"] = wp.array(
+            asm.csr_slots(Afc.row, Afc.col).astype(np.int32),
+            dtype=wp.int32, device=dm.device)
+    af_vals_d = wp.array(np.ascontiguousarray(Afc.data),
+                         dtype=wp.float64, device=dm.device)
+    bf_d = wp.array(np.ascontiguousarray(bf_c), dtype=wp.float64,
+                    device=dm.device)
+    sbv = np.concatenate([g_strong.reshape(-1), [0.0]])
+    fq_d = gpf.zeros_gp("f0")
 
     x = np.zeros(nfree * ndof)
     prev = None
+    aq_d = dq_d = None
     for it in range(picard):
         u_node = x.reshape(nfree, ndof)[:, :dim]
-        aq, dq = gp_field(u_node)
-        fq = {pv: np.zeros_like(aq[pv]) for pv in xq}
-        A, b = assemble_linear_ns(dm, aq, dq, fq, NU, sigma=0.0)
-        A = (A + Af_c).tolil()
-        b = b + bf_c
-        for k_, i in enumerate(strong):
-            for c in range(dim):
-                r_ = i * ndof + c
-                A.rows[r_] = [int(r_)]
-                A.data[r_] = [1.0]
-                b[r_] = g_strong[k_, c]
-        rp = pin * ndof + dim
-        A.rows[rp] = [rp]
-        A.data[rp] = [1.0]
-        b[rp] = 0.0
-        A = A.tocsr()
-        from diffsim.solvers.linsolve import solve_linear
-        x = solve_linear(A, b, solver="cudss")
+        aq_d, dq_d = gpf.interp_div(gpf.to_full(u_node, "u"), "u")
+        A_t, F_t = asm.assemble_device(
+            aq_d, dq_d, fq_d, NU, 0.0, sig2tau=0.0,
+            strong_b_vals=sbv,
+            extra_matrix=(_EPOCH["af_slots_d"], af_vals_d),
+            extra_rhs=(_EPOCH["rhs_dofs_d"], bf_d))
+        if "slv" not in _EPOCH:
+            from nvmath.sparse.advanced import DirectSolver
+            from diffsim.solvers.linsolve import cudss_options
+            b_t = torch.empty_like(F_t)
+            b_t.copy_(F_t)
+            slv = DirectSolver(A_t, b_t, options=cudss_options())
+            slv.plan()
+            _EPOCH.update(slv=slv, b_t=b_t)
+        else:
+            _EPOCH["b_t"].copy_(F_t)
+        _EPOCH["slv"].factorize()
+        x = np.asarray(_EPOCH["slv"].solve().cpu()).ravel()
         u_new = x.reshape(nfree, ndof)[:, :dim]
         if prev is not None and np.abs(u_new - prev).max() < tol:
             break
         prev = u_new.copy()
-    strong_rows = np.concatenate(
-        [np.array([i * ndof + c for i in strong for c in range(3)],
-                  np.int64), np.array([pin * ndof + 3], np.int64)])
+    # host copies the ADJOINT consumes (one download at convergence;
+    # the cotangent sweeps + transpose solve stay host — ms-class)
+    aq = {pv: aq_d[pv].numpy() for pv in dm.bins}
+    dq = {pv: dq_d[pv].numpy() for pv in dm.bins}
+    fq = {pv: np.zeros_like(aq[pv]) for pv in dm.bins}
+    A = sp.csr_matrix((asm.vals_d.numpy(), asm.indices, asm.indptr),
+                      shape=(asm.Nfull, asm.Nfull))
     # probe operator on velocity components (u_x, u_y, u_z stacked)
     W = point_eval_weights(mesh, PROBES)          # [np, n_nodes]
     return dict(dm=dm, sf=sf, geo=geo, oracle=o, A=A, x=x, T_vec=T_vec,

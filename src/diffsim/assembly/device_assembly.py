@@ -229,27 +229,46 @@ class DeviceNSAssembler:
 
     # ------------------------------------------------------------------
     def assemble(self, aq_by_bin, div_aq_by_bin, fq_by_bin, nu, sigma,
-                 sig2tau=None, s_skew=0.5, strong_b_vals=None):
+                 sig2tau=None, s_skew=0.5, strong_b_vals=None,
+                 extra_matrix=None, extra_rhs=None):
         """Numeric fill on device; returns (csr, F) with HOST copies for
-        now (the solver interface); vals stay resident in self.vals_d."""
+        now (the solver interface); vals stay resident in self.vals_d.
+
+        M1d closure: the GP-field inputs (aq/div/fq per bin) may be
+        DEVICE wp.arrays (assembly/gp_field.py products) — consumed
+        directly, no host round-trip; numpy inputs upload as before.
+        extra_matrix=(slots_d, vals_d) / extra_rhs=(dofs_d, vals_d):
+        additional device-resident contributions (e.g. a cached SBM face
+        system on the fixed pattern) atomically added AFTER the volume
+        scatter and BEFORE the strong rows — the composition order the
+        host path realizes as A_vol + Af then row surgery."""
         from ..api.ns_bricks import make_linear_ns_Ae, make_linear_ns_be
         dm = self.dm
         d = dm.device
+
+        def _dev(x):
+            return x if isinstance(x, wp.array) else wp.array(
+                np.ascontiguousarray(x), dtype=wp.float64, device=d)
+
         ndof = self.ndof
         if sig2tau is None:
             sig2tau = (2.0 * sigma) ** 2
         self.vals_d.zero_()
         self.F_d.zero_()
+        if not hasattr(self, "_gaq_d"):
+            self._gaq_d = {}
         for k_bin, (pv, b, ne, nbf, gdof) in enumerate(self._bins):
             nqp = b["nqp"]
-            aq = wp.array(np.ascontiguousarray(aq_by_bin[pv]),
-                          dtype=wp.float64, device=d)
-            dq = wp.array(np.ascontiguousarray(div_aq_by_bin[pv]),
-                          dtype=wp.float64, device=d)
-            ga = np.zeros((len(aq_by_bin[pv]), dm.dim * dm.dim))
-            gaq = wp.array(ga, dtype=wp.float64, device=d)
-            fq = wp.array(np.ascontiguousarray(fq_by_bin[pv]),
-                          dtype=wp.float64, device=d)
+            aq = _dev(aq_by_bin[pv])
+            dq = _dev(div_aq_by_bin[pv])
+            # frozen-a linearization: gaq only read at newton=1 (never
+            # here) — a cached zero buffer, not a per-step upload
+            gaq = self._gaq_d.get(pv)
+            if gaq is None:
+                gaq = wp.zeros((ne * nqp, dm.dim * dm.dim),
+                               dtype=wp.float64, device=d)
+                self._gaq_d[pv] = gaq
+            fq = _dev(fq_by_bin[pv])
             Ae = wp.zeros((ne, nbf * ndof, nbf * ndof), dtype=wp.float64,
                           device=d)
             be = wp.zeros((ne, nbf * ndof), dtype=wp.float64, device=d)
@@ -300,6 +319,10 @@ class DeviceNSAssembler:
                           inputs=[be.reshape((-1,)), self._bsrc_d[k_bin],
                                   self._bw_d[k_bin], self._gdof_d[k_bin],
                                   self.F_d], device=d)
+        if extra_matrix is not None:
+            self.add_matrix_values(*extra_matrix)
+        if extra_rhs is not None:
+            self.add_rhs_values(*extra_rhs)
         if getattr(self, "_strong", None) is not None:
             st = self._strong
             zk = _zero_slots_kernel()
@@ -315,11 +338,23 @@ class DeviceNSAssembler:
                       inputs=[st["diag_d"], st["rows_d"], bv,
                               self.vals_d, self.F_d],
                       device=self.dm.device)
+        if getattr(self, "_return_device", False) == "raw":
+            return None                    # fill-only (assemble_fill)
         if getattr(self, "_return_device", False):
             return self.device_csr()
         A = sp.csr_matrix((self.vals_d.numpy(), self.indices,
                            self.indptr), shape=(self.Nfull, self.Nfull))
         return A, self.F_d.numpy()
+
+    def assemble_fill(self, *a, **k):
+        """Numeric fill ONLY (vals_d/F_d updated in place, nothing
+        returned/pulled) — for solvers consuming the device buffers
+        directly (device_operator() + F_d; the fused-Krylov step path)."""
+        self._return_device = "raw"
+        try:
+            self.assemble(*a, **k)
+        finally:
+            self._return_device = False
 
     def assemble_device(self, *a, **k):
         """M1d D3: like assemble() but returns a DEVICE-RESIDENT torch
@@ -398,6 +433,54 @@ class DeviceNSAssembler:
                   inputs=[vals_d, dofs_d, self.F_d],
                   device=self.dm.device)
 
+    def device_operator(self):
+        """Operator-protocol view over the DEVICE-RESIDENT CSR (vals_d
+        zero-copy; indptr/indices uploaded once per epoch): .matvec(x_wp,
+        y_wp) for the fused Krylov — the direct-solver fallback when the
+        factorization exceeds HBM (measured: cuDSS ALLOC_FAILED at 3-D
+        L6, 1.1M dofs, on a 48 GB card — default AND hybrid memory mode;
+        the GH200 capacity question made concrete)."""
+        if not hasattr(self, "_op_idx"):
+            from .operators import csr_spmv
+            self._op_idx = (
+                wp.array(self.indptr.astype(np.int32), dtype=wp.int32,
+                         device=self.dm.device),
+                wp.array(self.indices.astype(np.int32), dtype=wp.int32,
+                         device=self.dm.device))
+            self._op_spmv = csr_spmv
+        asm = self
+
+        class _Op:
+            device = asm.dm.device
+            n_free = asm.Nfull
+
+            def matvec(self, x, y):
+                wp.launch(asm._op_spmv, dim=asm.Nfull,
+                          inputs=[asm._op_idx[0], asm._op_idx[1],
+                                  asm.vals_d, x, y],
+                          device=asm.dm.device)
+
+        return _Op()
+
+    def diag_host(self):
+        """Current matrix diagonal (host, for the Krylov Jacobi
+        preconditioner): slot ids once per epoch, then a device gather +
+        one small download per step."""
+        if not hasattr(self, "_diag_slots_d"):
+            probe = sp.csr_matrix(
+                (np.arange(self.nnz, dtype=np.float64), self.indices,
+                 self.indptr), shape=(self.Nfull, self.Nfull))
+            slots = probe.diagonal().astype(np.int64)
+            self._diag_slots_d = wp.array(slots.astype(np.int32),
+                                          dtype=wp.int32,
+                                          device=self.dm.device)
+            self._diag_d = wp.zeros(self.Nfull, dtype=wp.float64,
+                                    device=self.dm.device)
+        wp.launch(_gather_kernel(), dim=self.Nfull,
+                  inputs=[self.vals_d, self._diag_slots_d, self._diag_d],
+                  device=self.dm.device)
+        return self._diag_d.numpy()
+
     def device_csr(self):
         """Zero-copy torch CSR over vals_d + device rhs (dlpack)."""
         import torch
@@ -412,6 +495,22 @@ class DeviceNSAssembler:
             self._indptr_t, self._indices_t, vals_t,
             size=(self.Nfull, self.Nfull))
         return A_t, torch.from_dlpack(self.F_d.__dlpack__())
+
+
+def _gather_kernel():
+    key = ("dev_gather",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique")
+    def gat(vals: wp.array(dtype=wp.float64),
+            slots: wp.array(dtype=wp.int32),
+            out: wp.array(dtype=wp.float64)):
+        i = wp.tid()
+        out[i] = vals[slots[i]]
+
+    _kernel_cache[key] = gat
+    return gat
 
 
 def _scatter_kernel():

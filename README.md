@@ -232,12 +232,18 @@ test that needs it is opt-in via `DIFFSIM_RUN_3D_NS=1`.
   shape + constitutive gradients; PROVIDED INR checkpoints (GENIE edit
   modes, window contract, projection hardening); heroes: **sphere
   steady 1.8e-3 ✅, sphere transient 2.6e-4 ✅**.
-- ✅ **M1d — device migration** (capacity verdicts pending Nova):
+- ✅ **M1d — device migration** (GH200 capacity probe pending):
   cuDSS 300× over host splu; device CSR assembly 4–40× (uniform +
   hanging; strong rows folded; ndof-generic); zero-copy
   assemble→solve; steppers `use_device_assembly=True` (2.2× end-to-end,
   solver-bound); cuDSS mtlayer (~40× on refactorization loops).
-  Verdict: pure-device is THE profile; coherent = capacity-only.
+  **FORMALLY CLOSED 2026-07-08** (m1d-milestone-report.md): device
+  GP-field kernels (last per-step host compute migrated); D3 trace —
+  per-step host work 0.81% / 0.04% / 0.03% of step at 2-D L8 / 3-D L5 /
+  3-D L6 (< 5% bar); H1 hero epoch 44.3× (27 s vs the M1c-era
+  ~20 min). Verdict: pure-device is THE profile; coherent =
+  capacity-only (measured: 3-D L6 direct factorization exceeds 48 GB —
+  fused device Krylov carries it).
 - ✅ **M2 — Heat/Mass + closures + p2-NS**: scalar brick (orders
   2.00/3.00 EXACT, VMS-complete residual), coupler (de Vahl Davis Nu
   **0.05% / 0.02%**), SBM-thermal composition (Péclet-aware Nitsche,
