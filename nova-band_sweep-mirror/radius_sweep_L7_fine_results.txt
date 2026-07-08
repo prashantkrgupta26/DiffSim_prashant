@@ -1,0 +1,201 @@
+=== L7 fine sweep job 11473320 started Tue Jul  7 10:41:48 PM CDT 2026 on nova21-gpu-9 ===
+NVIDIA A100-SXM4-80GB, 81920 MiB
+--- radius 0.2700 start Tue Jul  7 10:41:48 PM CDT 2026 ---
+
+===== dim=3  (r=0.27, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+No multithreading interface library was specified using the DirectSolverOptions. The performance of CPU operations like planning will be significantly lower than if you provide a multithreading library.
+Warp 1.14.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA A100-SXM4-80GB" (79 GiB, sm_80, mempool enabled)
+   Kernel cache:
+     /home/baskarg/.cache/warp/1.14.0
+Module make_poisson_element_matrices__locals__poisson_Ke_3dca1c12 3dca1c1 load on device 'cuda:0' took 3.43 ms  (cached)
+Module make_poisson_element_matrices__locals__poisson_Ke_de3d907e de3d907 load on device 'cuda:0' took 2.43 ms  (cached)
+Module make_sbm_neumann_Ae__locals__sbm_neu_Ae_aac0d7b8 aac0d7b load on device 'cuda:0' took 2.61 ms  (cached)
+Module make_load_kernel__locals__load_951f6381 951f638 load on device 'cuda:0' took 2.23 ms  (cached)
+Module make_load_kernel__locals__load_a62cc77d a62cc77 load on device 'cuda:0' took 2.22 ms  (cached)
+Module make_sbm_neumann_be__locals__sbm_neu_be_9d18dc6e 9d18dc6 load on device 'cuda:0' took 2.49 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_b006579f b006579 load on device 'cuda:0' took 2.73 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_9a7db4b5 9a7db4b load on device 'cuda:0' took 2.17 ms  (cached)
+  band(3) L7: r=0.27  err=4.0333e-04  dofs=2416960  band_elems=61336  surrfaces=21744  [158s, cudss, res=2.3e-11]
+  orders band(3): 
+--- radius 0.2700 exit=0 Tue Jul  7 10:44:29 PM CDT 2026 ---
+--- radius 0.2725 start Tue Jul  7 10:44:29 PM CDT 2026 ---
+
+===== dim=3  (r=0.2725, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+No multithreading interface library was specified using the DirectSolverOptions. The performance of CPU operations like planning will be significantly lower than if you provide a multithreading library.
+Warp 1.14.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA A100-SXM4-80GB" (79 GiB, sm_80, mempool enabled)
+   Kernel cache:
+     /home/baskarg/.cache/warp/1.14.0
+Module make_poisson_element_matrices__locals__poisson_Ke_3dca1c12 3dca1c1 load on device 'cuda:0' took 2.93 ms  (cached)
+Module make_poisson_element_matrices__locals__poisson_Ke_de3d907e de3d907 load on device 'cuda:0' took 2.24 ms  (cached)
+Module make_sbm_neumann_Ae__locals__sbm_neu_Ae_aac0d7b8 aac0d7b load on device 'cuda:0' took 2.27 ms  (cached)
+Module make_load_kernel__locals__load_951f6381 951f638 load on device 'cuda:0' took 2.08 ms  (cached)
+Module make_load_kernel__locals__load_a62cc77d a62cc77 load on device 'cuda:0' took 2.18 ms  (cached)
+Module make_sbm_neumann_be__locals__sbm_neu_be_9d18dc6e 9d18dc6 load on device 'cuda:0' took 2.10 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_b006579f b006579 load on device 'cuda:0' took 2.58 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_9a7db4b5 9a7db4b load on device 'cuda:0' took 1.99 ms  (cached)
+  band(3) L7: r=0.2725  err=1.1407e-04  dofs=2420116  band_elems=62440  surrfaces=22128  [160s, cudss, res=3.6e-12]
+  orders band(3): 
+--- radius 0.2725 exit=0 Tue Jul  7 10:47:11 PM CDT 2026 ---
+--- radius 0.2750 start Tue Jul  7 10:47:11 PM CDT 2026 ---
+
+===== dim=3  (r=0.275, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+No multithreading interface library was specified using the DirectSolverOptions. The performance of CPU operations like planning will be significantly lower than if you provide a multithreading library.
+Warp 1.14.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA A100-SXM4-80GB" (79 GiB, sm_80, mempool enabled)
+   Kernel cache:
+     /home/baskarg/.cache/warp/1.14.0
+Module make_poisson_element_matrices__locals__poisson_Ke_3dca1c12 3dca1c1 load on device 'cuda:0' took 2.81 ms  (cached)
+Module make_poisson_element_matrices__locals__poisson_Ke_de3d907e de3d907 load on device 'cuda:0' took 2.22 ms  (cached)
+Module make_sbm_neumann_Ae__locals__sbm_neu_Ae_aac0d7b8 aac0d7b load on device 'cuda:0' took 2.43 ms  (cached)
+Module make_load_kernel__locals__load_951f6381 951f638 load on device 'cuda:0' took 2.04 ms  (cached)
+Module make_load_kernel__locals__load_a62cc77d a62cc77 load on device 'cuda:0' took 1.95 ms  (cached)
+Module make_sbm_neumann_be__locals__sbm_neu_be_9d18dc6e 9d18dc6 load on device 'cuda:0' took 2.18 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_b006579f b006579 load on device 'cuda:0' took 2.44 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_9a7db4b5 9a7db4b load on device 'cuda:0' took 2.08 ms  (cached)
+  band(3) L7: r=0.275  err=1.3128e-04  dofs=2424502  band_elems=63712  surrfaces=22608  [161s, cudss, res=1.2e-12]
+  orders band(3): 
+--- radius 0.2750 exit=0 Tue Jul  7 10:49:54 PM CDT 2026 ---
+--- radius 0.2775 start Tue Jul  7 10:49:54 PM CDT 2026 ---
+
+===== dim=3  (r=0.2775, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+No multithreading interface library was specified using the DirectSolverOptions. The performance of CPU operations like planning will be significantly lower than if you provide a multithreading library.
+Warp 1.14.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA A100-SXM4-80GB" (79 GiB, sm_80, mempool enabled)
+   Kernel cache:
+     /home/baskarg/.cache/warp/1.14.0
+Module make_poisson_element_matrices__locals__poisson_Ke_3dca1c12 3dca1c1 load on device 'cuda:0' took 2.88 ms  (cached)
+Module make_poisson_element_matrices__locals__poisson_Ke_de3d907e de3d907 load on device 'cuda:0' took 2.10 ms  (cached)
+Module make_sbm_neumann_Ae__locals__sbm_neu_Ae_aac0d7b8 aac0d7b load on device 'cuda:0' took 2.16 ms  (cached)
+Module make_load_kernel__locals__load_951f6381 951f638 load on device 'cuda:0' took 2.08 ms  (cached)
+Module make_load_kernel__locals__load_a62cc77d a62cc77 load on device 'cuda:0' took 2.02 ms  (cached)
+Module make_sbm_neumann_be__locals__sbm_neu_be_9d18dc6e 9d18dc6 load on device 'cuda:0' took 2.30 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_b006579f b006579 load on device 'cuda:0' took 2.50 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_9a7db4b5 9a7db4b load on device 'cuda:0' took 2.22 ms  (cached)
+  band(3) L7: r=0.2775  err=2.7044e-04  dofs=2428198  band_elems=64936  surrfaces=23064  [157s, cudss, res=1.6e-11]
+  orders band(3): 
+--- radius 0.2775 exit=0 Tue Jul  7 10:52:34 PM CDT 2026 ---
+--- radius 0.2800 start Tue Jul  7 10:52:34 PM CDT 2026 ---
+
+===== dim=3  (r=0.28, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+No multithreading interface library was specified using the DirectSolverOptions. The performance of CPU operations like planning will be significantly lower than if you provide a multithreading library.
+Warp 1.14.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA A100-SXM4-80GB" (79 GiB, sm_80, mempool enabled)
+   Kernel cache:
+     /home/baskarg/.cache/warp/1.14.0
+Module make_poisson_element_matrices__locals__poisson_Ke_3dca1c12 3dca1c1 load on device 'cuda:0' took 2.87 ms  (cached)
+Module make_poisson_element_matrices__locals__poisson_Ke_de3d907e de3d907 load on device 'cuda:0' took 2.22 ms  (cached)
+Module make_sbm_neumann_Ae__locals__sbm_neu_Ae_aac0d7b8 aac0d7b load on device 'cuda:0' took 2.23 ms  (cached)
+Module make_load_kernel__locals__load_951f6381 951f638 load on device 'cuda:0' took 2.25 ms  (cached)
+Module make_load_kernel__locals__load_a62cc77d a62cc77 load on device 'cuda:0' took 3.37 ms  (cached)
+Module make_sbm_neumann_be__locals__sbm_neu_be_9d18dc6e 9d18dc6 load on device 'cuda:0' took 1.96 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_b006579f b006579 load on device 'cuda:0' took 2.40 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_9a7db4b5 9a7db4b load on device 'cuda:0' took 1.99 ms  (cached)
+  band(3) L7: r=0.28  err=2.8521e-03  dofs=2429742  band_elems=65832  surrfaces=23400  [161s, cudss, res=1.0e-12]
+  orders band(3): 
+--- radius 0.2800 exit=0 Tue Jul  7 10:55:17 PM CDT 2026 ---
+--- radius 0.2825 start Tue Jul  7 10:55:17 PM CDT 2026 ---
+
+===== dim=3  (r=0.2825, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+No multithreading interface library was specified using the DirectSolverOptions. The performance of CPU operations like planning will be significantly lower than if you provide a multithreading library.
+Warp 1.14.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA A100-SXM4-80GB" (79 GiB, sm_80, mempool enabled)
+   Kernel cache:
+     /home/baskarg/.cache/warp/1.14.0
+Module make_poisson_element_matrices__locals__poisson_Ke_3dca1c12 3dca1c1 load on device 'cuda:0' took 3.01 ms  (cached)
+Module make_poisson_element_matrices__locals__poisson_Ke_de3d907e de3d907 load on device 'cuda:0' took 2.61 ms  (cached)
+Module make_sbm_neumann_Ae__locals__sbm_neu_Ae_aac0d7b8 aac0d7b load on device 'cuda:0' took 2.11 ms  (cached)
+Module make_load_kernel__locals__load_951f6381 951f638 load on device 'cuda:0' took 1.97 ms  (cached)
+Module make_load_kernel__locals__load_a62cc77d a62cc77 load on device 'cuda:0' took 2.22 ms  (cached)
+Module make_sbm_neumann_be__locals__sbm_neu_be_9d18dc6e 9d18dc6 load on device 'cuda:0' took 2.14 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_b006579f b006579 load on device 'cuda:0' took 3.32 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_9a7db4b5 9a7db4b load on device 'cuda:0' took 2.20 ms  (cached)
+  band(3) L7: r=0.2825  err=8.6664e-04  dofs=2433612  band_elems=67056  surrfaces=23832  [162s, cudss, res=5.1e-13]
+  orders band(3): 
+--- radius 0.2825 exit=0 Tue Jul  7 10:58:02 PM CDT 2026 ---
+--- radius 0.2850 start Tue Jul  7 10:58:02 PM CDT 2026 ---
+
+===== dim=3  (r=0.285, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+No multithreading interface library was specified using the DirectSolverOptions. The performance of CPU operations like planning will be significantly lower than if you provide a multithreading library.
+Warp 1.14.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA A100-SXM4-80GB" (79 GiB, sm_80, mempool enabled)
+   Kernel cache:
+     /home/baskarg/.cache/warp/1.14.0
+Module make_poisson_element_matrices__locals__poisson_Ke_3dca1c12 3dca1c1 load on device 'cuda:0' took 3.35 ms  (cached)
+Module make_poisson_element_matrices__locals__poisson_Ke_de3d907e de3d907 load on device 'cuda:0' took 2.11 ms  (cached)
+Module make_sbm_neumann_Ae__locals__sbm_neu_Ae_aac0d7b8 aac0d7b load on device 'cuda:0' took 2.13 ms  (cached)
+Module make_load_kernel__locals__load_951f6381 951f638 load on device 'cuda:0' took 2.03 ms  (cached)
+Module make_load_kernel__locals__load_a62cc77d a62cc77 load on device 'cuda:0' took 2.18 ms  (cached)
+Module make_sbm_neumann_be__locals__sbm_neu_be_9d18dc6e 9d18dc6 load on device 'cuda:0' took 2.12 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_b006579f b006579 load on device 'cuda:0' took 2.46 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_9a7db4b5 9a7db4b load on device 'cuda:0' took 2.01 ms  (cached)
+  band(3) L7: r=0.285  err=2.1786e-03  dofs=2436980  band_elems=68272  surrfaces=24312  [157s, cudss, res=3.9e-12]
+  orders band(3): 
+--- radius 0.2850 exit=0 Tue Jul  7 11:00:41 PM CDT 2026 ---
+--- radius 0.2875 start Tue Jul  7 11:00:41 PM CDT 2026 ---
+
+===== dim=3  (r=0.2875, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+No multithreading interface library was specified using the DirectSolverOptions. The performance of CPU operations like planning will be significantly lower than if you provide a multithreading library.
+Warp 1.14.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA A100-SXM4-80GB" (79 GiB, sm_80, mempool enabled)
+   Kernel cache:
+     /home/baskarg/.cache/warp/1.14.0
+Module make_poisson_element_matrices__locals__poisson_Ke_3dca1c12 3dca1c1 load on device 'cuda:0' took 2.78 ms  (cached)
+Module make_poisson_element_matrices__locals__poisson_Ke_de3d907e de3d907 load on device 'cuda:0' took 2.09 ms  (cached)
+Module make_sbm_neumann_Ae__locals__sbm_neu_Ae_aac0d7b8 aac0d7b load on device 'cuda:0' took 2.11 ms  (cached)
+Module make_load_kernel__locals__load_951f6381 951f638 load on device 'cuda:0' took 1.93 ms  (cached)
+Module make_load_kernel__locals__load_a62cc77d a62cc77 load on device 'cuda:0' took 1.85 ms  (cached)
+Module make_sbm_neumann_be__locals__sbm_neu_be_9d18dc6e 9d18dc6 load on device 'cuda:0' took 2.00 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_b006579f b006579 load on device 'cuda:0' took 2.41 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_9a7db4b5 9a7db4b load on device 'cuda:0' took 2.02 ms  (cached)
+  band(3) L7: r=0.2875  err=9.0819e-04  dofs=2439116  band_elems=69256  surrfaces=24672  [157s, cudss, res=1.4e-12]
+  orders band(3): 
+--- radius 0.2875 exit=0 Tue Jul  7 11:03:20 PM CDT 2026 ---
+--- radius 0.2900 start Tue Jul  7 11:03:20 PM CDT 2026 ---
+
+===== dim=3  (r=0.29, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+No multithreading interface library was specified using the DirectSolverOptions. The performance of CPU operations like planning will be significantly lower than if you provide a multithreading library.
+Warp 1.14.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA A100-SXM4-80GB" (79 GiB, sm_80, mempool enabled)
+   Kernel cache:
+     /home/baskarg/.cache/warp/1.14.0
+Module make_poisson_element_matrices__locals__poisson_Ke_3dca1c12 3dca1c1 load on device 'cuda:0' took 3.02 ms  (cached)
+Module make_poisson_element_matrices__locals__poisson_Ke_de3d907e de3d907 load on device 'cuda:0' took 2.09 ms  (cached)
+Module make_sbm_neumann_Ae__locals__sbm_neu_Ae_aac0d7b8 aac0d7b load on device 'cuda:0' took 2.12 ms  (cached)
+Module make_load_kernel__locals__load_951f6381 951f638 load on device 'cuda:0' took 1.89 ms  (cached)
+Module make_load_kernel__locals__load_a62cc77d a62cc77 load on device 'cuda:0' took 2.01 ms  (cached)
+Module make_sbm_neumann_be__locals__sbm_neu_be_9d18dc6e 9d18dc6 load on device 'cuda:0' took 2.14 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_b006579f b006579 load on device 'cuda:0' took 2.24 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_9a7db4b5 9a7db4b load on device 'cuda:0' took 1.91 ms  (cached)
+  band(3) L7: r=0.29  err=1.6580e-03  dofs=2444006  band_elems=70720  surrfaces=25200  [160s, cudss, res=1.0e-12]
+  orders band(3): 
+--- radius 0.2900 exit=0 Tue Jul  7 11:06:03 PM CDT 2026 ---
+=== L7 fine sweep job 11473320 finished Tue Jul  7 11:06:03 PM CDT 2026 ===

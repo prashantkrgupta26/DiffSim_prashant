@@ -359,3 +359,16 @@ M4 ADAPTIVITY OPENER (2026-07-08 night): spinodal CH through 2
    scoped accordingly. Epoch cost 0.03-0.05 s at L5+ (re-mesh is cheap;
    the M1d device stack keeps it so). Interface-band marker (nodal
    spread > 0.5) tracks the spinodal cleanly (1024 -> 3235 elems).
+
+4b(j) NOVA VERDICT (Baskar's runs, 2026-07-08; nova-band_sweep-mirror/):
+   **3-D BAND ASYMPTOTIC SECOND ORDER CONFIRMED** — r=0.15 ladder
+   L4->L7: orders 1.97/1.94/2.03, err to 3.95e-5 at 2.26M dofs (cuDSS
+   res 1e-12-14: solver exonerated everywhere). Clean window r=0.17-0.21
+   (L7 errs 3.8-4.6e-5). The degeneracy at scale: r=0.25 L7 = 1.58e-2
+   (400x clean). The r=0.27 L7 anomaly (4.03e-4) = the edge of a ROUGH
+   HALO around L7-dyadic radii (fine sweep: 0.2725 clean 1.1e-4; 0.28
+   spikes 2.9e-3; 0.28125=36/128 exact-dyadic): alignment sensitivity
+   GROWS with r/h (flatter surface -> wider tangency contact -> wider
+   halos). REVISED RULE: benchmark radii small AND far from dyadics at
+   ALL ladder levels — canonical radius moves r=0.27 -> r=0.19 (clean
+   at L4-L7; roomier band than 0.15). r>=0.29 additionally wall-bound.

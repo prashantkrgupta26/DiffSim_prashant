@@ -1,0 +1,33 @@
+=== r=0.15 ladder job 11473843 started Wed Jul  8 12:52:51 AM CDT 2026 on nova21-gpu-3 ===
+NVIDIA A100-SXM4-80GB, 81920 MiB
+
+===== dim=3  (r=0.15, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+Warp 1.14.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA A100-SXM4-80GB" (79 GiB, sm_80, mempool enabled)
+   Kernel cache:
+     /home/baskarg/.cache/warp/1.14.0
+Module make_poisson_element_matrices__locals__poisson_Ke_3dca1c12 3dca1c1 load on device 'cuda:0' took 4.50 ms  (cached)
+Module make_poisson_element_matrices__locals__poisson_Ke_de3d907e de3d907 load on device 'cuda:0' took 2.53 ms  (cached)
+Module make_sbm_neumann_Ae__locals__sbm_neu_Ae_aac0d7b8 aac0d7b load on device 'cuda:0' took 2.88 ms  (cached)
+Module make_load_kernel__locals__load_951f6381 951f638 load on device 'cuda:0' took 2.73 ms  (cached)
+Module make_load_kernel__locals__load_a62cc77d a62cc77 load on device 'cuda:0' took 2.66 ms  (cached)
+Module make_sbm_neumann_be__locals__sbm_neu_be_9d18dc6e 9d18dc6 load on device 'cuda:0' took 3.06 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_b006579f b006579 load on device 'cuda:0' took 2.82 ms  (cached)
+Module make_l2_masked_kernel__locals__l2m_9a7db4b5 9a7db4b load on device 'cuda:0' took 2.56 ms  (cached)
+  band(3) L4: r=0.15  err=2.4409e-03  dofs=9056  band_elems=688  surrfaces=72  [2s, direct, res=2.7e-16]
+Module make_sbm_neumann_Ae__locals__sbm_neu_Ae_94946b80 94946b8 load on device 'cuda:0' took 5.09 ms  (cached)
+Module make_sbm_neumann_be__locals__sbm_neu_be_6f2a2b48 6f2a2b4 load on device 'cuda:0' took 3.06 ms  (cached)
+  p1-only L4: err=2.2679e-03  [0s, direct, res=1.7e-16]
+  band(3) L5: r=0.15  err=6.2161e-04  dofs=46320  band_elems=1656  surrfaces=312  [25s, direct, res=2.0e-16]
+  p1-only L5: err=7.8205e-04  [10s, direct, res=1.7e-16]
+No multithreading interface library was specified using the DirectSolverOptions. The performance of CPU operations like planning will be significantly lower than if you provide a multithreading library.
+  band(3) L6: r=0.15  err=1.6173e-04  dofs=309426  band_elems=5584  surrfaces=1536  [16s, cudss, res=1.8e-14]
+No multithreading interface library was specified using the DirectSolverOptions. The performance of CPU operations like planning will be significantly lower than if you provide a multithreading library.
+  band(3) L7: r=0.15  err=3.9483e-05  dofs=2259850  band_elems=20080  surrfaces=6552  [149s, cudss, res=1.4e-14]
+  orders band(3): L4->L5: 1.97  L5->L6: 1.94  L6->L7: 2.03
+  orders p1-only: L4->L5: 1.54
+--- ladder exit=0 Wed Jul  8 12:56:16 AM CDT 2026 ---
+=== r=0.15 ladder job 11473843 finished Wed Jul  8 12:56:16 AM CDT 2026 ===
