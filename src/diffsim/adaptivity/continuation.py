@@ -19,7 +19,11 @@ import numpy as np
 
 def continuation_recover(epoch_fn, resid_fn, jac_fn, alpha0, trust,
                          n_epochs=8, inner_iters=4, lm=1e-3,
-                         verbose=True):
+                         sparsity=None, verbose=True):
+    """sparsity: optional (weights_vector, strength) — adds
+    strength*diag(weights) to the GN normal matrix and
+    strength*weights*alpha to the gradient (L2-toward-zero on selected
+    components; the bunny finisher's mode-2/3 penalty)."""
     alpha = np.asarray(alpha0, float).copy()
     history = []
     for ep in range(n_epochs):
@@ -30,8 +34,14 @@ def continuation_recover(epoch_fn, resid_fn, jac_fn, alpha0, trust,
             J = 0.5 * float(r @ r)
             Jac = jac_fn(epoch, alpha, r)
             lamb = lm * np.trace(Jac.T @ Jac) / max(len(alpha), 1)
-            step = np.linalg.solve(Jac.T @ Jac + lamb * np.eye(len(alpha)),
-                                   -(Jac.T @ r))
+            H = Jac.T @ Jac + lamb * np.eye(len(alpha))
+            g = Jac.T @ r
+            if sparsity is not None:
+                w_s, s_s = sparsity
+                sc = s_s * np.trace(Jac.T @ Jac) / max(len(alpha), 1)
+                H = H + sc * np.diag(w_s)
+                g = g + sc * w_s * alpha
+            step = np.linalg.solve(H, -g)
             # confine to the epoch's trust region around the anchor
             excess = np.linalg.norm(alpha + step - anchor)
             if excess > trust:
