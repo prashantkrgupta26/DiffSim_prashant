@@ -153,16 +153,31 @@ def _fmt(sinfo, dt):
     return ", ".join(parts)
 
 
+def _parse_flag(argv, name):
+    """Extract --name <val> or --name=<val>; returns (value|None,
+    remaining argv)."""
+    out, val, skip = [], None, False
+    for i, a in enumerate(argv):
+        if skip:
+            skip = False
+            continue
+        if a == f"--{name}":
+            val = argv[i + 1]
+            skip = True
+        elif a.startswith(f"--{name}="):
+            val = a.split("=", 1)[1]
+        else:
+            out.append(a)
+    return val, out
+
+
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if not a.startswith("--solver")]
-    forced = None
-    for a in sys.argv[1:]:
-        if a.startswith("--solver"):
-            forced = a.split("=", 1)[1] if "=" in a else None
-    if forced is None and "--solver" in sys.argv:
-        forced = sys.argv[sys.argv.index("--solver") + 1]
-        args = [a for a in args
-                if a != forced or args.count(forced) > 1]
+    forced, args = _parse_flag(sys.argv[1:], "solver")
+    radius, args = _parse_flag(args, "radius")
+    if radius is not None:
+        # reassign the module global BEFORE any use: Sphere(ctr, R) in
+        # run_case and the header f-string both read it
+        R = float(radius)
     dim = int(args[0])
     levels = [int(v) for v in args[1:]]
     log(f"\n===== dim={dim}  (r={R}, lambda=1.0 keep-all, exterior, "
@@ -173,8 +188,8 @@ if __name__ == "__main__":
         solver = forced if forced not in (None, "auto") else auto
         e, dt, nf, nb, nsf, si = run_case(dim, lv, 3, solver)
         errs_band[lv] = e
-        log(f"  band(3) L{lv}: err={e:.4e}  dofs={nf}  band_elems={nb}  "
-            f"surrfaces={nsf}  [{_fmt(si, dt)}]")
+        log(f"  band(3) L{lv}: r={R}  err={e:.4e}  dofs={nf}  "
+            f"band_elems={nb}  surrfaces={nsf}  [{_fmt(si, dt)}]")
         if dim == 2 or lv <= 5:
             e1, dt1, _, _, _, si1 = run_case(dim, lv, 0, solver)
             errs_p1[lv] = e1
