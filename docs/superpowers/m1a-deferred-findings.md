@@ -350,3 +350,12 @@ PURE-P2 FRAMEWORK LIVE (2026-07-07, Baskar directive): every stack
    is now observable-independent: EDIT SCALE vs h decides, not the
    QoI type. v2 = cell-scale edit (0.03 ~ 1 cell at L5) + per-alpha
    epoch re-carve (M3 rung 2 preview) — running.
+
+M4 ADAPTIVITY OPENER (2026-07-08 night): spinodal CH through 2
+   refine->P-transfer->continue epochs — MASS DRIFT EXACTLY ZERO:
+   refinement gives NESTED FE spaces, so the M3 rung-1 interpolatory P
+   is exact (hence conservative) by construction; the mass-conserving
+   L2-projection transfer is needed only for COARSENING (non-nested) —
+   scoped accordingly. Epoch cost 0.03-0.05 s at L5+ (re-mesh is cheap;
+   the M1d device stack keeps it so). Interface-band marker (nodal
+   spread > 0.5) tracks the spinodal cleanly (1024 -> 3235 elems).
