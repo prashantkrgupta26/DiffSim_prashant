@@ -197,7 +197,15 @@ class CahnHilliardStepper:
 
 
 def adaptive_march(stepper, t_end, tol=1e-4, dt_min=1e-5, dt_max=0.5,
-                   safety=0.85, verbose=False):
+                   safety=0.85, dt_cap=None, stride=2, verbose=False):
+    """dt_cap (Baskar 2026-07-08): a PHYSICS upper bound on dt that the
+    LTE controller cannot see — with evaporation, the constant solvent
+    flux out depletes the surface cell at rate ~ k_e/h_surf, capping
+    dt <= tol_phi*h_surf/(k_e*dphi) regardless of interior truncation
+    error. The controller proposes, the cap disposes. During active
+    evaporation the march runs AT the cap; LTE growth cashes in after
+    drying (pure coarsening). stride: dof stride of the conserved field
+    in stepper.x (2 for binary (c,mu), 4 for ternary)."""
     """M4: LTE-controlled adaptive time stepping (Wodo JCP 2011 class).
     Step-doubling estimator: one dt-step vs two dt/2-steps from the same
     state; LTE ~ |c1 - c2|_inf / (2^p - 1) with p the BDF order; accept
@@ -225,15 +233,18 @@ def adaptive_march(stepper, t_end, tol=1e-4, dt_min=1e-5, dt_max=0.5,
         # RELATIVE L2 LTE (max-norm measured hostage to the sharpest
         # interface node: dt collapsed to the floor, 16580 steps for
         # t=1.2 — worse than fixed-step; L2 tracks the FIELD's error)
-        num = float(np.linalg.norm(x1[0::2] - x2[0::2]))
-        den = max(float(np.linalg.norm(x2[0::2])), 1e-30)
+        num = float(np.linalg.norm(x1[0::stride] - x2[0::stride]))
+        den = max(float(np.linalg.norm(x2[0::stride])), 1e-30)
         lte = (num / den) / (2 ** p_ord - 1)
         if lte < tol or dt_full <= dt_min * 2:
             # accept the HALF-STEP solution (more accurate); dt update
-            stepper.dt = min(dt_max, max(
+            dt_new = min(dt_max, max(
                 dt_min, dt_full * min(2.0, max(
                     0.5, safety * (tol / max(lte, 1e-30))
                     ** (1.0 / (p_ord + 1))))))
+            if dt_cap is not None:
+                dt_new = min(dt_new, dt_cap)
+            stepper.dt = dt_new
             ts.append(stepper.t)
             dts.append(dt_full)
             if verbose:
