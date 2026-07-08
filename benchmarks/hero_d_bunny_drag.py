@@ -93,9 +93,10 @@ def run_transient(alpha_np, V, n_steps=N_STEPS):
     _EPOCH["_geo_last"] = geo
     if "Wwake" not in E:
         from diffsim.mesh.pointeval import point_eval_weights
-        py, pz = np.meshgrid(np.linspace(0.40, 0.62, 3),
-                             np.linspace(0.40, 0.62, 3))
-        wpts = np.column_stack([np.full(9, 0.86), py.ravel(), pz.ravel()])
+        py, pz = np.meshgrid(np.linspace(0.36, 0.66, 5),
+                             np.linspace(0.36, 0.66, 5))
+        wpts = np.column_stack([np.full(25, 0.86), py.ravel(),
+                                pz.ravel()])
         E["Wwake"] = point_eval_weights(E["mesh"], wpts)
     tsa = TransientShapeAdjoint(E["dm"], E["sf"], geo, o, NU, DT,
                                 ALPHA_F, E["strong"], E["g_strong"])
@@ -105,8 +106,10 @@ def run_transient(alpha_np, V, n_steps=N_STEPS):
     for x in xs:
         x_full = np.asarray(tsa.T_vec @ x)
         F = surrogate_traction(E["dm"], E["sf"], geo, x_full, NU, 4)
-        ux = E["Wwake"] @ x_full.reshape(-1, 4)[:, 0]
-        series.append(np.concatenate([F[:3], ux]))
+        xf = x_full.reshape(-1, 4)
+        ux = E["Wwake"] @ xf[:, 0]
+        uy = E["Wwake"] @ xf[:, 1]
+        series.append(np.concatenate([F[:3], ux, uy]))
     return tsa, xs, np.array(series).reshape(-1)
 
 

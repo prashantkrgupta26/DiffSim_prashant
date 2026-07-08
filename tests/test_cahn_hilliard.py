@@ -125,3 +125,20 @@ def test_ch_mass_energy_spinodal(device):
     assert c.max() > 0.6 and c.min() < -0.6, (c.min(), c.max())
     print(f"spinodal: c in [{c.min():.2f},{c.max():.2f}], "
           f"E {Es[0]:.4f}->{Es[-1]:.4f}, |dm|={abs(mass(c)-m0):.1e}")
+
+
+def test_ch_adaptive_dt(device):
+    """M4 temporal adaptivity: LTE-controlled dt GROWS through
+    coarsening (>4x by t_end) and the march stays physical."""
+    from diffsim.physics.cahn_hilliard import adaptive_march
+    dm, mesh, cons = _dm(5, 1, device)
+    st = CahnHilliardStepper(dm, 1.0, 5e-4, 0.005, order=2)
+    rng = np.random.default_rng(3)
+    st.set_initial(lambda x: 0.05 * rng.standard_normal(len(x)))
+    ts, dts = adaptive_march(st, t_end=0.8, tol=5e-4)
+    c = st.hist[0]
+    growth = dts[-1] / dts[0]
+    print(f"adaptive: {len(dts)} steps, dt {dts[0]:.4f}->{dts[-1]:.4f} "
+          f"({growth:.1f}x), c in [{c.min():.2f},{c.max():.2f}]")
+    assert growth > 4.0, (dts[0], dts[-1])
+    assert np.isfinite(c).all() and c.max() > 0.6 and c.min() < -0.6

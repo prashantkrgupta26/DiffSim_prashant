@@ -194,3 +194,56 @@ class CahnHilliardStepper:
         self.hist = [x[0::2].copy(), self.hist[0]]
         self.t = t_new
         return x[0::2], x[1::2]
+
+
+def adaptive_march(stepper, t_end, tol=1e-4, dt_min=1e-5, dt_max=0.5,
+                   safety=0.85, verbose=False):
+    """M4: LTE-controlled adaptive time stepping (Wodo JCP 2011 class).
+    Step-doubling estimator: one dt-step vs two dt/2-steps from the same
+    state; LTE ~ |c1 - c2|_inf / (2^p - 1) with p the BDF order; accept
+    if LTE < tol, and dt *= safety*(tol/LTE)^(1/(p+1)) (clamped [0.5,2]
+    per step). dt GROWS through coarsening — the property that makes
+    long phase-field horizons affordable. Returns (t_list, dt_list)."""
+    import copy
+    p_ord = stepper.order
+    ts, dts = [], []
+    while stepper.t < t_end - 1e-12:
+        state = (stepper.x.copy(), [h.copy() for h in stepper.hist],
+                 stepper.t)
+        # one full step
+        c1, _ = stepper.step()
+        x1 = stepper.x.copy()
+        # rewind; two half steps
+        stepper.x, stepper.hist, stepper.t = (state[0].copy(),
+                                              [h.copy() for h in state[1]],
+                                              state[2])
+        dt_full = stepper.dt
+        stepper.dt = dt_full / 2
+        stepper.step()
+        c2, _ = stepper.step()
+        x2 = stepper.x.copy()
+        # RELATIVE L2 LTE (max-norm measured hostage to the sharpest
+        # interface node: dt collapsed to the floor, 16580 steps for
+        # t=1.2 — worse than fixed-step; L2 tracks the FIELD's error)
+        num = float(np.linalg.norm(x1[0::2] - x2[0::2]))
+        den = max(float(np.linalg.norm(x2[0::2])), 1e-30)
+        lte = (num / den) / (2 ** p_ord - 1)
+        if lte < tol or dt_full <= dt_min * 2:
+            # accept the HALF-STEP solution (more accurate); dt update
+            stepper.dt = min(dt_max, max(
+                dt_min, dt_full * min(2.0, max(
+                    0.5, safety * (tol / max(lte, 1e-30))
+                    ** (1.0 / (p_ord + 1))))))
+            ts.append(stepper.t)
+            dts.append(dt_full)
+            if verbose:
+                print(f"  t={stepper.t:.3f} dt={dt_full:.4f} "
+                      f"lte={lte:.2e}", flush=True)
+        else:
+            # reject: rewind, halve
+            stepper.x, stepper.hist, stepper.t = (state[0].copy(),
+                                                  [h.copy()
+                                                   for h in state[1]],
+                                                  state[2])
+            stepper.dt = max(dt_min, dt_full / 2)
+    return ts, dts
