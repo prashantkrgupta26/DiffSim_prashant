@@ -73,7 +73,7 @@ def run_transient(alpha_np, V, n_steps=N_STEPS):
     geo = GeometryData.evaluate(o, E["ret"], E["sf"], face_tables(1, 3),
                                 domain="outside",
                                 warm_feet=E.get("feet"),
-                                max_fail_frac=0.005)
+                                max_fail_frac=0.012)
     # EPOCH HOMOTOPY (M3 rung 2 preview): per-alpha re-carve when the
     # surface drifts past the trust region — cell-scale edits become
     # representable; each alpha gets a deterministic carve + cold
@@ -87,10 +87,16 @@ def run_transient(alpha_np, V, n_steps=N_STEPS):
         geo = GeometryData.evaluate(o, E["ret"], E["sf"],
                                     face_tables(1, 3),
                                     domain="outside",
-                                    max_fail_frac=0.005)
+                                    max_fail_frac=0.012)
     if "feet" not in E:
         E["feet"] = geo.d.copy()
     _EPOCH["_geo_last"] = geo
+    if "Wwake" not in E:
+        from diffsim.mesh.pointeval import point_eval_weights
+        py, pz = np.meshgrid(np.linspace(0.40, 0.62, 3),
+                             np.linspace(0.40, 0.62, 3))
+        wpts = np.column_stack([np.full(9, 0.86), py.ravel(), pz.ravel()])
+        E["Wwake"] = point_eval_weights(E["mesh"], wpts)
     tsa = TransientShapeAdjoint(E["dm"], E["sf"], geo, o, NU, DT,
                                 ALPHA_F, E["strong"], E["g_strong"])
     xs = tsa.run(n_steps)
@@ -99,7 +105,8 @@ def run_transient(alpha_np, V, n_steps=N_STEPS):
     for x in xs:
         x_full = np.asarray(tsa.T_vec @ x)
         F = surrogate_traction(E["dm"], E["sf"], geo, x_full, NU, 4)
-        series.append(F[:3].copy())      # drag+lift+side: 3x samples
+        ux = E["Wwake"] @ x_full.reshape(-1, 4)[:, 0]
+        series.append(np.concatenate([F[:3], ux]))
     return tsa, xs, np.array(series).reshape(-1)
 
 

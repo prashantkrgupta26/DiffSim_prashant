@@ -24,3 +24,33 @@
   p1-only L5: err=4.4069e-03  [9s, direct, res=1.6e-16]
   orders band(3): L4->L5: 1.78
   orders p1-only: L4->L5: 0.40
+
+===== dim=3  (r=0.27, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+  band(3) L4: err=1.9471e-03  dofs=14448  band_elems=1528  surrfaces=264  [5s, direct, res=3.6e-16]
+  p1-only L4: err=5.8171e-03  [0s, direct, res=1.8e-16]
+
+===== dim=3  (r=0.27, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+  band(3) L4: err=1.9471e-03  dofs=14448  band_elems=1528  surrfaces=264  [4s, direct, res=3.6e-16]
+  p1-only L4: err=5.8171e-03  [0s, direct, res=1.8e-16]
+  band(3) L5: err=5.6772e-04  dofs=65428  band_elems=4696  surrfaces=1248  [190s, direct, res=2.7e-16]
+  p1-only L5: err=4.4069e-03  [9s, direct, res=1.6e-16]
+  orders band(3): L4->L5: 1.78
+  orders p1-only: L4->L5: 0.40
+
+===== dim=3  (r=0.27, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+  band(3) L4: r=0.27  err=1.9471e-03  dofs=14448  band_elems=1528  surrfaces=264  [5s, direct, res=3.7e-16]
+  p1-only L4: err=5.8171e-03  [0s, direct, res=1.8e-16]
+  band(3) L5: r=0.27  err=5.6772e-04  dofs=65428  band_elems=4696  surrfaces=1248  [142s, direct, res=2.7e-16]
+  p1-only L5: err=4.4069e-03  [8s, direct, res=1.6e-16]
+  orders band(3): L4->L5: 1.78
+  orders p1-only: L4->L5: 0.40
+
+===== dim=3  (r=0.31, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+  band(3) L4: r=0.31  err=1.9049e-03  dofs=15272  band_elems=1656  surrfaces=312  [4s, direct, res=3.9e-16]
+  p1-only L4: err=8.1771e-03  [0s, direct, res=1.6e-16]
+  orders band(3): 
+
+===== dim=3  (r=0.31, lambda=1.0 keep-all, exterior, node-band(3) vs p1) =====
+  band(3) L4: r=0.31  err=1.9049e-03  dofs=15272  band_elems=1656  surrfaces=312  [4s, direct, res=3.9e-16]
+  p1-only L4: err=8.1771e-03  [0s, direct, res=1.6e-16]
+  orders band(3): 

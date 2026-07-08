@@ -62,7 +62,7 @@ def jac_fn(E, alpha, r0):
 
 
 a_fin, hist = continuation_recover(epoch_fn, resid_fn, jac_fn,
-                                   np.zeros(hd.K), TRUST, n_epochs=6,
+                                   np.zeros(hd.K), TRUST, n_epochs=10,
                                    inner_iters=3, verbose=True)
 err = np.linalg.norm(a_fin - alpha_star)
 print(f"[result] recovered {np.round(a_fin, 5)} vs {alpha_star}",
