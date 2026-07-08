@@ -26,10 +26,12 @@ class DeviceNSAssembler:
     """Per-epoch object: symbolic pattern + slot maps once; numeric fill
     per step on device."""
 
-    def __init__(self, dm, sigma_like=1.0, coloring=False):
+    def __init__(self, dm, sigma_like=1.0, coloring=False, ndof=None):
+        # ndof: dofs per node (default dim+1 = the NS layout; 4 for the
+        # ternary CH film system, 2 for binary CH — M4 device-bound)
         self.dm = dm
         self.coloring = coloring
-        ndof = dm.dim + 1
+        ndof = (dm.dim + 1) if ndof is None else int(ndof)
         self.ndof = ndof
         T = dm.constraints.T.tocsr()
         n_free = T.shape[1]

@@ -52,6 +52,38 @@ Per accepted step: h_curr -= dt * K, K frozen at t_n (also frozen over
 the Newton solve). No Langevin noise (CHC term) in v1 — separation is
 seeded by initial-condition noise only. No SUPG on the advection term
 (cell Peclet ~ K*h_el/D_eff ~ 0.05 at Bi = 10, ny = 128; noted).
+
+v1.1 (M4-c Fig 6/7 2-D campaign) GENERALIZED METRIC: the computational
+strip may be a sub-rectangle [0, Xcomp] x [0, Ycomp] of the unit-square
+octree, representing a physical domain Lx x h_curr:
+  physical x = lat_scale * xi_x   (lat_scale = Lx / Xcomp, static)
+  theta      = xi_y / Ycomp,  physical z = h_curr * theta
+Gradient factors (per-direction ms, applied to test AND trial):
+  lateral mlat = 1/lat_scale;  vertical mvert = Ycomp / h_curr.
+Advection K theta (1/h) d/dtheta = K * xi_y * (1/h) * d/dxi_y — the
+Ycomp factors cancel, so the kernel keeps the RAW xi_y coordinate and a
+separate madv = 1/h_curr. Volume integrals carry a constant measure
+ratio (Ycomp/lat_scale) vs the mapped-physical ones while the top-edge
+boundary integral carries (1/lat_scale) only => the enrichment-flux
+coefficient picks up Ycomp: coef = K * (1/h) * Ycomp. With that pair
+the conservation identity d/dt [h * Int phi dx dtheta] = 0 is preserved
+(defaults lat_scale = Ycomp = 1 reproduce v1 exactly).
+Linear solve: linsolver = "splu" (v1 default) or "cudss" — nvmath
+DirectSolver, plan once on the first Newton iterate, then
+reset_operands(a=..) + refactorize per iterate (fixed sparsity).
+
+v1.1 CONSERVED LANGEVIN NOISE (their CHC term, Sec. 5.3): stochastic
+flux q_i per GP, residual += Int grad~(w) . q_i dV, q_i ~ N(0,1) *
+noise * sqrt(2 M_ii / dt) (FDT shape; the absolute nondimensional
+amplitude 'noise' is a free knob — the paper's RT/Vs normalization is
+absorbed). Load-vector only (frozen over the Newton solve, redrawn per
+attempt); GLOBAL solute content is conserved to machine precision by
+partition of unity (sum_a grad N_a = 0). noise = 0 reproduces v1.
+MEASURED NECESSITY (M4-c Fig 6/7): without it, IC noise diffusively
+decays before the N=5 quench crosses the spinodal (phi_s = 0.60) and
+separation inherits ONLY the vertical enrichment gradient -> spurious
+all-layered morphologies; the paper's percolated N=5 regime needs the
+continuous lateral re-seeding.
 """
 import numpy as np
 import scipy.sparse as sp
@@ -90,13 +122,16 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
                gm2k: wp.array2d(dtype=wp.float64),
                h1: wp.array(dtype=wp.float64),
                h2: wp.array(dtype=wp.float64),
+               q1: wp.array2d(dtype=wp.float64),
+               q2: wp.array2d(dtype=wp.float64),
                theta: wp.array(dtype=wp.float64),
                M11: wp.float64, M12: wp.float64, M22: wp.float64,
                c12: wp.float64, c1s: wp.float64, c2s: wp.float64,
                n1i: wp.float64, n2i: wp.float64, nsi: wp.float64,
                kap1: wp.float64, kap2: wp.float64,
                sigma: wp.float64,
-               minv: wp.float64, kadv: wp.float64,
+               mlat: wp.float64, mvert: wp.float64,
+               madv: wp.float64, kadv: wp.float64,
                Ae: wp.array3d(dtype=wp.float64),
                be: wp.array2d(dtype=wp.float64)):
         e = wp.tid()
@@ -118,19 +153,21 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
             d11 = n1i * _rinv(p1) + nsi * _rinv(ps) - wp.float64(2.0) * c1s
             d22 = n2i * _rinv(p2) + nsi * _rinv(ps) - wp.float64(2.0) * c2s
             d12 = nsi * _rinv(ps) + c12 - c1s - c2s
-            # advection coefficient on the RAW theta-derivative:
-            # K * theta * (1/h_curr)
-            adv = kadv * theta[gp] * minv
+            # advection coefficient on the RAW xi_y-derivative:
+            # K * xi_y * (1/h_curr)  (Ycomp cancels; see docstring)
+            adv = kadv * theta[gp] * madv
             for a in range(nbf):
                 Na = Ntab[q, a]
                 gM1 = wp.float64(0.0)
                 gM2 = wp.float64(0.0)
                 gP1 = wp.float64(0.0)
                 gP2 = wp.float64(0.0)
+                gQ1 = wp.float64(0.0)
+                gQ2 = wp.float64(0.0)
                 for dd in range(dim):
-                    ms = wp.float64(1.0)
+                    ms = mlat
                     if dd == vax:
-                        ms = minv
+                        ms = mvert
                     gNa = dNtab[q, a, dd] * dscale * ms
                     gM1 += gNa * (M11 * gm1k[gp, dd]
                                   + M12 * gm2k[gp, dd]) * ms
@@ -138,11 +175,13 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
                                   + M22 * gm2k[gp, dd]) * ms
                     gP1 += gNa * gp1k[gp, dd] * ms
                     gP2 += gNa * gp2k[gp, dd] * ms
+                    gQ1 += gNa * q1[gp, dd]
+                    gQ2 += gNa * q2[gp, dd]
                 r1 = (Na * (sigma * p1k[gp] - h1[gp]
-                            + adv * gp1k[gp, vax]) + gM1) * dJxW
+                            + adv * gp1k[gp, vax]) + gM1 + gQ1) * dJxW
                 rm1 = (Na * (m1k[gp] - mu1b)) * dJxW - kap1 * gP1 * dJxW
                 r2 = (Na * (sigma * p2k[gp] - h2[gp]
-                            + adv * gp2k[gp, vax]) + gM2) * dJxW
+                            + adv * gp2k[gp, vax]) + gM2 + gQ2) * dJxW
                 rm2 = (Na * (m2k[gp] - mu2b)) * dJxW - kap2 * gP2 * dJxW
                 wp.atomic_add(be, e, 4 * a + 0, -r1)
                 wp.atomic_add(be, e, 4 * a + 1, -rm1)
@@ -152,9 +191,9 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
                     Nb = Ntab[q, b]
                     lap = wp.float64(0.0)
                     for dd in range(dim):
-                        ms = wp.float64(1.0)
+                        ms = mlat
                         if dd == vax:
-                            ms = minv
+                            ms = mvert
                         lap += dNtab[q, a, dd] * dNtab[q, b, dd] \
                             * dscale * dscale * ms * ms
                     NN = Na * Nb * dJxW
@@ -202,7 +241,9 @@ class WodoFilmStepper(TernaryCHStepper):
 
     def __init__(self, dm, chi=(1.0, 0.3, 0.3), N=(5.0, 5.0, 1.0),
                  M=(0.225, 0.0, 0.225), kappa=(2e-4, 2e-4), k_e=1.0,
-                 dt=1e-4, newton_tol=1e-9, newton_max=50):
+                 dt=1e-4, newton_tol=1e-9, newton_max=50,
+                 lat_scale=1.0, linsolver="splu", noise=0.0,
+                 noise_seed=0):
         super().__init__(dm, chi=chi, M=M, kappa=kappa, dt=dt, order=1,
                          newton_tol=newton_tol, newton_max=newton_max)
         assert dm.mesh.p == 1, "Wodo film v1: linear elements only"
@@ -210,6 +251,17 @@ class WodoFilmStepper(TernaryCHStepper):
         self.k_e = float(k_e)
         self.h_curr = 1.0
         self.n_reject = 0
+        self.lat_scale = float(lat_scale)
+        self.linsolver = linsolver
+        self._cudss = None
+        self.noise = float(noise)
+        self._nrng = np.random.default_rng(noise_seed)
+        # skip the T4 congruence product when constraints are identity
+        # (uniform strips: no hanging nodes, natural BCs only)
+        n = self.Tc.shape[0]
+        self._proj_identity = (
+            self.Tc.shape[0] == self.Tc.shape[1]
+            and (self.Tc - sp.identity(n, format="csr")).nnz == 0)
         # theta at GPs (computational vertical coordinate; static)
         self.theta_wp = {
             pv: wp.array(np.ascontiguousarray(self.xq[pv][:, dm.dim - 1]),
@@ -223,6 +275,7 @@ class WodoFilmStepper(TernaryCHStepper):
         vax = self.dm.dim - 1
         ymax = coords[:, vax].max()
         tol = 1e-12
+        self.y_comp = float(ymax)     # computational vertical extent
         self.top_nodes = np.where(coords[:, vax] > ymax - tol)[0]
         assert len(self.top_nodes) > 0
         edges, elens = [], []
@@ -243,9 +296,37 @@ class WodoFilmStepper(TernaryCHStepper):
         f2 = np.asarray(self.Tc @ p2_free)
         return float(np.mean(1.0 - f1[self.top_nodes] - f2[self.top_nodes]))
 
+    # -- linear solve (per-Newton-iterate matrix; fixed sparsity) --------
+    def _solve(self, A, r):
+        if self.linsolver == "cudss":
+            from nvmath.sparse.advanced import (DirectSolver,
+                                                DirectSolverOptions)
+            import glob as _glob
+            b = np.ascontiguousarray(r, np.float64)
+            try:
+                if self._cudss is None:
+                    mt = _glob.glob(
+                        "/home/bglab/Baskar/DiffSim/.venv/lib/python3.12/"
+                        "site-packages/nvidia/cu12/lib/"
+                        "libcudss_mtlayer_gomp.so*")
+                    opts = (DirectSolverOptions(multithreading_lib=mt[0])
+                            if mt else None)
+                    self._cudss = DirectSolver(A, b, options=opts)
+                    self._cudss.plan()
+                else:
+                    self._cudss.reset_operands(a=A, b=b)
+                self._cudss.factorize()
+                return np.asarray(self._cudss.solve())
+            except Exception:
+                # bad state (singular factor / pattern mismatch): drop the
+                # plan and signal divergence to the dt heuristic
+                self._cudss = None
+                return np.full(A.shape[0], np.nan)
+        from scipy.sparse.linalg import splu
+        return splu(A.tocsc()).solve(r)
+
     # -- one implicit solve at frozen (h_curr, K); does NOT commit ------
     def _attempt(self, dt, K):
-        from scipy.sparse.linalg import splu
         d = self.dm.device
         sigma = 1.0 / dt
         v1, _ = self._gp(self.hist[0][0])
@@ -253,7 +334,20 @@ class WodoFilmStepper(TernaryCHStepper):
         h1_gp = {pv: sigma * v1[pv] for pv in v1}
         h2_gp = {pv: sigma * v2[pv] for pv in v2}
         minv = 1.0 / self.h_curr
-        coef = K * minv          # surface flux (1/h) * K, mapped measure
+        mlat = 1.0 / self.lat_scale
+        mvert = self.y_comp * minv
+        # surface flux K*(1/h), mapped measure; Ycomp = boundary/volume
+        # computational-measure ratio (docstring v1.1)
+        coef = K * minv * self.y_comp
+        # conserved Langevin flux (FDT shape), frozen over this attempt
+        rho1 = self.noise * np.sqrt(2.0 * abs(self.M11) / dt)
+        rho2 = self.noise * np.sqrt(2.0 * abs(self.M22) / dt)
+        q_gp = {}
+        for pv, b in self.dm.bins.items():
+            ngp = len(self.mesh.conn_of[pv]) * b["nqp"]
+            q_gp[pv] = (
+                rho1 * self._nrng.standard_normal((ngp, self.dm.dim)),
+                rho2 * self._nrng.standard_normal((ngp, self.dm.dim)))
         n0, n1 = self.top_edge_n[:, 0], self.top_edge_n[:, 1]
         le = self.top_edge_len
         x = self.x.copy()
@@ -277,14 +371,17 @@ class WodoFilmStepper(TernaryCHStepper):
                     arr(fields[1][0][pv]), arr(fields[1][1][pv]),
                     arr(fields[2][0][pv]), arr(fields[2][1][pv]),
                     arr(fields[3][0][pv]), arr(fields[3][1][pv]),
-                    arr(h1_gp[pv]), arr(h2_gp[pv]), self.theta_wp[pv],
+                    arr(h1_gp[pv]), arr(h2_gp[pv]),
+                    arr(q_gp[pv][0]), arr(q_gp[pv][1]),
+                    self.theta_wp[pv],
                     wp.float64(self.M11), wp.float64(self.M12),
                     wp.float64(self.M22), wp.float64(self.c12),
                     wp.float64(self.c1s), wp.float64(self.c2s),
                     wp.float64(1.0 / self.N1), wp.float64(1.0 / self.N2),
                     wp.float64(1.0 / self.Ns),
                     wp.float64(self.kap1), wp.float64(self.kap2),
-                    wp.float64(sigma), wp.float64(minv), wp.float64(K),
+                    wp.float64(sigma), wp.float64(mlat),
+                    wp.float64(mvert), wp.float64(minv), wp.float64(K),
                     Ae, be], device=d)
                 Aeh, beh = Ae.numpy(), be.numpy()
                 gdof = (conn[:, :, None] * 4
@@ -315,9 +412,12 @@ class WodoFilmStepper(TernaryCHStepper):
                 (np.concatenate(vals),
                  (np.concatenate(rows), np.concatenate(cols))),
                 shape=(self.dm.n_nodes * 4,) * 2).tocsr()
-            A = (self.T4.T @ Kmat @ self.T4).tocsr()
-            r = np.asarray(self.T4.T @ F_full)
-            dx = splu(A.tocsc()).solve(r)
+            if self._proj_identity:
+                A, r = Kmat, F_full
+            else:
+                A = (self.T4.T @ Kmat @ self.T4).tocsr()
+                r = np.asarray(self.T4.T @ F_full)
+            dx = self._solve(A, r)
             if not np.isfinite(dx).all() or np.abs(dx).max() > 1e6:
                 return None, it + 1, False               # diverged
             x = x + dx
@@ -327,12 +427,18 @@ class WodoFilmStepper(TernaryCHStepper):
 
     # -- march loop with the Appendix-A dt heuristic ---------------------
     def march(self, h_min=0.42, phis_stop=0.05, max_steps=20000,
-              dh_cap=0.004, dt_min=1e-12, callback=None):
+              dh_cap=0.004, dt_min=1e-12, callback=None, wall_cap=None):
         """March until avg phi_s <= phis_stop or h_curr <= h_min.
         dh_cap bounds the per-step height decrement (the h-update is
-        explicit). Returns a stop-reason string."""
+        explicit). wall_cap (seconds, optional) stops early on wall
+        clock. Returns a stop-reason string."""
+        import time as _time
+        t_wall0 = _time.time()
         reason = "max_steps"
         for _ in range(max_steps):
+            if wall_cap is not None and _time.time() - t_wall0 > wall_cap:
+                reason = "wall_cap"
+                break
             p1n, p2n = self.hist[0]
             phis_avg = float(np.mean(1.0 - np.asarray(self.Tc @ p1n)
                                      - np.asarray(self.Tc @ p2n)))
