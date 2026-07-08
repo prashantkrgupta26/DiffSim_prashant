@@ -87,6 +87,12 @@ EXPECTED RESULTS (the M4-a gate battery, tests/test_cahn_hilliard.py):
     energy: 0.2512 -> 0.0831 over the quench, monotone FROM STEP 1
     spinodal smoke: c in [-1.00, 1.03] (phases formed; the 3% overshoot
     is the standard quartic-potential excursion, not a bug)
+    demo 1 live extras (measured for THIS script): L(t) grows
+    0.085 -> 0.131 over steps 2-20; at step 15 one node briefly
+    overshoots to c ~ 2.5 during a domain-merger event and the quartic
+    well pulls it back within a step — energy STILL decays through it
+    (0.0885 -> 0.0878): pointwise bounds are not what implicit CH
+    guarantees, energy decay is.
 
 THE STEP-0 TEACHING MOMENT (read tests/test_cahn_hilliard.py:117).
     set_initial seeds mu = 0, which is INCONSISTENT with a rough IC

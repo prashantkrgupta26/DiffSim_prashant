@@ -1,0 +1,615 @@
+% M4 track (d): the phase-field course document --- new-student onboarding.
+% Companion to tutorials/F_phasefield/{F1,F2,F3}. Self-contained: only
+% amsmath/amssymb/graphicx/hyperref/booktabs. Compile: pdflatex (x2).
+\documentclass[11pt]{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\setlength{\parskip}{0.4em}
+\setlength{\parindent}{0pt}
+
+% ---- lightweight remark boxes (no external packages) ----------------
+\newcounter{remark}
+\newenvironment{remark}[1]{%
+  \refstepcounter{remark}\par\medskip
+  \noindent\begin{minipage}{\linewidth}
+  \hrule height 0.8pt \smallskip
+  \textbf{Remark \theremark\ (#1).}\ }{%
+  \smallskip\hrule height 0.8pt \end{minipage}\par\medskip}
+
+\newenvironment{measured}{%
+  \par\medskip\noindent\begin{minipage}{\linewidth}
+  \hrule height 0.8pt \smallskip
+  \textbf{Measured.}\ }{%
+  \smallskip\hrule height 0.8pt \end{minipage}\par\medskip}
+
+\newcommand{\diff}[2]{\frac{\partial #1}{\partial #2}}
+\newcommand{\vd}[2]{\frac{\delta #1}{\delta #2}}
+\newcommand{\ip}[2]{\left(#1,\,#2\right)}
+
+\title{Phase-Field Modeling on DiffSim:\\
+  Free Energies, Conserved Dynamics, and Adaptivity\\
+  \large The F-track course document (M4, track d) --- new-student onboarding}
+\author{The DiffSim curriculum}
+\date{July 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document is the theory companion to the runnable F-track tutorials
+(\texttt{tutorials/F\_phasefield/F1--F3}). It develops phase-field
+modeling from the free-energy functional up: variational derivatives,
+the Allen--Cahn and Cahn--Hilliard equations, their sharp-interface
+limits (Part I); the discretization exactly as implemented in the
+DiffSim bricks --- weak forms, BDF1/BDF2, monolithic Newton with the
+$2\times 2$ Cahn--Hilliard block Jacobian --- with the measured
+convergence and conservation gates as results (Part II); spatial
+adaptivity --- octree refinement, transfer operators, and conservation
+by nestedness, with the measured zero-drift result (Part III); and a
+one-page map of where this is going: learned free energies (Part IV).
+House rule throughout: \emph{theory predicts a number, then we print
+the measured number next to it.} All measurements quoted here are from
+the gate batteries \texttt{tests/test\_allen\_cahn.py},
+\texttt{tests/test\_cahn\_hilliard.py}, and
+\texttt{benchmarks/adaptive\_ch\_opener.py}, reproducible with one
+command each.
+\end{abstract}
+
+\tableofcontents
+
+%=======================================================================
+\section*{Part I: Theory}
+\addcontentsline{toc}{section}{Part I: Theory}
+
+\section{Free-energy functionals}
+
+Phase-field models do not start from a PDE; they start from an energy.
+Let $c(\mathbf{x},t)$ be an \emph{order parameter}: a smooth field
+whose value labels the local phase, with $c=\pm 1$ the two pure phases.
+The Ginzburg--Landau free energy is
+\begin{equation}
+  \mathcal{F}[c] \;=\; \int_\Omega \Big[\, f(c)
+    \;+\; \frac{\kappa}{2}\,\lvert\nabla c\rvert^2 \Big]\, dV,
+  \qquad
+  f(c) \;=\; \tfrac14\,(c^2-1)^2 .
+  \label{eq:F}
+\end{equation}
+The two terms compete. The \emph{double well} $f$ is minimized by pure
+phases and penalizes mixtures ($f(0)=\tfrac14$ is the barrier); the
+\emph{gradient energy} penalizes spatial variation, i.e.\ it charges
+rent for interfaces. Their balance sets both the interface width and
+the surface energy --- the two asymptotic results of
+Section~\ref{sec:sharp}.
+
+\begin{remark}{the general program}
+Everything in this course generalizes by swapping ingredients of
+\eqref{eq:F}: $f \to$ Flory--Huggins for polymer blends, $c \to$
+several coupled fields $(\phi_1,\phi_2,\eta_1,\eta_2)$ for the ternary
+solvent-evaporation systems of the M4 program (see the P0 formulation
+memo, \texttt{docs/phasefield\_formulation\_p0.md}), and ultimately
+$f \to$ a \emph{learned} function (Part IV). The machinery below ---
+variational derivatives, gradient flows, mixed forms, Newton ---
+survives every swap unchanged.
+\end{remark}
+
+\subsection{Variational derivatives}
+
+The chemical potential is the variational (functional) derivative of
+$\mathcal{F}$: perturb $c \to c + \epsilon v$ and expand,
+\begin{align}
+  \frac{d}{d\epsilon}\,\mathcal{F}[c+\epsilon v]\Big|_{\epsilon=0}
+  &= \int_\Omega \big[ f'(c)\, v + \kappa\, \nabla c \cdot \nabla v
+     \big]\, dV \notag\\
+  &= \int_\Omega \big[ f'(c) - \kappa\, \Delta c \big] v \, dV
+   \;+\; \kappa \oint_{\partial\Omega} v\, \nabla c\cdot \mathbf{n}\, dS .
+  \label{eq:varder}
+\end{align}
+With natural boundary conditions $\nabla c \cdot \mathbf{n} = 0$ (an
+interface meets a wall at $90^\circ$) the boundary term drops and
+\begin{equation}
+  \mu \;\equiv\; \vd{\mathcal{F}}{c} \;=\; f'(c) - \kappa \Delta c
+  \;=\; c^3 - c - \kappa \Delta c .
+  \label{eq:mu}
+\end{equation}
+Keep \eqref{eq:varder} in view: its first line \emph{is} the weak form
+we will discretize --- the integration by parts that FEM undoes is the
+same one the calculus of variations performed.
+
+\section{Two gradient flows}
+
+Dynamics is steepest descent on $\mathcal{F}$, and the \emph{metric} of
+the descent decides the physics.
+
+\subsection{Non-conserved: Allen--Cahn}
+
+If $c$ is not conserved (crystalline order, domain orientation), the
+simplest descent is pointwise, in $L^2$:
+\begin{equation}
+  \diff{c}{t} \;=\; -M\,\mu \;=\; -M\big[c^3 - c - \kappa \Delta c\big],
+  \qquad M>0 .
+  \label{eq:AC}
+\end{equation}
+Energy decay is a theorem, not an aspiration:
+\begin{equation}
+  \frac{d\mathcal{F}}{dt}
+  = \int_\Omega \vd{\mathcal{F}}{c}\,\diff{c}{t}\, dV
+  = -M \int_\Omega \mu^2 \, dV \;\le\; 0 .
+  \label{eq:ACdecay}
+\end{equation}
+Note that $\int_\Omega c\, dV$ may drift freely: phase can appear and
+disappear locally.
+
+\subsection{Conserved: Cahn--Hilliard}
+
+If $c$ is a composition (alloy fraction, polymer blend fraction), mass
+$\int_\Omega c\,dV$ must be invariant, so $c$ can only move by a flux:
+$\partial_t c = -\nabla\cdot \mathbf{J}$ with
+$\mathbf{J} = -M\,\nabla\mu$ (Onsager: flux down chemical-potential
+gradients). The result is fourth order in space:
+\begin{equation}
+  \diff{c}{t} \;=\; \nabla \cdot \big( M\, \nabla \mu \big),
+  \qquad
+  \mu = c^3 - c - \kappa \Delta c .
+  \label{eq:CH}
+\end{equation}
+Conservation is now structural,
+$\frac{d}{dt}\int_\Omega c \, dV = \oint_{\partial\Omega} M \nabla\mu
+\cdot \mathbf{n}\, dS = 0$ with no-flux walls, and energy still decays:
+\begin{equation}
+  \frac{d\mathcal{F}}{dt}
+  = \int_\Omega \mu \, \nabla\cdot(M\nabla\mu)\, dV
+  = -\int_\Omega M \lvert \nabla\mu \rvert^2 dV \;\le\; 0 .
+  \label{eq:CHdecay}
+\end{equation}
+
+\begin{remark}{spinodal instability}
+Linearize \eqref{eq:CH} about a uniform mixture $c_0$ with
+$c = c_0 + \hat c\, e^{i k x + s t}$:
+\begin{equation}
+  s(k) \;=\; -M k^2 \big( f''(c_0) + \kappa k^2 \big).
+\end{equation}
+Inside the \emph{spinodal} ($f''(c_0) = 3c_0^2 - 1 < 0$, i.e.\
+$\lvert c_0\rvert < 1/\sqrt3$) long waves grow: $s>0$ for
+$k^2 < -f''(c_0)/\kappa$, fastest at $k_* = \sqrt{-f''(c_0)/2\kappa}$.
+Two signatures to test: $s(0) = 0$ (conservation kills the $k=0$ mode
+--- Allen--Cahn has $s(0) = -Mf''(c_0) > 0$ instead), and an emergent
+pattern wavelength $\lambda_* = 2\pi/k_*$ ($= 2\pi\sqrt{2\kappa}$ at
+$c_0 = 0$). Tutorial F2 prints $\lambda_*$ against the mesh before
+running the quench.
+\end{remark}
+
+\section{Sharp-interface asymptotics}
+\label{sec:sharp}
+
+Two exact results give phase-field its quantitative teeth; both are
+gates in this stack.
+
+\textbf{(a) The equilibrium profile and width.} A flat interface in
+equilibrium has $\mu = 0$: $\kappa\, c'' = c^3 - c$. Multiply by $c'$
+and integrate once (the ``first integral''):
+$\tfrac{\kappa}{2}(c')^2 = f(c)$, whence
+\begin{equation}
+  c(x) \;=\; \tanh\!\Big( \frac{x}{\sqrt{2\kappa}} \Big),
+  \qquad
+  w \;=\; \sqrt{2\kappa},
+  \label{eq:tanh}
+\end{equation}
+so the intrinsic interface width scales as $\sqrt{2\kappa}$. The excess
+energy per unit area (surface tension) follows from the same first
+integral: $\gamma = \int (\kappa\, c'^2)\,dx =
+\frac{2\sqrt{2}}{3}\sqrt{\kappa}$.
+\emph{Resolution rule:} the mesh must place 3--4 elements across $w$,
+or the discrete interface pins to the mesh and motion stops (tutorial
+F1, Explore~4, makes you produce this failure on purpose).
+
+\textbf{(b) Motion by curvature (Allen--Cahn).} Matched asymptotics in
+$\kappa \to 0$ give the normal velocity of an interface as
+$v_n = -M\kappa\, H$ with $H$ the mean curvature. For a circle in 2-D,
+$H = 1/R$:
+\begin{equation}
+  \frac{dR}{dt} = -\frac{M\kappa}{R}
+  \quad\Longrightarrow\quad
+  R^2(t) = R_0^2 - 2M\kappa\, t .
+  \label{eq:circle}
+\end{equation}
+The \emph{area decays linearly in time} with a coefficient containing
+no fit parameters --- an exact benchmark hiding inside a nonlinear PDE.
+
+\begin{measured}
+Shrinking circle, level-6 mesh, $M{=}1$, $\kappa{=}2\times 10^{-4}$,
+25 BDF2 steps of $\Delta t = 0.02$: measured $c{=}0$ radius $0.2985$
+vs.\ theory $0.2997$ --- relative error $0.4\%$
+(\texttt{tests/test\_allen\_cahn.py}).
+\end{measured}
+
+%=======================================================================
+\section*{Part II: Discretization --- exactly as implemented}
+\addcontentsline{toc}{section}{Part II: Discretization}
+
+\section{Weak forms}
+
+The forms below are copied from the brick docstrings
+(\texttt{src/diffsim/physics/allen\_cahn.py},
+\texttt{cahn\_hilliard.py}) and the P0 memo; what you read here is what
+the kernels assemble, term for term.
+
+\subsection{Allen--Cahn (single field)}
+
+Multiply \eqref{eq:AC} by a test function $v$, integrate the Laplacian
+by parts (natural BCs kill the boundary term):
+\begin{equation}
+  \ip{v}{\partial_t c}
+  \;+\; M\kappa \ip{\nabla v}{\nabla c}
+  \;+\; M \ip{v}{\,c^3 - c\,}
+  \;=\; 0
+  \qquad \forall v \in V_h .
+  \label{eq:ACweak}
+\end{equation}
+Galerkin only --- there is no advection, hence no SUPG. Equal-order
+$C^0$ elements, $p_1$ or $p_2$, on the octree mesh.
+
+\subsection{Cahn--Hilliard: the mixed $(c,\mu)$ form}
+
+Equation \eqref{eq:CH} contains $\Delta^2 c$; $C^0$ elements cannot
+represent it (weak $\Delta^2$ needs second derivatives in the volume
+integral, i.e.\ $C^1$ continuity). The standard escape, and the one
+used by Wodo \& Ganapathysubramanian \cite{wodo2011} and by this stack:
+promote $\mu$ to an unknown and solve two coupled second-order
+equations. Find $(c,\mu) \in V_h \times V_h$ such that for all
+$(v,q) \in V_h \times V_h$:
+\begin{align}
+  R_c:\quad & \ip{v}{\partial_t c} + M \ip{\nabla v}{\nabla \mu} = 0,
+  \label{eq:CHweak1}\\
+  R_\mu:\quad & \ip{q}{\mu} - \ip{q}{\,c^3 - c\,}
+  - \kappa \ip{\nabla q}{\nabla c} = 0 .
+  \label{eq:CHweak2}
+\end{align}
+Equal-order pairs are stable here --- this is \emph{not} a Stokes-type
+saddle point; no inf--sup condition constrains the pair.
+
+\begin{remark}{conservation is structural}
+Take $v \equiv 1$ in \eqref{eq:CHweak1} (constants belong to $V_h$):
+\begin{equation}
+  \frac{d}{dt}\int_\Omega c_h \, dV
+  = -M \int_\Omega \nabla(1)\cdot\nabla\mu_h \, dV = 0
+  \qquad\text{\emph{exactly}.}
+\end{equation}
+The semi-discrete scheme conserves mass identically, and BDF time
+stepping preserves the property. Consequently the correct pass bar for
+a mass gate is \emph{machine precision}: a drift of $10^{-6}$ would
+indicate a bug, not an acceptable tolerance.
+\end{remark}
+
+\begin{measured}
+20 implicit steps of a spinodal quench (level 5, $\Delta t = 0.02$):
+$\lvert \Delta m \rvert = 1.9\times 10^{-15}$
+(\texttt{tests/test\_cahn\_hilliard.py}) --- roundoff accumulation
+only.
+\end{measured}
+
+\section{Time discretization: BDF1 and BDF2}
+
+With history $c^n, c^{n-1}$ and step $\Delta t$, the backward
+differentiation formulas replace $\partial_t c$ at $t^{n+1}$ by
+\begin{equation}
+  \partial_t c \;\approx\; \sigma\, c^{n+1} - h(t),
+  \qquad
+  \sigma = \frac{b_0}{\Delta t},
+  \qquad
+  h = \frac{b_1 c^{n} + b_2 c^{n-1}}{-\Delta t},
+\end{equation}
+with $(b_0, b_1, b_2) = (1, -1, 0)$ for BDF1 (first order) and
+$(\tfrac32, -2, \tfrac12)$ for BDF2 (second order). The first step has
+no history and is taken with BDF1 --- one step at local
+$O(\Delta t^2)$ does not spoil global second order (the C1 lesson).
+In the code, $\sigma$ multiplies the mass block and the history term
+$h$ is evaluated once per step at the quadrature points.
+
+Fully implicit treatment of the nonlinear potential is deliberate:
+explicit or semi-implicit splittings of $c^3-c$ trade stability limits
+or extra splitting error for linearity, whereas the implicit form
+inherits gradient stability at the step sizes we actually use, and
+Newton (next section) converges in 2--4 iterations throughout the
+quench. Temporal \emph{adaptivity} on top of BDF2 --- growing
+$\Delta t$ through coarsening under a local-truncation-error controller
+--- is the Wodo design \cite{wodo2011} and is previewed in
+Section~\ref{sec:lte}.
+
+\section{Newton linearization}
+
+\subsection{Allen--Cahn}
+
+Writing \eqref{eq:ACweak} as $R(c)=0$ and linearizing about the iterate
+$c_k$: with $f'(c) = c^3 - c$, $f''(c) = 3c^2 - 1$,
+\begin{equation}
+  \underbrace{\Big[ \sigma \ip{v}{\delta c}
+  + M\kappa \ip{\nabla v}{\nabla \delta c}
+  + M \ip{v}{\,(3c_k^2-1)\,\delta c} \Big]}_{J\,\delta c}
+  = -R(c_k),
+  \qquad c_{k+1} = c_k + \delta c .
+\end{equation}
+The nonlinearity enters the Jacobian only through $f''(c_k)$.
+
+\subsection{Cahn--Hilliard: the $2\times 2$ block Jacobian}
+
+Order the unknowns node-major as $(c,\mu)$ pairs. Linearizing
+\eqref{eq:CHweak1}--\eqref{eq:CHweak2} gives, per basis pair $(a,b)$,
+the $2\times2$ block
+\begin{equation}
+  J_{ab} \;=\;
+  \begin{bmatrix}
+    \dfrac{\partial R_c}{\partial c} & \dfrac{\partial R_c}{\partial \mu}\\[1.2em]
+    \dfrac{\partial R_\mu}{\partial c} & \dfrac{\partial R_\mu}{\partial \mu}
+  \end{bmatrix}_{ab}
+  =
+  \begin{bmatrix}
+    \sigma \ip{N_a}{N_b} & M \ip{\nabla N_a}{\nabla N_b}\\[0.6em]
+    -\ip{N_a}{(3c_k^2-1) N_b} - \kappa \ip{\nabla N_a}{\nabla N_b}
+      & \ip{N_a}{N_b}
+  \end{bmatrix}
+  \label{eq:blockJ}
+\end{equation}
+(the Suresh Jacobian pattern; assembled in one fused kernel,
+\texttt{make\_ch\_newton}, alongside the residual). The whole coupled
+system is solved \emph{monolithically} --- no operator splitting
+between $c$ and $\mu$, hence no splitting error and no sub-iteration.
+
+\begin{remark}{where a learned $f$ enters}
+$f$ appears in exactly two places: $f'(c_k)$ in the residual
+\eqref{eq:CHweak2} and $f''(c_k)$ in the lower-left block of
+\eqref{eq:blockJ}. Replace $c^3 - c$ by any differentiable
+$f'_\theta$ --- a basis expansion or a network --- and Newton needs
+precisely one more derivative, $f''_\theta$, obtainable by autograd or
+by differentiating the basis. Nothing else in the solver changes. This
+locality is the design decision that makes Part IV cheap.
+\end{remark}
+
+\subsection{Initialization of $\mu$: a cautionary measurement}
+
+The mixed system carries $\mu$ as an unknown, so it needs an initial
+value. Seeding $\mu^0 = 0$ under a rough (noisy) $c^0$ is
+\emph{inconsistent}: the true $\mu(c^0)$ is large. The first implicit
+step absorbs the inconsistency as a transient --- measured energy
+$0.251 \to 173 \to 0.61$, then monotone decay for all remaining steps.
+Nothing diverges, but an energy-decay gate asserted from step 0 would
+fail. The recorded refinement is a consistent projection,
+$\ip{q}{\mu^0} = \ip{q}{f'(c^0)} + \kappa\ip{\nabla q}{\nabla c^0}$
+(one mass-matrix solve). Two lessons: mixed methods need consistent
+auxiliary initialization, and a failing gate sometimes diagnoses your
+initial condition rather than your operator.
+
+\section{Verification: the measured gates}
+
+Both bricks are verified by the method of manufactured solutions (MMS)
+with Dirichlet data, per field, at $p_1$ and $p_2$. For the mixed
+system the trap is manufacturing $\mu$ from $c^*$ (which requires
+$\Delta(c^{*3})$); instead $\mu^*$ is manufactured \emph{independently}
+and both residuals get sources --- see
+\texttt{tests/test\_cahn\_hilliard.py} for the construction.
+
+\begin{table}[h]
+\centering
+\caption{Measured MMS convergence (2-D, BDF2, gate batteries of
+2026-07-08; errors are $L^2$ at the final step). Expected orders:
+$p_1 \to 2$, $p_2 \to 3$.}
+\begin{tabular}{llccc}
+\toprule
+Brick & Space & $E_{\text{coarse}}$ & $E_{\text{fine}}$ & order \\
+\midrule
+Allen--Cahn    & $p_1$ (L4$\to$L5) & $3.15\times10^{-3}$ & $7.88\times10^{-4}$ & 2.00 \\
+Allen--Cahn    & $p_2$ (L3$\to$L4) & $2.02\times10^{-4}$ & $2.52\times10^{-5}$ & 3.00 \\
+Cahn--Hilliard & $p_1$ (L4$\to$L5) & $2.86\times10^{-3}$ & $7.12\times10^{-4}$ & 2.01 \\
+Cahn--Hilliard & $p_2$ (L3$\to$L4) & $2.03\times10^{-4}$ & $2.54\times10^{-5}$ & 3.00 \\
+\bottomrule
+\end{tabular}
+\label{tab:mms}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Measured physics gates (same batteries).}
+\begin{tabular}{lll}
+\toprule
+Gate & Prediction & Measured \\
+\midrule
+AC energy decay (random quench) & monotone, Eq.~\eqref{eq:ACdecay} & monotone, all steps \\
+AC shrinking circle & $R^2 = R_0^2 - 2M\kappa t$ & rel.\ error $0.4\%$ \\
+CH mass conservation (20 steps) & exact (structural) & $\lvert\Delta m\rvert = 1.9\times10^{-15}$ \\
+CH energy decay (from step 1) & monotone, Eq.~\eqref{eq:CHdecay} & $0.2512 \to 0.0831$, monotone \\
+CH spinodal & phases at $c=\pm1$ & $c \in [-1.00,\, 1.03]$ \\
+\bottomrule
+\end{tabular}
+\label{tab:gates}
+\end{table}
+
+%=======================================================================
+\section*{Part III: Adaptivity}
+\addcontentsline{toc}{section}{Part III: Adaptivity}
+
+\section{Why and where to refine}
+
+A phase-field solution is expensive exactly where it is interesting:
+the interface needs elements of size $\lesssim w/3 \sim
+\sqrt{2\kappa}/3$, while in the bulk both $c$ and $\mu$ are nearly
+constant. Uniform meshes at interface resolution scale like
+$w^{-d}$ and are hopeless in 3-D at physical $\kappa$. The reference
+design for this stack is the adaptive implicit scheme of Wodo \&
+Ganapathysubramanian \cite{wodo2011}: refine a band around the
+interface, re-mesh as the morphology evolves, and control $\Delta t$
+by local truncation error.
+
+\subsection{Octree refinement and the marker}
+
+The mesh is an octree (quadtree in 2-D): marked cells split into
+$2^d$ children, followed by 2:1 \emph{balancing} (no face may border
+cells more than one level apart) so hanging-node constraints stay
+one-level. The interface marker is deliberately cheap --- per element,
+the nodal spread
+\begin{equation}
+  \eta_e = \max_{a \in e} c_a - \min_{a \in e} c_a,
+  \qquad \text{mark if } \eta_e > \theta
+\end{equation}
+($\theta = 0.5$ in the tutorials; $\eta_e \approx \lvert\nabla c\rvert
+h_e$ is the continuum reading). One \emph{epoch} = mark $\to$ refine
+$\to$ balance $\to$ rebuild mesh, constraints, and device arrays from
+scratch. Measured epoch cost at tutorial sizes: 0.03--0.05\,s ---
+re-meshing from scratch sounds wasteful and is the correct engineering
+call at that price.
+
+\section{State transfer and conservation by nestedness}
+
+A finite-element field is nodal values \emph{times basis functions};
+a new mesh means a new basis, so the state must be remapped. The M3
+transfer operator $P$
+(\texttt{src/diffsim/adaptivity/transfer.py}) maps old free-space
+values to all-node values on the new mesh, row by row in three
+classes: coordinate-matched nodes take the old constraint row
+(identity through hanging-node expansion); new interior nodes take FE
+interpolation weights on the old basis; nodes outside the old domain
+(moving boundaries only) fall back to nearest-node, $O(h)$ in a
+one-cell strip. $P$ is an explicit sparse matrix, so $P^{\!\top}$ is
+mechanical --- the property that lets the \emph{adjoint} cross a
+re-mesh event and makes adaptivity differentiable (the M3 result,
+inherited here for free).
+
+\begin{remark}{conservation by nestedness}
+Pure refinement makes the new space $V_h^{\text{new}} \supset
+V_h^{\text{old}}$: each parent $p_1$ basis function is reproduced
+exactly by its children. Interpolation onto a superset space is not an
+approximation --- the transferred field is \emph{the same function},
+re-expressed. Therefore every functional of the field, including
+$\int c\, dV$ and $\mathcal{F}[c]$, is preserved to the last bit.
+Conservation across re-meshing is a property of \emph{nestedness}, not
+of a carefully tuned projection. Coarsening breaks nestedness (the
+fine function leaves the coarse space); then plain interpolation loses
+mass, and a lumped or consistent $L^2$ \emph{projection} (conservative
+by construction, since it preserves $\ip{1}{c}$) is required. That is
+the recorded refinement in the M4 ledger, and tutorial F3, Explore~3,
+makes you measure the failure before fixing it.
+\end{remark}
+
+\begin{measured}
+Adaptive spinodal run (\texttt{benchmarks/adaptive\_ch\_opener.py};
+reproduced by tutorial F3): two epochs of interface-band refinement
+during a level-5 quench ($1024 \to 1897 \to 3235$ elements); mass
+drift across each transfer $= +0.000\times10^{0}$ --- exactly zero in
+floating point, both epochs, with the mass printing identically to all
+12 displayed digits. Epoch cost 0.03--0.06\,s.
+\end{measured}
+
+\begin{remark}{same function, two verdicts}
+Across the same transfer the \emph{energy} changes by
+$\sim\!10^{-4}$ --- and that is correct, not a failure of nestedness.
+Both functionals are evaluated by quadrature. Mass is linear in $c$
+and the $p_1$ rule integrates it exactly, so ``same function'' implies
+``same number'' to the bit. The quartic well $(c^2-1)^2/4$ is
+\emph{not} integrated exactly at $p_1$; parent and children sample it
+at different points, so the quadrature \emph{error} changes (and
+shrinks) even though the function does not. Know what your quadrature
+is exact for before deciding which invariants must hold to machine
+precision.
+\end{remark}
+
+\section{Temporal adaptivity: LTE-controlled steps}
+\label{sec:lte}
+
+Spinodal decomposition is fast; coarsening is slow ($L \sim t^{1/3}$).
+A fixed $\Delta t$ sized for the burst wastes orders of magnitude of
+compute in the long tail. The Wodo controller \cite{wodo2011} grows
+$\Delta t$ under a local-truncation-error (LTE) estimate; the
+step-doubling variant used as the F3 preview: from state $c^n$ take
+one step of $2\Delta t$ and two steps of $\Delta t$; for BDF2 the
+difference estimates the LTE ($\propto \Delta t^3$), and
+\begin{equation}
+  \Delta t_{\text{new}}
+  = \Delta t \left( \frac{\text{tol}}{\text{LTE}} \right)^{1/3},
+\end{equation}
+with acceptance, floors, and ceilings. The signature result is
+$\Delta t(t)$ growing near-monotonically through coarsening --- often
+by two orders of magnitude --- while the energy curve stays
+indistinguishable from the fixed-step reference. Implementing this
+controller is F3's final Explore problem, and it becomes load-bearing
+in the solvent-evaporation replication (track c), where evaporation
+fronts and nucleation events force $\Delta t$ back down transiently.
+
+%=======================================================================
+\section*{Part IV: The road to learned free energies}
+\addcontentsline{toc}{section}{Part IV: The road to learned free energies}
+
+\section{The M4 learning arc, in one page}
+
+Everything above treated $f(c)$ as given. The M4 program
+(\texttt{docs/superpowers/specs/2026-07-08-m4-phasefield.md}, track e;
+formulation in the P0 memo) inverts this: given spatio-temporal
+observations of a phase-separating system --- synthetic first, then MD,
+then operando experiments on ternary solvent-evaporation systems
+\cite{wodo2012} --- \emph{learn} the mixing free energy
+$f_{\text{mix}}(\phi_1,\phi_2)$ beyond the Flory--Huggins ansatz.
+
+\textbf{Parameterization ladder.} First a \emph{basis expansion}
+$f'_\theta = \sum_k \theta_k B_k(\phi)$ on the composition simplex ---
+linear in $\theta$, so identifiability is a linear-algebra question ---
+then a Lipschitz-constrained MLP. Flory--Huggins stays as the reference
+rung of the misfit ladder: the ``beyond-FH'' claim is the measured gap
+between rungs.
+
+\textbf{Where $\theta$ enters the solver.} By the Remark after
+Eq.~\eqref{eq:blockJ}: $f'_\theta$ in the residual, $f''_\theta$ in one
+Jacobian block. The forward solver is therefore differentiable in
+$\theta$ through exactly the adjoint machinery of the E-track, and the
+transfer operator's explicit $P^{\!\top}$ lets gradients cross re-mesh
+epochs.
+
+\textbf{Gauge freedom.} The dynamics see only $\nabla\mu$, and for a
+conserved field, adding any function \emph{affine} in $\phi_i$ to
+$f_{\text{mix}}$ shifts $\mu_i$ by constants and changes nothing
+observable. The learned surface is identifiable only modulo this gauge;
+it is fixed by anchoring $f_\theta$ at reference compositions before
+comparing surfaces or reporting misfits.
+
+\textbf{Identifiability discipline.} Before any fit: assemble the
+Gramian of the sensitivities $\{\partial(\text{data})/\partial
+\theta_k\}$ and look at its spectrum. Data that never visits a region
+of the simplex carries no information about $f$ there
+(composition-coverage diagnostics); mobility $M(\phi)$ and $f$ are
+partially degenerate on some observables, handled by data-window
+design; instrument-space losses --- structure factor $S(q,t)$, confocal
+point-spread convolutions, film thickness $h(t)$ --- replace pixel
+losses. The rule this course has already taught you twice (E2's
+recovery plateau; the M2--M3 observability ladder): \emph{mechanism
+before optimizer} --- when a fit stalls, measure identifiability before
+tuning the descent.
+
+Students finishing F1--F3 land at the start of this arc: the forward
+bricks are gated, adaptivity conserves exactly, and the two derivatives
+of $f$ are the only interface between the physics and the learning.
+
+%=======================================================================
+\begin{thebibliography}{9}
+
+\bibitem{wodo2011}
+O.~Wodo and B.~Ganapathysubramanian,
+\emph{Computationally efficient solution to the Cahn--Hilliard equation:
+adaptive implicit time schemes, mesh sensitivity analysis and the 3D
+isoperimetric problem},
+Journal of Computational Physics \textbf{230} (2011) 6037--6060.
+
+\bibitem{wodo2012}
+O.~Wodo and B.~Ganapathysubramanian,
+\emph{Modeling morphology evolution during solvent-based fabrication of
+organic solar cells},
+Computational Materials Science \textbf{55} (2012) 113--126.
+
+\bibitem{guide}
+The Baskar group FEM guide, Secs.~1.3 (Allen--Cahn) and 2.3
+(Cahn--Hilliard mixed weak forms) --- the canonical forms implemented
+by the DiffSim bricks (group-internal document; see also
+\texttt{docs/phasefield\_formulation\_p0.md}).
+
+\end{thebibliography}
+
+\end{document}

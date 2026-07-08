@@ -40,6 +40,16 @@ website is generated from them (`python tutorials/build_site.py`, then
 **E. Differentiable simulation**
 | E1 | `E_differentiable/E1_shape_optimization.py` | the adjoint loop: recover a hidden shape from probe data |
 
+**F. Phase field (microstructure evolution; the M4 track)**
+| F1 | `F_phasefield/F1_allen_cahn.py` | free energies, non-conserved gradient flow; the shrinking-circle law measured at 0.4% |
+| F2 | `F_phasefield/F2_cahn_hilliard.py` | mixed (c, mu) form; conservation as a structural property (1.9e-15); spinodal decomposition |
+| F3 | `F_phasefield/F3_adaptivity.py` | interface-band refinement, transfer operators, conservation by nestedness (drift exactly zero) |
+
+The F track has a self-contained LaTeX course document
+(`docs/latex/m4_phasefield_tutorial.tex`) covering the theory,
+the discretization as implemented, adaptivity, and the road to learned
+free energies.
+
 **P. Performance (the profiling thread)**
 | P1 | `P_performance/P1_cost_model_and_scaling.py` | the group's cost-model exercise on this stack: per-stage timing vs level, measured exponents, the memory model |
 | P2 | `P_performance/P2_solver_showdown.py` | direct vs host-Krylov vs fused device Krylov; counting synchronizations |
