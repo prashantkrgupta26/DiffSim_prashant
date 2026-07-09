@@ -136,7 +136,7 @@ benchmarks/         literature-anchored validation drivers, grouped by physics
   poisson-sbm/  navier-stokes/  heat-mass/  phase-field/
   inverse-heroes/  performance/           (each with its own README)
 tutorials/          the curriculum: tracks A–F + P, one runnable chapter each
-tests/              the ~280-test suite; baselines/ holds locked values
+tests/              the ~350-test suite; baselines/ holds locked values
 docs/
   projects/         the per-solver project pages (start here)
   theory/           formulations, memos, student briefs
