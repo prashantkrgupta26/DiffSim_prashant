@@ -105,6 +105,10 @@ The contract (*the lego gate*): this brick, fed through the generic factory,
 reproduces the hand-written production path bit-for-bit and the locked regression
 baselines. **If you can write the weak form, you can extend DiffSim.**
 
+The [fully-annotated `PoissonBrick`](src/diffsim/api/example_bricks.py) walks the
+strong form → weak form → discrete form → code line by line; the phase-field and
+Navier–Stokes bricks carry the same weak-form headers.
+
 ## Quickstart
 
 ```bash

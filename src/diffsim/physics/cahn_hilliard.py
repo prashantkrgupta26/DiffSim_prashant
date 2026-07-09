@@ -1,9 +1,46 @@
-"""M4 track (a): Cahn-Hilliard mixed (c, mu) brick — group guide Sec
-2.3, backward-Euler/BDF2, monolithic Newton (Suresh Jacobian pattern).
+r"""M4 track (a): Cahn-Hilliard mixed (c, mu) brick — group guide Sec 2.3.
 
-  R_c  = Int[v c_t] + M Int[grad v . grad mu]              (v test on c)
-  R_mu = Int[q mu] - Int[q (c^3 - c)] - kap Int[grad q . grad c]
-Node-major 2-dof layout (c, mu). Natural (no-flux) BCs default.
+See src/diffsim/api/example_bricks.py for the Poisson walk-through that
+introduces the strong -> weak -> discrete -> code recipe; this file applies the
+same recipe to a conserved phase field.
+
+-------------------------------------------------------------------------------
+The Cahn-Hilliard problem, from strong form to code
+-------------------------------------------------------------------------------
+
+PHYSICS.  A conserved order parameter c (a composition) relaxes to minimize the
+Ginzburg-Landau free energy  F[c] = Int [ f(c) + (kap/2) |grad c|^2 ] dV, with
+the double-well  f(c) = (1/4)(c^2 - 1)^2, so f'(c) = c^3 - c. Conserved gradient
+flow gives a 4th-order PDE, which we split into two 2nd-order equations by
+introducing the chemical potential mu = dF/dc:
+
+        c_t = div( M grad mu )          (mass balance; M = mobility)
+        mu  = f'(c) - kap div(grad c)   (chemical potential)
+
+MIXED WEAK FORM.  Test the first equation with v, the second with q, and
+integrate the divergence/Laplacian terms by parts. With natural no-flux
+boundaries (grad mu . n = grad c . n = 0) the surface terms vanish:
+
+    R_c(v)  = Int v c_t dV        + M   Int grad v . grad mu dV          = 0
+    R_mu(q) = Int q mu dV - Int q f'(c) dV - kap Int grad q . grad c dV  = 0
+
+    R_c  couples c to mu through the mobility (the conserved transport);
+    R_mu  is the definition of mu, with kap grad q . grad c the interface term.
+
+TIME + NEWTON.  BDF1/BDF2 turn c_t into (sigma c - hist), where sigma = b0/dt
+and hist = sum_j b_j c_{n-j}/dt (carried in per-Gauss-point). The system is
+nonlinear through f'(c); we solve it by monolithic Newton, linearizing about the
+current iterate (c_k, mu_k) with f''(c) = 3 c^2 - 1. The 2x2 node block
+[ dR_c/dc   dR_c/dmu ;  dR_mu/dc   dR_mu/dmu ] is, per (test a, trial b):
+
+    dR_c/dc   = sigma  Int N_a N_b                 (the mass/time term)
+    dR_c/dmu  = M      Int grad N_a . grad N_b      (mobility transport)
+    dR_mu/dc  = -f''(c) Int N_a N_b - kap Int grad N_a . grad N_b
+    dR_mu/dmu = Int N_a N_b
+
+DOF LAYOUT.  Node-major 2-dof (c, mu): global block index 2*a+0 is the c row of
+node a, 2*a+1 is its mu row. The kernel below writes both residual entries
+(be = -R) and all four Jacobian blocks at each Gauss point.
 """
 import numpy as np
 import scipy.sparse as sp
@@ -47,30 +84,39 @@ def make_ch_newton(nbf: int, nqp: int, dim: int):
             dfdc = wp.float64(3.0) * c_ * c_ - wp.float64(1.0)
             for a in range(nbf):
                 Na = Ntab[q, a]
-                # residuals (be = -r)
+                # residuals (be = -r). gv_gmu = grad N_a . grad mu (the
+                # mobility term of R_c); gv_gc = grad N_a . grad c (the
+                # interface term of R_mu).
                 gv_gmu = wp.float64(0.0)
                 gv_gc = wp.float64(0.0)
                 for d in range(dim):
                     gv_gmu += dNtab[q, a, d] * dscale * gmuk[gp, d]
                     gv_gc += dNtab[q, a, d] * dscale * gck[gp, d]
+                # R_c = Int v c_t + M Int grad v . grad mu   (v = N_a);
+                #   c_t -> sigma*c - hist (BDF); fcq is the MMS source.
                 r_c = (Na * (sigma * c_ - hist[gp]) + Mmob * gv_gmu
                        - Na * fcq[gp]) * dJxW
+                # R_mu = Int q mu - Int q f'(c) - kap Int grad q . grad c
+                #   (q = N_a);  f'(c) = c^3 - c;  fmq is the MMS source.
                 r_m = (Na * (muk[gp] - (c_ * c_ * c_ - c_))
                        - Na * fmq[gp]) * dJxW - kap * gv_gc * dJxW
                 wp.atomic_add(be, e, 2 * a + 0, -r_c)
                 wp.atomic_add(be, e, 2 * a + 1, -r_m)
                 for b in range(nbf):
                     Nb = Ntab[q, b]
+                    # lap = grad N_a . grad N_b, shared by the transport
+                    # (dR_c/dmu) and interface (dR_mu/dc) Jacobian terms.
                     lap = wp.float64(0.0)
                     for d in range(dim):
                         lap += dNtab[q, a, d] * dNtab[q, b, d] \
                             * dscale * dscale
-                    # dR_c/dc, dR_c/dmu
+                    # dR_c/dc = sigma N_a N_b ;  dR_c/dmu = M grad N_a . grad N_b
                     wp.atomic_add(Ae, e, 2 * a, 2 * b,
                                   sigma * Na * Nb * dJxW)
                     wp.atomic_add(Ae, e, 2 * a, 2 * b + 1,
                                   Mmob * lap * dJxW)
-                    # dR_mu/dc, dR_mu/dmu
+                    # dR_mu/dc = -f''(c) N_a N_b - kap grad N_a . grad N_b ;
+                    # dR_mu/dmu = N_a N_b   (dfdc = f''(c) = 3c^2 - 1)
                     wp.atomic_add(Ae, e, 2 * a + 1, 2 * b,
                                   (-dfdc * Na * Nb - kap * lap) * dJxW)
                     wp.atomic_add(Ae, e, 2 * a + 1, 2 * b + 1,

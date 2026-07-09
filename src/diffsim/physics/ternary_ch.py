@@ -13,6 +13,23 @@ Dynamics: d(phi_i)/dt = div( sum_j M_ij grad mu_j ), Onsager M SPD
 (constant v1; per-GP fields = the closure interface, later).
 mu_i = mu_i^bulk - kap_i lap phi_i (kap_12 cross-gradient deferred).
 Log clipping at PHI_EPS (standard FH practice). Natural BCs.
+
+WEAK FORM.  This is binary Cahn-Hilliard (cahn_hilliard.py) promoted to two
+coupled composition fields. Each solute i carries a (phi_i, mu_i) pair; testing
+the mass balance with v and the potential definition with q and integrating by
+parts (natural no-flux, surface terms drop) gives, for i = 1, 2:
+
+    R_{phi_i}(v) = Int v d(phi_i)/dt dV
+                 + sum_j M_ij Int grad v . grad mu_j dV            = 0
+    R_{mu_i}(q)  = Int q mu_i dV - Int q mu_i^bulk dV
+                 - kap_i Int grad q . grad phi_i dV                = 0
+
+The only new ingredients beyond binary CH are (i) the Onsager mobility M_ij
+coupling the two potentials in the transport term, and (ii) the Flory-Huggins
+bulk potential mu_i^bulk replacing the double-well f'(c). Monolithic Newton over
+the 4-dof node block (phi_1, mu_1, phi_2, mu_2) uses the d(mu_i)/d(phi) entries
+above. The evaporating-film driver (wodo_film.py) adds the moving top surface
+and the solvent-flux boundary term on top of this.
 """
 import numpy as np
 import scipy.sparse as sp

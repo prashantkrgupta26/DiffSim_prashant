@@ -59,5 +59,6 @@ python benchmarks/inverse-heroes/hero_m3_bunny_continuation.py  # bunny, the hea
 - Tutorials: E1 (shape optimization), E2 (GENIE INR + DiffSBM)
 - Benchmarks: [`benchmarks/inverse-heroes/`](../../benchmarks/inverse-heroes/README.md)
 - The Integrands brick API (write a new differentiable physics):
-  `src/diffsim/api/equation.py`
+  `src/diffsim/api/equation.py`; the fully-annotated `PoissonBrick` with its
+  weak-form derivation is `src/diffsim/api/example_bricks.py`
 - Provenance: `docs/dev/m1a-deferred-findings.md`, `docs/dev/m1d-milestone-report.md`

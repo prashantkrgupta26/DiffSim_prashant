@@ -1,5 +1,20 @@
 """M2-A1: scalar advection-diffusion brick (temperature / species).
 
+See src/diffsim/api/example_bricks.py for the Poisson strong -> weak -> code
+walk-through. Poisson is the pure-diffusion (kappa grad T . grad w) core of this
+brick; here we add transport by a velocity field a and the stabilization that
+makes it robust at high Peclet number.
+
+STRONG FORM.  For scalar T advected by a with diffusivity kappa and source f:
+
+        sigma T + a . grad T - kappa div(grad T) = f
+
+(sigma = reaction / BDF time coefficient, 0 for steady). Testing with w and
+integrating the diffusion term by parts gives the Galerkin weak form
+sigma (T, w) + (a.grad T, w) + kappa (grad T, grad w) = (f, w). Pure Galerkin
+oscillates once advection dominates diffusion, so we add SUPG/VMS stabilization
+on the strong residual:
+
 The one-dof member of the NS kernel family: for scalar T with advecting
 field a (frozen at GPs, same contract as the linearized NS step),
 

@@ -7,46 +7,11 @@ import os
 import numpy as np
 import pytest
 import warp as wp
-from diffsim.api.equation import (CEquation, assemble_brick_csr,
-                                  brick_load_vector)
-from diffsim.assembly.femelm import FEMElm, fe_N, fe_dN_s
+from diffsim.api.equation import assemble_brick_csr, brick_load_vector
+from diffsim.api.example_bricks import PoissonBrick  # the documented exemplar
 from diffsim.assembly.operators import assemble_csr
 
 pytestmark = pytest.mark.tier3
-
-
-class PoissonBrick(CEquation):
-    """-div(grad u) = f — the Hughes-form brick (spec S3.1 example)."""
-    ndof = 1
-
-    @staticmethod
-    @wp.func
-    def Integrands_Ae(fe: FEMElm,
-                      Ntab: wp.array2d(dtype=wp.float64),
-                      dNtab: wp.array3d(dtype=wp.float64),
-                      detJxW: wp.float64, dscale: wp.float64,
-                      nbf: wp.int32, dim: wp.int32, ndof: wp.int32,
-                      Ae: wp.array3d(dtype=wp.float64), e: wp.int32):
-        for a in range(nbf):
-            for b in range(nbf):
-                K = wp.float64(0.0)
-                for k in range(dim):
-                    K += fe_dN_s(dNtab, fe, a, k, dscale) \
-                         * fe_dN_s(dNtab, fe, b, k, dscale)
-                Ae[e, ndof * a, ndof * b] += K * detJxW
-
-    @staticmethod
-    @wp.func
-    def Integrands_be(fe: FEMElm,
-                      Ntab: wp.array2d(dtype=wp.float64),
-                      dNtab: wp.array3d(dtype=wp.float64),
-                      detJxW: wp.float64, dscale: wp.float64,
-                      nbf: wp.int32, dim: wp.int32, ndof: wp.int32,
-                      fq: wp.array(dtype=wp.float64), nqp: wp.int32,
-                      be: wp.array2d(dtype=wp.float64), e: wp.int32):
-        fv = fq[e * nqp + fe.q]
-        for a in range(nbf):
-            be[e, ndof * a] += fe_N(Ntab, fe, a) * fv * detJxW
 
 
 def _dm(dim, p, device, mixed=False):

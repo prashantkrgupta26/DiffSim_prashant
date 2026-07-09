@@ -1,6 +1,35 @@
-"""NS bricks for M1b Task 5 — the linearized monolithic (u, p) momentum
-block per production-code-conventions.md 'Linearized NS, Flow-Bench-Dendrite
-variant' + Biswajit's draft:
+r"""NS bricks for M1b Task 5 — the linearized monolithic (u, p) momentum block.
+
+See src/diffsim/api/example_bricks.py for the Poisson strong -> weak -> code
+walk-through; this is the same recipe for a coupled, stabilized, nonlinear
+system, so it is necessarily denser.
+
+-------------------------------------------------------------------------------
+The incompressible Navier-Stokes weak form
+-------------------------------------------------------------------------------
+
+STRONG FORM.  Velocity u and pressure p on Omega (density 1, viscosity nu):
+
+        u_t + (u . grad) u = -grad p + nu div(grad u) + f      (momentum)
+                   div u   = 0                                  (continuity)
+
+WEAK FORM.  Test momentum with w, continuity with q. Integrate the viscous and
+pressure terms by parts (the "do-nothing" outflow drops their surface terms):
+
+    Int w . u_t + Int w . (u.grad)u + nu Int grad w : grad u
+        - Int (div w) p          = Int w . f                    (momentum)
+    Int q (div u)                = 0                            (continuity)
+
+Equal-order (u, p) is inf-sup UNSTABLE, so we add residual-based VMS/SUPG-PSPG
+stabilization on the momentum strong residual res_M = u_t + (u.grad)u + grad p
+- nu lap u - f: a SUPG term tau_M (a.grad w).res_M, a PSPG term tau_M (grad q).
+res_M (this is what lets equal-order work), and a grad-div term tau_C (div w)
+(div u). See physics/vms.py for tau_M, tau_C.
+
+The rest of this header documents how the NONLINEAR convection is linearized
+into the monolithic block this brick assembles:
+
+- ndof = dim+1, node-major (u_1..u_dim, p);
 
 - ndof = dim+1, node-major (u_1..u_dim, p);
 - advecting velocity `a` is a PRECOMPUTED Gauss-point field (Stokes: a = 0;

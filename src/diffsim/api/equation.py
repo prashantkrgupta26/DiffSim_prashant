@@ -26,6 +26,12 @@ The framework owns the element loop and the Gauss-point loop (spec S3.1);
 the brick is called once per integration point with the FEMElm view and the
 Hughes-nomenclature accessors (fe_N, fe_dN_s, node-major Ae blocks).
 
+>>> For a fully-annotated version of this brick — the strong form, the weak
+    form, and a line-by-line map from the variational terms to the code — read
+    example_bricks.py (imported as `from diffsim.api import PoissonBrick`). The
+    phase-field bricks (physics/cahn_hilliard.py, allen_cahn.py, ternary_ch.py)
+    and the NS brick (ns_bricks.py) carry the same weak-form headers.
+
 v1 deltas from TalyFEM, documented per spec S3.2: (i) basis tables and
 compile-time sizes are explicit arguments (warp structs cannot carry
 arrays); (ii) Ae is indexed [e, ndof*a+i, ndof*b+j] with the element id

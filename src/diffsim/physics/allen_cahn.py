@@ -1,13 +1,30 @@
-"""M4 track (b): Allen-Cahn brick (p1 + p2) — the group guide Sec 1.3
-weak form, backward-Euler/BDF2, monolithic Newton on the c^3 term.
+r"""M4 track (b): Allen-Cahn brick (p1 + p2) — group guide Sec 1.3.
 
-    Int[v c_t] + M kappa Int[grad v . grad c] + M Int[v (c^3 - c)] = 0
+The NON-conserved sibling of Cahn-Hilliard (see cahn_hilliard.py). Same free
+energy F[c] = Int [ f(c) + (kap/2)|grad c|^2 ] dV with double-well
+f(c) = (1/4)(c^2-1)^2, f'(c) = c^3 - c — but here the order parameter is NOT
+conserved, so the dynamics is plain (not conserved) gradient flow:
 
-Newton linearization about c_k: the (c^3 - c) term contributes
-M Int[v (3 c_k^2 - 1) dc] to the Jacobian and M Int[v (c_k^3 - c_k)]
-to the residual; time term sigma = c0/dt mass block. Kernels follow the
-scalar_transport factory pattern (no SUPG — AC has no advection here;
-Galerkin + lapN-free)."""
+        c_t = -M ( f'(c) - kap div(grad c) ) = -M dF/dc         (strong form)
+
+WEAK FORM.  Test with v and integrate the Laplacian by parts (natural no-flux
+boundary, so the surface term drops):
+
+    R(v) = Int v c_t dV  +  M kap Int grad v . grad c dV  +  M Int v f'(c) dV = 0
+           \___________/     \__________________________/     \______________/
+             time term            interface (stiffness)         reaction
+
+Contrast with Cahn-Hilliard: there conservation forces the 4th-order operator
+and a second field mu; here f'(c) enters directly as a reaction term and a
+single field c suffices. That is the whole conserved-vs-nonconserved distinction
+in one line of code.
+
+TIME + NEWTON.  BDF1/BDF2 give c_t -> (sigma c - hist), sigma = b0/dt. Newton
+about c_k uses f''(c) = 3 c_k^2 - 1: the reaction term contributes
+M Int v f''(c_k) N_b to the Jacobian and M Int v f'(c_k) to the residual. No
+SUPG (there is no advection) — Galerkin, and lapN-free (no second-derivative
+tables needed). Kernels follow the scalar_transport factory pattern.
+"""
 import numpy as np
 import scipy.sparse as sp
 import warp as wp
@@ -40,15 +57,19 @@ def make_ac_newton_Ae(nbf: int, nqp: int, dim: int):
         for q in range(nqp):
             dJxW = wtab[q] * jac
             gp = e * nqp + q
+            # dfdd = M f''(c) = M (3 c_k^2 - 1) — the reaction Jacobian factor.
             dfdd = Mmob * (wp.float64(3.0) * ck[gp] * ck[gp]
                            - wp.float64(1.0))
-            for a in range(nbf):
+            for a in range(nbf):                       # test function v = N_a
                 Na = Ntab[q, a]
-                for b in range(nbf):
+                for b in range(nbf):                   # trial (increment) N_b
+                    # lap = grad N_a . grad N_b (the interface/stiffness term)
                     lap = wp.float64(0.0)
                     for d in range(dim):
                         lap += dNtab[q, a, d] * dNtab[q, b, d] \
                             * dscale * dscale
+                    # dR/dc = sigma N_a N_b  (time)  + M kap grad N_a . grad N_b
+                    #         (interface)  + M f''(c) N_a N_b  (reaction)
                     wp.atomic_add(
                         Ae, e, a, b,
                         (sigma * Na * Ntab[q, b] + Mmob * kap * lap
@@ -90,12 +111,15 @@ def make_ac_residual_be(nbf: int, nqp: int, dim: int):
             dJxW = wtab[q] * jac
             gp = e * nqp + q
             c_ = ck[gp]
-            nl = Mmob * (c_ * c_ * c_ - c_)
-            for a in range(nbf):
+            nl = Mmob * (c_ * c_ * c_ - c_)            # M f'(c) = M (c^3 - c)
+            for a in range(nbf):                       # test function v = N_a
                 Na = Ntab[q, a]
+                # gg = grad N_a . grad c  (the interface term of the residual)
                 gg = wp.float64(0.0)
                 for d in range(dim):
                     gg += dNtab[q, a, d] * dscale * gck0[gp, d]
+                # R = Int v c_t + M kap Int grad v . grad c + M Int v f'(c)
+                #   c_t -> sigma*c - hist (BDF); fq is the MMS source.
                 r_a = (Na * (sigma * c_ - hist[gp]) + Mmob * kap * gg
                        + Na * nl - Na * fq[gp]) * dJxW
                 wp.atomic_add(be, e, a, -r_a)

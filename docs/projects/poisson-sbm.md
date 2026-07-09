@@ -47,6 +47,9 @@ the correctness backbone for the inverse-design heroes.
 
 ## Learn more
 
+- Author a brick: the fully-annotated `PoissonBrick`
+  (`src/diffsim/api/example_bricks.py`) maps the weak form to code line by line —
+  the template for extending DiffSim with new physics.
 - Tutorials: A1 (MMS discipline), A3 (shifted boundary), A5 (3-D), A6 (carving
   geometry)
 - Benchmarks: [`benchmarks/poisson-sbm/`](../../benchmarks/poisson-sbm/README.md)
