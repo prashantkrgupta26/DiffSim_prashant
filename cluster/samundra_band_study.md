@@ -28,11 +28,11 @@ A100/H200 remove that. Your run decides the hypothesis.
 ```bash
 cd DiffSim && bash cluster/bootstrap.sh
 # individual levels (each appends to band_study_results.txt):
-.venv-nova/bin/python benchmarks/band_study.py 3 4 5     # ~minutes
-.venv-nova/bin/python benchmarks/band_study.py 3 6       # ~20-30 min
-.venv-nova/bin/python benchmarks/band_study.py 3 7       # hours; needs
+.venv-nova/bin/python benchmarks/poisson-sbm/band_study.py 3 4 5     # ~minutes
+.venv-nova/bin/python benchmarks/poisson-sbm/band_study.py 3 6       # ~20-30 min
+.venv-nova/bin/python benchmarks/poisson-sbm/band_study.py 3 7       # hours; needs
                                                           # >= 80 GB card
-.venv-nova/bin/python benchmarks/band_study.py 3 8       # H200 ONLY,
+.venv-nova/bin/python benchmarks/poisson-sbm/band_study.py 3 8       # H200 ONLY,
                                                           # stretch: may
                                                           # ALLOC-fail —
                                                           # that is a

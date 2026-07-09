@@ -1,67 +1,48 @@
 # DiffSim benchmarks
 
-Literature-anchored validation drivers. Philosophy:
+Literature-anchored validation drivers, grouped by physics. Philosophy:
 
-- **CI-coarse variants live in `tests/`** (fast, tolerance-locked, run on
-  every commit: `tests/test_cavity.py`, `tests/test_cylinder.py`).
-- **These scripts are the full/parametric versions** — refinement studies,
-  higher Re, longer horizons — for reports, papers, and student runs. They
-  print tables against the reference values and never assert; you read them.
+- **CI-coarse variants live in `tests/`** — fast, tolerance-locked, run on
+  every commit (`tests/test_cavity.py`, `tests/test_cylinder.py`, …).
+- **These scripts are the full / parametric versions** — refinement studies,
+  higher Re, longer horizons, cluster campaigns — for reports, papers, and
+  student runs. Most print tables against the reference and never assert; you
+  read them.
 
-| Script | Case | Reference | Current status (measured, level-5 CI variant) |
-|---|---|---|---|
-| `cavity_ghia.py` | lid-driven cavity, Re = 100/400/1000 | Ghia, Ghia & Shin (1982) | Re=100: max profile diff 0.035 (monolithic), 0.0035 (projection) |
-| `cylinder_forces.py` | immersed cylinder in channel, Re = 20 | confined-cylinder literature band | C_d = 2.847, C_l = -3e-5 at 14% blockage |
+All drivers are run from the repo root, e.g.
 
-Roadmap additions (M1b completion): cylinder Re=100 (Strouhal + force
-history), sphere Re=300 (3D), and the `m1b_baselines.json` lock of every
-number in this table.
+```bash
+python benchmarks/navier-stokes/cavity_ghia.py
+python benchmarks/phase-field/wodo_nova.py --list
+```
 
-Both steppers (monolithic linearized, Leray projection) run every benchmark —
-a standing project discipline (spec §17): two time-discretizations agreeing
-on the same physics is a cheap, powerful cross-check.
+Each script self-registers its sibling imports via `_bench_bootstrap.py`, so
+grouping into subfolders is transparent — no `PYTHONPATH` needed.
+
+## The groups
+
+| Folder | Physics | Headline result |
+|---|---|---|
+| [`poisson-sbm/`](poisson-sbm/README.md) | shifted-boundary Poisson convergence | 3-D band asymptotic 2nd order; the dyadic-halo rule |
+| [`navier-stokes/`](navier-stokes/README.md) | incompressible flow, p1 & p2 | cavity vs Ghia; cylinder C_d 1.352 (p1) / 1.334 (p2) |
+| [`heat-mass/`](heat-mass/README.md) | SBM-thermal + Boussinesq | de Vahl Davis Nu to 0.05 % / 0.02 % |
+| [`phase-field/`](phase-field/README.md) | Cahn–Hilliard / Allen–Cahn / evaporating films | Wodo CMS-2012, all 14 cases, ~11 min on one A100 |
+| [`inverse-heroes/`](inverse-heroes/README.md) | differentiable inverse design | sphere & **bunny INR recovery, headline 1.23e-3** |
+| [`performance/`](performance/README.md) | device-migration profiling | the 300× assembly finding; H1 epoch 44.3× |
 
 ## Solver backends
 
-All drivers accept `--solver {splu, fused, cudss, amgx}`:
+All flow/thermal drivers accept `--solver {splu, fused, cudss, amgx}`:
 
-- `splu` — host direct (scipy). Fine small; refactorizes every new matrix.
-- `fused` — device single-sync Krylov (ours). Wins on SPD systems; Jacobi
-  preconditioning is not competitive on the monolithic (u,p) block.
-- `cudss` — NVIDIA cuDSS via `pip install nvmath-python[cu12]`. GPU direct:
-  the drop-in splu replacement and the MEASURED default for stepping
-  (cavity L8: 2.4 s/step vs splu 16.9 s — 7.1x).
-- `amgx` — NVIDIA AMGX (algebraic multigrid): the large-scale path for the
-  SPD subsystems (Leray PPE); classical AMG does not converge on the
-  coupled (u,p) block (findings 8e) — block preconditioning is the open
-  production item. Build once:
-      git clone --recursive https://github.com/NVIDIA/AMGX
-      cmake -B build -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.4/bin/nvcc \
-            -DCMAKE_CUDA_ARCHITECTURES=<arch> AMGX
-      make -C build -j amgxsh
-      cp build/libamgxsh.so <repo>/extern/
-      pip install --no-build-isolation <path-to-pyamgx-clone>  # AMGX_DIR set
-  Configs: AMGX's own validated JSONs, packaged under
-  src/diffsim/solvers/amgx_configs (see m1b findings 8 for the sharp edges).
-
-Measured per-step timings: see the table in m1b findings 8 / the commit that
-introduced this section.
-
-## Current inventory (2026-07-08)
-
-| Script | What it demonstrates | Status |
-|---|---|---|
-| `band_study.py` | p2-band Neumann sphere ladder (`--solver`, `--radius`) | 3-D asymptotic 2nd order (Nova, L7) |
-| `cavity_ghia.py`, `cavity_p2.py` | cavity vs Ghia at p1/p2 | p2-L4 beats p1-L5 |
-| `cylinder_forces.py`, `cylinder_p2.py` | cylinder C_d | 1.352 (p1) / 1.334 (p2, α~p²) |
-| `coupled_nu.py`, `heated_cylinder.py`, `devahl_davis.py` | SBM-thermal + Boussinesq | Nu 0.05%/0.02% (de Vahl Davis) |
-| `b1_dqdkappa_wip.py`, `b2_closure_recovery.py`, `b3_retrain_demo.py` | field-κ adjoints; closures-in-loop | dQ/dκ 3e-9; S2 demo RMSE 0.049 |
-| `hero_h1/h2/h3/h4`, `hero_d_bunny_drag.py`, `hero_m3_bunny_continuation.py` | the inverse-design hero ladder | sphere ✅✅; **bunny headline 1.23e-3** |
-| `adaptive_ch_opener.py` | re-mesh + transfer (zero drift) | M4 |
-| `wodo_fig3.py`, `wodo_fig67.py` | evaporating-film replication (CMS-2012) | Fig-3 ✅ first-run; Fig 6/7 campaign |
-| `wodo_nova.py` | Wodo figs 3-7 Nova runner (cluster/wodo_campaign/) | device-bound 56×/8×; 250×100 full res |
-| `profile_stages.py` | the M1d migration profiler | the 300× finding |
-| `p2band_ns_wip.py`, `shape_opt_cylinder.py` | recorded WIP / research items | honest markers |
+- `splu` — host direct (scipy). Fine for small systems; refactorizes every
+  matrix.
+- `fused` — device single-sync Krylov (ours). Wins on SPD systems.
+- `cudss` — NVIDIA cuDSS (`pip install nvmath-python[cu12]`). GPU direct: the
+  drop-in `splu` replacement and the measured default for stepping (cavity L8:
+  2.4 s/step vs splu 16.9 s — 7.1×).
+- `amgx` — NVIDIA AMGX algebraic multigrid: the large-scale path for the SPD
+  subsystems. Block preconditioning of the coupled (u,p) system is the open
+  production item (see `docs/dev/m1b-deferred-findings.md` §8).
 
 Baselines lock in `tests/baselines/*.json`; the findings logs
-(`docs/superpowers/*findings*.md`) carry every number's provenance.
+(`docs/dev/*findings*.md`) carry every number's provenance.

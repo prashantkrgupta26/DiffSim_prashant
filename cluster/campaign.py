@@ -177,7 +177,7 @@ def stage_band_study(run, results, card):
     for lv in levels:
         try:
             r = subprocess.run(
-                [sys.executable, "benchmarks/band_study.py", "3", str(lv)],
+                [sys.executable, "benchmarks/poisson-sbm/band_study.py", "3", str(lv)],
                 capture_output=True, text=True, cwd=ROOT,
                 timeout=6 * 3600)
             lines = [ln for ln in r.stdout.splitlines() if "band(3)" in ln]
@@ -195,7 +195,7 @@ def stage_band_study(run, results, card):
 def stage_hero_timing(run, results):
     t0 = time.perf_counter()
     r = subprocess.run(
-        [sys.executable, "benchmarks/hero_h1_sphere_steady.py", "4", "1"],
+        [sys.executable, "benchmarks/inverse-heroes/hero_h1_sphere_steady.py", "4", "1"],
         capture_output=True, text=True, cwd=ROOT, timeout=2 * 3600)
     dt = time.perf_counter() - t0
     tail = [ln for ln in r.stdout.splitlines()

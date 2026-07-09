@@ -27,7 +27,7 @@ RES=$OUT/results.txt
 echo "== Wodo 3-D stretch (128x128x48) $(date) ==" | tee $RES
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | tee -a $RES
 
-$PY benchmarks/wodo_nova.py --fig 3d --case stretch \
+$PY benchmarks/phase-field/wodo_nova.py --fig 3d --case stretch \
     --resolution full --to-phis 0.05 --device-bound \
     --wall-cap 72000 --results-file $RES --outdir $OUT \
     > $OUT/fig3d_stretch.log 2>&1 \

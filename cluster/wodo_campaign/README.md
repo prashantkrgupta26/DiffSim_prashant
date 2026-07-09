@@ -2,7 +2,7 @@
 
 Full-resolution replication of Wodo & Ganapathysubramanian, Comput.
 Mater. Sci. 55 (2012) 113-126, figs 3-7, on Nova — plus ONE reduced-3D
-stretch. Runner: `benchmarks/wodo_nova.py` (case table via `--list`).
+stretch. Runner: `benchmarks/phase-field/wodo_nova.py` (case table via `--list`).
 All marches are DEVICE-BOUND (`use_device_assembly=True`: slot-map
 scatter into a once-per-mesh CSR pattern + zero-copy torch-CSR cuDSS;
 measured on the workstation at 96x48: 56x vs host-splu, 8x vs

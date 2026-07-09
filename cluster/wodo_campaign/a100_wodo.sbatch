@@ -1,6 +1,6 @@
 #!/bin/bash
 # M4 Wodo CMS-2012 replication campaign — SEQUENTIAL full-resolution
-# runs (figs 3-7, 14 cases; benchmarks/wodo_nova.py --list for the
+# runs (figs 3-7, 14 cases; benchmarks/phase-field/wodo_nova.py --list for the
 # table). 2-D full = 250x100 (the paper's own mesh); fig3 1-D at
 # 4x256. Device-bound marches (slot-map scatter + zero-copy cuDSS;
 # measured 56x vs host-splu, 8x vs host-cudss at 96x48). Order:
@@ -28,7 +28,7 @@ for spec in "6 n5" "6 n100" "7 chifs" "7 chips" "6 n20" "7 sym" \
             "3 bi0.1" "3 bi1" "3 bi10"; do
   set -- $spec
   echo "===== fig$1 / $2 (full) $(date) =====" | tee -a $RES
-  $PY benchmarks/wodo_nova.py --fig "$1" --case "$2" \
+  $PY benchmarks/phase-field/wodo_nova.py --fig "$1" --case "$2" \
       --resolution full --to-phis 0.05 --device-bound \
       --wall-cap 10800 --results-file $RES --outdir $OUT \
       > $OUT/fig$1_$2.log 2>&1 \
