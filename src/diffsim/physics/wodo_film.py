@@ -1,7 +1,15 @@
-"""M4 track (c): Wodo & Ganapathysubramanian, Comput. Mater. Sci. 55
+r"""M4 track (c): Wodo & Ganapathysubramanian, Comput. Mater. Sci. 55
 (2012) 113-126 — evaporating ternary film (polymer/fullerene/solvent) in
 the Landau-mapped frame. Adapts TernaryCHStepper (4-dof monolithic
 Newton, C1-regularized FH log).
+
+This is the ternary Cahn-Hilliard brick (ternary_ch.py) on a SHRINKING film:
+same (phi_1, mu_1, phi_2, mu_2) system, but the domain is mapped to a fixed
+strip while the physical height h(t) evaporates away. For the base weak form see
+ternary_ch.py; for the strong -> weak -> code recipe see
+src/diffsim/api/example_bricks.py. The three additions here — the mapped
+gradient, the frame advection, and the top-surface flux — are laid out in the
+WEAK FORM section below and labeled inline in the kernel.
 
 MODEL (their Eqs. 16-23, nondimensionalized):
   theta = z / h_curr(t): computational domain FIXED (strip in [0,1]^2,
@@ -14,6 +22,32 @@ MODEL (their Eqs. 16-23, nondimensionalized):
 
   d(phi_i)/dt + K (theta/h) d(phi_i)/dtheta = grad~ . (M_ij grad~ mu_j)
   mu_i = dfFH/dphi_i - kap_i lap~ phi_i
+
+WEAK FORM.  Test the mass balance with v and the potential with q, integrate the
+mapped divergence/Laplacian by parts. Only the top surface contributes a
+boundary term (sides/bottom are no-flux):
+
+  R_{phi_i}(v) = Int v [ d(phi_i)/dt + K (theta/h) d(phi_i)/dtheta ] dV
+               + sum_j M_ij Int grad~ v . grad~ mu_j dV
+               - (K/h) Int_{top} v phi_i dS                         = 0
+  R_{mu_i}(q)  = Int q mu_i dV - Int q mu_i^FH dV
+               - kap_i Int grad~ q . grad~ phi_i dV                 = 0
+
+Three things distinguish this from plain ternary CH, each visible in the kernel:
+
+  (1) MAPPED GRADIENT grad~ scales the vertical component by 1/h_curr, so every
+      grad and lap picks up 1/h on the vertical block (1/h^2 in the Laplacian).
+      In code the per-direction factor `ms` is `mvert = 1/h` on the vertical axis
+      `vax` and `mlat = 1` otherwise.
+  (2) FRAME ADVECTION K (theta/h) d/dtheta — the top surface sweeping DOWN as the
+      film thins shows up as an advection of phi_i in the fixed frame. In code
+      this is `adv` multiplying the vertical field-gradient (residual) and the
+      vertical shape-gradient `advw` (Jacobian).
+  (3) TOP-SURFACE ENRICHMENT FLUX -(K/h) Int_top v phi_i dS — only solvent
+      evaporates, so solute left at the receding interface is a Neumann inflow.
+      Assembled from the P1 face mass over the top node row (_build_top_faces),
+      NOT in the volume kernel. Paired with the +K theta/h advection it exactly
+      conserves the physical solute content h*Int phi_i dtheta (the SIGN NOTE).
 
 SIGN NOTE (load-bearing; the paper's Sec. 5.2 text has a slip): with
 h' = dh/dt = -k_e avg(phi_s^top) = -K (K >= 0), the mapping z = theta h
@@ -258,8 +292,10 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
             # advection coefficient on the RAW xi_y-derivative:
             # K * xi_y * (1/h_curr)  (Ycomp cancels; see docstring)
             adv = kadv * theta[gp] * madv
-            for a in range(nbf):
+            for a in range(nbf):                       # test function v / q = N_a
                 Na = Ntab[q, a]
+                # grad~ v . grad~ mu_j  (transport, gM); grad~ v . grad~ phi_i
+                # (interface, gP); grad~ v . flux (Langevin noise, gQ).
                 gM1 = wp.float64(0.0)
                 gM2 = wp.float64(0.0)
                 gP1 = wp.float64(0.0)
@@ -267,6 +303,8 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
                 gQ1 = wp.float64(0.0)
                 gQ2 = wp.float64(0.0)
                 for dd in range(dim):
+                    # ms = mapped-gradient factor: 1/h on the vertical axis
+                    # (grad~), 1 laterally. Applied twice => 1/h^2 in grad.grad.
                     ms = mlat
                     if dd == vax:
                         ms = mvert
@@ -279,9 +317,13 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
                     gP2 += gNa * gp2k[gp, dd] * ms
                     gQ1 += gNa * q1[gp, dd] * s1
                     gQ2 += gNa * q2[gp, dd] * s2
+                # R_phi1 = Int v[ phi_t + adv d(phi1)/dtheta ] + Int grad~ v.M grad~ mu
+                #   phi_t -> sigma*phi1 - hist (BDF); adv = K theta/h (frame sweep)
                 r1 = (Na * (sigma * p1k[gp] - h1[gp]
                             + adv * gp1k[gp, vax]) + gM1 + gQ1) * dJxW
+                # R_mu1 = Int q(mu1 - mu1^FH) - kap1 Int grad~ q . grad~ phi1
                 rm1 = (Na * (m1k[gp] - mu1b)) * dJxW - kap1 * gP1 * dJxW
+                # R_phi2, R_mu2: identical structure for the second solute
                 r2 = (Na * (sigma * p2k[gp] - h2[gp]
                             + adv * gp2k[gp, vax]) + gM2 + gQ2) * dJxW
                 rm2 = (Na * (m2k[gp] - mu2b)) * dJxW - kap2 * gP2 * dJxW
