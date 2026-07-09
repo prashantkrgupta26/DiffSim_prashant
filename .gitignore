@@ -24,3 +24,6 @@ extern/
 benchmarks/data/wodo_nova/
 docs/dev/nova-mirrors/**/*.npy
 docs/dev/nova-mirrors/**/*.npz
+
+# --- generated docs site content (from tutorials/build_site.py) ---
+docs/site_src/

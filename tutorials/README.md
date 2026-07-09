@@ -46,7 +46,7 @@ website is generated from them (`python tutorials/build_site.py`, then
 | F3 | `F_phasefield/F3_adaptivity.py` | interface-band refinement, transfer operators, conservation by nestedness (drift exactly zero) |
 
 The F track has a self-contained LaTeX course document
-(`docs/latex/m4_phasefield_tutorial.tex`) covering the theory,
+(`docs/course/m4_phasefield_tutorial.tex`) covering the theory,
 the discretization as implemented, adaptivity, and the road to learned
 free energies.
 

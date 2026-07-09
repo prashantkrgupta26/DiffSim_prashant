@@ -1,36 +1,68 @@
-"""Generate the MkDocs site from the tutorial scripts.
+"""Generate the MkDocs site for DiffSim.
 
-The .py files are the single source of truth. This script turns each one
-into a site page: module docstring -> prose, remaining code -> a fenced,
-syntax-highlighted block. Regenerate after editing any tutorial:
+Assembles the documentation site from four sources — the landing page, the
+per-solver project pages (docs/projects/), the theory notes (docs/theory/), and
+the tutorial scripts (the .py files are the single source of truth) — into
+docs/site_src/, and rewrites the nav block in mkdocs.yml in place.
 
     python tutorials/build_site.py
-    mkdocs serve            # then open http://127.0.0.1:8000
+    mkdocs serve            # http://127.0.0.1:8000
+    mkdocs gh-deploy        # publish to GitHub Pages
 
-Deploy (when the repo goes to GitHub Pages): mkdocs gh-deploy.
+Links inside a project page that point into the repository (../../benchmarks,
+../../src, cluster/, docs/dev/) are rewritten to GitHub blob URLs so the built
+site is self-contained; intra-site links (../assets, ../theory) are preserved.
+Images live in docs/assets/img/ and are copied to site_src/assets/img/ — swap a
+PNG there (or rerun docs/assets/make_images.py) and rebuild.
 """
 import ast
+import re
 import pathlib
 import shutil
 
 ROOT = pathlib.Path(__file__).resolve().parent
-SITE = ROOT.parent / "docs" / "site_src"
+REPO = ROOT.parent
+DOCS = REPO / "docs"
+SITE = DOCS / "site_src"
+BLOB = "https://github.com/BaskarGS/diffsim/blob/master"
+
 TRACKS = {
     "A_foundations": "A. Foundations",
     "B_nonlinear": "B. Nonlinear",
     "C_time": "C. Time",
     "D_flow": "D. Flow",
     "E_differentiable": "E. Differentiable",
+    "F_phasefield": "F. Phase field",
     "P_performance": "P. Performance",
 }
 
+_LINK = re.compile(r"\]\(([^)]+)\)")
 
-def page_for(py: pathlib.Path, rel: str) -> str:
+
+def rewrite_links(md: str) -> str:
+    """Point repo-relative links at GitHub; keep intra-site links."""
+    def repl(m):
+        tgt = m.group(1)
+        if tgt.startswith(("http://", "https://", "#",
+                           "../assets/", "../theory/", "assets/", "theory/")):
+            return m.group(0)
+        if tgt.startswith("../../"):
+            return "](" + BLOB + "/" + tgt[len("../../"):] + ")"
+        if tgt.startswith(("../", "docs/", "cluster/", "src/", "benchmarks/",
+                           "tests/")):
+            clean = tgt.lstrip("./")
+            if clean.startswith("../"):
+                clean = clean[3:]
+            return "](" + BLOB + "/" + clean + ")"
+        return m.group(0)
+    return _LINK.sub(repl, md)
+
+
+def tutorial_page(py: pathlib.Path, rel: str) -> str:
     src = py.read_text()
-    mod = ast.parse(src)
-    doc = ast.get_docstring(mod) or ""
+    doc = ast.get_docstring(ast.parse(src)) or ""
     body = src.split('"""', 2)[-1].lstrip("\n")
-    title = doc.splitlines()[0].rstrip(".")
+    title = doc.splitlines()[0].rstrip(".") if doc else py.stem
     prose = "\n".join(doc.splitlines()[1:]).strip()
     return (f"# {title}\n\n{prose}\n\n"
             f"??? example \"Full script — `tutorials/{rel}` (run it!)\"\n\n"
@@ -39,24 +71,68 @@ def page_for(py: pathlib.Path, rel: str) -> str:
             + "\n    ```\n")
 
 
-if __name__ == "__main__":
+def build():
     if SITE.exists():
         shutil.rmtree(SITE)
     SITE.mkdir(parents=True)
-    nav_lines = ["nav:", "  - Home: index.md"]
-    index = ["# The DiffSim curriculum\n",
-             (ROOT / "README.md").read_text().split("\n", 1)[1]]
-    (SITE / "index.md").write_text("\n".join(index))
+
+    # --- images ---
+    img_src = DOCS / "assets" / "img"
+    img_dst = SITE / "assets" / "img"
+    img_dst.mkdir(parents=True)
+    for p in img_src.glob("*.png"):
+        shutil.copy(p, img_dst / p.name)
+
+    # --- landing ---
+    (SITE / "index.md").write_text(rewrite_links((DOCS / "site_landing.md").read_text()))
+
+    nav = ["nav:", "  - Home: index.md"]
+
+    # --- project pages ---
+    (SITE / "projects").mkdir()
+    proj_order = ["README", "poisson-sbm", "navier-stokes", "heat-mass",
+                  "phase-field", "differentiable", "adaptivity"]
+    nav.append("  - Solver projects:")
+    for stem in proj_order:
+        src = DOCS / "projects" / f"{stem}.md"
+        if not src.exists():
+            continue
+        name = "index" if stem == "README" else stem
+        (SITE / "projects" / f"{name}.md").write_text(rewrite_links(src.read_text()))
+        title = "Overview" if stem == "README" else \
+            src.read_text().splitlines()[0].lstrip("# ").strip().split(":")[0]
+        nav.append(f'    - "{title}": projects/{name}.md')
+
+    # --- theory ---
+    (SITE / "theory").mkdir()
+    nav.append("  - Theory:")
+    for src in sorted((DOCS / "theory").glob("*.md")):
+        (SITE / "theory" / src.name).write_text(rewrite_links(src.read_text()))
+        title = (src.read_text().splitlines()[0].lstrip("# ").strip().split(":")[0]
+                 or src.stem)
+        nav.append(f'    - "{title}": theory/{src.name}')
+
+    # --- curriculum ---
+    nav.append("  - Curriculum:")
     for track_dir, track_name in TRACKS.items():
         chapters = sorted((ROOT / track_dir).glob("*.py"))
         if not chapters:
             continue
-        nav_lines.append(f"  - {track_name}:")
+        nav.append(f"    - {track_name}:")
         for py in chapters:
-            rel = f"{track_dir}/{py.name}"
             out = SITE / f"{py.stem}.md"
-            out.write_text(page_for(py, rel))
-            nav_lines.append(f"    - {py.stem}: {py.stem}.md")
-    print("\n".join(nav_lines))
-    print(f"\nwrote {len(list(SITE.glob('*.md')))} pages to {SITE}")
-    print("paste the nav block above into mkdocs.yml if you add chapters.")
+            out.write_text(tutorial_page(py, f"{track_dir}/{py.name}"))
+            nav.append(f"      - {py.stem}: {py.stem}.md")
+
+    # --- write nav into mkdocs.yml (between the marker and EOF) ---
+    cfg = (REPO / "mkdocs.yml").read_text()
+    marker = "# nav is (re)generated by: python tutorials/build_site.py\n"
+    head = cfg.split(marker)[0] + marker
+    (REPO / "mkdocs.yml").write_text(head + "\n".join(nav) + "\n")
+
+    n = len(list(SITE.rglob("*.md")))
+    print(f"wrote {n} pages to {SITE}; nav updated in mkdocs.yml")
+
+
+if __name__ == "__main__":
+    build()
