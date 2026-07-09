@@ -285,16 +285,19 @@ def test_stepper_device_resident_cudss_parity(device):
 def test_stepper_device_resident_fused_parity(device):
     """The fused-Krylov device step (zero-copy CSR operator, vals never
     leave the GPU — the factorization-exceeds-HBM fallback) matches the
-    host splu trajectory at the iterative tol: velocity 1e-7, pressure
-    1e-6 (BiCGStab rtol 1e-10; measured 2.3e-8 velocity / 3.3e-7
+    host splu trajectory at the iterative tol: velocity 1e-6, pressure
+    1e-5 (BiCGStab rtol 1e-10; typical 2.3e-8 velocity / 3.3e-7
     near-uniform pressure wiggle — the pin fixes one node; the rest
-    rides the residual)."""
+    rides the residual). TOLERANCE NOTE (measured 2026-07-09): run-to-run
+    GPU nondeterminism in the iterative stopping point reaches 2.0e-7
+    velocity — the original 1e-7 gate flaked 4/10 standalone. Tolerances
+    sit 5x above the observed tail; a real parity break is O(1e-2)+."""
     xs_h = _cavity_traj(device, 2, 5, False, 4)
     xs_d = _cavity_traj(device, 2, 5, True, 4, solver="fused")
     for a, b_ in zip(xs_h, xs_d):
         scale = max(np.abs(a).max(), 1e-30)
-        assert np.abs(a[:, :2] - b_[:, :2]).max() / scale < 1e-7
-        assert np.abs(a[:, 2] - b_[:, 2]).max() / scale < 1e-6
+        assert np.abs(a[:, :2] - b_[:, :2]).max() / scale < 1e-6
+        assert np.abs(a[:, 2] - b_[:, 2]).max() / scale < 1e-5
 
 
 def test_assemble_device_resident(device):
