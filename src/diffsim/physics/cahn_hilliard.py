@@ -9,10 +9,25 @@ The Cahn-Hilliard problem, from strong form to code
 -------------------------------------------------------------------------------
 
 PHYSICS.  A conserved order parameter c (a composition) relaxes to minimize the
-Ginzburg-Landau free energy  F[c] = Int [ f(c) + (kap/2) |grad c|^2 ] dV, with
-the double-well  f(c) = (1/4)(c^2 - 1)^2, so f'(c) = c^3 - c. Conserved gradient
-flow gives a 4th-order PDE, which we split into two 2nd-order equations by
-introducing the chemical potential mu = dF/dc:
+Ginzburg-Landau free energy  F[c] = Int [ f(c) + (kap/2) |grad c|^2 ] dV. Two
+bulk free energies are supported (energy= in the stepper):
+
+  "poly" (default): the double-well  f(c) = (1/4)(c^2 - 1)^2,
+      f'(c) = c^3 - c,  f''(c) = 3c^2 - 1,  c in [-1, 1].
+  "fh": the Flory-Huggins logarithmic form (Wodo & Ganapathysubramanian,
+      JCP 230 (2011) 6037, Eq. 4), phi in (0, 1):
+      f(phi) = A [phi ln phi + (1-phi) ln(1-phi)] + B phi (1-phi)
+      f'     = A [ln phi - ln(1-phi)] + B (1 - 2 phi)
+      f''    = A [1/phi + 1/(1-phi)] - 2B
+      The logs enter through the C1-regularized _rlog/_rinv shared with
+      the ternary brick (linear extension below 1e-4 keeps a GROWING
+      restoring force at the walls — the hard-clamp lesson). Note the
+      curvature split: the entropic part A(1/phi + 1/(1-phi)) >= 4A is
+      strictly convex; all the destabilization is the CONSTANT -2B
+      (spinodal where A(1/phi + 1/(1-phi)) < 2B).
+
+Conserved gradient flow gives a 4th-order PDE, which we split into two
+2nd-order equations by introducing the chemical potential mu = dF/dc:
 
         c_t = div( M grad mu )          (mass balance; M = mobility)
         mu  = f'(c) - kap div(grad c)   (chemical potential)
@@ -49,11 +64,14 @@ import warp as wp
 from ..assembly.operators import _kernel_cache
 
 
-def make_ch_newton(nbf: int, nqp: int, dim: int):
-    key = ("ch_newton", nbf, nqp, dim)
+def make_ch_newton(nbf: int, nqp: int, dim: int, energy: str = "poly"):
+    key = ("ch_newton", nbf, nqp, dim, energy)
     if key in _kernel_cache:
         return _kernel_cache[key]
     dim_pow = float(dim)
+    fh = energy == "fh"
+    if fh:
+        from .ternary_ch import _rlog, _rinv
 
     @wp.kernel(module="unique", enable_backward=False,
                module_options=({"max_unroll": 0}
@@ -71,6 +89,7 @@ def make_ch_newton(nbf: int, nqp: int, dim: int):
              fcq: wp.array(dtype=wp.float64),     # MMS source in R_c
              fmq: wp.array(dtype=wp.float64),     # MMS source in R_mu
              Mmob: wp.float64, kap: wp.float64, sigma: wp.float64,
+             pA: wp.float64, pB: wp.float64,      # FH (A, B); poly ignores
              Ae: wp.array3d(dtype=wp.float64),
              be: wp.array2d(dtype=wp.float64)):
         e = wp.tid()
@@ -81,7 +100,16 @@ def make_ch_newton(nbf: int, nqp: int, dim: int):
             dJxW = wtab[q] * jac
             gp = e * nqp + q
             c_ = ck[gp]
-            dfdc = wp.float64(3.0) * c_ * c_ - wp.float64(1.0)
+            if wp.static(fh):
+                # f'  = A[ln c - ln(1-c)] + B(1-2c)   (regularized logs)
+                # f'' = A[1/c + 1/(1-c)] - 2B
+                fp = pA * (_rlog(c_) - _rlog(wp.float64(1.0) - c_)) \
+                    + pB * (wp.float64(1.0) - wp.float64(2.0) * c_)
+                dfdc = pA * (_rinv(c_) + _rinv(wp.float64(1.0) - c_)) \
+                    - wp.float64(2.0) * pB
+            else:
+                fp = c_ * c_ * c_ - c_
+                dfdc = wp.float64(3.0) * c_ * c_ - wp.float64(1.0)
             for a in range(nbf):
                 Na = Ntab[q, a]
                 # residuals (be = -r). gv_gmu = grad N_a . grad mu (the
@@ -97,8 +125,8 @@ def make_ch_newton(nbf: int, nqp: int, dim: int):
                 r_c = (Na * (sigma * c_ - hist[gp]) + Mmob * gv_gmu
                        - Na * fcq[gp]) * dJxW
                 # R_mu = Int q mu - Int q f'(c) - kap Int grad q . grad c
-                #   (q = N_a);  f'(c) = c^3 - c;  fmq is the MMS source.
-                r_m = (Na * (muk[gp] - (c_ * c_ * c_ - c_))
+                #   (q = N_a);  fp = f'(c) per the energy; fmq = MMS source.
+                r_m = (Na * (muk[gp] - fp)
                        - Na * fmq[gp]) * dJxW - kap * gv_gc * dJxW
                 wp.atomic_add(be, e, 2 * a + 0, -r_c)
                 wp.atomic_add(be, e, 2 * a + 1, -r_m)
@@ -116,7 +144,7 @@ def make_ch_newton(nbf: int, nqp: int, dim: int):
                     wp.atomic_add(Ae, e, 2 * a, 2 * b + 1,
                                   Mmob * lap * dJxW)
                     # dR_mu/dc = -f''(c) N_a N_b - kap grad N_a . grad N_b ;
-                    # dR_mu/dmu = N_a N_b   (dfdc = f''(c) = 3c^2 - 1)
+                    # dR_mu/dmu = N_a N_b   (dfdc = f''(c) per the energy)
                     wp.atomic_add(Ae, e, 2 * a + 1, 2 * b,
                                   (-dfdc * Na * Nb - kap * lap) * dJxW)
                     wp.atomic_add(Ae, e, 2 * a + 1, 2 * b + 1,
@@ -126,13 +154,32 @@ def make_ch_newton(nbf: int, nqp: int, dim: int):
     return ch_k
 
 
+def np_rlog(x, eps=1e-4):
+    """numpy mirror of ternary_ch._rlog (C1 linear extension below eps),
+    for energy functionals in tests/diagnostics."""
+    x = np.asarray(x, dtype=np.float64)
+    return np.where(x < eps, np.log(eps) + (x - eps) / eps,
+                    np.log(np.maximum(x, eps)))
+
+
+def fh_bulk_energy(c, A=1.0, B=3.0):
+    """Flory-Huggins bulk density f(c) = A[c ln c + (1-c)ln(1-c)] + Bc(1-c)
+    with the SAME regularized log the kernel uses."""
+    c = np.asarray(c, dtype=np.float64)
+    return A * (c * np_rlog(c) + (1.0 - c) * np_rlog(1.0 - c)) \
+        + B * c * (1.0 - c)
+
+
 class CahnHilliardStepper:
     def __init__(self, dm, M, kappa, dt, order=2, fc_fn=None, fm_fn=None,
                  dirichlet=None, gc_fn=None, gm_fn=None,
-                 newton_tol=1e-10, newton_max=15):
+                 newton_tol=1e-10, newton_max=15,
+                 energy="poly", fh_A=1.0, fh_B=3.0):
         from ..physics.poisson import gauss_points
         self.dm, self.M, self.kappa, self.dt = dm, M, kappa, dt
         self.order = order
+        assert energy in ("poly", "fh"), energy
+        self.energy, self.fh_A, self.fh_B = energy, float(fh_A), float(fh_B)
         z = lambda x, t: np.zeros(len(x))
         self.fc_fn, self.fm_fn = fc_fn or z, fm_fn or z
         self.dirichlet, self.gc_fn, self.gm_fn = dirichlet, gc_fn, gm_fn
@@ -199,7 +246,7 @@ class CahnHilliardStepper:
                 Ae = wp.zeros((ne, 2 * nbf, 2 * nbf), dtype=wp.float64,
                               device=d)
                 be = wp.zeros((ne, 2 * nbf), dtype=wp.float64, device=d)
-                kk = make_ch_newton(nbf, nqp, self.dm.dim)
+                kk = make_ch_newton(nbf, nqp, self.dm.dim, self.energy)
                 wp.launch(kk, dim=ne,
                           inputs=[b["conn"], b["h"], b["N"], b["dN"],
                                   b["w"], arr(cv[pv]), arr(cg[pv]),
@@ -209,7 +256,9 @@ class CahnHilliardStepper:
                                   arr(self.fm_fn(self.xq[pv], t_new)),
                                   wp.float64(self.M),
                                   wp.float64(self.kappa),
-                                  wp.float64(sigma), Ae, be], device=d)
+                                  wp.float64(sigma),
+                                  wp.float64(self.fh_A),
+                                  wp.float64(self.fh_B), Ae, be], device=d)
                 Aeh, beh = Ae.numpy(), be.numpy()
                 gdof = (conn[:, :, None] * 2
                         + np.arange(2)[None, None, :]).reshape(ne,
