@@ -263,8 +263,9 @@ def drag_shape_gradient(dm, sf, geo, oracle, A, x_full, nu, alpha,
                     else distance_torch(oracle, geo.xq))
     n_t = -n_t     # raw gradient normal -> domain-signed (measured: geo.n
     #                = -n_t uniformly for domain="outside"; d_t == geo.d)
-    # corr = n . n_tilde with the FIXED surrogate face normal n_tilde
-    nqf = fs.ftab.nqf
+    # corr = n . n_tilde with the FIXED surrogate face normal n_tilde;
+    # geo arrays hold nqf quadrature points per surrogate face
+    nqf = geo.n.shape[0] // len(sf.elem)
     ntil = np.zeros_like(geo.n)
     for fi in range(len(sf.elem)):
         f = int(sf.face[fi])
