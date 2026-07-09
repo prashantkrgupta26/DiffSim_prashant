@@ -36,9 +36,18 @@ def cudss_options():
     if _CUDSS_OPTS is ...:
         from nvmath.sparse.advanced import DirectSolverOptions
         import glob as _glob
-        mt = _glob.glob(
-            "/home/bglab/Baskar/DiffSim/.venv/lib/python3.12/"
-            "site-packages/nvidia/cu12/lib/libcudss_mtlayer_gomp.so*")
+        import os as _os
+        try:
+            import nvidia
+            _roots = list(nvidia.__path__)
+        except ImportError:
+            _roots = []
+        mt = []
+        for _r in _roots:
+            mt = _glob.glob(_os.path.join(
+                _r, "cu12", "lib", "libcudss_mtlayer_gomp.so*"))
+            if mt:
+                break
         _CUDSS_OPTS = (DirectSolverOptions(multithreading_lib=mt[0])
                        if mt else None)
     return _CUDSS_OPTS

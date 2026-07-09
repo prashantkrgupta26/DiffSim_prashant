@@ -462,13 +462,8 @@ class WodoFilmStepper(TernaryCHStepper):
     # -- linear solve (per-Newton-iterate matrix; fixed sparsity) --------
     @staticmethod
     def _cudss_opts():
-        from nvmath.sparse.advanced import DirectSolverOptions
-        import glob as _glob
-        mt = _glob.glob(
-            "/home/bglab/Baskar/DiffSim/.venv/lib/python3.12/"
-            "site-packages/nvidia/cu12/lib/libcudss_mtlayer_gomp.so*")
-        return DirectSolverOptions(multithreading_lib=mt[0]) if mt \
-            else None
+        from ..solvers.linsolve import cudss_options
+        return cudss_options()
 
     def _solve(self, A, r):
         if self.linsolver == "cudss":
