@@ -1,12 +1,26 @@
-mypapers/
-.remember/
-.DS_Store
-.superpowers/
+# --- Python / env ---
 .venv/
 __pycache__/
 *.egg-info/
-.claude/
-MyPapers/
+*.pyc
+.pytest_cache/
+
+# --- build artifacts (setuptools/mkdocs output; regenerated) ---
+build/
 site/
+
+# --- editor / OS ---
+.DS_Store
+.claude/
+.remember/
+.superpowers/
+
+# --- private / external (do NOT ship: copyrighted papers, vendored deps) ---
+MyPapers/
+mypapers/
 extern/
+
+# --- large runtime data drops (regenerated on cluster; keep out of git) ---
 benchmarks/data/wodo_nova/
+docs/dev/nova-mirrors/**/*.npy
+docs/dev/nova-mirrors/**/*.npz

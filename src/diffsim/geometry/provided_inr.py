@@ -1,7 +1,7 @@
 """ProvidedINROracle — wraps a trained SIREN checkpoint (spec N2/N3).
 
 DiffSim does not train INRs (program boundary N0). This wrapper consumes
-checkpoints as produced by the group's GENIE pipeline (SDF examples/):
+checkpoints as produced by the group's GENIE pipeline (assets/sdf/):
 sine layers sin(w0 (Wx+b)), skip concatenation [h, x]/sqrt(2) at given
 layers (the /sqrt2 is the reference siren.ts convention and was decisive
 in evaluating both provided models), linear final head.

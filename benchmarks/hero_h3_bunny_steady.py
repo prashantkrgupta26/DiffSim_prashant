@@ -23,7 +23,7 @@ from hero_h1_sphere_steady import (steady, alpha_gradient,
                                    probe_values, K)
 import hero_h1_sphere_steady as h1
 
-BUNNY_JSON = os.path.join("SDF examples",
+BUNNY_JSON = os.path.join("assets", "sdf",
                           "bunny_ear_movement_two_head.json")
 
 

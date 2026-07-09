@@ -1,5 +1,5 @@
 """Spec N4 gate 6: the REAL provided checkpoints through the pipeline.
-Sphere INR (SDF examples/model_single_head0.pt, w0=1.0 measured): full
+Sphere INR (assets/sdf/model_single_head0.pt, w0=1.0 measured): full
 ladder — admissibility, level-set geometry, 3D SBM Poisson forward,
 alpha-gradient adjoint-vs-FD. Bunny (GENIE json): admissibility + carve
 + mode extraction. Skipped when the checkpoints are absent."""
@@ -12,13 +12,13 @@ import torch
 from diffsim.geometry.oracle import admissibility
 from diffsim.geometry.provided_inr import ProvidedINROracle, extract_modes
 
-SDF_DIR = os.path.join(os.path.dirname(__file__), "..", "SDF examples")
+SDF_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "sdf")
 SPHERE_PT = os.path.join(SDF_DIR, "model_single_head0.pt")
 BUNNY_JSON = os.path.join(SDF_DIR, "bunny_ear_movement_two_head.json")
 
 pytestmark = [pytest.mark.geometry,
               pytest.mark.skipif(not os.path.exists(SPHERE_PT),
-                                 reason="SDF examples not present")]
+                                 reason="assets/sdf not present")]
 
 # sphere in INR frame: center 0, r ~ 0.26. Window half=0.5 -> pipeline
 # r ~ 0.26 (8+ cells across at L4 — the resolution the projector needs;

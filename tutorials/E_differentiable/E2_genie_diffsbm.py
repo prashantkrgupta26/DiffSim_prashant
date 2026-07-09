@@ -50,7 +50,7 @@ EXPECTED RESULTS (measured, sphere checkpoint, L5, k=4 modes)
       converges: advective transport enriches the measurement.
 
 Run:  python tutorials/E_differentiable/E2_genie_diffsbm.py
-      (expects SDF examples/model_single_head0.pt; swap in your own
+      (expects assets/sdf/model_single_head0.pt; swap in your own
       checkpoint via ProvidedINROracle.from_genie_json)
 """
 import os
@@ -74,7 +74,7 @@ from diffsim.sbm.poisson import SBMPoisson
 from diffsim.sbm.adjoint import solve_adjoint, shape_gradient, probe_qoi
 
 SPHERE_PT = os.path.join(os.path.dirname(__file__), "..", "..",
-                         "SDF examples", "model_single_head0.pt")
+                         "assets", "sdf", "model_single_head0.pt")
 K, LEVEL = 4, 5
 C = 0.47                          # window_center=0.03 -> sphere center
 # probes on a NEAR SHELL (r ~ 0.36 about the sphere at C=0.47): Poisson

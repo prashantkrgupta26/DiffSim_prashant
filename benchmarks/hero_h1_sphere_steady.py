@@ -29,7 +29,7 @@ from diffsim.sbm.adjoint import distance_torch
 from diffsim.mesh.pointeval import point_eval_weights
 import warp as wp
 
-SPHERE_PT = "SDF examples/model_single_head0.pt"
+SPHERE_PT = "assets/sdf/model_single_head0.pt"
 U_IN, NU, ALPHA_F = 1.0, 0.01, 10.0
 K = 4
 # probes: downstream of the (windowed, shifted) sphere at c=(0.47,...)
