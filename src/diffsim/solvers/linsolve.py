@@ -215,6 +215,267 @@ def _blockch_pairs(A, b, meta, tol, device):
     return x, (it[0], inner_it[0])
 
 
+def _pair_pattern_maps(indptr, indices, ndof, off):
+    """Host-once symbolic work for the DEVICE blockch setup (G5): for
+    the (phi, mu) pair at dof offsets (ndof*k+off, ndof*k+off+1), gather
+    maps from positions in A.data to the four pair blocks. The element
+    assembly writes FULL ndof x ndof node blocks, so Acc/Acm/Amc/Amm all
+    share ONE node-neighbor pattern (asserted) — W1/W2 live on it too.
+    Returns (rowptr, colnodes, pos{cc,cm,mc,mm}, diag_slots), all host."""
+    import scipy.sparse as _sp
+    n = (len(indptr) - 1) // ndof
+    nodes = np.arange(n, dtype=np.int64)
+    pos = {}
+    rowptr = colnodes = None
+    for row_off, names in ((off, ("cc", "cm")), (off + 1, ("mc", "mm"))):
+        rows = nodes * ndof + row_off
+        starts = np.asarray(indptr)[rows].astype(np.int64)
+        cnt = (np.asarray(indptr)[rows + 1] - starts).astype(np.int64)
+        # positions of every entry in these rows (vectorized ranges)
+        base = np.repeat(starts - np.concatenate(
+            ([0], np.cumsum(cnt)[:-1])), cnt)
+        idx = base + np.arange(int(cnt.sum()), dtype=np.int64)
+        cols = np.asarray(indices)[idx].astype(np.int64)
+        row_of = np.repeat(nodes, cnt)
+        for name, col_off in zip(names, (off, off + 1)):
+            sel = (cols % ndof) == col_off
+            pos[name] = idx[sel]
+            cn = (cols[sel] // ndof).astype(np.int32)
+            rp = np.zeros(n + 1, np.int64)
+            np.cumsum(np.bincount(row_of[sel], minlength=n), out=rp[1:])
+            if rowptr is None:
+                rowptr, colnodes = rp, cn
+            else:
+                assert len(cn) == len(colnodes) and (
+                    cn == colnodes).all(), \
+                    "pair blocks do not share one node pattern"
+    probe = _sp.csr_matrix(
+        (np.arange(len(colnodes), dtype=np.float64), colnodes, rowptr),
+        shape=(n, n))
+    diag = probe.diagonal().astype(np.int64)
+    return rowptr, colnodes, pos, diag
+
+
+def _blockch_pair_fill_kernel():
+    from ..assembly.operators import _kernel_cache
+    import warp as wp
+    key = ("blockch_pair_fill",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def pf(Ad: wp.array(dtype=wp.float64),
+           pcc: wp.array(dtype=wp.int32),
+           pcm: wp.array(dtype=wp.int32),
+           pmc: wp.array(dtype=wp.int32),
+           pmm: wp.array(dtype=wp.int32),
+           c_acc: wp.float64, c_acm: wp.float64,
+           c_f_acm: wp.float64, c_w2f: wp.float64,
+           amm: wp.array(dtype=wp.float64),
+           acm: wp.array(dtype=wp.float64),
+           amc: wp.array(dtype=wp.float64),
+           w1: wp.array(dtype=wp.float64),
+           w2: wp.array(dtype=wp.float64)):
+        # W1 = c_acc*Acc + c_acm*Acm;  F = -Amc + c_f_acm*Acm (SIGNED);
+        # W2 = W1 + c_w2f*F — one pass over the pair's node pattern
+        i = wp.tid()
+        vcm = Ad[pcm[i]]
+        vmc = Ad[pmc[i]]
+        amm[i] = Ad[pmm[i]]
+        acm[i] = vcm
+        amc[i] = vmc
+        w1i = c_acc * Ad[pcc[i]] + c_acm * vcm
+        w1[i] = w1i
+        w2[i] = w1i + c_w2f * (-vmc + c_f_acm * vcm)
+
+    _kernel_cache[key] = pf
+    return pf
+
+
+def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
+                         device="cuda:0", cache=None, cache_key=None):
+    """G5: _blockch_pairs with a DEVICE-RESIDENT setup. A's values live
+    on the GPU (warp array vals_d, e.g. DeviceNSAssembler.vals_d);
+    indptr/indices are the assembler's HOST pattern mirrors. Symbolic
+    work (pair gather maps, diag slots, full-A index upload, derived
+    value buffers) is host-once per pattern, cached under
+    ('blockch_dev_setup', cache_key). Per Newton iterate: one fill
+    kernel per pair builds Amm/Acm/Amc/W1/W2 values on the shared node
+    pattern (no host matrix ever exists), inners run on the fused
+    device Krylov stack, and the outer host FGMRES sees A only through
+    a device-spmv closure — 2 vector transfers per outer matvec + the
+    inner-solve rhs/solution transfers are the recorded host cost of
+    this rung. Same recipe/laws as _blockch_pairs; escalation gathers
+    Acc lazily and runs the per-pair exact Schur via device matvecs.
+    Returns host x; records ('blockch_iters', cache_key)."""
+    import warp as wp
+    from scipy.sparse.linalg import (LinearOperator, gmres as _gmres,
+                                     lgmres as _lgmres)
+    from ..assembly.operators import CSROperator
+    from ..assembly.device_assembly import _gather_kernel
+    from .krylov_dev import cg_dev, bicgstab_dev
+    sig = meta["sigma"]
+    ndof = meta["ndof"]
+    N = len(indptr) - 1
+    n = N // ndof
+    nnz = len(indices)
+    assert nnz < 2 ** 31, "int32 device slot maps (add int64 variant)"
+    fp = (N, nnz, len(meta["pairs"]))
+    setup = (cache or {}).get(("blockch_dev_setup", cache_key))
+    if setup is None or setup["fp"] != fp:
+        setup = {"fp": fp, "pairs": []}
+        for p in meta["pairs"]:
+            rowptr, colnodes, pos, diag = _pair_pattern_maps(
+                indptr, indices, ndof, p["off"])
+            nnzp = len(colnodes)
+            dev = lambda a_, dt: wp.array(np.ascontiguousarray(a_),
+                                          dtype=dt, device=device)
+            setup["pairs"].append(dict(
+                nnzp=nnzp,
+                rowptr_d=dev(rowptr.astype(np.int32), wp.int32),
+                colnodes_d=dev(colnodes, wp.int32),
+                pos_d={k: dev(v.astype(np.int32), wp.int32)
+                       for k, v in pos.items()},
+                diag_d=dev(diag.astype(np.int32), wp.int32),
+                amm_d=wp.zeros(nnzp, dtype=wp.float64, device=device),
+                acm_d=wp.zeros(nnzp, dtype=wp.float64, device=device),
+                amc_d=wp.zeros(nnzp, dtype=wp.float64, device=device),
+                w1_d=wp.zeros(nnzp, dtype=wp.float64, device=device),
+                w2_d=wp.zeros(nnzp, dtype=wp.float64, device=device),
+                dg_d=wp.zeros(n, dtype=wp.float64, device=device)))
+        setup["A_idx_d"] = (
+            wp.array(np.ascontiguousarray(
+                np.asarray(indptr).astype(np.int32)),
+                dtype=wp.int32, device=device),
+            wp.array(np.ascontiguousarray(
+                np.asarray(indices).astype(np.int32)),
+                dtype=wp.int32, device=device))
+        if cache is not None:
+            cache[("blockch_dev_setup", cache_key)] = setup
+    inner_it = [0]
+    _cb = lambda *_: inner_it.__setitem__(0, inner_it[0] + 1)
+
+    def _dev_solve(op, y, dg, rtol, krylov, label):
+        x_, info = krylov(op, y, tol=rtol, atol=1e-13, maxiter=4000,
+                          diag=dg, check_every=50)
+        if not info.get("converged"):
+            raise RuntimeError(f"blockch {label} device solve: {info}")
+        inner_it[0] += info.get("iters", 0)
+        return x_
+
+    gat = _gather_kernel()
+    fill = _blockch_pair_fill_kernel()
+    pairs = []
+    for p, Pd in zip(meta["pairs"], setup["pairs"]):
+        mmo, kap = p["m"], p["kappa"]
+        wp.launch(fill, dim=Pd["nnzp"], inputs=[
+            vals_d, Pd["pos_d"]["cc"], Pd["pos_d"]["cm"],
+            Pd["pos_d"]["mc"], Pd["pos_d"]["mm"],
+            wp.float64(np.sqrt(sig) / sig),
+            wp.float64(np.sqrt(mmo * kap) / mmo),
+            wp.float64(-kap / mmo), wp.float64(mmo / np.sqrt(sig)),
+            Pd["amm_d"], Pd["acm_d"], Pd["amc_d"], Pd["w1_d"],
+            Pd["w2_d"]], device=device)
+        dgs = []
+        for arr in (Pd["amm_d"], Pd["w1_d"], Pd["w2_d"]):
+            wp.launch(gat, dim=n, inputs=[arr, Pd["diag_d"], Pd["dg_d"]],
+                      device=device)
+            dg = Pd["dg_d"].numpy()
+            dg[dg == 0] = 1.0
+            dgs.append(dg)
+        dgs[2] = np.abs(dgs[2])         # Jacobi sign-guard (indefinite)
+        mkop = lambda a_, Pd=Pd: CSROperator.from_device_arrays(
+            Pd["rowptr_d"], Pd["colnodes_d"], a_, n, device)
+        opM = mkop(Pd["amm_d"])
+        opW1, opW2 = mkop(Pd["w1_d"]), mkop(Pd["w2_d"])
+        base = np.arange(n, dtype=np.int64) * ndof + p["off"]
+        pairs.append(dict(
+            ci=base, mi=base + 1, m=mmo, Pd=Pd,
+            opAcm=mkop(Pd["acm_d"]), opAmc=mkop(Pd["amc_d"]), opM=opM,
+            msolve=lambda y, o=opM, d_=dgs[0]:
+                _dev_solve(o, y, d_, 1e-10, cg_dev, "mass"),
+            w1solve=lambda y, o=opW1, d_=dgs[1]:
+                _dev_solve(o, y, d_, 1e-8, cg_dev, "W1"),
+            w2solve=lambda y, o=opW2, d_=dgs[2]:
+                _dev_solve(o, y, d_, 1e-8, bicgstab_dev, "W2")))
+
+    def apply(r):
+        z = r.copy()
+        for P in pairs:
+            rc, rm = r[P["ci"]], r[P["mi"]]
+            a = P["w1solve"](rc - P["opAcm"].matvec_numpy(
+                P["msolve"](rm)))
+            zc = P["w2solve"](P["opM"].matvec_numpy(a))
+            zm = P["msolve"](rm - P["opAmc"].matvec_numpy(zc))
+            z[P["ci"]] = zc
+            z[P["mi"]] = zm
+        return z
+
+    opA = CSROperator.from_device_arrays(*setup["A_idx_d"], vals_d, N,
+                                         device)
+    it = [0]
+    x, info = _lgmres(LinearOperator((N, N), opA.matvec_numpy), b,
+                      M=LinearOperator((N, N), apply),
+                      rtol=tol, atol=1e-13, maxiter=100,
+                      callback=lambda _: it.__setitem__(0, it[0] + 1))
+    if info != 0:
+        # ESCALATE: per-pair exact Schur; Acc gathered lazily on device
+        def _mk_schur(P):
+            Pd = P["Pd"]
+            acc_d = wp.zeros(Pd["nnzp"], dtype=wp.float64, device=device)
+            wp.launch(gat, dim=Pd["nnzp"],
+                      inputs=[vals_d, Pd["pos_d"]["cc"], acc_d],
+                      device=device)
+            opAcc = CSROperator.from_device_arrays(
+                Pd["rowptr_d"], Pd["colnodes_d"], acc_d, n, device)
+            Sc = LinearOperator(
+                (n, n), lambda v: opAcc.matvec_numpy(v)
+                + P["opAcm"].matvec_numpy(
+                    P["msolve"](-P["opAmc"].matvec_numpy(v))))
+            Mpre = LinearOperator(
+                (n, n), lambda v: P["w1solve"](
+                    P["opM"].matvec_numpy(P["w1solve"](v))))
+
+            def schur(y):
+                zz, sinfo = _gmres(Sc, y, M=Mpre, rtol=1e-8, atol=0.0,
+                                   maxiter=800, restart=160, callback=_cb,
+                                   callback_type="legacy")
+                if sinfo != 0:
+                    raise RuntimeError(
+                        f"blockch fallback Schur GMRES: {sinfo}")
+                return zz
+
+            return schur
+
+        for P in pairs:
+            P["schur"] = _mk_schur(P)
+
+        def apply_fb(r):
+            z = r.copy()
+            for P in pairs:
+                rc, rm = r[P["ci"]], r[P["mi"]]
+                zc = P["schur"](rc - P["opAcm"].matvec_numpy(
+                    P["msolve"](rm)))
+                zm = P["msolve"](rm - P["opAmc"].matvec_numpy(zc))
+                z[P["ci"]] = zc
+                z[P["mi"]] = zm
+            return z
+
+        it[0] = 0
+        x, info = _lgmres(LinearOperator((N, N), opA.matvec_numpy), b,
+                          M=LinearOperator((N, N), apply_fb),
+                          rtol=tol, atol=1e-13, maxiter=40,
+                          callback=lambda _:
+                          it.__setitem__(0, it[0] + 1))
+        if info != 0:
+            raise RuntimeError(
+                f"blockch fallback FGMRES not converged: {info}")
+        it[0] += 1000
+    if cache is not None:
+        cache[("blockch_iters", cache_key)] = (it[0], inner_it[0])
+    return x
+
+
 def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                  device="cuda:0", cache=None, cache_key=None):
     """Solve A x = b (scipy CSR A, host b). Returns host x.

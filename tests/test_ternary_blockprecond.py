@@ -187,6 +187,69 @@ def test_film_blockch_reduction_parity(device):
     assert not any(i >= 1000 for i in its), ("fallback engaged", its)
 
 
+def test_film_blockch_device_setup_parity(device):
+    """G5 gate: blockch with the DEVICE-RESIDENT setup
+    (use_device_assembly=True -> linsolve.blockch_pairs_device: pair
+    W1/W2/mass values built by a fill kernel on the assembler's slot-map
+    CSR, device inner Krylov, no host matrix) vs the host-setup blockch
+    trajectory, on the evaporation config. Measured (2026-07-09, 30
+    march steps): trajectory parity 3.03e-14; accepted/reject ladders
+    identical (30/0 both, dt sequences equal); the OUTER-iteration
+    ladder wobbles by +-1 in 6/91 solves (device inner-stack rounding —
+    the 7badd7b GPU-nondeterminism class; invisible to the dt heuristic,
+    which only tests iters < 20). Bitwise ladder equality is therefore
+    NOT asserted; solve count, accept/reject ladder, parity and
+    iteration bounds are. Cost note (measured): at this tiny 2-D size
+    the device-setup path is ~45x slower than host-setup (latency-bound
+    inner launches) — it exists for the 3-D sizes where a host CSR
+    cannot (G5)."""
+    def run(dev_asm, nsteps=10):
+        tree0 = build_uniform(5, dim=2)
+        keep = tree0.centers()[:, 0] < 4 / 32
+        tree = Octree(tree0.keys[keep], tree0.levels[keep], dim=2,
+                      periodic=tree0.periodic)
+        mesh = build_mesh(tree, p=1)
+        cons = build_constraints(mesh)
+        dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2),
+                                  device)
+        st = WodoFilmStepper(dm, chi=(1.0, 0.3, 0.3), N=(5.0, 5.0, 1.0),
+                             M=(0.225, 0.0, 0.225), kappa=(2e-4, 2e-4),
+                             k_e=1.0, dt=1e-3, linsolver="blockch",
+                             use_device_assembly=dev_asm)
+        rng = np.random.default_rng(3)
+        st.set_initial(
+            lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)),
+            lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)))
+        st._solver_cache = _RecCache()
+        rec = []
+        st.march(h_min=0.8, phis_stop=0.05, max_steps=nsteps,
+                 callback=lambda s, K, dt, it:
+                 rec.append((dt, s.x.copy())))
+        return rec, st.n_reject, st._solver_cache.iters
+
+    rec_h, rej_h, its_h = run(False)
+    rec_d, rej_d, its_d = run(True)
+    assert rej_h == rej_d and len(rec_h) == len(rec_d)
+    # dt compared RELATIVELY, not bitwise: march clamps dt_eff =
+    # min(dt, dh_cap/K) and K is a continuous function of the state, so
+    # the 1e-14 trajectory difference perturbs the clamped dt in its
+    # last ulps (measured: exact dt equality fails once the clamp binds)
+    assert all(abs(a[0] - b[0]) < 1e-9 * a[0]
+               for a, b in zip(rec_h, rec_d)), "dt ladder diverged"
+    assert len(its_h) == len(its_d), "solve count diverged"
+    errs = [np.abs(a[1] - b[1]).max() / max(np.abs(a[1]).max(), 1e-30)
+            for a, b in zip(rec_h, rec_d)]
+    mx = max(i % 1000 for i in its_d)
+    fb = sum(1 for i in its_d if i >= 1000)
+    wobble = sum(1 for a, b in zip(its_h, its_d) if a != b)
+    print(f"film device-setup parity: {len(rec_h)} steps, parity max "
+          f"{max(errs):.2e}, outer wobble {wobble}/{len(its_d)} solves, "
+          f"dev max outer {mx}, fallbacks {fb}")
+    assert max(errs) < 1e-9, errs
+    assert mx <= 8, its_d
+    assert fb == 0, ("fallback engaged", its_d)
+
+
 def test_film_blockch_evaporation(device):
     """The full film physics through the pairwise preconditioner —
     test_wodo_film.py::test_wodo_film_evaporation's config with

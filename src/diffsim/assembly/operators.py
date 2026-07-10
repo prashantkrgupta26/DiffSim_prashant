@@ -376,6 +376,17 @@ class CSROperator:
         self.n_free = A.shape[0]
         self._dev = _csr_to_device(A, device)
 
+    @classmethod
+    def from_device_arrays(cls, indptr_d, indices_d, data_d, n, device):
+        """Wrap an ALREADY-DEVICE CSR (wp.int32 indptr/indices, wp.float64
+        data) without any host round-trip — the G5 device-resident
+        blockch setup consumes assembler-owned value buffers directly."""
+        op = cls.__new__(cls)
+        op.device = device
+        op.n_free = n
+        op._dev = (indptr_d, indices_d, data_d)
+        return op
+
     def matvec(self, x: wp.array, y: wp.array):
         wp.launch(csr_spmv, dim=self.n_free,
                   inputs=[*self._dev, x, y], device=self.device)

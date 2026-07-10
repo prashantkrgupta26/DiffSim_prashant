@@ -538,6 +538,27 @@ class WodoFilmStepper(TernaryCHStepper):
             self._cudss_dev = None
             return np.full(asm.Nfull, np.nan)
 
+    def _solve_device_blockch(self, asm):
+        """G5: blockch with a DEVICE-RESIDENT setup — consumes the
+        assembler's device CSR values directly (no host matrix, no
+        cuDSS): per-pair W1/W2/mass values built by one device fill
+        kernel on the slot-map pattern, device inner Krylov
+        (linsolve.blockch_pairs_device). sigma stashed by
+        _attempt_device. Non-convergence (two-factor AND exact-Schur
+        escalation) signals divergence to the Appendix-A reject ladder,
+        matching the host blockch and cudss contracts."""
+        from ..solvers.linsolve import blockch_pairs_device
+        meta = {"sigma": self._sigma, "ndof": 4, "pairs": [
+            {"off": 0, "m": self.M11, "kappa": self.kap1},
+            {"off": 2, "m": self.M22, "kappa": self.kap2}]}
+        try:
+            return blockch_pairs_device(
+                asm.indptr, asm.indices, asm.vals_d, asm.F_d.numpy(),
+                meta, tol=1e-10, device=self.dm.device,
+                cache=self._solver_cache, cache_key="wodo_dev")
+        except RuntimeError:
+            return np.full(asm.Nfull, np.nan)
+
     # -- one implicit solve at frozen (h_curr, K); does NOT commit ------
     def _attempt(self, dt, K):
         if self.use_device_assembly:
@@ -681,6 +702,7 @@ class WodoFilmStepper(TernaryCHStepper):
         asm = self._asm
         d = self.dm.device
         sigma = 1.0 / dt
+        self._sigma = sigma      # blockch meta (device-setup route)
         v1, _ = self._gp(self.hist[0][0])
         v2, _ = self._gp(self.hist[0][1])
         h1_gp = {pv: sigma * v1[pv] for pv in v1}
@@ -748,7 +770,9 @@ class WodoFilmStepper(TernaryCHStepper):
                 self._flux_gdof_d,
                 wp.array(np.ascontiguousarray(load), dtype=wp.float64,
                          device=d))
-            dx = self._solve_device(asm)
+            dx = (self._solve_device_blockch(asm)
+                  if self.linsolver in ("blockch", "blockch_dev")
+                  else self._solve_device(asm))
             if not np.isfinite(dx).all() or np.abs(dx).max() > 1e6:
                 return None, it + 1, False               # diverged
             x = x + dx
