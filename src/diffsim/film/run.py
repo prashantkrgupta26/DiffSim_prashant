@@ -81,6 +81,7 @@ class FilmRun:
             lat_scale=r.lat_scale, linsolver=p.linsolver,
             noise=p.noise, noise_seed=p.noise_seed,
             var_mob=r.var_mob, D_ratio=r.D_pair, b_reg=p.b_reg,
+            mob_model=("negi" if p.mobility == "negi" else "wodo"),
             f_cheb=tuple(p.f_cheb),
             use_device_assembly=p.device_assembly)
         st._solver_cache = _IterCache()

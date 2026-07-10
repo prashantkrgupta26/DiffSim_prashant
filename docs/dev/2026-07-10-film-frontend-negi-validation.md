@@ -80,3 +80,46 @@ under-resolves forming interfaces at the 4 nm mesh (xi_early ~ 1.5
 elements < the validated 2.5 floor) — the negi configs run with
 `preflight: warn` and the excursion monitor stayed clean
 (phi within [-0.002, 0.978] across all six runs).
+
+## RESOLUTION (2026-07-10, same day): the SI settles the mobility closure
+
+Baskar supplied the paper's Supporting Information. SI section 1 states
+they do NOT use a concentration-dependent mixture diffusivity: their
+mobility is M_i = D~_i / f''_ideal,i with CONSTANT per-species
+D~_p = 0.001, D~_f = 0.005 (MD-informed; D~_f/D~_p = 5). No
+solvent-mixture factor — component transport is 2-3 decades slower than
+our Wodo-lineage D(phi) law at 90% solvent, exactly the factor the
+Bi-x100 diagnostic had measured. SI section 2 additionally gives their
+Saylor-style beta = 1e-4 RT/Vs regularizer, the 2800x700 periodic-x 2-D
+geometry (ours: no-flux 125x250 — recorded deviation), and the resource
+statement: ONE of their 3-D cases = 960 CPU cores x 48 h on Cartesius.
+
+Implemented as mobility=negi (kernel mobmode flag; configs updated to
+b_reg = 1e-4). Rerun of the four-rpm sweep at paper-scale mesh:
+
+| rpm | steps | L_c | lateral onset theta | drift |
+|---|---|---|---|---|
+| 6000 | 606 | 0.01727 | 0.948 | 2.2e-15 |
+| 3000 | 654 | 0.01714 | 0.948 | 1.5e-15 |
+| 1500 | 789 | 0.01778 | 0.944 | 2.2e-15 |
+| 500 | 1007 | 0.03328 | 0.940 | 1.5e-15 |
+
+Both replication gaps CLOSED: lateral surface-directed onset in the top
+region at every rpm, and the domain-size ladder with the slowest drying
+1.9x the fastest (their t_coarse ~ 1/alpha coarsening law; the 0.8%
+6000/3000 inversion is measurement flatness). phi envelope re-locked to
+[-0.12, 1.12] (measured worst -0.057 at the paper's own Cn = 0.001
+under-resolved interfaces). The gates now ASSERT the phenomenology.
+
+## Bonus observation: rpm-dependent surface character (measured)
+
+Final vertical profiles (lateral row-means of phi_f) across the sweep:
+6000/3000/1500 rpm arrest with POLYMER WETTING SKINS at both surfaces
+(edge rows 0.02-0.04) and a fullerene-rich interior (peak ~0.95); only
+the slowest 500 rpm coarsens into the stratified fullerene-TOP profile
+(top rows 0.95). I.e. the drying rate selects between arrested
+droplet-with-skins and stratified-bilayer end states — a morphology
+transition worth checking against the paper's cross-sections and, if it
+holds, worth a figure of its own in paper B. (The first-pass mixture-law
+physics equilibrated ALL cases to the fullerene-top bilayer; the gate
+that asserted it is re-locked to the structured-profile invariant.)

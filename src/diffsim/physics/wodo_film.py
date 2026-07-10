@@ -241,6 +241,7 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
                theta: wp.array(dtype=wp.float64),
                M11: wp.float64, M12: wp.float64, M22: wp.float64,
                Drp: wp.float64, Drf: wp.float64,
+               mobmode: wp.int32,
                c12: wp.float64, c1s: wp.float64, c2s: wp.float64,
                n1i: wp.float64, n2i: wp.float64, nsi: wp.float64,
                breg: wp.float64,
@@ -294,7 +295,16 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
             # branch keeps the v2 arithmetic (bit-for-bit with old runs)
             M11l = M11
             M22l = M22
-            if Drp >= wp.float64(0.0):
+            if mobmode == wp.int32(1):
+                # Negi SI-1 closure: M_ii = D~_i / f''_ideal,i with
+                # CONSTANT per-species D~ (no solvent-mixture factor;
+                # their MD-informed D~f/D~p = 5). This is what makes
+                # their Bi ~ 5e-3 dynamically active: component
+                # transport is 2-3 decades slower than the Wodo mixture
+                # law at 90% solvent.
+                M11l = Drp / (n1i * _rinv(p1) + nsi * _rinv(ps))
+                M22l = Drf / (n2i * _rinv(p2) + nsi * _rinv(ps))
+            elif Drp >= wp.float64(0.0):
                 Dloc = wp.float64(0.0)
                 if Drp == Drf:
                     Dloc = wp.max(ps + Drp * (p1 + p2), Drp)
@@ -404,7 +414,8 @@ class WodoFilmStepper(TernaryCHStepper):
                  dt=1e-4, newton_tol=1e-9, newton_max=50,
                  lat_scale=1.0, linsolver="splu", noise=0.0,
                  noise_seed=0, var_mob=False, D_ratio=1e-3, b_reg=0.0,
-                 f_cheb=(0.0, 0.0, 0.0), use_device_assembly=False):
+                 f_cheb=(0.0, 0.0, 0.0), use_device_assembly=False,
+                 mob_model="wodo"):
         super().__init__(dm, chi=chi, M=M, kappa=kappa, dt=dt, order=1,
                          newton_tol=newton_tol, newton_max=newton_max)
         assert dm.mesh.p == 1, "Wodo film v1: linear elements only"
@@ -421,6 +432,8 @@ class WodoFilmStepper(TernaryCHStepper):
         self.noise = float(noise)
         self._nrng = np.random.default_rng(noise_seed)
         self.var_mob = bool(var_mob)
+        assert mob_model in ("wodo", "negi"), mob_model
+        self.mob_model = mob_model
         # v2.1: scalar (both species, the historical meaning) or a
         # (D_p, D_f) pair (per-species ratios, front-end)
         if np.ndim(D_ratio) == 0:
@@ -605,7 +618,10 @@ class WodoFilmStepper(TernaryCHStepper):
             q_gp[pv] = (
                 rho * self._nrng.standard_normal((ngp, self.dm.dim)),
                 rho * self._nrng.standard_normal((ngp, self.dm.dim)))
-        Drp, Drf = self.D_ratio if self.var_mob else (-1.0, -1.0)
+        negi = self.mob_model == "negi"
+        Drp, Drf = (self.D_ratio if (self.var_mob or negi)
+                    else (-1.0, -1.0))
+        mobm = 1 if negi else 0
         x = self.x.copy()
         for it in range(self.newton_max):
             fields = [self._gp(x[i::4]) for i in range(4)]
@@ -632,7 +648,8 @@ class WodoFilmStepper(TernaryCHStepper):
                     self.theta_wp[pv],
                     wp.float64(self.M11), wp.float64(self.M12),
                     wp.float64(self.M22), wp.float64(Drp),
-                    wp.float64(Drf), wp.float64(self.c12),
+                    wp.float64(Drf), wp.int32(mobm),
+                    wp.float64(self.c12),
                     wp.float64(self.c1s), wp.float64(self.c2s),
                     wp.float64(1.0 / self.N1), wp.float64(1.0 / self.N2),
                     wp.float64(1.0 / self.Ns),
@@ -742,7 +759,10 @@ class WodoFilmStepper(TernaryCHStepper):
             q_gp[pv] = (
                 rho * self._nrng.standard_normal((ngp, self.dm.dim)),
                 rho * self._nrng.standard_normal((ngp, self.dm.dim)))
-        Drp, Drf = self.D_ratio if self.var_mob else (-1.0, -1.0)
+        negi = self.mob_model == "negi"
+        Drp, Drf = (self.D_ratio if (self.var_mob or negi)
+                    else (-1.0, -1.0))
+        mobm = 1 if negi else 0
         # flux Jacobian values: frozen over the attempt (coef frozen)
         flux_vals_d = wp.array(
             np.ascontiguousarray(-coef * self._flux_base),
@@ -789,7 +809,8 @@ class WodoFilmStepper(TernaryCHStepper):
                         self.theta_wp[pv][s0:s1],
                         wp.float64(self.M11), wp.float64(self.M12),
                         wp.float64(self.M22), wp.float64(Drp),
-                        wp.float64(Drf), wp.float64(self.c12),
+                        wp.float64(Drf), wp.int32(mobm),
+                    wp.float64(self.c12),
                         wp.float64(self.c1s), wp.float64(self.c2s),
                         wp.float64(1.0 / self.N1),
                         wp.float64(1.0 / self.N2),

@@ -17,11 +17,12 @@ physics:
     h0_nm: 1000
     Vs_cm3_mol: 80.7
     T_K: 300
-  b_reg: 1.0e-3               # Wodo footnote-2 simplex regularizer
+  b_reg: 1.0e-4               # their Saylor-style beta = 1e-4 RT/Vs (SI-2)
 evaporation:
   Bi: 0.0033                  # 1500 rpm
 mobility:
-  model: variable             # D(phi) freeze-out (Wodo v2)
+  model: negi                 # SI-1: M_i = D~_i/f._ideal,i, CONSTANT D~
+                              # (no solvent-mixture factor; their MD choice)
   D_p: 1.0e-3                 # per-species: D_p / D_s
   D_f: 5.0e-3                 # D_f / D_s (fullerene diffuses faster)
 domain:

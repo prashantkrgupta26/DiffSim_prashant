@@ -177,7 +177,8 @@ class FilmParams:
     def validate(self):
         assert len(self.chi) == 3, "chi = (chi_pf, chi_ps, chi_fs)"
         assert len(self.N) == 3, "N = (N_p, N_f, N_s)"
-        assert self.mobility in ("constant", "variable"), self.mobility
+        assert self.mobility in ("constant", "variable", "negi"), \
+            self.mobility
         assert self.linsolver in ("splu", "cudss", "blockch",
                                   "blockch_dev"), self.linsolver
         assert self.dim in (2, 3), self.dim
