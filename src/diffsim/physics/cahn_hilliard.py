@@ -174,12 +174,14 @@ class CahnHilliardStepper:
     def __init__(self, dm, M, kappa, dt, order=2, fc_fn=None, fm_fn=None,
                  dirichlet=None, gc_fn=None, gm_fn=None,
                  newton_tol=1e-10, newton_max=15,
-                 energy="poly", fh_A=1.0, fh_B=3.0):
+                 energy="poly", fh_A=1.0, fh_B=3.0, linsolver="splu"):
         from ..physics.poisson import gauss_points
         self.dm, self.M, self.kappa, self.dt = dm, M, kappa, dt
         self.order = order
         assert energy in ("poly", "fh"), energy
         self.energy, self.fh_A, self.fh_B = energy, float(fh_A), float(fh_B)
+        self.linsolver = linsolver
+        self._solver_cache = {}
         z = lambda x, t: np.zeros(len(x))
         self.fc_fn, self.fm_fn = fc_fn or z, fm_fn or z
         self.dirichlet, self.gc_fn, self.gm_fn = dirichlet, gc_fn, gm_fn
@@ -193,13 +195,58 @@ class CahnHilliardStepper:
         self.nfree = self.Tc.shape[1]
         self.t = 0.0
 
-    def set_initial(self, c0_fn):
+    def set_initial(self, c0_fn, mu_init="zero"):
+        """mu_init='consistent' seeds mu0 from the lumped weak potential
+        mu0 = [Int N f'(c0) + kap Int grad N . grad c0] / Ml — removing the
+        step-0 transient (poly gate measured E 0.25 -> 173 -> 0.61 with
+        mu=0; for FH the same transient Newton-overshoots c into the walls
+        where f'' hits the regularization cap 1/eps = 1e4)."""
         c0 = c0_fn(self.free_coords)
         self.hist = [c0.copy(), c0.copy()]
         self.x = np.zeros(self.nfree * 2)
         self.x[0::2] = c0
+        if mu_init == "consistent":
+            self.x[1::2] = self._consistent_mu(c0)
         self.t = 0.0
         return c0
+
+    def _fprime_np(self, c):
+        if self.energy == "fh":
+            eps = 1e-4
+            rlog = lambda x: np.where(x < eps,
+                                      np.log(eps) + (x - eps) / eps,
+                                      np.log(np.maximum(x, eps)))
+            return self.fh_A * (rlog(c) - rlog(1.0 - c)) \
+                + self.fh_B * (1.0 - 2.0 * c)
+        return c ** 3 - c
+
+    def _consistent_mu(self, c0):
+        """Lumped L2 projection of f'(c0) - kap lap c0 (natural BCs)."""
+        cv, cg = self._gp_scalar(c0)
+        F_full = np.zeros(self.dm.n_nodes)
+        Ml_full = np.zeros(self.dm.n_nodes)
+        for pv, b in self.dm.bins.items():
+            tb = self.dm.tables_by_p[pv]
+            conn = self.mesh.conn_of[pv].astype(np.int64)
+            ne, nbf = conn.shape
+            nqp = b["nqp"]
+            h = self.mesh.tree.h()[self.mesh.bins[pv]]
+            jac = (h / 2.0) ** self.dm.dim
+            wq = tb.w[None, :] * jac[:, None]                  # [ne,nqp]
+            fp = self._fprime_np(cv[pv]).reshape(ne, nqp)
+            # Int N_a f'(c0):
+            ra = np.einsum("eq,qa->ea", wq * fp, tb.N)
+            # + kap Int grad N_a . grad c0 (dscale on the test gradient):
+            g = cg[pv].reshape(ne, nqp, self.dm.dim)
+            ra += self.kappa * np.einsum(
+                "eqd,qad,eq,e->ea", g, tb.dN, wq, 2.0 / h)
+            np.add.at(F_full, conn.ravel(), ra.ravel())
+            np.add.at(Ml_full, conn.ravel(),
+                      np.einsum("eq,qa->ea", wq, tb.N).ravel())
+        rhs = np.asarray(self.Tc.T @ F_full)
+        ml = np.asarray(self.Tc.T @ Ml_full)
+        ml[ml <= 0] = ml[ml > 0].min()
+        return rhs / ml
 
     def _gp_scalar(self, vec):
         full = np.asarray(self.Tc @ vec)
@@ -281,8 +328,34 @@ class CahnHilliardStepper:
                         rr = i * 2 + c_
                         A.rows[rr] = [int(rr)]; A.data[rr] = [1.0]
                         r[rr] = gval - x[rr]
-            dx = splu(A.tocsr().tocsc()).solve(r)
+            if self.linsolver == "splu":
+                dx = splu(A.tocsr().tocsc()).solve(r)
+            else:
+                from ..solvers.linsolve import solve_linear
+                # sigma changes with BDF startup/adaptive dt: refresh meta
+                self._solver_cache[("blockch_meta", "ch")] = {
+                    "sigma": sigma, "m": self.M, "kappa": self.kappa}
+                dx = solve_linear(A.tocsr(), r, solver=self.linsolver,
+                                  tol=1e-10, cache=self._solver_cache,
+                                  cache_key="ch")
+            # Newton trust clamp: a c-increment beyond 2 units is always a
+            # diverging transient (poly's physical range is [-1,1], FH's
+            # (0,1)); scale the WHOLE update to preserve direction.
+            # Unclamped, quench-onset Newton at large dt reaches |c| ~ 37
+            # (measured), where f'' = 3c^2 - 1 ~ 4100 poisons any
+            # iterative Jacobian solver.
+            dc_max = np.abs(dx[0::2]).max()
+            if dc_max > 2.0:
+                dx = dx * (2.0 / dc_max)
             x = x + dx
+            if self.energy == "fh":
+                # projected Newton: keep iterates physical. Converged FH
+                # states sit at the binodal (>= 0.059 measured at B=3), so
+                # the projection only clips transient overshoots — without
+                # it the step-0 overshoot reaches the f'' regularization
+                # cap (measured f'' = 9984 at Newton iterate 2) and any
+                # iterative solver of the Jacobian is hostage to it.
+                np.clip(x[0::2], 1e-3, 1.0 - 1e-3, out=x[0::2])
             if np.abs(dx).max() < self.newton_tol:
                 break
         self.x = x
