@@ -368,3 +368,107 @@ def test_stepper_p2_sanity(device):
     assert np.isfinite(x_h).all() and np.abs(x_h).max() < 10
     x_d = run(True)
     assert np.abs(x_h - x_d).max() / max(np.abs(x_h).max(), 1e-30) < 1e-11
+
+
+# ---------------------------------------------------------------------
+# G5 rung c: node-graph pattern build (dof CSR = kron(G, ones(4,4))
+# structurally; closed-form in-kernel slot maps) vs the original dof-COO
+# build — the EXACTNESS gate for the full-res film assembler.
+# ---------------------------------------------------------------------
+def _strip3d(device, nx, ny, nz, level):
+    from diffsim.octree.build import Octree
+    tree0 = build_uniform(level, dim=3)
+    hc = 2.0 ** -level
+    cen = tree0.centers()
+    keep = ((cen[:, 0] < nx * hc) & (cen[:, 1] < ny * hc)
+            & (cen[:, 2] < nz * hc))
+    tree = Octree(tree0.keys[keep], tree0.levels[keep], dim=3,
+                  periodic=tree0.periodic)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    return DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3),
+                                device)
+
+
+def test_node_pattern_exactness(device):
+    """32x32x16 3-D strip (74k dofs, 4-dof node-major): the node-graph
+    pattern build must reproduce the dof-COO build EXACTLY — identical
+    CSR indptr/indices, and identical scattered values (same random
+    element blocks through both slot-map paths; tolerance covers only
+    atomic-order rounding on shared slots)."""
+    import warp as wp
+    dm = _strip3d(device, 32, 32, 16, 5)
+    a_old = DeviceNSAssembler(dm, ndof=4, node_pattern=False)
+    a_new = DeviceNSAssembler(dm, ndof=4, node_pattern=True)
+    assert a_new.node_mode and not a_old.node_mode
+    assert a_old.nnz == a_new.nnz
+    assert np.array_equal(np.asarray(a_old.indptr, np.int64),
+                          np.asarray(a_new.indptr, np.int64))
+    assert np.array_equal(np.asarray(a_old.indices, np.int64),
+                          np.asarray(a_new.indices, np.int64))
+    pv, b, ne, nbf, _ = a_old._bins[0]
+    nl = 4 * nbf
+    rng = np.random.default_rng(11)
+    Ae = rng.standard_normal((ne, nl, nl))
+    be = rng.standard_normal((ne, nl))
+    Ae_d = wp.array(Ae, dtype=wp.float64, device=device)
+    be_d = wp.array(be, dtype=wp.float64, device=device)
+    for asm in (a_old, a_new):
+        asm.zero_fill()
+        asm.scatter_bin(0, Ae_d, be_d)
+    v_o, v_n = a_old.vals_d.numpy(), a_new.vals_d.numpy()
+    f_o, f_n = a_old.F_d.numpy(), a_new.F_d.numpy()
+    va = np.abs(v_o - v_n).max()
+    fa = np.abs(f_o - f_n).max()
+    print(f"node-pattern exactness: nnz={a_new.nnz} "
+          f"max|dA|={va:.2e} max|dF|={fa:.2e}")
+    assert va < 1e-14 * max(1.0, np.abs(v_o).max()), va
+    assert fa < 1e-14 * max(1.0, np.abs(f_o).max()), fa
+    # batched scatter == whole-bin scatter (the rung-c launch unit)
+    a_new.zero_fill()
+    step = ne // 3 + 1
+    for e0 in range(0, ne, step):
+        nb = min(step, ne - e0)
+        Ab = wp.array(np.ascontiguousarray(Ae[e0:e0 + nb]),
+                      dtype=wp.float64, device=device)
+        bb = wp.array(np.ascontiguousarray(be[e0:e0 + nb]),
+                      dtype=wp.float64, device=device)
+        a_new.scatter_batch(0, e0, Ab, bb, nb)
+    v_b = a_new.vals_d.numpy()
+    assert np.abs(v_b - v_n).max() < 1e-14 * max(1.0, np.abs(v_n).max())
+
+
+def test_film_node_pattern_march_parity(device):
+    """The ternary film system through BOTH pattern builds: a short 3-D
+    film march (blockch, device assembly + device blockch setup) with
+    the node-graph pattern forced on/off must agree — the whole-pipeline
+    value gate (element scatter + top-flux csr_slots adds + F_d)."""
+    from diffsim.physics.wodo_film import WodoFilmStepper
+
+    def run(node_pattern, nsteps=3):
+        dm = _strip3d(device, 16, 16, 8, 4)
+        st = WodoFilmStepper(dm, chi=(1.0, 0.3, 0.3), N=(5.0, 5.0, 1.0),
+                             M=(0.225, 0.0, 0.225), kappa=(2e-4, 2e-4),
+                             k_e=1.0, dt=1e-3, linsolver="blockch",
+                             use_device_assembly=True)
+        st._node_pattern = node_pattern
+        rng = np.random.default_rng(3)
+        st.set_initial(
+            lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)),
+            lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)))
+        rec = []
+        st.march(h_min=0.8, phis_stop=0.05, max_steps=nsteps,
+                 callback=lambda s, K, dt, it:
+                 rec.append((dt, s.x.copy())))
+        return rec, st.n_reject
+
+    rec_o, rej_o = run(False)
+    rec_n, rej_n = run(True)
+    assert rej_o == rej_n and len(rec_o) == len(rec_n)
+    assert all(abs(a[0] - b[0]) < 1e-9 * a[0]
+               for a, b in zip(rec_o, rec_n)), "dt ladder diverged"
+    errs = [np.abs(a[1] - b[1]).max() / max(np.abs(a[1]).max(), 1e-30)
+            for a, b in zip(rec_o, rec_n)]
+    print(f"film node-pattern march parity: {len(rec_o)} steps, "
+          f"max rel {max(errs):.2e}")
+    assert max(errs) < 1e-9, errs

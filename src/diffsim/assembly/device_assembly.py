@@ -22,11 +22,21 @@ import warp as wp
 from .operators import _kernel_cache
 
 
+# Auto-switch threshold for the node-graph pattern build (G5 rung c):
+# above this many dof-pair entries (sum over bins of ne*(nbf*ndof)^2)
+# the old host COO/slot build becomes the memory binder (measured
+# exit-137 ladder at 62 GB host: 4.12M dofs = 4.2G entries dies; 3.26M
+# = 805M entries works, 37 s), so identity-T assemblers flip to the
+# node-graph path, which is exactness-gated against the old one.
+NODE_PATTERN_AUTO_ENTRIES = 2 * 10 ** 8
+
+
 class DeviceNSAssembler:
     """Per-epoch object: symbolic pattern + slot maps once; numeric fill
     per step on device."""
 
-    def __init__(self, dm, sigma_like=1.0, coloring=False, ndof=None):
+    def __init__(self, dm, sigma_like=1.0, coloring=False, ndof=None,
+                 node_pattern=None):
         # ndof: dofs per node (default dim+1 = the NS layout; 4 for the
         # ternary CH film system, 2 for binary CH — M4 device-bound)
         self.dm = dm
@@ -39,6 +49,24 @@ class DeviceNSAssembler:
         identity_T = (T.shape[0] == T.shape[1]) and (
             T != sp.identity(T.shape[0], format="csr")).nnz == 0
         self._identity_T = identity_T
+        self.node_mode = False
+        # ---- node-graph pattern path (G5 rung c) -----------------------
+        # node_pattern: True forces it, False forbids it, None = auto by
+        # entry count. Identity-T, non-colored meshes only.
+        tot_entries = sum(
+            len(dm.mesh.conn_of[pv]) * (dm.mesh.conn_of[pv].shape[1]
+                                        * ndof) ** 2
+            for pv in dm.bins)
+        if node_pattern is None:
+            node_pattern = (identity_T and not coloring
+                            and tot_entries > NODE_PATTERN_AUTO_ENTRIES)
+        if node_pattern:
+            assert identity_T and not coloring, (
+                "node-graph pattern requires identity constraints and "
+                "no coloring")
+            self.Nfull = dm.n_nodes * ndof
+            self._init_node_pattern(dm, ndof)
+            return
         # CONSTRAINT-AWARE (D1 item 3, cuFEM design): element entries are
         # expanded THROUGH the constraint weights host-once — full dof
         # (node n, comp c) -> masters (m_i, c) with weights w_i; each
@@ -203,6 +231,88 @@ class DeviceNSAssembler:
                                          np.arange(color.max() + 2))
                 self._colors.append((order.astype(np.int32), bounds))
 
+    # ------------------------------------------------------------------
+    # G5 rung c: node-graph symbolic pattern. Build the NODE adjacency
+    # graph G (nbf^2 pairs/element — ndof^2-fold fewer host COO entries
+    # than the dof pattern), then the dof-level CSR structurally
+    # = kron(G, ones(ndof, ndof)) with indptr/indices in CLOSED FORM
+    # (no dof-level COO ever exists; indices built by a device kernel).
+    # Element slot maps are computed IN-KERNEL from the per-element
+    # node-pair position in G:
+    #   dof row (ndof*na + ca) starts at
+    #       indptr[ndof*na + ca] = ndof^2*Gptr[na] + ca*ndof*deg(na),
+    #   and the entry for G-neighbor at offset q = s - Gptr[na] (s the
+    #   node-pair slot) and dof col comp cb sits at + ndof*q + cb.
+    # This removes the three measured full-res binders (15.15M dofs):
+    # the host dof COO (~61 GB), the K2[rr, cc] slot fancy-indexing
+    # (exit-137 at 4.12M dofs / 62 GB host), and the ne x (nbf*ndof)^2
+    # device slot map (15.2 GB); the per-element G-slot map is
+    # ne x nbf^2 int32 (~0.95 GB at full res).
+    # ------------------------------------------------------------------
+    def _init_node_pattern(self, dm, ndof):
+        self.node_mode = True
+        d = dm.device
+        n = dm.n_nodes
+        rows_all, cols_all = [], []
+        self._bins = []
+        self._conn_d = []
+        for pv, b in dm.bins.items():
+            conn = dm.mesh.conn_of[pv].astype(np.int32)
+            ne, nbf = conn.shape
+            self._bins.append((pv, b, ne, nbf, None))
+            self._conn_d.append(b["conn"])
+            # a varies slowly, b fast — matches gslot index a*nbf + b
+            rows_all.append(np.repeat(conn, nbf, axis=1).ravel())
+            cols_all.append(np.tile(conn, (1, nbf)).ravel())
+        r = np.concatenate(rows_all) if len(rows_all) > 1 else rows_all[0]
+        c = np.concatenate(cols_all) if len(cols_all) > 1 else cols_all[0]
+        # duplicate count per node pair <= elements sharing the pair
+        # (<= 2^dim on conforming hexes) — int8 cannot overflow
+        G = sp.coo_matrix((np.ones(len(r), np.int8), (r, c)),
+                          shape=(n, n)).tocsr()
+        G.sort_indices()
+        del r, c
+        Gptr = G.indptr.astype(np.int64)
+        Gind = G.indices.astype(np.int32)
+        del G
+        gnnz = int(Gptr[-1])
+        self.nnz = gnnz * ndof * ndof
+        assert self.nnz < 2 ** 31, (
+            f"node-pattern dof nnz {self.nnz} >= 2^31: the int32 device "
+            f"slot arithmetic overflows — needs an int64 kernel variant")
+        # dof-level indptr in closed form (int64: values reach nnz)
+        deg = np.diff(Gptr)
+        self.indptr = np.concatenate(
+            ([0], np.cumsum(np.repeat(deg * ndof, ndof)))).astype(np.int64)
+        assert self.indptr[-1] == self.nnz
+        # dof-level indices by device kernel (one thread per dof row);
+        # int32 mirror kept on host (blockch symbolic setup, csr_slots)
+        self._Gptr_d = wp.array(Gptr.astype(np.int32), dtype=wp.int32,
+                                device=d)
+        Gind_d = wp.array(Gind, dtype=wp.int32, device=d)
+        ind_d = wp.zeros(self.nnz, dtype=wp.int32, device=d)
+        wp.launch(_dof_indices_kernel(), dim=self.Nfull,
+                  inputs=[self._Gptr_d, Gind_d, wp.int32(ndof), ind_d],
+                  device=d)
+        self.indices = ind_d.numpy()
+        del ind_d, Gind_d
+        # per-element node-pair slot in G via keyed searchsorted
+        # (Gkey strictly increasing: CSR row-major + sorted columns)
+        Gkey = np.repeat(np.arange(n, dtype=np.int64), deg) * n + Gind
+        self._gslot_d = []
+        for (pv, b, ne, nbf, _), rr, cc in zip(self._bins, rows_all,
+                                               cols_all):
+            key = rr.astype(np.int64) * n + cc
+            slot = np.searchsorted(Gkey, key)
+            assert slot.max() < gnnz and (Gkey[slot] == key).all(), \
+                "node-pair slot lookup failed"
+            self._gslot_d.append(wp.array(slot.astype(np.int32),
+                                          dtype=wp.int32, device=d))
+            del key, slot
+        del Gkey, Gind, rows_all, cols_all
+        self.vals_d = wp.zeros(self.nnz, dtype=wp.float64, device=d)
+        self.F_d = wp.zeros(self.Nfull, dtype=wp.float64, device=d)
+
     def set_strong_rows(self, rows, diag_vals=None):
         """D1 item 2: per-epoch strong-row plan. rows: global dof ids
         whose equations become identity rows. Precomputes slot spans and
@@ -286,6 +396,9 @@ class DeviceNSAssembler:
                               be], device=d)
             npair = (nbf * ndof) ** 2
             scat = _scatter_kernel()
+            if self.node_mode:
+                self.scatter_bin(k_bin, Ae, be)   # A and b together
+                continue
             if not self._identity_T:
                 scw = _scatter_weighted_kernel()
                 wp.launch(scw, dim=len(self._slot_bins[k_bin]),
@@ -380,6 +493,40 @@ class DeviceNSAssembler:
         self.vals_d.zero_()
         self.F_d.zero_()
 
+    def scatter_batch(self, k_bin, e0, Ae_d, be_d, nb):
+        """Scatter BATCH-LOCAL device element blocks for the nb elements
+        [e0, e0 + nb) of bin k_bin (Ae_d flat or [>=nb, nl, nl], be_d
+        flat or [>=nb, nl]) into vals_d / F_d. This is the launch unit
+        that keeps (a) the Ae transient bounded (~2 GB at full res vs
+        30 GB whole-mesh) and (b) kernel dims < 2^31. Works in both
+        pattern modes; node mode computes dof slots in-kernel."""
+        d = self.dm.device
+        pv, b, ne, nbf, gdof = self._bins[k_bin]
+        ndof = self.ndof
+        nl = nbf * ndof
+        npair = nl * nl
+        if self.node_mode:
+            wp.launch(_scatter_node_kernel(), dim=nb * npair,
+                      inputs=[Ae_d.reshape((-1,)), self._gslot_d[k_bin],
+                              self._conn_d[k_bin], self._Gptr_d,
+                              wp.int32(e0), wp.int32(nbf),
+                              wp.int32(ndof), self.vals_d], device=d)
+            wp.launch(_scatter_node_vec_kernel(), dim=nb * nl,
+                      inputs=[be_d.reshape((-1,)), self._conn_d[k_bin],
+                              wp.int32(e0), wp.int32(nbf),
+                              wp.int32(ndof), self.F_d], device=d)
+            return
+        assert self._identity_T, (
+            "scatter_batch: constraint-aware path is whole-bin only")
+        slots_v = self._slots_d[k_bin][e0 * npair:(e0 + nb) * npair]
+        wp.launch(_scatter_kernel(), dim=nb * npair,
+                  inputs=[Ae_d.reshape((-1,)), slots_v, self.vals_d],
+                  device=d)
+        gdof_v = self._gdof_d[k_bin][e0 * nl:(e0 + nb) * nl]
+        wp.launch(_scatter_vec_kernel(), dim=nb * nl,
+                  inputs=[be_d.reshape((-1,)), gdof_v, self.F_d],
+                  device=d)
+
     def scatter_bin(self, k_bin, Ae_d, be_d):
         """Scatter one bin's device element blocks (Ae [ne, nl, nl],
         be [ne, nl]; nl = nbf*ndof, dof-major layout node*ndof + comp)
@@ -387,6 +534,18 @@ class DeviceNSAssembler:
         d = self.dm.device
         pv, b, ne, nbf, gdof = self._bins[k_bin]
         npair = (nbf * self.ndof) ** 2
+        if self.node_mode:
+            # chunk launches: dim = ne*npair can exceed 2^31 at full res
+            nl = nbf * self.ndof
+            Ae_f = Ae_d.reshape((-1,))
+            be_f = be_d.reshape((-1,))
+            step = max(1, (2 ** 31 - 1) // npair)
+            for e0 in range(0, ne, step):
+                nb = min(step, ne - e0)
+                self.scatter_batch(
+                    k_bin, e0, Ae_f[e0 * npair:(e0 + nb) * npair],
+                    be_f[e0 * nl:(e0 + nb) * nl], nb)
+            return
         if not self._identity_T:
             wp.launch(_scatter_weighted_kernel(),
                       dim=len(self._slot_bins[k_bin]),
@@ -616,6 +775,97 @@ def _scatter_weighted_kernel():
 
     _kernel_cache[key] = scw
     return scw
+
+
+def _dof_indices_kernel():
+    """dof-level CSR indices from the node graph, one thread per dof
+    row r = ndof*na + ca: entries (q, cb) get column ndof*Gind[g0+q]+cb
+    at indptr[r] + ndof*q + cb, indptr[r] = ndof^2*Gptr[na]
+    + ca*ndof*deg(na). int32-safe: nnz < 2^31 asserted at build."""
+    key = ("dev_dof_indices",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique")
+    def dik(Gptr: wp.array(dtype=wp.int32),
+            Gind: wp.array(dtype=wp.int32),
+            ndof: wp.int32,
+            out: wp.array(dtype=wp.int32)):
+        r = wp.tid()
+        na = r / ndof
+        ca = r % ndof
+        g0 = Gptr[na]
+        dnb = Gptr[na + 1] - g0
+        base = ndof * ndof * g0 + ca * ndof * dnb
+        for q in range(dnb):
+            col = ndof * Gind[g0 + q]
+            for cb in range(ndof):
+                out[base + ndof * q + cb] = col + cb
+
+    _kernel_cache[key] = dik
+    return dik
+
+
+def _scatter_node_kernel():
+    """Closed-form slot scatter (node-graph pattern): the dof slot is
+    derived in-kernel from the element node-pair's position in G —
+    no ne x (nbf*ndof)^2 slot map exists. Batch-local vals_e for the
+    nb elements at global offset e0. All index arithmetic stays below
+    nnz < 2^31 (asserted at build), so int32 is exact."""
+    key = ("dev_scatter_node",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique")
+    def scn(vals_e: wp.array(dtype=wp.float64),
+            gslot: wp.array(dtype=wp.int32),
+            conn: wp.array2d(dtype=wp.int32),
+            Gptr: wp.array(dtype=wp.int32),
+            e0: wp.int32, nbf: wp.int32, ndof: wp.int32,
+            out: wp.array(dtype=wp.float64)):
+        i = wp.tid()
+        nl = nbf * ndof
+        npair = nl * nl
+        el = i / npair
+        rem = i % npair
+        rl = rem / nl
+        cl = rem % nl
+        a = rl / ndof
+        ca = rl % ndof
+        bb = cl / ndof
+        cb = cl % ndof
+        e = e0 + el
+        s = gslot[e * nbf * nbf + a * nbf + bb]
+        na = conn[e, a]
+        g0 = Gptr[na]
+        dnb = Gptr[na + 1] - g0
+        slot = ndof * ndof * g0 + ca * ndof * dnb + ndof * (s - g0) + cb
+        wp.atomic_add(out, slot, vals_e[i])
+
+    _kernel_cache[key] = scn
+    return scn
+
+
+def _scatter_node_vec_kernel():
+    key = ("dev_scatter_node_vec",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique")
+    def scnv(vals_e: wp.array(dtype=wp.float64),
+             conn: wp.array2d(dtype=wp.int32),
+             e0: wp.int32, nbf: wp.int32, ndof: wp.int32,
+             out: wp.array(dtype=wp.float64)):
+        i = wp.tid()
+        nl = nbf * ndof
+        el = i / nl
+        loc = i % nl
+        a = loc / ndof
+        c = loc % ndof
+        wp.atomic_add(out, conn[e0 + el, a] * ndof + c, vals_e[i])
+
+    _kernel_cache[key] = scnv
+    return scnv
 
 
 def _scatter_vec_weighted_kernel():

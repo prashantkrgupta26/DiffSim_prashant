@@ -92,6 +92,60 @@ binodal-confined [0.068, 0.934].
   kappa(h) scaling). Needs a dedicated dumped-system lab like the 2-D
   offenders. Recorded, not diagnosed.
 
+## G5 addendum (2026-07-10): the full-res 3-D film ladder, CLOSED
+
+Device-resident blockch setup (ff6f3c1: `blockch_pairs_device` — pair
+Amm/Acm/Amc/W1/W2 values by one fill kernel per pair on the assembler
+slot-map CSR, device inner Krylov, outer host FGMRES through a
+device-spmv closure; no host matrix ever exists) + the **node-graph
+pattern fix** (rung c commit): the assembler's dof-level COO/slot host
+build (61 GB of rows/cols + the `K2[rr,cc]` fancy-index — measured
+exit-137 at 4.12M dofs on 62 GB host) is replaced by the NODE adjacency
+graph G (nbf^2 = 64 entries/element, 16x less), with the dof CSR
+structurally = kron(G, ones(4,4)): indptr/indices in closed form (a
+device kernel writes indices), and element slots computed IN-KERNEL
+from the node-pair position in G (slot = 16 Gptr[na] + 4 ca deg(na)
++ 4 q + cb) — the 15.2 GB device slot map never exists. The 30 GB
+whole-mesh Ae transient is batched (2 GB buffer, fill -> scatter ->
+reuse). Exactness-gated: identical CSR pattern + values to 3.6e-15 vs
+the old build (random blocks AND a 3-D film march at 9.0e-16 parity,
+tests/test_device_assembly.py); auto-switch above 2e8 dof-pair entries.
+int32 slot arithmetic asserted loudly against nnz < 2^31 — full res
+sits at 75% of the range.
+
+Ladder (wodo_nova fig3d/stretch physics: Np=Nf=5, chi=(1,.3,.3),
+Bi=0.3, phi_s0=0.66, Lx=Ly=3.3, kap=2e-4, noise=1e-3, var_mob,
+b_reg=1e-3, dt0=1e-4; ONE RTX 6000 Ada 48 GB, cuda:1; zero
+rejects/fallbacks everywhere; outer its <= 3 everywhere):
+
+| rung | dofs | nnz | s/step | setup | peak GPU | peak host |
+|---|---|---|---|---|---|---|
+| a 96x96x32 (ff6f3c1) | 1,241,988 | 129.6M | 48.2 (41 steady) | 13 s | 9.4 GB | — |
+| b 128x128x48 (ff6f3c1) | 3,261,636 | 343.9M | 82.1 (66 steady) | 37 s | 23.2 GB | — |
+| 144x144x48 (was exit-137) | 4,120,900 | 435.0M | 115* | 11 s | 10.8 GB | 10.4 GB |
+| 160x160x48 (was exit-137) | 5,080,516 | 536.8M | 163* | 14 s | 12.7 GB | 12.8 GB |
+| **c 230x230x70 FULL RES** | **15,154,524** | **1,611,975,856** | **268 (236 steady)** | **52 s** | **33.4 GB** | **37.7 GB** |
+
+(* = measured while sharing the GPU with the test suite; rungs a/b GPU
+peaks are pre-fix numbers, whose slot map the fix removes.)
+
+**Rung c verdict**: the paper's own 230x230x70 3-D mesh (Wodo runs it
+on 256 CPUs) marches on ONE 48 GB card — 9 accepted steps in the
+40-minute measurement window (2412 s wall, dt grew 1e-4 -> 6e-4 on the
+Appendix-A heuristic, h 1.0 -> 0.9995), 37 Newton solves at outer its
+1-3, solve = 74% of wall (1778 s; the rest is host GP fields + element
+fill + scatter), 4 Newton its/step steady. Host peak 37.7 GB (was: OOM
+building the pattern at a QUARTER of this size), GPU peak 33.4 GB of
+48. First step 502 s (carries the blockch host-once symbolic pair-map
+build on the 1.61B-entry pattern).
+
+Full production runs to phi_s = 0.05 at ~236 s/step remain a
+multi-day proposition on this card (the paper marches ~t=6.9, i.e.
+thousands of steps) — Nova A100-80 fits the same footprint with ~2.4x
+headroom in HBM bandwidth-bound spmv; nnz 1.61B is 75% of the int32
+slot range, so ~1.33x lateral resolution is the hard ceiling of the
+current int32 kernels (the assert raises loudly there).
+
 ## Open (G2+)
 
 - One regime defeats BOTH the two-factor form and the W1-preconditioned

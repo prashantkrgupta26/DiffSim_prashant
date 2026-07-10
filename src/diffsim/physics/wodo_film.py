@@ -672,7 +672,11 @@ class WodoFilmStepper(TernaryCHStepper):
         assert self._proj_identity, (
             "device-bound film v1.2: identity constraints only "
             "(uniform strips; no hanging nodes)")
-        self._asm = DeviceNSAssembler(self.dm, ndof=4)
+        # _node_pattern: optional override (tests force old/new pattern
+        # builds; None = the assembler's size-based auto switch)
+        self._asm = DeviceNSAssembler(
+            self.dm, ndof=4,
+            node_pattern=getattr(self, "_node_pattern", None))
         d = self.dm.device
         ntf, nfn = self.top_faces.shape
         rows, cols, gdofs = [], [], []
@@ -724,40 +728,61 @@ class WodoFilmStepper(TernaryCHStepper):
             np.ascontiguousarray(-coef * self._flux_base),
             dtype=wp.float64, device=d)
         x = self.x.copy()
+        # element launches are BATCHED (G5 rung c): the whole-mesh Ae
+        # transient is 30 GB at full res; a batch buffer capped at
+        # ~2 GB is filled -> scattered -> reused. Buffers live for the
+        # attempt; small meshes see a single batch (= the old launch).
+        bufs = {}
         for it in range(self.newton_max):
             fields = [self._gp(x[i::4]) for i in range(4)]
             asm.zero_fill()
             for k_bin, (pv, b, ne, nbf, gdof) in enumerate(asm._bins):
                 nqp = b["nqp"]
-                arr = lambda a_: wp.array(np.ascontiguousarray(a_),
-                                          dtype=wp.float64, device=d)
-                Ae = wp.zeros((ne, 4 * nbf, 4 * nbf), dtype=wp.float64,
-                              device=d)
-                be = wp.zeros((ne, 4 * nbf), dtype=wp.float64, device=d)
+                nl = 4 * nbf
+                if k_bin not in bufs:
+                    nb_cap = min(ne, max(1, (2 << 30) // (nl * nl * 8)))
+                    bufs[k_bin] = (
+                        nb_cap,
+                        wp.zeros((nb_cap, nl, nl), dtype=wp.float64,
+                                 device=d),
+                        wp.zeros((nb_cap, nl), dtype=wp.float64,
+                                 device=d))
+                nb_cap, Ae, be = bufs[k_bin]
                 kk = make_wodo_newton(nbf, nqp, self.dm.dim)
-                wp.launch(kk, dim=ne, inputs=[
-                    b["conn"], b["h"], b["N"], b["dN"], b["w"],
-                    arr(fields[0][0][pv]), arr(fields[0][1][pv]),
-                    arr(fields[1][0][pv]), arr(fields[1][1][pv]),
-                    arr(fields[2][0][pv]), arr(fields[2][1][pv]),
-                    arr(fields[3][0][pv]), arr(fields[3][1][pv]),
-                    arr(h1_gp[pv]), arr(h2_gp[pv]),
-                    arr(q_gp[pv][0]), arr(q_gp[pv][1]),
-                    self.theta_wp[pv],
-                    wp.float64(self.M11), wp.float64(self.M12),
-                    wp.float64(self.M22), wp.float64(Dr),
-                    wp.float64(self.c12),
-                    wp.float64(self.c1s), wp.float64(self.c2s),
-                    wp.float64(1.0 / self.N1), wp.float64(1.0 / self.N2),
-                    wp.float64(1.0 / self.Ns),
-                    wp.float64(self.b_reg),
-                    wp.float64(self.ch2), wp.float64(self.ch3),
-                    wp.float64(self.ch4),
-                    wp.float64(self.kap1), wp.float64(self.kap2),
-                    wp.float64(sigma), wp.float64(mlat),
-                    wp.float64(mvert), wp.float64(minv), wp.float64(K),
-                    Ae, be], device=d)
-                asm.scatter_bin(k_bin, Ae, be)
+                for e0 in range(0, ne, nb_cap):
+                    nb = min(nb_cap, ne - e0)
+                    s0, s1 = e0 * nqp, (e0 + nb) * nqp
+                    arr = lambda a_: wp.array(
+                        np.ascontiguousarray(a_[s0:s1]),
+                        dtype=wp.float64, device=d)
+                    Ae.zero_()
+                    be.zero_()
+                    wp.launch(kk, dim=nb, inputs=[
+                        b["conn"], b["h"][e0:e0 + nb], b["N"], b["dN"],
+                        b["w"],
+                        arr(fields[0][0][pv]), arr(fields[0][1][pv]),
+                        arr(fields[1][0][pv]), arr(fields[1][1][pv]),
+                        arr(fields[2][0][pv]), arr(fields[2][1][pv]),
+                        arr(fields[3][0][pv]), arr(fields[3][1][pv]),
+                        arr(h1_gp[pv]), arr(h2_gp[pv]),
+                        arr(q_gp[pv][0]), arr(q_gp[pv][1]),
+                        self.theta_wp[pv][s0:s1],
+                        wp.float64(self.M11), wp.float64(self.M12),
+                        wp.float64(self.M22), wp.float64(Dr),
+                        wp.float64(self.c12),
+                        wp.float64(self.c1s), wp.float64(self.c2s),
+                        wp.float64(1.0 / self.N1),
+                        wp.float64(1.0 / self.N2),
+                        wp.float64(1.0 / self.Ns),
+                        wp.float64(self.b_reg),
+                        wp.float64(self.ch2), wp.float64(self.ch3),
+                        wp.float64(self.ch4),
+                        wp.float64(self.kap1), wp.float64(self.kap2),
+                        wp.float64(sigma), wp.float64(mlat),
+                        wp.float64(mvert), wp.float64(minv),
+                        wp.float64(K),
+                        Ae, be], device=d)
+                    asm.scatter_batch(k_bin, e0, Ae, be, nb)
             # top-face enrichment flux (host values -> device add)
             asm.add_matrix_values(self._flux_slots_d, flux_vals_d)
             f1 = np.asarray(self.Tc @ x[0::4])
