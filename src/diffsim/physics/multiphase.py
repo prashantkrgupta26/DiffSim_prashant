@@ -85,6 +85,50 @@ solvent eliminated).  Mobility closures (NAMED, per the house rule):
                   Picard-frozen in the Jacobian (wodo var_mob lesson:
                   same converged solution, the Appendix-A heuristic
                   absorbs the odd extra iteration).
+  mob="fastmode_n" | "slowmode_n" (S2): the MULTICOMPONENT Onsager
+                  matrices of the anchor framework (Ronsin-Harting 2022,
+                  2204.11628 Eqs. 11-12), any M, over the FULL species
+                  set (eliminated solvent included) with omega_i
+                  = N_i phi_i D_i(phi, psi):
+                  fast:  Lam_ii = (1-phi_i)^2 w_i + phi_i^2 SUM_{k!=i} w_k
+                         Lam_ij = -(1-phi_i) phi_j w_i
+                                  - (1-phi_j) phi_i w_j
+                                  + phi_i phi_j SUM_{k!=i,j} w_k
+                  slow:  Lam_ii = w_i (1 - w_i/SUM w),
+                         Lam_ij = -w_i w_j / SUM w
+                  (the M x M block over retained species enters the
+                  exchange-potential fluxes; fastmode_n reduces EXACTLY
+                  to "fastmode" at M = 1 — parity-gated).  Self-diffusion
+                  is the VIGNES law (their Eq. 14 product):
+                  D_i = f_drop PROD_j Dslf[i, j]^phi_j, with Dslf[i, j]
+                  the self-diffusion of i in pure j ((M+1)^2 input
+                  D_self), and f_drop the LIQUID-SOLID MOBILITY DROP
+                  (their Eq. 13-14):
+                    log f(x; d, c, w) = (1/2) log(d) (1 + tanh(w(x-c))),
+                    x = psi_tot = 1 - PROD_k (1 - psi_k),
+                  parameters ls_drop = (d, c, w) (their PenVal/PenCentr/
+                  PenSlop; d = 1 disables, the default).  UNLIKE the
+                  M = 1 "fastmode" (Picard-frozen), the _n modes carry
+                  the EXACT dLam/dphi_j and dLam/dpsi_k blocks in the
+                  Jacobian (div(dLam .. grad mu) terms) — MEASURED
+                  NECESSITY: the 16390 deep-quench SD at the Vignes
+                  3-decade mobility contrast reduces frozen-Lam Newton
+                  to a 13-43-iteration linear tail with dt-ladder
+                  collapse to 1e-3 s (2026-07-10 calibration), i.e. the
+                  wodo var_mob lesson does NOT transfer to
+                  composition-singular mobilities.  dLam/dpsi_k uses
+                  the homogeneity Lam ~ f_drop:
+                  dLam_ij/dpsi_k = Lam_ij dln(f)/dpsi_k.
+                  CHC noise_phi with a matrix mobility needs a flux-space
+                  factorization we do not carry — asserted noise_phi = 0
+                  in the _n modes.
+
+CRYSTALLINE NOISE DAMPING (S2, anchor Eq. 18's f(phi_k) interpolation):
+noise_damp = (d, c, w) multiplies the FDT psi-noise per GP by
+f(psi_k; d, c, w) with the SAME Eq. 13 interpolation evaluated at the
+last committed psi_k (frozen per attempt, consistent with the noise
+freezing) — fluctuations damp inside crystalline domains (their
+PenValFluctAC/PenCentrFluctAC/PenSlopFluctAC).  None disables.
 
 Stochastic AC (each psi_k):  dpsi_k/dt = -L_k [ df/dpsi_k
 - div(eps_k^2 grad psi_k) ] + xi_k, with L_k the LUMPED mobility
@@ -139,6 +183,10 @@ are unaffected — fixed-point of the exact residual):
 The psi-column of the theta row and all phi/psi cross blocks are exact.
 
 TIME STEPPING.  BDF1 + Newton with the house safeguards: trust clamp
+(+ OPTIONAL ||r||_2 backtracking line search, line_search=True — the S2
+globalization; measured on the 16390 SD purification: plain Newton
+line-searches to 3-4 iterations/step at dt = 2e-2 where the unglobalized
+iteration rejected down to dt ~ 1e-4)
 (a phi/psi increment beyond 2 units scales the WHOLE update), projected
 iterates (phi clipped to [1e-3, 1-1e-3] then simplex-rescaled so
 sum phi <= 1 - 1e-3 preserving ratios; psi clipped to [0, 1]; theta
@@ -171,6 +219,15 @@ def np_rlog(x, eps=1e-4):
 def np_rinv(x, eps=1e-4):
     x = np.asarray(x, dtype=np.float64)
     return np.where(x < eps, 1.0 / eps, 1.0 / np.maximum(x, eps))
+
+
+def np_ls_interp(x, d, c, w):
+    """Anchor Eq. 13 liquid-solid interpolation: log f = (1/2) log(d)
+    (1 + tanh(w (x - c))).  f -> 1 for x << c (liquid), f -> ~d for
+    x >> c (crystal).  Used for the mobility drop (kernel mirror) and
+    the crystalline FDT-noise damping (host side)."""
+    x = np.asarray(x, dtype=np.float64)
+    return d ** (0.5 * (1.0 + np.tanh(w * (x - c))))
 
 
 def _np_chi_eff(pars, i, j, psi_of):
@@ -268,14 +325,17 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
     if key in _kernel_cache:
         return _kernel_cache[key]
     assert bulk in ("p1", "r14"), bulk
-    assert mob in ("const", "fastmode"), mob
+    assert mob in ("const", "fastmode", "fastmode_n", "slowmode_n"), mob
     if mob == "fastmode":
-        assert M == 1, "fastmode Onsager closure: M = 1 only (S2 item)"
+        assert M == 1, "fastmode Onsager closure: M = 1 only " \
+            "(fastmode_n is the generic-M mode)"
     dim_pow = float(dim)
     Kp = max(K, 1)
     ndof = 2 * M + 2 * K
     R14 = bulk == "r14"
     FASTMODE = mob == "fastmode"
+    SLOWN = mob == "slowmode_n"
+    MATMOB = mob in ("fastmode_n", "slowmode_n")
     n_sp = M + 1
     VecSp = wp.types.vector(length=n_sp, dtype=wp.float64)
     VecM = wp.types.vector(length=M, dtype=wp.float64)
@@ -283,6 +343,8 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
     MatSp = wp.types.matrix(shape=(n_sp, n_sp), dtype=wp.float64)
     MatKSp = wp.types.matrix(shape=(Kp, n_sp), dtype=wp.float64)
     MatMM = wp.types.matrix(shape=(M, M), dtype=wp.float64)
+    MatSpM = wp.types.matrix(shape=(n_sp, M), dtype=wp.float64)
+    MatMD = wp.types.matrix(shape=(M, M * M), dtype=wp.float64)
     MatMK = wp.types.matrix(shape=(M, Kp), dtype=wp.float64)
     MatKK = wp.types.matrix(shape=(Kp, Kp), dtype=wp.float64)
     MatKM = wp.types.matrix(shape=(Kp, M), dtype=wp.float64)
@@ -308,6 +370,9 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
               Ons: wp.array2d(dtype=wp.float64),     # [M, M] (const mob)
               dlo: wp.array(dtype=wp.float64),       # [M+1] fastmode D(own->0)
               dhi: wp.array(dtype=wp.float64),       # [M+1] fastmode D(own->1)
+              Dslf: wp.array2d(dtype=wp.float64),    # [(M+1),(M+1)] Vignes
+              dsl: wp.float64, csl: wp.float64,      # Eq. 13 drop d, c
+              wsl: wp.float64,                       # Eq. 13 drop w
               kap: wp.array(dtype=wp.float64),       # [M]
               dsig: wp.array(dtype=wp.float64),      # [Kp]
               drive: wp.array(dtype=wp.float64),     # [Kp] (host: T-law)
@@ -524,6 +589,19 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                 d2pp[k, k] = bulk2 \
                     + (wp.float64(6.0) - wp.float64(12.0) * psiv[k]) \
                     * Eori[k]
+                if wp.static(R14):
+                    # r14 chi curvature: dD1[k,l]/dpsi_k = D1/psi_k
+                    # (D1 = 2 psi_k (chi_ca + s_l^2 chi_cc)); was a
+                    # frozen quasi-Newton block through S1 (measured FD
+                    # gap 4.7e-4 rel) — exact since S2
+                    for l in range(n_sp):
+                        if l != k:
+                            sl2 = wp.float64(0.0)
+                            if l < K:
+                                sl2 = psiv[l] * psiv[l]
+                            d2pp[k, k] += phiv[k] * phiv[l] \
+                                * wp.float64(2.0) \
+                                * (chi_ca[k, l] + sl2 * chi_cc[k, l])
                 for l in range(K):
                     if l != k:
                         if wp.static(R14):
@@ -548,6 +626,128 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                 d2s = wp.pow(dlo[1], pc) * wp.pow(dhi[1], omp)
                 lam = omp * omp * pc / Ninv[0] * d1s \
                     + pc * pc * omp / Ninv[1] * d2s
+            lamM = MatMM()
+            dLamT = MatMD()      # dLamT[i, jp*M + j] = d Lam_{i,jp}/d phi_j
+            dlnf = VecKp()       # d ln(f_drop) / d psi_k
+            for i0 in range(M):
+                for j0 in range(M):
+                    lamM[i0, j0] = wp.float64(0.0)
+                for j0 in range(M * M):
+                    dLamT[i0, j0] = wp.float64(0.0)
+            for k0 in range(Kp):
+                dlnf[k0] = wp.float64(0.0)
+            if wp.static(MATMOB):
+                # liquid-solid drop factor (Eq. 13-14; dsl = 1 disables)
+                pt = wp.float64(1.0)
+                for k0 in range(K):
+                    pt *= wp.float64(1.0) - wp.min(
+                        wp.max(psiv[k0], wp.float64(0.0)), wp.float64(1.0))
+                tnh = wp.tanh(wsl * (wp.float64(1.0) - pt - csl))
+                fdrop = wp.pow(dsl, wp.float64(0.5)
+                               * (wp.float64(1.0) + tnh))
+                # d ln f/d psi_k = 0.5 ln(d) w sech^2 PROD_{l!=k}(1-psi_l)
+                dfac = wp.float64(0.5) * wp.log(dsl) * wsl \
+                    * (wp.float64(1.0) - tnh * tnh)
+                for k0 in range(K):
+                    prd = wp.float64(1.0)
+                    for l0 in range(K):
+                        if l0 != k0:
+                            prd *= wp.float64(1.0) - wp.min(
+                                wp.max(psiv[l0], wp.float64(0.0)),
+                                wp.float64(1.0))
+                    dlnf[k0] = dfac * prd
+                # omega_i = N_i phi_i D_i, Vignes D_i (Eq. 14), and
+                # d omega_i/d phi_j (j retained; phi_M = 1 - sum)
+                omv = VecSp()
+                dom = MatSpM()
+                somv = wp.float64(0.0)
+                for i0 in range(n_sp):
+                    dsi = fdrop
+                    for j0 in range(n_sp):
+                        pj = wp.min(wp.max(phiv[j0], wp.float64(0.0)),
+                                    wp.float64(1.0))
+                        dsi *= wp.pow(Dslf[i0, j0], pj)
+                    pc0 = wp.min(wp.max(phiv[i0], wp.float64(1e-6)),
+                                 wp.float64(1.0) - wp.float64(1e-6))
+                    omv[i0] = pc0 / Ninv[i0] * dsi
+                    somv += omv[i0]
+                    for j0 in range(M):
+                        fac = wp.float64(0.0)
+                        if i0 == j0:
+                            fac = wp.float64(1.0)
+                        if i0 == M:
+                            fac = wp.float64(-1.0)
+                        dom[i0, j0] = fac * omv[i0] / pc0 \
+                            + omv[i0] * wp.log(Dslf[i0, j0]
+                                               / Dslf[i0, M])
+                dS = VecM()
+                for j0 in range(M):
+                    acc0 = wp.float64(0.0)
+                    for i0 in range(n_sp):
+                        acc0 += dom[i0, j0]
+                    dS[j0] = acc0
+                for i0 in range(M):
+                    if wp.static(SLOWN):
+                        lamM[i0, i0] = omv[i0] \
+                            * (wp.float64(1.0) - omv[i0] / somv)
+                        for j0 in range(M):
+                            dLamT[i0, i0 * M + j0] = dom[i0, j0] \
+                                * (wp.float64(1.0)
+                                   - wp.float64(2.0) * omv[i0] / somv) \
+                                + omv[i0] * omv[i0] / (somv * somv) \
+                                * dS[j0]
+                    else:
+                        opi = wp.float64(1.0) - phiv[i0]
+                        lamM[i0, i0] = opi * opi * omv[i0] \
+                            + phiv[i0] * phiv[i0] * (somv - omv[i0])
+                        for j0 in range(M):
+                            dij = wp.float64(0.0)
+                            if j0 == i0:
+                                dij = wp.float64(1.0)
+                            dLamT[i0, i0 * M + j0] = \
+                                wp.float64(-2.0) * opi * dij * omv[i0] \
+                                + opi * opi * dom[i0, j0] \
+                                + wp.float64(2.0) * phiv[i0] * dij \
+                                * (somv - omv[i0]) \
+                                + phiv[i0] * phiv[i0] \
+                                * (dS[j0] - dom[i0, j0])
+                    for l0 in range(M):
+                        if l0 != i0:
+                            if wp.static(SLOWN):
+                                lamM[i0, l0] = -omv[i0] * omv[l0] / somv
+                                for j0 in range(M):
+                                    dLamT[i0, l0 * M + j0] = \
+                                        -(dom[i0, j0] * omv[l0]
+                                          + omv[i0] * dom[l0, j0]) \
+                                        / somv \
+                                        + omv[i0] * omv[l0] \
+                                        / (somv * somv) * dS[j0]
+                            else:
+                                opi = wp.float64(1.0) - phiv[i0]
+                                opl = wp.float64(1.0) - phiv[l0]
+                                rest = somv - omv[i0] - omv[l0]
+                                lamM[i0, l0] = -opi * phiv[l0] * omv[i0] \
+                                    - opl * phiv[i0] * omv[l0] \
+                                    + phiv[i0] * phiv[l0] * rest
+                                for j0 in range(M):
+                                    dij = wp.float64(0.0)
+                                    if j0 == i0:
+                                        dij = wp.float64(1.0)
+                                    dlj = wp.float64(0.0)
+                                    if j0 == l0:
+                                        dlj = wp.float64(1.0)
+                                    dLamT[i0, l0 * M + j0] = \
+                                        dij * phiv[l0] * omv[i0] \
+                                        - opi * dlj * omv[i0] \
+                                        - opi * phiv[l0] * dom[i0, j0] \
+                                        + dlj * phiv[i0] * omv[l0] \
+                                        - opl * dij * omv[l0] \
+                                        - opl * phiv[i0] * dom[l0, j0] \
+                                        + (dij * phiv[l0]
+                                           + dlj * phiv[i0]) * rest \
+                                        + phiv[i0] * phiv[l0] \
+                                        * (dS[j0] - dom[i0, j0]
+                                           - dom[l0, j0])
             # ---- assemble ----------------------------------------------
             for a in range(nbf):
                 Na = Ntab[q, a]
@@ -580,9 +780,16 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                         tr = lam * gmu[i]
                         sm = wp.sqrt(lam)
                     else:
-                        for j in range(M):
-                            tr += Ons[i, j] * gmu[j]
-                        sm = wp.sqrt(wp.max(Ons[i, i], wp.float64(0.0)))
+                        if wp.static(MATMOB):
+                            for j in range(M):
+                                tr += lamM[i, j] * gmu[j]
+                            sm = wp.sqrt(wp.max(lamM[i, i],
+                                                wp.float64(0.0)))
+                        else:
+                            for j in range(M):
+                                tr += Ons[i, j] * gmu[j]
+                            sm = wp.sqrt(wp.max(Ons[i, i],
+                                                wp.float64(0.0)))
                     r_p = (Na * (sigma * vals[gp, 2 * i]
                                  - hist[gp, 2 * i] - src[gp, 2 * i])
                            + tr + sm * gq[i]) * dJxW
@@ -622,10 +829,33 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                             wp.atomic_add(Ae, e, ra, ndof * b + 1,
                                           lam * lapw)
                         else:
-                            for j in range(M):
-                                wp.atomic_add(Ae, e, ra,
-                                              ndof * b + 2 * j + 1,
-                                              Ons[i, j] * lapw)
+                            if wp.static(MATMOB):
+                                for j in range(M):
+                                    wp.atomic_add(Ae, e, ra,
+                                                  ndof * b + 2 * j + 1,
+                                                  lamM[i, j] * lapw)
+                                # exact mobility-derivative columns:
+                                # d/dphi_j int grad(Na).Lam grad(mu)
+                                trm = wp.float64(0.0)
+                                for j in range(M):
+                                    trm += lamM[i, j] * gmu[j]
+                                    dv2 = wp.float64(0.0)
+                                    for jp in range(M):
+                                        dv2 += dLamT[i, jp * M + j] \
+                                            * gmu[jp]
+                                    wp.atomic_add(Ae, e, ra,
+                                                  ndof * b + 2 * j,
+                                                  dv2 * Nb * dJxW)
+                                for k in range(K):
+                                    wp.atomic_add(
+                                        Ae, e, ra,
+                                        ndof * b + 2 * M + 2 * k,
+                                        dlnf[k] * trm * Nb * dJxW)
+                            else:
+                                for j in range(M):
+                                    wp.atomic_add(Ae, e, ra,
+                                                  ndof * b + 2 * j + 1,
+                                                  Ons[i, j] * lapw)
                         # mu_i row
                         rm = ra + 1
                         wp.atomic_add(Ae, e, rm, ndof * b + 2 * i + 1,
@@ -684,12 +914,13 @@ class MultiPhaseStepper:
                  dsig=None, dh=None, Tm=None, eps2=None, L_psi=None,
                  alpha_th=None, beta_th=None, L_th=None,
                  T=1.0, T_fn=None, dt=1e-3, bulk="p1", mob="const",
-                 D_lo=None, D_hi=None,
+                 D_lo=None, D_hi=None, D_self=None, ls_drop=None,
                  newton_tol=1e-9, newton_max=50, linsolver="splu",
                  noise_psi=0.0, noise_phi=0.0, noise_seed=0,
+                 noise_damp=None,
                  b_reg=0.0, kg_delta=1e-3, p_floor=1e-6,
                  dirichlet=None, g_fns=None, src_fns=None, guards=True,
-                 clip_psi=True):
+                 clip_psi=True, line_search=False):
         from ..physics.poisson import gauss_points
         self.dm = dm
         self.M, self.K = int(M), int(K)
@@ -732,11 +963,25 @@ class MultiPhaseStepper:
         self.L_th = pad(L_th, 1.0)
         self.T, self.T_fn = float(T), T_fn
         self.bulk, self.mob = bulk, mob
-        assert bulk in ("p1", "r14") and mob in ("const", "fastmode")
+        assert bulk in ("p1", "r14")
+        assert mob in ("const", "fastmode", "fastmode_n", "slowmode_n")
         self.D_lo = (np.ones(n_sp) if D_lo is None
                      else np.asarray(D_lo, np.float64).reshape(n_sp))
         self.D_hi = (np.ones(n_sp) if D_hi is None
                      else np.asarray(D_hi, np.float64).reshape(n_sp))
+        self.D_self = (np.ones((n_sp, n_sp)) if D_self is None
+                       else np.asarray(D_self, np.float64
+                                       ).reshape(n_sp, n_sp))
+        # anchor Eq. 13 drop (d, c, w); d = 1 disables exactly (1^x = 1)
+        self.ls_drop = (1.0, 0.5, 1.0) if ls_drop is None \
+            else tuple(float(v) for v in ls_drop)
+        assert len(self.ls_drop) == 3 and self.ls_drop[0] > 0.0
+        self.noise_damp = None if noise_damp is None \
+            else tuple(float(v) for v in noise_damp)
+        if mob in ("fastmode_n", "slowmode_n"):
+            assert noise_phi == 0.0, \
+                "CHC noise with a matrix Onsager mobility needs a " \
+                "flux-space factorization (not carried; docstring)"
         self.dt = float(dt)
         self.newton_tol, self.newton_max = newton_tol, newton_max
         self.linsolver = linsolver
@@ -754,6 +999,9 @@ class MultiPhaseStepper:
         # Newton — the S0 parity gate matches the reference stepper's
         # unguarded iteration; production keeps them on)
         self.guards = bool(guards)
+        # line_search=True globalizes Newton with ||r||_2 backtracking
+        # (S2; _attempt docstring) — default OFF (S0/S1 behavior exact)
+        self.line_search = bool(line_search)
         # clip_psi=False skips the [0, 1] psi projection: the r14
         # double well q(psi) is SELF-RESTORING outside [0, 1], and the
         # 2310.11844 replication needs unrectified FDT noise statistics
@@ -784,7 +1032,8 @@ class MultiPhaseStepper:
         self._par = {k: arr(v) for k, v in dict(
             chi_aa=self.chi_aa, chi_ac=self.chi_ac, chi_ca=self.chi_ca,
             chi_cc=self.chi_cc, Ninv=self.Ninv, Ons=self.onsager,
-            dlo=self.D_lo, dhi=self.D_hi, kap=self.kap, dsig=self.dsig,
+            dlo=self.D_lo, dhi=self.D_hi, Dslf=self.D_self,
+            kap=self.kap, dsig=self.dsig,
             eps2=self.eps2, Lpsi=self.L_psi, alpha=self.alpha_th,
             beta=self.beta_th, Lth=self.L_th).items()}
 
@@ -919,6 +1168,10 @@ class MultiPhaseStepper:
                                   * np.sqrt(2.0 * self.L_psi[k]
                                             / (dt * wJ))
                                   * self._nrng.standard_normal(ngp))
+                    if self.noise_damp is not None:
+                        dda, ddc, ddw = self.noise_damp
+                        qpsi[:, k] *= np_ls_interp(
+                            hv[pv][:, 2 * self.M + 2 * k], dda, ddc, ddw)
             qphi = np.zeros((ngp, self.M, self.dm.dim))
             if self.noise_phi > 0.0:
                 qphi = (self.noise_phi
@@ -936,8 +1189,7 @@ class MultiPhaseStepper:
                     if fn is not None:
                         s[:, f] = fn(self.xq[pv], t_new)
             src_gp[pv] = s
-        x = self.x.copy()
-        for it in range(self.newton_max):
+        def assemble(x):
             vals, grads = self._pack_fields(x)
             rows, cols, valsK = [], [], []
             F_full = np.zeros(self.dm.n_nodes * nd)
@@ -957,7 +1209,10 @@ class MultiPhaseStepper:
                     arr(vals[pv]), arr(grads[pv]), arr(hist_gp[pv]),
                     arr(src_gp[pv]), arr(qpsi_gp[pv]), arr(qphi_gp[pv]),
                     p["chi_aa"], p["chi_ac"], p["chi_ca"], p["chi_cc"],
-                    p["Ninv"], p["Ons"], p["dlo"], p["dhi"], p["kap"],
+                    p["Ninv"], p["Ons"], p["dlo"], p["dhi"], p["Dslf"],
+                    wp.float64(self.ls_drop[0]),
+                    wp.float64(self.ls_drop[1]),
+                    wp.float64(self.ls_drop[2]), p["kap"],
                     p["dsig"], drive_d, p["eps2"], p["Lpsi"],
                     p["alpha"], p["beta"], p["Lth"],
                     wp.float64(sigma), wp.float64(self.b_reg),
@@ -989,6 +1244,11 @@ class MultiPhaseStepper:
                         A.data[rr] = [1.0]
                         r[rr] = gv[k2] - x[rr]
                 A = A.tocsr()
+            return A, r
+
+        x = self.x.copy()
+        A, r = assemble(x)
+        for it in range(self.newton_max):
             dx = self._solve(A, r)
             if not np.isfinite(dx).all() or np.abs(dx).max() > 1e6:
                 return None, it + 1, False               # diverged
@@ -1001,6 +1261,31 @@ class MultiPhaseStepper:
                               np.abs(dx[2 * self.M + 2 * k::nd]).max())
                 if inc > 2.0:
                     dx = dx * (2.0 / inc)
+            if self.line_search:
+                # backtracking on ||r||_2 (globalized Newton; the
+                # deep-quench SD purification lesson — plain Newton
+                # diverges at dt > ~2e-4 while the damped direction
+                # converges at the physical dt): accept the first
+                # fraction that reduces the residual norm; the assembly
+                # at the accepted iterate is REUSED for the next solve,
+                # so an accepted full step costs exactly one assembly
+                # (the undamped path's cost).
+                rn0 = float(np.linalg.norm(r))
+                best, best_rn = None, np.inf
+                for s in (1.0, 0.5, 0.25, 0.125, 0.0625):
+                    xt = x + s * dx
+                    if self.guards:
+                        xt = self._project(xt)
+                    At, rt = assemble(xt)
+                    rnt = float(np.linalg.norm(rt))
+                    if rnt < best_rn:
+                        best, best_rn = (xt, At, rt), rnt
+                    if rnt < rn0 * (1.0 - 1e-4):
+                        break
+                xn, A, r = best
+                conv = np.abs(xn - x).max()
+                x = xn
+            elif self.guards:
                 xn = self._project(x + dx)
                 # projected-Newton convergence: the APPLIED increment.
                 # A p1-mode boundary well pins psi at the [0, 1] clip
@@ -1009,9 +1294,11 @@ class MultiPhaseStepper:
                 # projected iterate is the correct criterion there.
                 conv = np.abs(xn - x).max()
                 x = xn
+                A, r = assemble(x)
             else:
                 x = x + dx
                 conv = np.abs(dx).max()
+                A, r = assemble(x)
             if conv < self.newton_tol:
                 return x, it + 1, True
         return x, self.newton_max, False                 # no convergence
