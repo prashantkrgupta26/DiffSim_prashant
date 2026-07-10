@@ -140,3 +140,34 @@ R3. THIS IS M5 — "OrgElMorph" (Organic Electronics Morphology). Spec:
     docs/dev/specs/2026-07-10-m5-orgelmorph.md. The film front-end +
     RunLog + preconditioner stack + Negi/Wodo validations delivered
     this week are M5's enabling tracks, recorded as delivered.
+
+## 8. Fidelity checks vs Ronsin & Harting 2022 (2026-07-10; the ref-14
+framework paper, now in MyPapers/OSC/2204.11628_ronsin_harting_framework.pdf)
+
+THETA: the anchor framework prescribes NO theta kinetics — their theta_k
+is a HEURISTIC marker field (nucleus detection assigns grain IDs;
+markers propagate with growth fronts; the p(Phi) pi eps_g^2 |grad theta|
+delta_D energy penalizes impingement at marker jumps; "separate
+crystallites never merge in our framework" by construction). Our
+dynamic Kobayashi-Giga gradient-flow theta is therefore a PHYSICS
+SUPERSET (true OFPF-class dynamics) whose impingement energy matches
+theirs in form (alpha <-> pi eps_g^2). Verdict: keep ours; their marker
+heuristic recorded as a cheap alternative bookkeeping mode for
+many-grain scale (follow-up, not required).
+
+NOISE: their Eqs. 9/18 carry ADJUSTABLE intensity prefactors sigma_CH /
+sigma_AC ("used to adjust the intensity of the noise") plus a
+crystalline-domain damping interpolation f(phi_k). The anchor treats
+absolute noise intensity as a calibration knob — our noise_psi /
+noise_phi amplitudes (FDT-exact normalization, noise_psi^2 = kBT
+nondim) ARE that knob; the 2-D depth ambiguity is absorbed into it
+exactly as in the source framework. Absolute nucleation onsets are
+calibration-bound IN THE ANCHOR TOO; quantitative onset comparisons
+require matching their sigma values (unstated in 2310.11844 — recorded).
+
+S3 DESIGN NOTE: their evaporation is a VAPOR-PHASE AC field
+(phi_vap, Hertz-Knudsen outflux, Eq. 16) — an alternative to our
+Wodo-lineage moving-frame film. S3 proceeds on the film frame per the
+ratified contract; the vapor-field mode is recorded as a possible v2
+(it naturally handles solvent BLENDS with distinct volatilities via
+per-species saturation pressures — relevant to S4a).
