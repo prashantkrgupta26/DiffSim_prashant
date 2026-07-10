@@ -16,11 +16,12 @@ n species with volume fractions phi_i (sum = 1; ONE eliminated via the
 simplex, giving M = n-1 conserved CH pairs), of which a subset
 K = {crystallizable i} carries a non-conserved crystallinity psi_i in
 [0, 1] (relative crystallinity of species i; phi_i psi_i = crystalline
-volume fraction of i). Optional orientation theta_i deferred (isotropic
-crystals v1, per 2310.11844's own simplification).
+volume fraction of i) AND an orientation theta_i (ruling R1: individual-
+crystal identification + impingement; KWC-class, Kobayashi-Giga
+regularized).
 
 Node-major dof layout: [(phi_1, mu_1), ..., (phi_M, mu_M),
-psi_1, ..., psi_K] = 2M + K dofs per node. (M, K) are COMPILE-TIME
+(psi_1, theta_1), ..., (psi_K, theta_K)] = 2M + 2K dofs per node. (M, K) are COMPILE-TIME
 constants of the kernel factory (the nbf/nqp pattern), so the species
 loops unroll; chi matrices ride in as small device arrays.
 
@@ -121,15 +122,21 @@ days, S3 ~1-2 days (film integration), S4 ~1 day (configs + gates).
 Agent-driven with formulation control here; each stage commit-per-green
 with measured tables.
 
-## 7. Open rulings for Baskar
+## 7. Rulings (Baskar, 2026-07-10)
 
-R1. Orientation fields theta_i: defer (isotropic, their own v1 choice)
-    or include from the start? (Defer recommended; impingement physics
-    can be added without layout changes.)
-R2. S1 replication target: their reference case table (2310.11844
-    Table 1 params) — replicate kinetics curves quantitatively, or
-    morphology-class qualitatively? (Quantitative recommended; their
-    parameter tables are complete.)
-R3. Does this arc become M5 (with the film/framework work as M5's
-    delivered opening tracks), or M6 after ratifying the current work
-    as M5? Ledger clarity only; no technical impact.
+R1. ORIENTATION INCLUDED from S1: one theta_i per crystallizable
+    species (KWC-class term p(psi_i)(alpha_i/2)|grad theta_i|, their
+    Eq. 5) — required for individual-crystal identification +
+    impingement. Layout becomes 2M + 2K dofs/node. Numerical care:
+    the |grad theta| singularity at grad theta = 0 needs the standard
+    Kobayashi-Giga regularization; theta is grain-periodic. Recorded
+    fallback if the singular term fights the Newton/preconditioner
+    stack: post-hoc psi-field watershed labeling identifies crystals
+    without in-model impingement (identification-only degradation,
+    physics loss recorded).
+R2. QUANTITATIVE kinetics curves (crystallinity vs t, nuclei counts vs
+    their parameter tables) AND morphology-class matching, both.
+R3. THIS IS M5 — "OrgElMorph" (Organic Electronics Morphology). Spec:
+    docs/dev/specs/2026-07-10-m5-orgelmorph.md. The film front-end +
+    RunLog + preconditioner stack + Negi/Wodo validations delivered
+    this week are M5's enabling tracks, recorded as delivered.
