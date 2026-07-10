@@ -72,6 +72,26 @@ poly 1335 accepted steps / 4026 solves / max 3 outer / 0 fallbacks;
 FH 653 steps / 1983 solves / max 4 outer / 0 fallbacks, field
 binodal-confined [0.068, 0.934].
 
+## G3 ladder addendum (2026-07-10)
+
+- 3-D marches (poly, blockch_dev): L5 (72k dofs) 4 steps at 1 outer it;
+  L6 (549k dofs) 4 steps at 1 outer it, ~45 s/step (HOST-assembly
+  dominated — the recorded device-assembly follow-up).
+- **THE RESURRECTION, measured**: cuDSS direct on the L7 system
+  (4.29M dofs, 228M nnz) = ALLOC_FAILED after 195 s on the 48 GB card;
+  the SAME system marches with blockch_dev at **1 outer iteration per
+  step** (2 steps, 580/712 s wall — host assembly + host preconditioner
+  setup dominated; the solve itself is immediate). G3 CLOSED: the
+  preconditioner solves a size class 8x beyond where direct
+  factorization died on this card.
+- **OPEN — FH at 3-D scale**: the FH L6 quench-onset step stalls BOTH
+  inner paths (device BiCGStab > 1 h; host GMRES > 1.5 h, killed).
+  2-D FH is 1-iteration clean, so the mechanism is scale- or
+  spectrum-dependent (candidates: W2 inner Krylov without AMG-class
+  preconditioning at 275k rows; the sqrt(sigma) balance at this
+  kappa(h) scaling). Needs a dedicated dumped-system lab like the 2-D
+  offenders. Recorded, not diagnosed.
+
 ## Open (G2+)
 
 - One regime defeats BOTH the two-factor form and the W1-preconditioned
