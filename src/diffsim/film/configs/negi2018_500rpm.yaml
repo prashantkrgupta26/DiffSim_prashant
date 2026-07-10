@@ -1,0 +1,46 @@
+# Negi et al. 2018 — spin-coated PDPP5T:PC71BM blend, 500 rpm.
+# Bi = 0.0019. Identical material system to negi2018_6000rpm.yaml —
+# see THAT file for the blend weight->volume assumption, the eps^2
+# nondimensionalization derivation (kappa = 3.235e-6), and the
+# preflight interface-resolution note (why preflight: warn).
+# Only Bi and the seeds differ across the four rpm cases.
+name: negi2018_500rpm
+comment: PDPP5T:PC71BM 1:2 (vol) in chloroform, 90% solvent, 500 rpm
+physics:
+  chi: [1.0, 0.1, 0.9]        # (chi_pf, chi_ps, chi_fs)
+  N: [87, 5, 1]               # (N_p, N_f, N_s)
+  blend:
+    ratio: "1:2"              # p:f by volume (assumption above)
+    phi_s0: 0.9               # 90 vol% solvent at spin-up
+  eps2:                       # -> kappa = 3.235e-6 (derivation above)
+    value_Jm: 1.0e-10
+    h0_nm: 1000
+    Vs_cm3_mol: 80.7
+    T_K: 300
+  b_reg: 1.0e-3               # Wodo footnote-2 simplex regularizer
+evaporation:
+  Bi: 0.0019                  # 500 rpm
+mobility:
+  model: variable             # D(phi) freeze-out (Wodo v2)
+  D_p: 1.0e-3                 # per-species: D_p / D_s
+  D_f: 5.0e-3                 # D_f / D_s (fullerene diffuses faster)
+domain:
+  dim: 2                      # 500 x 1000 nm section of 500x500x1000
+  Lx: 0.5                     # 500 nm in units of h0 = 1000 nm
+  resolution: [125, 250]      # 4 nm cells (paper-scale); vertical last
+numerics:
+  dt0: 1.0e-4
+  noise: 1.0e-3               # CHC conserved Langevin flux ON
+  noise_seed: 501
+  ic_noise: 0.01
+  ic_seed: 502
+  linsolver: cudss
+  device_assembly: true
+stop:
+  h_min: 0.10                 # solute content 0.1 -> h = 0.105 at
+  phis_stop: 0.05             #   phi_s = 0.05 (dryness)
+  max_steps: 200000
+  wall_cap: null
+output:
+  snap_h: [0.9, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2]
+preflight: warn               # interface check FAILs by design (above)

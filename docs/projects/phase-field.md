@@ -34,6 +34,37 @@ python benchmarks/phase-field/wodo_fig67.py           # local 2-D morphology rep
 python benchmarks/phase-field/m4_learn_fmix.py        # learn Flory–Huggins from a trajectory
 ```
 
+## The film front end — run a new material system by editing four numbers
+
+`diffsim.film` is the user-facing entry point for evaporating-film
+studies: copy the nearest named config from
+[`src/diffsim/film/configs/`](../../src/diffsim/film/configs/README.md)
+and edit **chi, N, the blend, and Bi** — everything else carries
+validated campaign defaults.
+
+```bash
+python -m diffsim.film src/diffsim/film/configs/negi2018_6000rpm.yaml \
+    --outdir runs/negi6000                # a full spin-coating case
+python -m diffsim.film my_case.yaml --preflight-only   # sanity-check first
+```
+
+Every run gets a four-layer diagnostic **RunLog**: (a) a *preflight*
+that grades interface resolution (the ≥4-elements rule), IC
+thermodynamics (spinodal position of the drying line, b-regularizer
+included), the evaporation dt-cap, a G5-calibrated GPU/host memory
+forecast, and the int32 slot ceiling — strict configs refuse to burn
+GPU-days on a run that fails; (b) a per-attempt JSONL *flight
+recorder* (dt ladder, Newton/outer iterations, per-component mass
+drift, phi bounds, GPU memory); (c) an *autopsy* on failure — fields +
+tail + a DIAGNOSIS pattern-matched from the known-failure catalog
+(dt-collapse at onset, under-resolved interface, conservation bug,
+blockch out-of-contract, OOM); (d) a *provenance* header (git SHA,
+config hash, seeds, versions, GPU). Yaml knobs cover per-species
+mobility ratios (D_p, D_f), CHC noise, all four linear solvers
+(splu/cudss/blockch/blockch_dev), and 2-D/3-D domains; the cluster
+kits in `cluster/wodo_campaign/` submit these same configs with `--set`
+domain overrides. Gates: `tests/test_film_frontend.py`.
+
 ## Validation
 
 | Case | Result |

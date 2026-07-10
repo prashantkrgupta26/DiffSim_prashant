@@ -1,0 +1,77 @@
+# Negi et al. 2018 — spin-coated PDPP5T:PC71BM blend, 6000 rpm.
+# (Negi/Wodo spin-coating study; the Wodo CMS-2012 evaporating-film
+# model with per-species mobility ratios. p = PDPP5T polymer,
+# f = PC71BM fullerene, s = solvent.)
+#
+# BLEND (weight -> volume ASSUMPTION, stated): the experimental blend is
+# 1:2 PDPP5T:PC71BM by WEIGHT at 90 vol% solvent. We take equal mass
+# densities for polymer and fullerene, so 1:2 by weight = 1:2 by VOLUME
+# -> phi_p0 = 0.1/3 = 0.03333, phi_f0 = 0.2/3 = 0.06667. (True densities
+# ~1.1 vs ~1.6 g/cm3 would give ~1:1.4 by volume; the 1:2 volume reading
+# is the documented choice here — swap the ratio to change it.)
+#
+# NONDIMENSIONALIZATION (worked out; params.kappa_from_eps2):
+#   energy density scale E0 = RT/V_s, length scale h0 (initial film
+#   height), time scale h0^2/D_s => Bi = k_e h0 / D_s and
+#     kappa = eps^2 / (E0 h0^2).
+#   Here: eps^2 = 1e-10 J/m (the paper's value), h0 = 1000 nm (the
+#   1000 nm vertical extent of the 500x500x1000 nm domain),
+#   V_s = 80.7 cm^3/mol (chloroform, the PDPP5T casting solvent —
+#   ASSUMPTION, stated), T = 300 K:
+#     E0 = 8.3145*300 / 80.7e-6 = 3.091e7 J/m^3
+#     kappa = 1e-10 / (3.091e7 * (1e-6)^2) = 3.235e-6.
+#   CONSISTENCY with the committed Wodo cases: their eps^2 = 3.57e-10
+#   J/m <-> kappa = 2e-4 implies E0 h0^2 = 1.785e-6 J/m, i.e. the SAME
+#   scheme at h0 ~ 240 nm — the kappa ratio is the (h0 ratio)^2, not a
+#   different convention.
+#
+# PREFLIGHT NOTE (honest deviation, recorded): at the paper-scale mesh
+# (125x250 over 500x1000 nm => 4 nm cells) the PHYSICAL eps^2 gives
+# forming-interface widths xi_early ~ 6 nm ~ 1.5 elements — below both
+# the 4-element rule and the validated 2.5-element floor, so the
+# interface-resolution check FAILs. We keep the paper's eps^2 exactly
+# and set preflight: warn so the run proceeds with phi min/max
+# monitored in flight. Resolving xi >= 4 elements at this kappa needs
+# a ~500x1000 mesh (2M dofs) or a numerically thickened eps^2.
+#
+# Bi = 0.0073 at 6000 rpm (fastest drying of the four rpm cases).
+name: negi2018_6000rpm
+comment: PDPP5T:PC71BM 1:2 (vol) in chloroform, 90% solvent, 6000 rpm
+physics:
+  chi: [1.0, 0.1, 0.9]        # (chi_pf, chi_ps, chi_fs)
+  N: [87, 5, 1]               # (N_p, N_f, N_s)
+  blend:
+    ratio: "1:2"              # p:f by volume (assumption above)
+    phi_s0: 0.9               # 90 vol% solvent at spin-up
+  eps2:                       # -> kappa = 3.235e-6 (derivation above)
+    value_Jm: 1.0e-10
+    h0_nm: 1000
+    Vs_cm3_mol: 80.7
+    T_K: 300
+  b_reg: 1.0e-3               # Wodo footnote-2 simplex regularizer
+evaporation:
+  Bi: 0.0073                  # 6000 rpm
+mobility:
+  model: variable             # D(phi) freeze-out (Wodo v2)
+  D_p: 1.0e-3                 # per-species: D_p / D_s
+  D_f: 5.0e-3                 # D_f / D_s (fullerene diffuses faster)
+domain:
+  dim: 2                      # 500 x 1000 nm section of 500x500x1000
+  Lx: 0.5                     # 500 nm in units of h0 = 1000 nm
+  resolution: [125, 250]      # 4 nm cells (paper-scale); vertical last
+numerics:
+  dt0: 1.0e-4
+  noise: 1.0e-3               # CHC conserved Langevin flux ON
+  noise_seed: 6001
+  ic_noise: 0.01
+  ic_seed: 6002
+  linsolver: cudss
+  device_assembly: true
+stop:
+  h_min: 0.10                 # solute content 0.1 -> h = 0.105 at
+  phis_stop: 0.05             #   phi_s = 0.05 (dryness)
+  max_steps: 200000
+  wall_cap: null
+output:
+  snap_h: [0.9, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2]
+preflight: warn               # interface check FAILs by design (above)

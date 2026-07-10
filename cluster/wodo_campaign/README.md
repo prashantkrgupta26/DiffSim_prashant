@@ -1,19 +1,23 @@
 # Wodo CMS-2012 Nova Campaign (M4 track c)
 
 Full-resolution replication of Wodo & Ganapathysubramanian, Comput.
-Mater. Sci. 55 (2012) 113-126, figs 3-7, on Nova — plus ONE reduced-3D
-stretch. Runner: `benchmarks/phase-field/wodo_nova.py` (case table via `--list`).
-All marches are DEVICE-BOUND (`use_device_assembly=True`: slot-map
-scatter into a once-per-mesh CSR pattern + zero-copy torch-CSR cuDSS;
-measured on the workstation at 96x48: 56x vs host-splu, 8x vs
-host-cudss, 36 ms/step).
+Mater. Sci. 55 (2012) 113-126, figs 3-7, on Nova — plus the 3-D kits.
+Runners: the legacy 2-D campaign uses
+`benchmarks/phase-field/wodo_nova.py` (case table via `--list`); the
+3-D kits drive the FILM FRONT END (`python -m diffsim.film`) so that
+case parameters live in ONE place — `src/diffsim/film/configs/*.yaml`
+— and the sbatch scripts only override the 3-D domain/solver knobs.
+All marches are DEVICE-BOUND (measured on the workstation at 96x48:
+56x vs host-splu, 8x vs host-cudss, 36 ms/step).
 
 ## Submit lines (from the repo root on Nova)
 
 ```bash
-# fill FIXME_PARTITION in both scripts first:  sinfo -o "%P %G %N"
-sbatch cluster/wodo_campaign/a100_wodo.sbatch   # 14 cases, full res, seq.
-sbatch cluster/wodo_campaign/h200_wodo.sbatch   # ONE 3-D stretch case
+# fill FIXME_PARTITION in each script first:  sinfo -o "%P %G %N"
+sbatch cluster/wodo_campaign/a100_wodo.sbatch        # 14 cases, 2-D full res
+sbatch cluster/wodo_campaign/h200_wodo.sbatch        # ONE reduced-3D stretch
+sbatch cluster/wodo_campaign/a100_negi3d.sbatch      # Negi rpm ladder, FULL 3-D
+sbatch cluster/wodo_campaign/a100_wodo3d_hero.sbatch # fig6/7 regimes, FULL 3-D
 ```
 
 ## What runs
@@ -33,9 +37,34 @@ sbatch cluster/wodo_campaign/h200_wodo.sbatch   # ONE 3-D stretch case
 - **h200_wodo.sbatch** — the reduced-3D stretch: 128x128x48
   (~3.4M dofs; phi_s0=0.66, Lx=Ly=3.3, Bi=0.3). try/except ALLOC —
   EITHER outcome is the result (it locates the cuDSS wall for the
-  coupled 4-dof CH factor on 141 GB). Full-res 3-D (230x230x70,
-  ~15M dofs) needs the CH block preconditioner — recorded M4 item;
-  do not attempt it with a direct solver.
+  coupled 4-dof CH factor on 141 GB). Full-res 3-D with a DIRECT
+  solver is out; the blockch preconditioner kits below carry it.
+- **a100_negi3d.sbatch** — Negi 2018 spin-coating rpm ladder
+  (Bi = 0.0073/0.0051/0.0033/0.0019) in FULL 3-D: 125x125x250 cells
+  over 500x500x1000 nm (15.94M dofs, nnz 79% of the int32 slot
+  ceiling), `blockch_dev`. Physics from
+  `src/diffsim/film/configs/negi2018_*rpm.yaml` (single source of
+  truth); the script overrides only `domain.*` and the solver.
+- **a100_wodo3d_hero.sbatch** — the fig6 N-ladder + fig7 selectivity
+  regimes at the paper's own 3-D mesh 230x230x70 (15.15M dofs,
+  1.61B nnz — G5 rung-c size exactly), `blockch_dev`, phi_s0 = 0.66 /
+  Lx = Ly = 3.3 (the paper's 3-D box). Physics from
+  `src/diffsim/film/configs/wodo2012_fig{6,7}_*.yaml`.
+
+## Expected walls for the 3-D kits (honest basis)
+
+MEASURED: 236 s/step steady at 15.15M dofs (230x230x70) on RTX 6000
+Ada 48 GB, 33.4 GB GPU / 37.7 GB host peak, outer its <= 3, zero
+fallbacks (G5 rung c, docs/dev/2026-07-09-blockch-preconditioner.md;
+first step +~500 s of one-time symbolic setup). A100-80 is an
+ESTIMATE, not a measurement: ~1.5-2x faster (~120-160 s/step) from
+HBM-bandwidth-bound spmv, with 2.3-2.4x memory headroom. The dh_cap
+ladder needs >= ~185-225 accepted steps to the stop criteria, so plan
+>= 1 day/case for full dryness; the shipped per-case wall caps yield
+partial marches (height-milestone snapshots still land) on the first
+pass. Every run writes the front end's four-layer RunLog
+(preflight + runlog.jsonl flight recorder + autopsy-on-failure +
+provenance) into its case directory.
 
 ## Mirror-folder workflow (how results come home)
 

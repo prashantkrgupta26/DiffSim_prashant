@@ -17,6 +17,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.package-data]
 "diffsim.solvers" = ["amgx_configs/*.json"]
+"diffsim.film" = ["configs/*.yaml", "configs/README.md"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

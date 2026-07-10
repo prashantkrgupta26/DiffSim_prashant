@@ -1,0 +1,44 @@
+# Wodo & Ganapathysubramanian CMS 55 (2012) Fig. 3 — 1-D drying,
+# Bi = 0.1. Parameters read from the committed campaign table
+# (benchmarks/phase-field/wodo_nova.py FIG3 + wodo_fig3.py): blend 1:1,
+# phi_s0 = 0.6, Np = Nf = 5, chi = (1, .3, .3), kappa = 2e-4 (their
+# eps^2 = 3.57e-10 J/m at the campaign scale — see the
+# nondimensionalization note in negi2018_6000rpm.yaml).
+# v1 CONSTANT-mobility mapping, NO CHC noise / var-mob / b-reg:
+# 1-D physics needs none of them (fig3 gate configuration exactly).
+# Strip: 4 x 256 cells (physics is 1-D vertical; Lx = 4/256 keeps the
+# historical lat_scale = 1 metric of the committed fig3 gate).
+name: wodo2012_fig3_bi0.1
+comment: Wodo 2012 Fig 3, Bi=0.1 (1-D vertical drying, thin strip)
+physics:
+  chi: [1.0, 0.3, 0.3]
+  N: [5, 5, 1]
+  blend: {phi_p0: 0.2, phi_f0: 0.2}
+  kappa: 2.0e-4
+  b_reg: 0.0
+evaporation:
+  Bi: 0.1
+mobility:
+  model: constant             # frozen M at the initial blend (v1)
+  D_p: 1.0e-3
+  D_f: 1.0e-3
+domain:
+  dim: 2
+  Lx: 0.015625                # 4/256: historical lat_scale = 1
+  resolution: [4, 256]
+numerics:
+  dt0: 1.0e-4
+  noise: 0.0                  # no CHC noise (fig3 gate config)
+  noise_seed: 32
+  ic_noise: 0.01
+  ic_seed: 8
+  linsolver: cudss
+  device_assembly: true
+stop:
+  h_min: 0.42
+  phis_stop: 0.05
+  max_steps: 200000
+  wall_cap: null
+output:
+  snap_h: [0.9, 0.75, 0.6, 0.45]
+preflight: strict

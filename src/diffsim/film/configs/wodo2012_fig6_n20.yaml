@@ -1,0 +1,45 @@
+# Wodo & Ganapathysubramanian CMS 55 (2012) Fig. 6 — chain-length
+# ladder, Np = 20 (intermediate regime). Parameters read from the
+# committed campaign table (benchmarks/phase-field/wodo_nova.py FIG2D
+# ("6","n20") + wodo_fig67.py): Nf = 5 FIXED (the paper's Sec. 7.3
+# ladder varies Np only), blend 1:1, phi_s0 = 0.75 (paper 2-D value),
+# Bi = 0.4, kappa = 2e-4 (their eps^2 = 3.57e-10 J/m; the N-ladder
+# kappa scales by their eps^2 ratios 3.57 : 2.62 : 2.05).
+# Model config = the fig67 GATE-PASSING one exactly: CHC noise 1e-3,
+# var-mob (D_ratio 1e-3 both species), b_reg 1e-3.
+# Resolution 250x100 = the paper's own 2-D mesh (level-9 strip via the
+# v1.1 generalized metric, lat_scale = 5.12).
+name: wodo2012_fig6_n20
+comment: Wodo 2012 Fig 6, Np=20 (intermediate regime)
+physics:
+  chi: [1.0, 0.3, 0.3]
+  N: [20, 5, 1]
+  blend: {phi_p0: 0.125, phi_f0: 0.125}
+  kappa: 1.4678e-4          # 2e-4 * 2.62/3.57 (their eps^2 ratio)
+  b_reg: 1.0e-3
+evaporation:
+  Bi: 0.4
+mobility:
+  model: variable
+  D_p: 1.0e-3
+  D_f: 1.0e-3
+domain:
+  dim: 2
+  Lx: 2.5
+  resolution: [250, 100]
+numerics:
+  dt0: 1.0e-4
+  noise: 1.0e-3
+  noise_seed: 6201
+  ic_noise: 0.01
+  ic_seed: 6202
+  linsolver: cudss
+  device_assembly: true
+stop:
+  h_min: 0.25
+  phis_stop: 0.05
+  max_steps: 200000
+  wall_cap: null
+output:
+  snap_h: [0.9, 0.7, 0.6, 0.5, 0.4]
+preflight: strict

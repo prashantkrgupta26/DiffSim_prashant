@@ -96,7 +96,14 @@ M_ii(phi) = D(phi) / f''_ideal,i,  D = phi_s + D_ratio (1 - phi_s),
 f''_ideal,i = 1/(N_i phi_i) + 1/(N_s phi_s)  (regularized inverses),
 evaluated per GP at the current Newton iterate; the Jacobian keeps M
 PICARD-FROZEN (no dM/dphi blocks) — same converged solution, the
-Appendix-A heuristic absorbs the odd extra iteration. MEASURED
+Appendix-A heuristic absorbs the odd extra iteration.
+
+MOBILITY v2.1 PER-SPECIES D (M-film front-end): D_ratio also accepts a
+pair (D_p, D_f), giving the paper's full D = phi_s + D_p phi_p +
+D_f phi_f (D floored at min(D_p, D_f)). A single value keeps the old
+meaning D = phi_s + D_ratio (1 - phi_s): the kernel branches to the
+ORIGINAL arithmetic when D_p == D_f, so existing single-ratio runs
+reproduce bit-for-bit (same ops, same order). MEASURED
 NECESSITY: without freeze-out the frozen-M film keeps coarsening at
 D ~ D0 ~ 0.75 after the solvent is gone (their D -> 0.1 at
 phi_s = 0.1) and every 2-D morphology collapses to the equilibrium
@@ -233,7 +240,7 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
                q2: wp.array2d(dtype=wp.float64),
                theta: wp.array(dtype=wp.float64),
                M11: wp.float64, M12: wp.float64, M22: wp.float64,
-               Dr: wp.float64,
+               Drp: wp.float64, Drf: wp.float64,
                c12: wp.float64, c1s: wp.float64, c2s: wp.float64,
                n1i: wp.float64, n2i: wp.float64, nsi: wp.float64,
                breg: wp.float64,
@@ -281,12 +288,19 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
             d11 += wp.float64(8.0) * ch2 * sc \
                 + ch3 * (wp.float64(24.0) * s2 - wp.float64(6.0)) \
                 + ch4 * (wp.float64(64.0) * s2 - wp.float64(32.0)) * sc
-            # mobility: constant (Dr < 0) or their local
-            # M_ii = D(phi)/f''_ideal,i (v2; Picard-frozen in Jacobian)
+            # mobility: constant (Drp < 0) or their local
+            # M_ii = D(phi)/f''_ideal,i (v2; Picard-frozen in Jacobian).
+            # v2.1: per-species D = ps + Drp p1 + Drf p2; the equal-ratio
+            # branch keeps the v2 arithmetic (bit-for-bit with old runs)
             M11l = M11
             M22l = M22
-            if Dr >= wp.float64(0.0):
-                Dloc = wp.max(ps + Dr * (p1 + p2), Dr)
+            if Drp >= wp.float64(0.0):
+                Dloc = wp.float64(0.0)
+                if Drp == Drf:
+                    Dloc = wp.max(ps + Drp * (p1 + p2), Drp)
+                else:
+                    Dloc = wp.max(ps + Drp * p1 + Drf * p2,
+                                  wp.min(Drp, Drf))
                 M11l = Dloc / (n1i * _rinv(p1) + nsi * _rinv(ps))
                 M22l = Dloc / (n2i * _rinv(p2) + nsi * _rinv(ps))
             s1 = wp.sqrt(M11l)
@@ -407,7 +421,13 @@ class WodoFilmStepper(TernaryCHStepper):
         self.noise = float(noise)
         self._nrng = np.random.default_rng(noise_seed)
         self.var_mob = bool(var_mob)
-        self.D_ratio = float(D_ratio)
+        # v2.1: scalar (both species, the historical meaning) or a
+        # (D_p, D_f) pair (per-species ratios, front-end)
+        if np.ndim(D_ratio) == 0:
+            self.D_ratio = (float(D_ratio), float(D_ratio))
+        else:
+            self.D_ratio = tuple(float(d) for d in D_ratio)
+            assert len(self.D_ratio) == 2, D_ratio
         self.b_reg = float(b_reg)
         # v1.3 Chebyshev delta-f'(phi_p) coefficients (T2..T4)
         self.ch2, self.ch3, self.ch4 = (float(c) for c in f_cheb)
@@ -585,7 +605,7 @@ class WodoFilmStepper(TernaryCHStepper):
             q_gp[pv] = (
                 rho * self._nrng.standard_normal((ngp, self.dm.dim)),
                 rho * self._nrng.standard_normal((ngp, self.dm.dim)))
-        Dr = self.D_ratio if self.var_mob else -1.0
+        Drp, Drf = self.D_ratio if self.var_mob else (-1.0, -1.0)
         x = self.x.copy()
         for it in range(self.newton_max):
             fields = [self._gp(x[i::4]) for i in range(4)]
@@ -611,8 +631,8 @@ class WodoFilmStepper(TernaryCHStepper):
                     arr(q_gp[pv][0]), arr(q_gp[pv][1]),
                     self.theta_wp[pv],
                     wp.float64(self.M11), wp.float64(self.M12),
-                    wp.float64(self.M22), wp.float64(Dr),
-                    wp.float64(self.c12),
+                    wp.float64(self.M22), wp.float64(Drp),
+                    wp.float64(Drf), wp.float64(self.c12),
                     wp.float64(self.c1s), wp.float64(self.c2s),
                     wp.float64(1.0 / self.N1), wp.float64(1.0 / self.N2),
                     wp.float64(1.0 / self.Ns),
@@ -722,7 +742,7 @@ class WodoFilmStepper(TernaryCHStepper):
             q_gp[pv] = (
                 rho * self._nrng.standard_normal((ngp, self.dm.dim)),
                 rho * self._nrng.standard_normal((ngp, self.dm.dim)))
-        Dr = self.D_ratio if self.var_mob else -1.0
+        Drp, Drf = self.D_ratio if self.var_mob else (-1.0, -1.0)
         # flux Jacobian values: frozen over the attempt (coef frozen)
         flux_vals_d = wp.array(
             np.ascontiguousarray(-coef * self._flux_base),
@@ -768,8 +788,8 @@ class WodoFilmStepper(TernaryCHStepper):
                         arr(q_gp[pv][0]), arr(q_gp[pv][1]),
                         self.theta_wp[pv][s0:s1],
                         wp.float64(self.M11), wp.float64(self.M12),
-                        wp.float64(self.M22), wp.float64(Dr),
-                        wp.float64(self.c12),
+                        wp.float64(self.M22), wp.float64(Drp),
+                        wp.float64(Drf), wp.float64(self.c12),
                         wp.float64(self.c1s), wp.float64(self.c2s),
                         wp.float64(1.0 / self.N1),
                         wp.float64(1.0 / self.N2),
@@ -807,11 +827,18 @@ class WodoFilmStepper(TernaryCHStepper):
 
     # -- march loop with the Appendix-A dt heuristic ---------------------
     def march(self, h_min=0.42, phis_stop=0.05, max_steps=20000,
-              dh_cap=0.004, dt_min=1e-12, callback=None, wall_cap=None):
+              dh_cap=0.004, dt_min=1e-12, callback=None, wall_cap=None,
+              on_attempt=None):
         """March until avg phi_s <= phis_stop or h_curr <= h_min.
         dh_cap bounds the per-step height decrement (the h-update is
         explicit). wall_cap (seconds, optional) stops early on wall
-        clock. Returns a stop-reason string."""
+        clock. Returns a stop-reason string.
+
+        callback(self, K, dt, iters) fires on ACCEPTED steps only
+        (historical contract). on_attempt(self, K, dt, iters, ok)
+        fires on EVERY attempt — rejected ones included, before the
+        dt-underflow break — for flight-recorder logging (film front
+        end); accepted attempts see the committed state."""
         import time as _time
         t_wall0 = _time.time()
         reason = "max_steps"
@@ -834,6 +861,8 @@ class WodoFilmStepper(TernaryCHStepper):
             if not ok:
                 self.n_reject += 1
                 self.dt = dt_eff * 0.25                  # reject + retry
+                if on_attempt is not None:
+                    on_attempt(self, K, dt_eff, iters, False)
                 if self.dt < dt_min:
                     reason = "dt_underflow"
                     break
@@ -847,6 +876,8 @@ class WodoFilmStepper(TernaryCHStepper):
                 self.dt = dt_eff * 1.25
             else:
                 self.dt = dt_eff
+            if on_attempt is not None:
+                on_attempt(self, K, dt_eff, iters, True)
             if callback is not None:
                 callback(self, K, dt_eff, iters)
         return reason

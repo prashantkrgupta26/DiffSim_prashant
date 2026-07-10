@@ -26,6 +26,12 @@ Cluster campaign kit (A100 / H200 sbatch + case table):
 (gitignored runtime data); the committed campaign evidence and logs are in
 `docs/dev/nova-mirrors/wodo_campaign/`.
 
+USER-FACING FRONT END: new film studies should go through
+`python -m diffsim.film <config.yaml>` (named validated configs in
+`src/diffsim/film/configs/`, four-layer RunLog diagnostics, preflight
+rule checks) — these scripts remain the committed campaign/benchmark
+lineage the front end was promoted from.
+
 ## The physics ledger
 
 Three model completions were **measured-necessary** for the Wodo regimes:
