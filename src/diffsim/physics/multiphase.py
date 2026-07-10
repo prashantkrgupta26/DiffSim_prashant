@@ -1001,10 +1001,18 @@ class MultiPhaseStepper:
                               np.abs(dx[2 * self.M + 2 * k::nd]).max())
                 if inc > 2.0:
                     dx = dx * (2.0 / inc)
-                x = self._project(x + dx)
+                xn = self._project(x + dx)
+                # projected-Newton convergence: the APPLIED increment.
+                # A p1-mode boundary well pins psi at the [0, 1] clip
+                # with a nonzero raw dx forever (measured: dt_underflow
+                # on the seeded-disc gate); stationarity of the
+                # projected iterate is the correct criterion there.
+                conv = np.abs(xn - x).max()
+                x = xn
             else:
                 x = x + dx
-            if np.abs(dx).max() < self.newton_tol:
+                conv = np.abs(dx).max()
+            if conv < self.newton_tol:
                 return x, it + 1, True
         return x, self.newton_max, False                 # no convergence
 
@@ -1018,10 +1026,14 @@ class MultiPhaseStepper:
         return x
 
     def march(self, t_end, max_steps=100000, dt_min=1e-12, dt_max=None,
-              callback=None):
+              callback=None, grow_iters=20):
         """Appendix-A ladder (wodo pattern, no evaporation): reject
         (no convergence/divergence) => dt *= 0.25 retry; accept with
-        iters < 20 => dt *= 1.25 (capped).  Returns stop reason."""
+        iters < grow_iters => dt *= 1.25 (capped).  grow_iters default
+        20 (the wodo constant); KWC grain-boundary states carry the
+        KG-Picard LINEAR Newton tail (measured 0.5-0.9 contraction),
+        where 20 starves dt growth — raise it there.  Returns stop
+        reason."""
         reason = "max_steps"
         for _ in range(max_steps):
             if self.t >= t_end - 1e-14:
@@ -1039,7 +1051,7 @@ class MultiPhaseStepper:
             self.x = x_new
             self.hist = x_new.copy()
             self.t += dt_eff
-            if iters < 20:
+            if iters < grow_iters:
                 self.dt = dt_eff * 1.25
                 if dt_max is not None:
                     self.dt = min(self.dt, dt_max)

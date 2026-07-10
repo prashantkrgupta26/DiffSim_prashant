@@ -289,3 +289,344 @@ def test_s1a_mms_orders(bulk, device):
     # CLEAN order 2.00 in both bulk modes (p1: 6.2e-4 -> 1.6e-4); the
     # nonsmoothness worry only materializes as kg_delta -> 0.
     assert orders["theta"] > 1.8, (errs["theta"], orders["theta"])
+
+
+# ---------------------------------------------------------------------
+# S1b — SINGLE-CRYSTAL SANITY (r14 family = the S1c replication mode)
+# ---------------------------------------------------------------------
+def _s1b_stepper(dm, T, eps2, alpha=0.0, beta=0.0, L_th=5.0,
+                 kg_delta=1e-2, L_psi=5.0, tol=1e-7, newton_max=60):
+    """PCBM-class binary (M=1, K=1), r14 bulk (2310.11844 Table-1
+    energetics nondimensionalized on a 64 nm box; W-bar 2.6355,
+    L-bar 1.3072), constant small Onsager mobility (growth-limited
+    regime), no noise."""
+    chi_aa = np.array([[0.0, 0.7248], [0.7248, 0.0]])
+    chi_ca = np.array([[0.0, 1.0836], [0.0, 0.0]])
+    return MultiPhaseStepper(
+        dm, M=1, K=1, chi_aa=chi_aa, chi_ac=chi_ca.T.copy(),
+        chi_ca=chi_ca, N=[5.0298, 1.0], onsager=[[0.1]], kappa=[2e-4],
+        dsig=[2.6355], dh=[1.3072], Tm=[558.0], eps2=[eps2],
+        L_psi=[L_psi], alpha_th=[alpha], beta_th=[beta], L_th=[L_th],
+        T=T, dt=2e-3, bulk="r14", kg_delta=kg_delta, p_floor=1e-6,
+        newton_tol=tol, newton_max=newton_max)
+
+
+def _disc(c, r0, w):
+    return lambda x: 0.5 * (1.0 - np.tanh(
+        (np.sqrt((x[:, 0] - c[0]) ** 2
+                 + (x[:, 1] - c[1]) ** 2) - r0) / w))
+
+
+def test_s1b_growth_melt(device):
+    """Seeded psi disc in a uniform undercooled blend (phi0 = 0.6,
+    no noise): crystalline area GROWS for T < Tm and MELTS OUT for
+    T > Tm.  Measured (r14, PCBM energetics): T=333 area
+    0.0693 -> 0.1120 (1.62x, with solvent expulsion phi -> 0.93 in the
+    crystal); T=700 area -> 0.0002, psi_max 0.50.  Locked with
+    >= 2x-class headroom."""
+    dm, mesh, cons = _dm(6, device)
+    phi0 = 0.6
+    res = {}
+    for T in (333.0, 700.0):
+        st = _s1b_stepper(dm, T, 1e-3)
+        st.set_initial([lambda x: np.full(len(x), phi0)],
+                       [_disc((0.5, 0.5), 0.15, 0.02)],
+                       [lambda x: np.zeros(len(x))])
+        a0 = float(np.mean(st.psi(0) > 0.5))
+        reason = st.march(t_end=0.5, dt_max=0.02, max_steps=300,
+                          dt_min=1e-7)
+        res[T] = (a0, float(np.mean(st.psi(0) > 0.5)), reason)
+    print(f"S1b grow/melt: T=333 area {res[333.0][0]:.4f} -> "
+          f"{res[333.0][1]:.4f}; T=700 area {res[700.0][0]:.4f} -> "
+          f"{res[700.0][1]:.4f}")
+    a0, a1, _ = res[333.0]
+    assert a1 > a0 * 1.3, res[333.0]        # measured 1.62x
+    b0, b1, _ = res[700.0]
+    assert b1 < b0 * 0.1, res[700.0]        # measured 0.003x
+
+
+def test_s1b_growth_melt_p1(device):
+    """The RATIFIED p1 bulk form, same sanity: dh < 0 (crystallization
+    enthalpy; the sign ruling in the module docstring), chi-neutral
+    (chi_ca = chi_aa isolates the psi-bulk driving), N = 1.  Measured:
+    T = 0.5 Tm area 0.0693 -> 0.0949 (+37%); T = 1.5 Tm -> 0.0324
+    (-53%, psi_max 0.88 melting)."""
+    dm, mesh, cons = _dm(6, device)
+    chi_aa = np.array([[0.0, 0.7248], [0.7248, 0.0]])
+    res = {}
+    for T in (0.5, 1.5):
+        st = MultiPhaseStepper(
+            dm, M=1, K=1, chi_aa=chi_aa, chi_ac=chi_aa.copy(),
+            chi_ca=chi_aa.copy(), N=[1.0, 1.0], onsager=[[0.1]],
+            kappa=[2e-4], dsig=[1.0], dh=[-1.0], Tm=[1.0], eps2=[1e-3],
+            L_psi=[5.0], alpha_th=[0.0], beta_th=[0.0], L_th=[5.0],
+            T=T, dt=2e-3, bulk="p1", newton_tol=1e-7, newton_max=40)
+        st.set_initial([lambda x: np.full(len(x), 0.6)],
+                       [_disc((0.5, 0.5), 0.15, 0.02)],
+                       [lambda x: np.zeros(len(x))])
+        a0 = float(np.mean(st.psi(0) > 0.5))
+        st.march(t_end=0.4, dt_max=0.02, max_steps=300, dt_min=1e-7)
+        res[T] = (a0, float(np.mean(st.psi(0) > 0.5)))
+    print(f"S1b p1 grow/melt: T=0.5Tm {res[0.5][0]:.4f} -> "
+          f"{res[0.5][1]:.4f}; T=1.5Tm {res[1.5][0]:.4f} -> "
+          f"{res[1.5][1]:.4f}")
+    assert res[0.5][1] > res[0.5][0] * 1.15, res[0.5]   # measured 1.37x
+    assert res[1.5][1] < res[1.5][0] * 0.7, res[1.5]    # measured 0.47x
+
+
+def test_s1b_interface_width_scaling(device):
+    """Interface width vs the eps/sqrt(W)-class scaling: at T = Tm
+    (zero driving) the relaxed profile width must scale as sqrt(eps2)
+    — quadrupling eps2 doubles it.  EXTRACTION NOTE (measured): the
+    crystal-interior psi plateau sits at ~0.89, not 1 (T = Tm, chi_ca
+    feedback), so the crossings are PLATEAU-NORMALIZED 25%/75% levels
+    (absolute 10/90 levels alias the plateau and return disc-scale
+    garbage — measured 0.26 for both eps2)."""
+    dm, mesh, cons = _dm(6, device)
+    phi0 = 0.6
+    widths = {}
+    for eps2 in (1e-3, 4e-3):
+        st = _s1b_stepper(dm, 558.0, eps2)
+        st.set_initial([lambda x: np.full(len(x), phi0)],
+                       [_disc((0.5, 0.5), 0.25, 0.02)],
+                       [lambda x: np.zeros(len(x))])
+        st.march(t_end=0.1, dt_max=0.01, max_steps=200, dt_min=1e-7)
+        coords = st.free_coords
+        row = np.abs(coords[:, 1] - 0.5) < 1e-9
+        xs, ps = coords[row, 0], st.psi(0)[row]
+        o = np.argsort(xs)
+        xs, ps = xs[o], ps[o]
+        right = xs > 0.55
+        xr, pr = xs[right], ps[right]
+        plateau = pr[xr < 0.62].mean()
+        x25 = np.interp(0.25 * plateau, pr[::-1], xr[::-1])
+        x75 = np.interp(0.75 * plateau, pr[::-1], xr[::-1])
+        widths[eps2] = x25 - x75
+    ratio = widths[4e-3] / widths[1e-3]
+    print(f"S1b width (25-75, plateau-normalized): eps2 1e-3 -> "
+          f"{widths[1e-3]:.4f}, 4e-3 -> {widths[4e-3]:.4f}, ratio "
+          f"{ratio:.2f} (sqrt-scaling expects 2.0); theory-class "
+          f"delta = sqrt(eps2/(2 W phi)) = "
+          f"{np.sqrt(1e-3 / (2 * 2.6355 * phi0)):.4f}")
+    assert 1.5 < ratio < 2.5, (widths, ratio)
+
+
+def test_s1b_impingement_and_grain_id(device):
+    """Two near-contact seeds with DIFFERENT theta plateaus (0 and 1,
+    smooth tanh transition): with the KWC term the crystals STOP at the
+    boundary (measured: psi dip 0.0011 persists — the seam stays
+    amorphous-class; theta-watershed finds exactly 2 grains, 210/203
+    nodes); without it they merge (measured: dip heals to 0.916, one
+    psi-connected component).  NUMERICS (measured ladder study): the
+    paper-magnitude alpha = 3.334 with sharp theta collapses the
+    Appendix-A dt to 3e-5 (GB force ~ alpha |grad theta| ~ 10^2 x bulk
+    driving), and kg_delta <= 0.05 keeps dt pinned ~7e-4 via rejects;
+    kg_delta = 0.2 + beta = 0.1 tame the singular coefficient with the
+    GB energy (~ p alpha/2 |Delta theta|, delta-independent to leading
+    order) intact — 0 rejects, ~40 steps.  grow_iters = 45 covers the
+    KG-Picard linear Newton tail."""
+    dm, mesh, cons = _dm(6, device)
+    phi0 = 0.6
+    dips, grains = {}, {}
+    for alpha, beta in ((0.5, 0.1), (0.0, 0.0)):
+        st = _s1b_stepper(dm, 333.0, 1e-3, alpha=alpha, beta=beta,
+                          L_th=0.2, kg_delta=0.2, tol=1e-6,
+                          newton_max=80)
+        st.dt = 2e-4
+        # seeds nearly touching (gap ~ interface width): the GB forms
+        # within the horizon without a long growth phase
+        st.set_initial(
+            [lambda x: np.full(len(x), phi0)],
+            [lambda x: np.maximum(_disc((0.365, 0.5), 0.13, 0.02)(x),
+                                  _disc((0.635, 0.5), 0.13, 0.02)(x))],
+            [lambda x: 0.5 * (1.0 + np.tanh((x[:, 0] - 0.5) / 0.05))])
+        st.march(t_end=0.12, dt_max=0.02, max_steps=250, dt_min=1e-8,
+                 grow_iters=45)
+        coords = st.free_coords
+        seg = (np.abs(coords[:, 1] - 0.5) < 1e-9) \
+            & (np.abs(coords[:, 0] - 0.5) < 0.1)
+        dips[alpha] = float(st.psi(0)[seg].min())
+        labels, sizes = grain_labels(
+            dm.mesh.node_coords, np.asarray(cons.T @ st.psi(0)),
+            np.asarray(cons.T @ st.theta(0)), psi_th=0.5,
+            theta_tol=0.3)
+        grains[alpha] = sizes
+    print(f"S1b impinge: theta-ON dip {dips[0.5]:.4f}, grains "
+          f"{grains[0.5][:4]}; theta-OFF dip {dips[0.0]:.4f}, "
+          f"psi-connected components {len(grains[0.0])}")
+    # KWC ON: boundary persists, watershed finds exactly 2 crystals
+    assert len(grains[0.5]) == 2, grains[0.5]
+    assert dips[0.5] < 0.3, dips                # measured 0.0011
+    # OFF: merged (seam heals to one crystal)
+    assert dips[0.0] > 0.7, dips                # measured 0.916
+    assert len(grains[0.0]) == 1, grains[0.0]
+    assert dips[0.0] - dips[0.5] > 0.5, dips    # measured 0.915
+
+
+def test_grain_labels_synthetic():
+    """Pure-numpy watershed unit test: two psi blobs TOUCHING through a
+    crystalline bridge but with distinct theta plateaus -> the theta
+    tolerance splits them into exactly 2 grains; with theta_tol = inf
+    the same field is 1 connected component; sizes sorted descending."""
+    n = 33
+    xs = np.linspace(0.0, 1.0, n)
+    X, Y = np.meshgrid(xs, xs, indexing="ij")
+    coords = np.stack([X.ravel(), Y.ravel()], axis=1)
+    r1 = np.sqrt((X - 0.35) ** 2 + (Y - 0.5) ** 2)
+    r2 = np.sqrt((X - 0.68) ** 2 + (Y - 0.5) ** 2)
+    psi = np.maximum(1.0 * (r1 < 0.20), 1.0 * (r2 < 0.16)).ravel()
+    theta = np.where(X.ravel() < 0.52, 0.0, 1.0)
+    labels, sizes = grain_labels(coords, psi, theta, psi_th=0.5,
+                                 theta_tol=0.3)
+    labels1, sizes1 = grain_labels(coords, psi, theta, psi_th=0.5,
+                                   theta_tol=np.inf)
+    print(f"grain_labels synthetic: split {len(sizes)} grains "
+          f"{sizes}, merged {len(sizes1)} component {sizes1}")
+    assert len(sizes) == 2 and sizes[0] >= sizes[1], sizes
+    assert len(sizes1) == 1, sizes1
+    assert labels[psi <= 0.5].max() == -1
+    assert sizes.sum() == (psi > 0.5).sum() == sizes1.sum()
+
+
+# ---------------------------------------------------------------------
+# S1c — 2310.11844 REFERENCE-CASE REPLICATION (in-suite anchors)
+# ---------------------------------------------------------------------
+def _s1c_stepper(dm, cons_mesh, phi0, level, seed=11):
+    """The paper's Table-1 PCBM/oDCB reference case, nondimensionalized
+    on a (2^level) nm box at their Delta-x = 1 nm (length unit l0 =
+    box edge, time unit 1 s, energy density RT/v0): W-bar 2.6355,
+    L-bar 1.3072, drive L(T/Tm - 1) = -0.5271 at T = 333 K, chi_aa
+    0.7248 + chi_ca 1.0836 psi^2 (their Eq. 7), fast-mode Onsager
+    (Eqs. 15-16, log-mean D interpolation), M(phi) = M0 = 0.1/s
+    constant, FDT noise std sqrt((2 v0/Na) N1 M0) with 2-D cell volume
+    dx^2 * dx (depth = dx ASSUMPTION, recorded — the paper states no
+    2-D noise normalization).  Thermal nucleation ONLY (uniform IC,
+    no seeds, no IC noise — their Sec 3.2)."""
+    R, Na = 8.314, 6.022e23
+    rho, v0, N1, N2 = 1600.0, 1.131e-4, 5.0298, 1.0
+    Tq, Tm = 333.0, 558.0
+    u0 = R * Tq / v0
+    l0 = float(1 << level) * 1e-9
+    Dsc = 1.0 / l0 ** 2
+    Lpsi = N1 * 0.1
+    A_fdt = (2.0 * v0 / Na) * Lpsi
+    noise_psi = np.sqrt(A_fdt / (l0 ** 2 * 1e-9 * 2.0 * Lpsi))
+    chi_aa = np.array([[0.0, 0.7248], [0.7248, 0.0]])
+    chi_ca = np.array([[0.0, 1.0836], [0.0, 0.0]])
+    st = MultiPhaseStepper(
+        dm, M=1, K=1, chi_aa=chi_aa, chi_ac=chi_ca.T.copy(),
+        chi_ca=chi_ca, N=[N1, N2], mob="fastmode",
+        D_lo=[5e-10 * Dsc, 2e-9 * Dsc], D_hi=[1e-13 * Dsc, 1e-12 * Dsc],
+        kappa=[2e-10 / (u0 * l0 ** 2)],
+        dsig=[40322.5806 * rho / u0], dh=[20000.0 * rho / u0],
+        Tm=[Tm], eps2=[1e-10 / (u0 * l0 ** 2)], L_psi=[Lpsi],
+        alpha_th=[8.1621e7 / u0], beta_th=[0.0], L_th=[Lpsi], T=Tq,
+        dt=1e-3, bulk="r14", kg_delta=1e-2, p_floor=1e-6,
+        newton_tol=1e-8, newton_max=50, linsolver="splu",
+        noise_psi=noise_psi, noise_seed=seed, clip_psi=False)
+    st.set_initial([lambda x: np.full(len(x), phi0)],
+                   [lambda x: np.zeros(len(x))],
+                   [lambda x: np.zeros(len(x))])
+    return st
+
+
+def test_s1c_fdt_statistics(device):
+    """QUANTITATIVE noise gate: the stationary pre-nucleation psi
+    fluctuation variance vs the Gaussian equipartition mode sum
+    Var = (kT/L^2) SUM_q 1/(f''(0) + eps2 q^2) on the periodic grid
+    (kT = noise_psi^2 by the wJ-normalized FDT construction; f''(0)
+    includes the chi_ca psi^2-coupling curvature 2 phi(1-phi) chi_ca).
+    Measured at the paper's parameters: ratio 0.822 at L5/32 nm
+    (0.848 at L6/64 nm) — the deficit is the BDF1 high-q damping at
+    dt * rate ~ O(1).  Locked ratio in [0.65, 1.10]."""
+    level = 5
+    tree = build_uniform(level, dim=2, periodic=(True, True))
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2),
+                              device)
+    st = _s1c_stepper(dm, (cons, mesh), 0.3, level, seed=5)
+    st.dt = 0.25
+    vs = []
+    st.march(t_end=30.0, dt_max=0.25,
+             callback=lambda s, dt, it:
+             vs.append(np.var(s.psi(0))) if s.t > 8.0 else None)
+    var_meas = float(np.mean(vs[::4]))
+    phi0 = 0.3
+    Wb, Lb, Tq, Tm = 2.6355, 1.3072, 333.0, 558.0
+    drive = Lb * (Tq / Tm - 1.0)
+    fpp = phi0 * (2 * Wb + 6 * drive) + 2 * phi0 * (1 - phi0) * 1.0836
+    eps2 = st.eps2[0]
+    kT = st.noise_psi ** 2
+    ng = 1 << level
+    k1 = 2 * np.pi * np.fft.fftfreq(ng, d=1.0 / ng)
+    KX, KY = np.meshgrid(k1, k1)
+    var_pred = kT * np.mean(1.0 / (fpp + eps2 * (KX ** 2 + KY ** 2))) \
+        * ng ** 2
+    ratio = var_meas / var_pred
+    print(f"S1c FDT: measured psi-var {var_meas:.3e} (std "
+          f"{np.sqrt(var_meas):.4f}) vs equipartition {var_pred:.3e} "
+          f"(std {np.sqrt(var_pred):.4f}); ratio {ratio:.3f}")
+    assert 0.65 < ratio < 1.10, (var_meas, var_pred, ratio)
+
+
+def test_s1c_replication_anchors(device):
+    """2310.11844 reference case on a 64 nm periodic box (their 1 nm
+    resolution; domain reduced from 512 nm — DEVIATION recorded: fewer
+    simultaneous nuclei, intensive kinetics unaffected to leading
+    order).  Text-stated anchors exercised:
+    (a) phi0 = 0.8: THERMAL nucleation from the FDT noise alone, then
+        sigmoidal crystallinity (their Sec 4.1) — measured (seed 11):
+        first nucleus t = 8.0 s, tau50 = 27 s, plateau X = 0.939;
+    (b) phi0 = 0.3: NO crystallization on the same horizon (their
+        'no crystallization below phi0 = 0.4' / one-step pathway
+        kinetically impeded, Secs 4.1 + Fig 2-b);
+    (c) orientation field inert in (a)/(b): the paper's theta
+        ORIENTATION-ASSIGNMENT at nucleation is unspecified (Eq. 5 is a
+        Kronecker penalty; kinetics defer to Ronsin-Harting 2022), so
+        kinetics run orientation-uniform — the impingement mechanism is
+        gated separately (S1b).  Full-horizon curves + the 128 nm
+        campaign live in the milestone report."""
+    level = 6
+    tree = build_uniform(level, dim=2, periodic=(True, True))
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2),
+                              device)
+    full = lambda st, v: np.asarray(cons.T @ v)
+    horizon = 45.0
+    curves = {}
+    for phi0 in (0.8, 0.3):
+        st = _s1c_stepper(dm, (cons, mesh), phi0, level)
+        rec = []
+
+        def cb(s, dt, iters):
+            phi = full(s, s.phi(0))
+            psi = full(s, s.psi(0))
+            X = float((phi * psi).mean() / phi.mean())
+            _, sizes = grain_labels(mesh.node_coords, psi,
+                                    np.zeros(len(psi)), psi_th=0.5,
+                                    theta_tol=np.inf, periodic=True)
+            rec.append((s.t, X, int((sizes >= 4).sum())))
+        reason = st.march(t_end=horizon, dt_max=1.0, callback=cb)
+        curves[phi0] = np.array(rec)
+        assert reason == "t_end", reason
+    a = curves[0.8]
+    onset = a[np.argmax(a[:, 2] >= 1), 0] if (a[:, 2] >= 1).any() \
+        else np.inf
+    plateau_X = a[-1, 1]
+    i50 = np.argmax(a[:, 1] >= 0.5)
+    t50 = a[i50, 0] if (a[:, 1] >= 0.5).any() else np.inf
+    b = curves[0.3]
+    print(f"S1c anchors (64 nm, seed 11): phi0=0.8 onset {onset:.1f} s "
+          f"tau50-class {t50:.1f} s X(45) {plateau_X:.3f} nuclei_max "
+          f"{int(a[:, 2].max())}; phi0=0.3 X_max {b[:, 1].max():.4f} "
+          f"nuclei_max {int(b[:, 2].max())}")
+    # (a) thermal nucleation + sigmoid past 50% (measured onset 8 s,
+    #     tau50 27 s, X(45) ~ 0.87; >= 2x-headroom locks)
+    assert onset < 25.0, onset
+    assert t50 < 45.0, t50
+    assert plateau_X > 0.5, plateau_X
+    # (b) the below-0.4 anchor: nothing nucleates at phi0 = 0.3
+    assert int(b[:, 2].max()) == 0, b[:, 2].max()
+    assert b[:, 1].max() < 0.05, b[:, 1].max()
