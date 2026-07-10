@@ -53,6 +53,168 @@ def cudss_options():
     return _CUDSS_OPTS
 
 
+def _blockch_pairs(A, b, meta, tol, device):
+    """blockch generalized to ndof-node-major systems carrying several
+    (phi, mu) pairs (G4: the ternary 4-dof CH block (phi1,mu1,phi2,mu2)
+    and the Wodo film). Each pair p = {"off", "m", "kappa"} gets the
+    SAME two-factor recipe as the binary branch (design laws 1-4 apply
+    unchanged; see the blockch branch of solve_linear):
+        K_p  = Acm_p / m_p,   F_p = -Amc_p - kap_p K_p     (SIGNED, law 3)
+        W1_p = (sqrt(sig)/sig) Acc_p + sqrt(m_p kap_p) K_p
+        W2_p = W1_p + (m_p/sqrt(sig)) F_p
+    with Acc/Acm/Amc/Amm extracted at dof offsets (ndof*k+off,
+    ndof*k+off+1). The cross blocks (M12 transport, d12 FH coupling;
+    the film's advection and top-flux rows live INSIDE the extracted
+    blocks) are dropped in the PRECONDITIONER only — the outer FGMRES
+    carries them. Escalation on outer stall switches the WHOLE apply to
+    per-pair exact-Schur. Returns (x, (outer(+1000 on fallback),
+    inner_total))."""
+    from scipy.sparse.linalg import (LinearOperator, cg as _cg,
+                                     gmres as _gmres, lgmres as _lgmres)
+    sig = meta["sigma"]
+    ndof = meta["ndof"]
+    n = A.shape[0] // ndof
+    base = np.arange(n) * ndof
+    inner_it = [0]
+    _cb = lambda *_: inner_it.__setitem__(0, inner_it[0] + 1)
+
+    def _host_solvers(Amm, W1, W2):
+        def _jacobi(W):
+            d = W.diagonal().copy()
+            d[d == 0] = 1.0
+            return LinearOperator(W.shape, lambda v: v / d)
+
+        MjM, Mj1, Mj2 = _jacobi(Amm), _jacobi(W1), _jacobi(W2)
+
+        def msolve(y):
+            z, info = _cg(Amm, y, M=MjM, rtol=1e-10, atol=0.0,
+                          maxiter=1000, callback=_cb)
+            if info != 0:
+                raise RuntimeError(f"blockch mass CG not converged: {info}")
+            return z
+
+        def w1solve(y):
+            z, info = _cg(W1, y, M=Mj1, rtol=1e-8, atol=0.0,
+                          maxiter=3000, callback=_cb)
+            if info != 0:
+                raise RuntimeError(f"blockch W1 CG not converged: {info}")
+            return z
+
+        def w2solve(y):
+            z, info = _gmres(W2, y, M=Mj2, rtol=1e-8, atol=0.0,
+                             maxiter=3000, restart=100, callback=_cb,
+                             callback_type="legacy")
+            if info != 0:
+                raise RuntimeError(f"blockch W2 GMRES not converged: {info}")
+            return z
+
+        return msolve, w1solve, w2solve
+
+    def _device_solvers(Amm, W1, W2):
+        # fused single-sync Krylov stack; W2 indefinite -> bicgstab_dev
+        from ..assembly.operators import CSROperator
+        from .krylov_dev import cg_dev, bicgstab_dev
+        ops = [CSROperator(X, device) for X in (Amm, W1, W2)]
+        dgs = [np.asarray(X.diagonal()).copy() for X in (Amm, W1, W2)]
+        for dg in dgs:
+            dg[dg == 0] = 1.0
+        dgs[2] = np.abs(dgs[2])         # Jacobi sign-guard (indefinite)
+
+        def _dev(op, y, dg, rtol, krylov, label):
+            x_, info = krylov(op, y, tol=rtol, atol=1e-13,
+                              maxiter=4000, diag=dg, check_every=50)
+            if not info.get("converged"):
+                raise RuntimeError(f"blockch {label} device solve: {info}")
+            inner_it[0] += info.get("iters", 0)
+            return x_
+
+        return (lambda y: _dev(ops[0], y, dgs[0], 1e-10, cg_dev, "mass"),
+                lambda y: _dev(ops[1], y, dgs[1], 1e-8, cg_dev, "W1"),
+                lambda y: _dev(ops[2], y, dgs[2], 1e-8, bicgstab_dev,
+                               "W2"))
+
+    mk = (_device_solvers if meta.get("inners") == "device"
+          else _host_solvers)
+    pairs = []
+    for p in meta["pairs"]:
+        mmo, kap = p["m"], p["kappa"]
+        ci = base + p["off"]
+        mi = ci + 1
+        Acm = A[ci][:, mi].tocsr()
+        Amc = A[mi][:, ci].tocsr()
+        Amm = A[mi][:, mi].tocsr()
+        Acc = A[ci][:, ci].tocsr()
+        K = (Acm / mmo).tocsr()
+        F = (-Amc - kap * K).tocsr()        # signed curvature (law 3)
+        W1 = ((np.sqrt(sig) / sig) * Acc + np.sqrt(mmo * kap) * K).tocsr()
+        W2 = (W1 + (mmo / np.sqrt(sig)) * F).tocsr()
+        msolve, w1solve, w2solve = mk(Amm, W1, W2)
+        pairs.append(dict(ci=ci, mi=mi, m=mmo, Acm=Acm, Amc=Amc,
+                          Amm=Amm, Acc=Acc, K=K, msolve=msolve,
+                          w1solve=w1solve, w2solve=w2solve))
+
+    def apply(r):
+        z = r.copy()            # identity on any dof no pair covers
+        for P in pairs:
+            rc, rm = r[P["ci"]], r[P["mi"]]
+            a = P["w1solve"](rc - P["Acm"] @ P["msolve"](rm))
+            zc = P["w2solve"](P["Amm"] @ a)
+            zm = P["msolve"](rm - P["Amc"] @ zc)
+            z[P["ci"]] = zc
+            z[P["mi"]] = zm
+        return z
+
+    it = [0]
+    x, info = _lgmres(A, b, M=LinearOperator(A.shape, apply),
+                      rtol=tol, atol=1e-13, maxiter=100,
+                      callback=lambda _: it.__setitem__(0, it[0] + 1))
+    if info != 0:
+        # ESCALATE the whole apply: per-pair exact Schur (matrix-free),
+        # W1-form preconditioned — the binary escape hatch, pairwise.
+        def _mk_schur(P):
+            H = (-P["Amc"]).tocsr()
+            Sc = LinearOperator(
+                (n, n), lambda v: P["Acc"] @ v
+                + P["m"] * (P["K"] @ P["msolve"](H @ v)))
+            Mpre = LinearOperator(
+                (n, n),
+                lambda v: P["w1solve"](P["Amm"] @ P["w1solve"](v)))
+
+            def schur(y):
+                zz, sinfo = _gmres(Sc, y, M=Mpre, rtol=1e-8, atol=0.0,
+                                   maxiter=800, restart=160, callback=_cb,
+                                   callback_type="legacy")
+                if sinfo != 0:
+                    raise RuntimeError(
+                        f"blockch fallback Schur GMRES: {sinfo}")
+                return zz
+
+            return schur
+
+        for P in pairs:
+            P["schur"] = _mk_schur(P)
+
+        def apply_fb(r):
+            z = r.copy()
+            for P in pairs:
+                rc, rm = r[P["ci"]], r[P["mi"]]
+                zc = P["schur"](rc - P["Acm"] @ P["msolve"](rm))
+                zm = P["msolve"](rm - P["Amc"] @ zc)
+                z[P["ci"]] = zc
+                z[P["mi"]] = zm
+            return z
+
+        it[0] = 0
+        x, info = _lgmres(A, b, M=LinearOperator(A.shape, apply_fb),
+                          rtol=tol, atol=1e-13, maxiter=40,
+                          callback=lambda _: it.__setitem__(0, it[0] + 1))
+        if info != 0:
+            raise RuntimeError(
+                f"blockch fallback FGMRES not converged: {info}")
+        it[0] += 1000           # mark fallback path in the iters record
+    return x, (it[0], inner_it[0])
+
+
 def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                  device="cuda:0", cache=None, cache_key=None):
     """Solve A x = b (scipy CSR A, host b). Returns host x.
@@ -199,6 +361,14 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         if meta is None:
             raise ValueError("blockch requires ('blockch_meta', cache_key) "
                              "= {'sigma','m','kappa'} in cache")
+        if "pairs" in meta:
+            # G4: multi-pair generalization (meta {'sigma','ndof','pairs'})
+            # — the ternary 4-dof block and the Wodo film; the binary
+            # path below is untouched.
+            x, iters = _blockch_pairs(A, b, meta, tol, device)
+            if cache is not None:
+                cache[("blockch_iters", cache_key)] = iters
+            return x
         sig, mmo, kap = meta["sigma"], meta["m"], meta["kappa"]
         n = A.shape[0] // 2
         ci = np.arange(n) * 2

@@ -171,13 +171,17 @@ class TernaryCHStepper:
 
     def __init__(self, dm, chi=(2.5, 1.0, 0.6), M=(1.0, -0.2, 1.0),
                  kappa=(1e-3, 1e-3), dt=0.01, order=2,
-                 newton_tol=1e-9, newton_max=20):
+                 newton_tol=1e-9, newton_max=20, linsolver="splu"):
         from ..physics.poisson import gauss_points
         self.dm = dm
         self.c12, self.c1s, self.c2s = chi
         self.M11, self.M12, self.M22 = M
         self.kap1, self.kap2 = kappa
         self.dt, self.order = dt, order
+        # "splu" (default) | "blockch" | "blockch_dev": the G4 per-pair
+        # two-factor Schur preconditioner (solvers/linsolve.py)
+        self.linsolver = linsolver
+        self._solver_cache = {}
         self.newton_tol, self.newton_max = newton_tol, newton_max
         self.mesh, self.cons = dm.mesh, dm.constraints
         self.Tc = self.cons.T.tocsr()
@@ -270,7 +274,26 @@ class TernaryCHStepper:
                 shape=(self.dm.n_nodes * 4,) * 2).tocsr()
             A = (self.T4.T @ K @ self.T4).tocsr()
             r = np.asarray(self.T4.T @ F_full)
-            dx = splu(A.tocsc()).solve(r)
+            if self.linsolver == "splu":
+                dx = splu(A.tocsc()).solve(r)
+            else:
+                from ..solvers.linsolve import solve_linear
+                # sigma changes with BDF startup/adaptive dt: refresh the
+                # meta per iterate. Pair A = (phi1, mu1) at offset 0 with
+                # (M11, kap1); pair B = (phi2, mu2) at offset 2 with
+                # (M22, kap2); the M12/d12 cross blocks stay with the
+                # outer FGMRES.
+                solver = self.linsolver
+                meta = {"sigma": sigma, "ndof": 4, "pairs": [
+                    {"off": 0, "m": self.M11, "kappa": self.kap1},
+                    {"off": 2, "m": self.M22, "kappa": self.kap2}]}
+                if solver == "blockch_dev":
+                    solver = "blockch"
+                    meta["inners"] = "device"
+                self._solver_cache[("blockch_meta", "tch")] = meta
+                dx = solve_linear(A, r, solver=solver, tol=1e-10,
+                                  cache=self._solver_cache,
+                                  cache_key="tch", device=self.dm.device)
             x = x + dx
             if np.abs(dx).max() < self.newton_tol:
                 break

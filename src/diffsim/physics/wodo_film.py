@@ -128,7 +128,9 @@ the conservation identity d/dt [h * Int phi dx dtheta] = 0 is preserved
 (defaults lat_scale = Ycomp = 1 reproduce v1 exactly).
 Linear solve: linsolver = "splu" (v1 default) or "cudss" — nvmath
 DirectSolver, plan once on the first Newton iterate, then
-reset_operands(a=..) + refactorize per iterate (fixed sparsity).
+reset_operands(a=..) + refactorize per iterate (fixed sparsity) — or
+"blockch"/"blockch_dev" (G4): the per-pair two-factor Schur
+preconditioner (solvers/linsolve.py, "pairs" meta); host assembly only.
 
 v1.2 DEVICE-BOUND MARCH (use_device_assembly=True; M4): the host
 COO + scipy assembly is replaced by DeviceNSAssembler(ndof=4) — the
@@ -466,6 +468,30 @@ class WodoFilmStepper(TernaryCHStepper):
         return cudss_options()
 
     def _solve(self, A, r):
+        if self.linsolver in ("blockch", "blockch_dev"):
+            # G4: per-pair two-factor Schur preconditioner (linsolve
+            # "pairs" meta). The film's advection, mapped-metric
+            # anisotropy and top-flux rows ride in through the extracted
+            # blocks — no special-casing. sigma is stashed by _attempt
+            # (K frozen there; sigma the only per-attempt scalar the
+            # preconditioner needs). Non-convergence of BOTH the
+            # two-factor form and the exact-Schur escalation signals
+            # divergence to the Appendix-A reject ladder, matching the
+            # cudss contract.
+            from ..solvers.linsolve import solve_linear
+            meta = {"sigma": self._sigma, "ndof": 4, "pairs": [
+                {"off": 0, "m": self.M11, "kappa": self.kap1},
+                {"off": 2, "m": self.M22, "kappa": self.kap2}]}
+            if self.linsolver == "blockch_dev":
+                meta["inners"] = "device"
+            self._solver_cache[("blockch_meta", "wodo")] = meta
+            try:
+                return solve_linear(A, r, solver="blockch", tol=1e-10,
+                                    cache=self._solver_cache,
+                                    cache_key="wodo",
+                                    device=self.dm.device)
+            except RuntimeError:
+                return np.full(A.shape[0], np.nan)
         if self.linsolver == "cudss":
             from nvmath.sparse.advanced import DirectSolver
             b = np.ascontiguousarray(r, np.float64)
@@ -518,6 +544,7 @@ class WodoFilmStepper(TernaryCHStepper):
             return self._attempt_device(dt, K)
         d = self.dm.device
         sigma = 1.0 / dt
+        self._sigma = sigma      # _solve reads it for the blockch meta
         v1, _ = self._gp(self.hist[0][0])
         v2, _ = self._gp(self.hist[0][1])
         h1_gp = {pv: sigma * v1[pv] for pv in v1}
