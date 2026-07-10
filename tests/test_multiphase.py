@@ -257,7 +257,11 @@ def test_s1a_mms_orders(bulk, device):
             dsig=[dsig], dh=[dh], Tm=[Tm], eps2=[eps2], L_psi=[Lpsi],
             alpha_th=[alpha], beta_th=[beta], L_th=[Lth], T=Tq,
             dt=dt, bulk=bulk, kg_delta=kgd, p_floor=pfl,
-            newton_tol=1e-11, newton_max=30,
+            # KG-Picard frozen 1/|g|_d gives a LINEAR Newton tail on the
+            # theta rows (measured contraction 0.52/iterate at this
+            # config); 1e-10 in <= 80 iterations, far below the spatial
+            # error floor
+            newton_tol=1e-10, newton_max=80,
             dirichlet=np.where(bdry)[0],
             g_fns=[phis, mus, psis, ths],
             src_fns=[f_phi, f_mu, f_psi, f_th])
@@ -280,6 +284,8 @@ def test_s1a_mms_orders(bulk, device):
         f"order {orders[f]:.2f}" for f in errs))
     assert orders["phi"] > 1.8, (errs["phi"], orders["phi"])
     assert orders["psi"] > 1.8, (errs["psi"], orders["psi"])
-    # theta: the KG-regularized |grad theta| coefficient is only ~C1 in
-    # the fields; measured orders locked at > 1.5 (see milestone report)
-    assert orders["theta"] > 1.5, (errs["theta"], orders["theta"])
+    # theta subtlety, resolved: with the KG smoothing (kg_delta = 1e-2)
+    # the |grad theta| coefficient is C-infinity and theta measures a
+    # CLEAN order 2.00 in both bulk modes (p1: 6.2e-4 -> 1.6e-4); the
+    # nonsmoothness worry only materializes as kg_delta -> 0.
+    assert orders["theta"] > 1.8, (errs["theta"], orders["theta"])

@@ -688,7 +688,8 @@ class MultiPhaseStepper:
                  newton_tol=1e-9, newton_max=50, linsolver="splu",
                  noise_psi=0.0, noise_phi=0.0, noise_seed=0,
                  b_reg=0.0, kg_delta=1e-3, p_floor=1e-6,
-                 dirichlet=None, g_fns=None, src_fns=None, guards=True):
+                 dirichlet=None, g_fns=None, src_fns=None, guards=True,
+                 clip_psi=True):
         from ..physics.poisson import gauss_points
         self.dm = dm
         self.M, self.K = int(M), int(K)
@@ -753,6 +754,14 @@ class MultiPhaseStepper:
         # Newton — the S0 parity gate matches the reference stepper's
         # unguarded iteration; production keeps them on)
         self.guards = bool(guards)
+        # clip_psi=False skips the [0, 1] psi projection: the r14
+        # double well q(psi) is SELF-RESTORING outside [0, 1], and the
+        # 2310.11844 replication needs unrectified FDT noise statistics
+        # around psi = 0 (a hard clip biases the nucleation rate).  The
+        # p1 barrier form REQUIRES the clip (boundary minima).
+        self.clip_psi = bool(clip_psi)
+        assert clip_psi or bulk == "r14", \
+            "clip_psi=False only valid for the self-restoring r14 well"
         self.n_reject = 0
         self.mesh, self.cons = dm.mesh, dm.constraints
         self.Tc = self.cons.T.tocsr()
@@ -839,9 +848,10 @@ class MultiPhaseStepper:
             scale = hi / s[bad]
             for p in phis:
                 p[bad] *= scale
-        for k in range(self.K):
-            np.clip(x[2 * self.M + 2 * k::self.ndof], 0.0, 1.0,
-                    out=x[2 * self.M + 2 * k::self.ndof])
+        if self.clip_psi:
+            for k in range(self.K):
+                np.clip(x[2 * self.M + 2 * k::self.ndof], 0.0, 1.0,
+                        out=x[2 * self.M + 2 * k::self.ndof])
         return x
 
     def _drive(self, t_new):
@@ -856,10 +866,20 @@ class MultiPhaseStepper:
             from .wodo_film import WodoFilmStepper
             b = np.ascontiguousarray(r, np.float64)
             try:
+                # the scipy T^T K T triple product PRUNES exact zeros, so
+                # the CSR pattern GROWS when a field leaves its uniform
+                # initial state (measured: 884736 -> 1179648 nnz when
+                # psi-noise switches on the coupling blocks at iterate 1)
+                # — reset_operands demands a fixed pattern; rebuild the
+                # plan on any nnz change instead of failing the attempt.
+                if self._cudss is not None and \
+                        getattr(self, "_cudss_nnz", -1) != A.nnz:
+                    self._cudss = None
                 if self._cudss is None:
                     self._cudss = DirectSolver(
                         A, b, options=WodoFilmStepper._cudss_opts())
                     self._cudss.plan()
+                    self._cudss_nnz = A.nnz
                 else:
                     self._cudss.reset_operands(a=A, b=b)
                 self._cudss.factorize()
