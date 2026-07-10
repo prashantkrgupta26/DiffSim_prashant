@@ -218,30 +218,62 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
             d[d == 0] = 1.0
             return LinearOperator(W.shape, lambda v: v / d)
 
-        MjM, Mj1, Mj2 = _jacobi(Amm), _jacobi(W1), _jacobi(W2)
         _cb = lambda *_: inner_it.__setitem__(0, inner_it[0] + 1)
+        if meta.get("inners") == "device":
+            # DEVICE inners: the fused single-sync Krylov stack. W1/M are
+            # SPD -> cg_dev; W2 is indefinite where f'' < 0 -> bicgstab_dev.
+            # Matrices ride to the device once per Newton solve.
+            from ..assembly.operators import CSROperator
+            from .krylov_dev import cg_dev, bicgstab_dev
+            opM = CSROperator(Amm, device)
+            opW1 = CSROperator(W1, device)
+            opW2 = CSROperator(W2, device)
+            dgM, dg1, dg2 = (np.asarray(X.diagonal()).copy()
+                             for X in (Amm, W1, W2))
+            for dg in (dgM, dg1, dg2):
+                dg[dg == 0] = 1.0
+            dg2 = np.abs(dg2)               # Jacobi sign-guard (indefinite)
 
-        def _msolve(y):
-            z, info = _cg(Amm, y, M=MjM, rtol=1e-10, atol=0.0,
-                          maxiter=1000, callback=_cb)
-            if info != 0:
-                raise RuntimeError(f"blockch mass CG not converged: {info}")
-            return z
+            def _dev(op, y, dg, rtol, krylov, label):
+                x_, info = krylov(op, y, tol=rtol, atol=1e-13,
+                                  maxiter=4000, diag=dg, check_every=50)
+                if not info.get("converged"):
+                    raise RuntimeError(f"blockch {label} device solve: "
+                                       f"{info}")
+                inner_it[0] += info.get("iters", 0)
+                return x_
 
-        def _w1solve(y):
-            z, info = _cg(W1, y, M=Mj1, rtol=1e-8, atol=0.0, maxiter=3000,
-                          callback=_cb)
-            if info != 0:
-                raise RuntimeError(f"blockch W1 CG not converged: {info}")
-            return z
+            _msolve = lambda y: _dev(opM, y, dgM, 1e-10, cg_dev, "mass")
+            _w1solve = lambda y: _dev(opW1, y, dg1, 1e-8, cg_dev, "W1")
+            _w2solve = lambda y: _dev(opW2, y, dg2, 1e-8, bicgstab_dev,
+                                      "W2")
+        else:
+            MjM, Mj1, Mj2 = _jacobi(Amm), _jacobi(W1), _jacobi(W2)
 
-        def _w2solve(y):
-            z, info = _gmres(W2, y, M=Mj2, rtol=1e-8, atol=0.0,
-                             maxiter=3000, restart=100, callback=_cb,
-                             callback_type="legacy")
-            if info != 0:
-                raise RuntimeError(f"blockch W2 GMRES not converged: {info}")
-            return z
+            def _msolve(y):
+                z, info = _cg(Amm, y, M=MjM, rtol=1e-10, atol=0.0,
+                              maxiter=1000, callback=_cb)
+                if info != 0:
+                    raise RuntimeError(
+                        f"blockch mass CG not converged: {info}")
+                return z
+
+            def _w1solve(y):
+                z, info = _cg(W1, y, M=Mj1, rtol=1e-8, atol=0.0,
+                              maxiter=3000, callback=_cb)
+                if info != 0:
+                    raise RuntimeError(
+                        f"blockch W1 CG not converged: {info}")
+                return z
+
+            def _w2solve(y):
+                z, info = _gmres(W2, y, M=Mj2, rtol=1e-8, atol=0.0,
+                                 maxiter=3000, restart=100, callback=_cb,
+                                 callback_type="legacy")
+                if info != 0:
+                    raise RuntimeError(
+                        f"blockch W2 GMRES not converged: {info}")
+                return z
 
         def apply(r):
             rc, rm = r[ci], r[mi]

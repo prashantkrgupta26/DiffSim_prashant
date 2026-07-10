@@ -332,12 +332,18 @@ class CahnHilliardStepper:
                 dx = splu(A.tocsr().tocsc()).solve(r)
             else:
                 from ..solvers.linsolve import solve_linear
-                # sigma changes with BDF startup/adaptive dt: refresh meta
-                self._solver_cache[("blockch_meta", "ch")] = {
-                    "sigma": sigma, "m": self.M, "kappa": self.kappa}
-                dx = solve_linear(A.tocsr(), r, solver=self.linsolver,
+                # sigma changes with BDF startup/adaptive dt: refresh meta.
+                # linsolver="blockch_dev" routes the inner Krylov solves
+                # through the fused device stack (cg_dev/bicgstab_dev).
+                solver = self.linsolver
+                meta = {"sigma": sigma, "m": self.M, "kappa": self.kappa}
+                if solver == "blockch_dev":
+                    solver = "blockch"
+                    meta["inners"] = "device"
+                self._solver_cache[("blockch_meta", "ch")] = meta
+                dx = solve_linear(A.tocsr(), r, solver=solver,
                                   tol=1e-10, cache=self._solver_cache,
-                                  cache_key="ch")
+                                  cache_key="ch", device=self.dm.device)
             # Newton trust clamp: a c-increment beyond 2 units is always a
             # diverging transient (poly's physical range is [-1,1], FH's
             # (0,1)); scale the WHOLE update to preserve direction.
