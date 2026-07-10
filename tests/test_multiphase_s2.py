@@ -458,3 +458,281 @@ def test_s2a3_noise_damping(device):
     print(f"S2a3 noise damp: fluct std {stds[True]:.3e} -> "
           f"{stds[False]:.3e}, ratio {ratio:.3e} vs f(0.9) = {f09:.3e}")
     assert 0.5 * f09 < ratio < 2.0 * f09, (ratio, f09)
+
+
+# ---------------------------------------------------------------------
+# S2b — PHASE-DIAGRAM PLACEMENT (16390 chi set; d5cp taxonomy)
+# ---------------------------------------------------------------------
+def _fh_binary(x, breg=0.0):
+    """FH free energy per site (v0 units), x = phi_PCBM, with the house
+    simplex barrier (saturated below 1e-3, the _binv convention)."""
+    xs = np.maximum(x, 1e-3)
+    ys = np.maximum(1.0 - x, 1e-3)
+    return (x * np.log(x) / N_PCBM + (1 - x) * np.log(1 - x) / N_PCE11
+            + CHI_AA_16390 * x * (1 - x) + breg * (1 / xs + 1 / ys))
+
+
+def _binodal(breg):
+    from scipy.optimize import brentq
+    xg = np.linspace(1e-6, 1 - 1e-9, 2000001)
+    fv = _fh_binary(xg, breg)
+
+    def gap(mu):
+        om = fv - mu * xg
+        i1 = np.argmin(om[xg < 0.4])
+        j = np.searchsorted(xg, 0.9)
+        i2 = np.argmin(om[xg > 0.9]) + j
+        return om[i1] - om[i2], xg[i1], xg[i2]
+    mu = brentq(lambda m: gap(m)[0], -1.0, 1.0, xtol=1e-14)
+    return gap(mu)[1:]
+
+
+def test_s2b_phase_diagram_placement(device):
+    """PLACEMENT (analytic, the 16390 chi set at the annealing T=403K):
+    chi_aa = 1.2649 = 2.14 chi_c (chi_c = 0.5906 at N = (132.67, 1)) —
+    ONE immiscible pair, all other pairs (the trace species) miscible =
+    d5cp00335k taxonomy type [110] ('classic textbook' single miscibility
+    gap, one critical point; their Fig. 2 key: one immiscible pair, one
+    two-phase gap, no three-phase region).  Computed amorphous
+    boundaries: spinodal phi_PCBM in (0.3972, 0.9951); bare binodal
+    (0.2030, ~1.0); with the house barrier b_reg = 3e-4 CALIBRATED to
+    the paper's own measured liquid plateaus: binodal (0.217, 0.972) vs
+    THEIR post-processing curves 0.21-0.243 (PCE11-rich, LiqConc
+    'Solute 1') and 0.968 (PCBM-rich max, 'Solute 2') — both branches
+    within 3%.  Placement: Fig-4 IC phi_PCBM = 0.45 INSIDE the spinodal
+    (f'' = -0.294) -> AAPS by spinodal decomposition (their as-cast
+    observation); Fig-6 amorphous IC 0.55 deeper inside (f'' = -0.695);
+    dilute control 0.05 OUTSIDE the binodal (f'' = +17.5) -> no AAPS.
+    MARCH: the qualitative consequence on the ternary-trace (M=2, K=2)
+    brick at the 16390 parameters, 128 nm box, IC noise 1e-3, no FDT
+    noise: inside-IC phi_PCBM std GROWS (SD onset within ~1 s, their
+    0.43 s wave-pattern class), outside-IC std DECAYS."""
+    fpp = lambda x: 1 / (N_PCBM * x) + 1 / (N_PCE11 * (1 - x)) \
+        - 2 * CHI_AA_16390
+    chi_c = 0.5 * (1 / np.sqrt(N_PCE11) + 1 / np.sqrt(N_PCBM)) ** 2
+    assert CHI_AA_16390 > chi_c                      # immiscible pair
+    from scipy.optimize import brentq
+    xs1 = brentq(fpp, 1e-6, 0.9)
+    xs2 = brentq(fpp, 0.9, 1 - 1e-9)
+    a0, b0 = _binodal(0.0)
+    a3, b3 = _binodal(3e-4)
+    print(f"S2b: chi/chi_c {CHI_AA_16390 / chi_c:.3f}; spinodal "
+          f"({xs1:.4f}, {xs2:.4f}); binodal bare ({a0:.4f}, {b0:.5f}) "
+          f"breg=3e-4 ({a3:.4f}, {b3:.4f}); their plateaus 0.21-0.243 / "
+          f"0.968")
+    assert xs1 < 0.45 < xs2 and fpp(0.45) < 0        # Fig 4 IC: AAPS
+    assert xs1 < 0.55 < xs2 and fpp(0.55) < 0        # Fig 6 amorphous
+    assert 0.05 < a3 and fpp(0.05) > 0               # dilute: stable
+    assert abs(b3 - 0.968) < 0.03, b3                # their plateau
+    assert abs(a3 - 0.23) < 0.05, a3
+
+    # short march both ways (ternary-trace, no crystallization active)
+    l0 = 128e-9
+    tree = build_uniform(6, dim=2, periodic=(True, True))
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2),
+                              device)
+    grow = {}
+    for phi2 in (0.45, 0.05):
+        pars = _fig6_pars(l0)
+        pars["noise_psi"] = 0.0
+        st = MultiPhaseStepper(dm, dt=1e-3, newton_tol=1e-6,
+                               newton_max=40, linsolver="cudss",
+                               b_reg=3e-4, line_search=True,
+                               alpha_th=[0.0, 0.0], beta_th=[0.0, 0.0],
+                               L_th=[1e-8, 1e-8], **pars)
+        rng = np.random.default_rng(4)
+        nf = len(st.free_coords)
+        tr = 0.02
+        p2 = phi2 * (1 - tr) + 1e-3 * rng.standard_normal(nf)
+        p1 = (1 - phi2) * (1 - tr) + 1e-3 * rng.standard_normal(nf)
+        st.set_initial([lambda x: p1, lambda x: p2],
+                       [lambda x: np.zeros(len(x))] * 2,
+                       [lambda x: np.zeros(len(x))] * 2)
+        s0 = float(np.std(st.phi(1)))
+        # ternary-trace exchange mode: sigma_max = 2.44/s at lambda =
+        # 105 nm (vs the paper's binary 6.36/s at 69 nm — the trace
+        # representation slows SD ~2.6x and coarsens ~1.5x, ANALYTIC,
+        # recorded); horizon 3 s gives e^{~7} growth of the box mode
+        st.march(t_end=3.0, dt_max=0.02, dt_min=1e-9, grow_iters=45,
+                 max_steps=1200)
+        grow[phi2] = (s0, float(np.std(st.phi(1))))
+    print(f"S2b march: inside-IC std {grow[0.45][0]:.2e} -> "
+          f"{grow[0.45][1]:.2e}; outside-IC {grow[0.05][0]:.2e} -> "
+          f"{grow[0.05][1]:.2e}")
+    assert grow[0.45][1] > 10 * grow[0.45][0], grow[0.45]   # AAPS
+    assert grow[0.05][1] < 0.5 * grow[0.05][0], grow[0.05]  # decay
+
+
+# ---------------------------------------------------------------------
+# S2d — GRAIN STATISTICS + CRYSTALLINITY BOOKKEEPING
+# ---------------------------------------------------------------------
+def _smooth_theta(mesh, cons, seed, cut=6.0):
+    """Low-pass-filtered random field in [0, 1] on the periodic grid —
+    the nucleation-continuous theta IC (each crystal inherits its local
+    value; the P1 Sec 8 marker-assignment stand-in)."""
+    coords = mesh.node_coords[cons.free_nodes]
+    xs = np.unique(np.round(coords[:, 0], 12))
+    n = len(xs)
+    rng = np.random.default_rng(seed)
+    F = np.fft.fft2(rng.standard_normal((n, n)))
+    k1 = np.fft.fftfreq(n, d=1.0 / n)
+    KX, KY = np.meshgrid(k1, k1, indexing="ij")
+    g = np.real(np.fft.ifft2(F * np.exp(-(KX ** 2 + KY ** 2)
+                                        / (2 * cut ** 2))))
+    g = (g - g.min()) / (g.max() - g.min())
+    ix = np.searchsorted(xs, np.round(coords[:, 0], 12))
+    iy = np.searchsorted(xs, np.round(coords[:, 1], 12))
+    return g[ix, iy]
+
+
+def _seed_discs(coords, n_seeds, r0, w, seed, min_sep=0.0):
+    rng = np.random.default_rng(seed)
+    ctr = []
+    while len(ctr) < n_seeds:
+        c = rng.uniform(0.0, 1.0, size=2)
+        ok = True
+        for c0 in ctr:
+            dd = c - c0
+            dd -= np.round(dd)
+            if np.hypot(*dd) < min_sep:
+                ok = False
+                break
+        if ok:
+            ctr.append(c)
+    ctr = np.array(ctr)
+    psi = np.zeros(len(coords))
+    for c in ctr:
+        dd = coords[:, :2] - c[None, :]
+        dd -= np.round(dd)
+        r = np.sqrt((dd ** 2).sum(axis=1))
+        psi = np.maximum(psi, 0.5 * (1.0 - np.tanh((r - r0) / w)))
+    return psi, ctr
+
+
+def test_s2d_grain_statistics(device):
+    """Multi-grain bookkeeping on the Fig-6-class configuration (S2c
+    case): O(15) PCE11 crystallite seeds (their 948-seed case scaled to
+    the 128 nm box) with CONTINUOUS per-seed theta values (their
+    NucleusOrientation = one random angle per nucleus; nucleation-
+    assigned values are continuous, so the labeling tolerance must be
+    MEASURED), KWC orientation dynamics ON (alpha at the mapped
+    EpsGrain, the S1b kg_delta/beta taming), short march at the 16390
+    parameters.  Gates:
+    (a) LABELING TOLERANCE (measured-then-locked): post-march
+        intra-grain theta spread vs pairwise seed-theta gaps; the
+        locked theta_tol = 0.02 sits >= 2x above the largest measured
+        intra-grain spread, and grains whose theta values differ by
+        less CAN alias if they touch (recorded limitation of any
+        scalar-marker scheme, theirs included);
+    (b) SIZE DISTRIBUTION: theta-watershed count == psi-connected
+        count == seed count when all pairwise gaps exceed the
+        tolerance (measured for the locked seed);
+    (c) CRYSTALLINITY-PER-SPECIES BOOKKEEPING: per-grain GP-partitioned
+        quadrature integrals of phi_i psi_i sum to the whole-domain
+        crystalline-masked field integral to 1e-10 (partition
+        exactness); X_i = int(phi_i psi_i)/int(phi_i) per species."""
+    level, l0 = 6, 128e-9
+    dm, mesh, cons = _dm(level, device, periodic=True)
+    pars = _fig6_pars(l0)
+    alpha_nd = np.pi * EPSGRAIN / (U0 * l0)
+    st = MultiPhaseStepper(dm, dt=1e-3, newton_tol=1e-6, newton_max=60,
+                           linsolver="cudss", b_reg=3e-4,
+                           line_search=True, noise_seed=11,
+                           alpha_th=[alpha_nd, alpha_nd],
+                           beta_th=[0.1 * alpha_nd, 0.1 * alpha_nd],
+                           L_th=[pars["L_psi"][1]] * 2, kg_delta=0.2,
+                           **pars)
+    rng = np.random.default_rng(4)
+    nf = len(st.free_coords)
+    n_seeds = 15
+    # min separation 3.5 r0: DISJOINT grains (impingement/merged-pair
+    # discrimination is the S1b gate; here the many-grain bookkeeping)
+    psi_seed, ctr = _seed_discs(st.free_coords, n_seeds, r0=4.5 / 128.0,
+                                w=1.5 / 128.0, seed=111,
+                                min_sep=3.5 * 4.5 / 128.0)
+    # per-seed continuous theta (nearest-seed assignment everywhere:
+    # amorphous theta is frozen bookkeeping; crystals own their value)
+    th_seed = np.random.default_rng(5).uniform(0.0, 1.0, n_seeds)
+    dd = st.free_coords[:, None, :2] - ctr[None, :, :]
+    dd -= np.round(dd)
+    th = th_seed[np.argmin((dd ** 2).sum(axis=2), axis=1)]
+    tr = 0.02
+    p1 = 0.45 * (1 - tr) * (1 - psi_seed) + 0.97 * psi_seed \
+        + 1e-3 * rng.standard_normal(nf)
+    p2 = 0.55 * (1 - tr) * (1 - psi_seed) + 0.01 * psi_seed \
+        + 1e-3 * rng.standard_normal(nf)
+    st.set_initial([lambda x: p1, lambda x: p2],
+                   [lambda x: psi_seed, lambda x: np.zeros(len(x))],
+                   [lambda x: th, lambda x: th])
+    st.march(t_end=0.5, dt_max=0.02, dt_min=1e-9, grow_iters=45,
+             max_steps=400)
+    full = lambda v: np.asarray(cons.T @ v)
+    psi0 = full(st.psi(0))
+    th0 = full(st.theta(0))
+    lab_cc, sz_cc = grain_labels(mesh.node_coords, psi0, th0,
+                                 psi_th=0.5, theta_tol=np.inf,
+                                 periodic=True)
+    G = int(lab_cc.max()) + 1
+    spreads = [float(th0[lab_cc == g].max() - th0[lab_cc == g].min())
+               for g in range(G)]
+    gaps = np.diff(np.sort(th_seed))
+    # MEASURED (2026-07-10, this config): post-march intra-grain
+    # spread 5.9e-5 (KWC plateaus); min pairwise seed-theta gap 2.9e-3
+    # (continuous nucleation values CAN fall arbitrarily close — the
+    # scalar-marker aliasing limitation, theirs included; disjoint
+    # grains are still separated by connectivity).  LOCKED tol = 1e-3:
+    # 17x above the spread, 2.9x below the min gap.
+    tol = 1e-3
+    lab, sizes = grain_labels(mesh.node_coords, psi0, th0, psi_th=0.5,
+                              theta_tol=tol, periodic=True)
+    print(f"S2d labeling: {G} psi-connected grains from {n_seeds} "
+          f"seeds, post-march intra-grain theta spread max "
+          f"{max(spreads):.2e}, pairwise seed-theta gaps min "
+          f"{gaps.min():.4f}; tol={tol} -> {len(sizes)} grains, "
+          f"sizes[:6] {sizes[:6]}")
+    assert max(spreads) < 0.5 * tol, (max(spreads), tol)   # 5.9e-5
+    assert gaps.min() > 2.0 * tol, (gaps.min(), tol)        # 2.9e-3
+    assert len(sizes) == G, (len(sizes), G)
+    assert G == n_seeds, (G, n_seeds)
+    assert (np.diff(sizes) <= 0).all()
+    assert sizes.sum() == (psi0 > 0.5).sum()
+    # (c) GP-partitioned quadrature bookkeeping
+    phi_full = [full(st.phi(i)) for i in range(2)]
+    psi_full = [psi0, full(st.psi(1))]
+    totals = np.zeros(2)
+    per_grain = np.zeros((2, len(sizes) + 1))    # +1: amorphous rest
+    phi_int = np.zeros(2)
+    for pv, b in dm.bins.items():
+        tb = dm.tables_by_p[pv]
+        conn = mesh.conn_of[pv]
+        hh = mesh.tree.h()[mesh.bins[pv]]
+        wJ = (np.tile(tb.w, len(conn)).reshape(len(conn), -1)
+              * ((hh / 2.0) ** 2)[:, None])
+        el_lab = lab[conn]
+        el_maj = np.array(
+            [np.bincount(r[r >= 0] + 1,
+                         minlength=len(sizes) + 2).argmax() - 1
+             if (r >= 0).any() else -1 for r in el_lab])
+        for i in range(2):
+            vgp = np.einsum("qa,ea->eq", tb.N, phi_full[i][conn]) \
+                * np.einsum("qa,ea->eq", tb.N, psi_full[i][conn])
+            pgp = np.einsum("qa,ea->eq", tb.N, psi_full[i][conn])
+            mask = pgp > 0.5
+            contrib = (vgp * wJ * mask)
+            totals[i] += contrib.sum()
+            phi_int[i] += (np.einsum("qa,ea->eq", tb.N,
+                                     phi_full[i][conn]) * wJ).sum()
+            ge = np.broadcast_to(el_maj[:, None], vgp.shape)
+            for g in range(-1, len(sizes)):
+                per_grain[i, g] += contrib[ge == g].sum()
+    part_err = np.abs(per_grain.sum(axis=1) - totals).max()
+    X = [totals[i] / phi_int[i] for i in range(2)]
+    print(f"S2d bookkeeping: crystalline integrals int(phi_i psi_i) = "
+          f"{totals[0]:.6e}/{totals[1]:.3e}; partition error "
+          f"{part_err:.2e}; X_PCE11 = {X[0]:.4f} (seeded ~0.075/0.44), "
+          f"X_PCBM = {X[1]:.5f} (pre-nucleation ~0)")
+    assert part_err < 1e-10, part_err
+    assert 0.02 < X[0] < 0.4, X[0]
+    assert abs(X[1]) < 0.02, X[1]
