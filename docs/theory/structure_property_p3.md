@@ -2,8 +2,9 @@
 
 Planning memo (2026-07-11). Source: previous_codes/excitonic_drift_
 diffusion (Dendrite-KT CEquation app; Balaji/Nirmal/Dhruv framework
-paper + 7 more in MyPapers/OSC/StructureProperty/). The port completes
-OrgElMorph's promise: process -> structure -> PROPERTY, differentiable.
+paper + 7 more in MyPapers/OSC/StructureProperty/). Baskar's ruling: DISTINCT process-structure and structure-property
+simulators; linkage (the differentiable process->structure->property
+chain) is a separate later phase.
 
 ## Physics inventory (from the source headers, 299 lines total)
 
@@ -22,17 +23,22 @@ port onto that machinery.
    Newton; VMS scalar stabilization at drift-dominated regimes) +
    exciton brick (x_d, x_a) + the closures module (their
    material_parameters API transcribed; dimensional -> nondim layer).
-2. MORPHOLOGY ADAPTER — the flagship piece: consume the LIVE phase
-   field (phi_p threshold -> morph; distance-to-interface from the
-   phi=1/2 level set via our closest-point machinery) instead of
-   their (x,y,z,morph,dist) file. File-based mode kept for validation
-   against their test cases (bilayer tests ship in their repo).
+2. STANDALONE BY DESIGN (Baskar ruling 2026-07-11): the
+   structure-property simulator is a DISTINCT tool, not coupled into
+   the film pipeline. Input contract = morphology files: their
+   (x,y,z,morph,dist) format PLUS a reader for DiffSim film-output
+   npz (offline handoff) PLUS experimental voxel data (TEM/tomography)
+   — the same simulator serves simulated AND measured morphologies.
+   The live in-memory adapter and the end-to-end differentiable
+   d(Jsc)/d(processing) chain are the FUTURE LINKAGE PHASE, planned
+   only after both simulators stand on their own gates.
 3. Gates: (i) their 2-D/3-D bilayer test cases — J-V parity vs the
    CPU code outputs; (ii) MMS on the coupled DD system; (iii) the
    Kodali-2012 class morphology studies (papers in StructureProperty);
-   (iv) end-to-end: a Wodo/M5 morphology -> Jsc, with d(Jsc)/d(chi,
-   Bi, ...) adjoint gradients as the differentiable-pipeline demo —
-   the Gu-2017 Jsc-vs-domain-size trend as the physics sanity anchor.
+   (iv) an M5 film-output npz -> Jsc through the OFFLINE handoff,
+   with the Gu-2017 Jsc-vs-domain-size trend as the physics sanity
+   anchor (adjoint d(Jsc)/d(morphology-params) stays WITHIN the
+   property simulator; cross-simulator gradients = linkage phase).
 4. Estimated 4-6 agent-days after M5 S3/S4; C++ -> brick transcription
    is the designed use of the Integrands API (zero-relearning promise).
 
