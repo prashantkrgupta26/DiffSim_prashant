@@ -47,3 +47,45 @@ port onto that machinery.
 After M5 S4 (or interleaved when GPUs idle): port + file-mode parity
 gates -> morphology adapter -> differentiable Jsc demo. Feeds the
 flagship paper (process->structure->property gradients).
+
+## SP-2 — Conjugate ionic-electronic transport (bioelectronics/OMIEC)
+
+Added by Baskar's ruling 2026-07-11. Spec: MyPapers/OSC/StructureProperty/
+bioelectronic_device_models.pdf ("Morphology-Aware Bioelectronic Device
+Modeling" — a complete, verification-first framework document). The
+Structure-Property milestone is therefore a TWO-SIMULATOR family:
+
+  SP-1: excitonic drift-diffusion (OPV; the CPU-code port; J-V/Jsc).
+  SP-2: conjugate ionic-electronic (OMIEC/OECT; NEW build to the spec):
+    two-domain Omega_e (electrolyte PNP, Eqs. 16-17) + Omega_p (polymer:
+    ion PNP + hole drift-diffusion + Poisson with fixed charge, Eqs.
+    18-20), interface menu at Gamma_pe (potential/flux continuity;
+    optional partitioning K_s, Donnan, Stern C_S closures), electrode BC
+    menu (Dirichlet/blocking/reservoir/Butler-Volmer). FROZEN morphology
+    contract (swelling/poro-mechanics = recorded future extension).
+
+  CANONICAL GATE: the spec's OECT 2-D cross-section benchmark — its own
+  six-rung verification ladder (1-D reduction -> electrolyte-only PNP ->
+  homogeneous-polymer OECT -> morphology-sweep monotonicity -> mesh/time
+  convergence of I_D(t) and front position -> interface-closure limits).
+  QoIs: I_D transfer/output/transients, doping-front tracking, the
+  speed-gain trade-off vs the four morphology knobs (ion-path
+  percolation, correlation length, anisotropy, Gamma_pe roughness).
+
+  SHARED INFRASTRUCTURE with SP-1 (build once): the morphology input
+  contract (the spec's m(x) indicator == SP-1's morph field; same
+  file/npz/voxel readers), VMS transport bricks, consistent-flux current
+  extraction (I_D exactly as Jsc), electrode BC menu, octree adaptivity
+  at doping fronts and Gamma_pe (the Debye-ratio lambda_D/L smallness is
+  where adaptivity pays).
+
+  DiffSim synergies: PNP is the recorded DendrIon-heritage roadmap item
+  landing here; the stiff Poisson-PNP-DD coupling is a blockch-class
+  preconditioning candidate (recorded, not assumed); the nondimensional
+  groups (beta, lambda_D/L, transport contrasts, chi_fixed) drive the
+  RunLog preflight rules for SP-2.
+
+  Sequencing: SP-1 port first (validation targets exist as shipped test
+  cases), SP-2 build second on the shared infrastructure; both distinct
+  from the process-structure simulator per the standing ruling; linkage
+  phase unchanged.
