@@ -1123,6 +1123,15 @@ class MultiPhaseStepper:
                 # plan on any nnz change instead of failing the attempt.
                 if self._cudss is not None and \
                         getattr(self, "_cudss_nnz", -1) != A.nnz:
+                    # EXPLICITLY release the old plan: leaving it to the
+                    # GC finalizer double-frees device buffers under
+                    # nnz-flapping noise runs (measured 2026-07-10:
+                    # intermittent CUDA 700 + glibc free() corruption in
+                    # the S2c calibration marches)
+                    try:
+                        self._cudss.free()
+                    except Exception:
+                        pass
                     self._cudss = None
                 if self._cudss is None:
                     self._cudss = DirectSolver(
@@ -1134,6 +1143,10 @@ class MultiPhaseStepper:
                 self._cudss.factorize()
                 return np.asarray(self._cudss.solve())
             except Exception:
+                try:
+                    self._cudss.free()
+                except Exception:
+                    pass
                 self._cudss = None
                 return np.full(A.shape[0], np.nan)
         from scipy.sparse.linalg import splu
