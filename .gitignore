@@ -32,3 +32,6 @@ docs/site_src/
 papers/
 paper-outlines-*.tar.gz
 benchmarks/data/negi2018/
+
+# --- private review material (never push) ---
+CriticalEvaluations/
