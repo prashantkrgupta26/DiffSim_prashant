@@ -318,10 +318,20 @@ def np_potentials(phis, psis, pars):
 # kernel factory
 # ---------------------------------------------------------------------
 def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
-                    bulk: str = "p1", mob: str = "const"):
+                    bulk: str = "p1", mob: str = "const",
+                    theta: str = "kwc"):
     """Monolithic Newton kernel for the 2M+2K node-major system.
-    (M, K, bulk, mob) compile-time; see module docstring for the forms."""
-    key = ("mpf_newton", nbf, nqp, dim, M, K, bulk, mob)
+    (M, K, bulk, mob, theta) compile-time; see module docstring.
+    theta="frozen" replaces the KWC theta rows by the EXACT bookkeeping
+    identity theta = theta_old (mass-matrix row) — the anchor's marker
+    semantics, and the well-posed form of the alpha = beta = 0 limit:
+    the degenerate KWC row (diag ~ p_floor sigma NN ~ 1e-9 with
+    roundoff coupling entries) makes the direct solve return garbage
+    theta increments (MEASURED 2026-07-11: |dx_theta| 4.9e13 at
+    |r_theta| 1e-19, dt-INDEPENDENT — the divergence guard then
+    underflows the ladder; whether the garbage crosses the 1e6 guard
+    is an assembly-atomics coin flip, the house FP-fate lesson)."""
+    key = ("mpf_newton", nbf, nqp, dim, M, K, bulk, mob, theta)
     if key in _kernel_cache:
         return _kernel_cache[key]
     assert bulk in ("p1", "r14"), bulk
@@ -329,6 +339,8 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
     if mob == "fastmode":
         assert M == 1, "fastmode Onsager closure: M = 1 only " \
             "(fastmode_n is the generic-M mode)"
+    assert theta in ("kwc", "frozen"), theta
+    TH_FROZEN = theta == "frozen"
     dim_pow = float(dim)
     Kp = max(K, 1)
     ndof = 2 * M + 2 * K
@@ -805,10 +817,15 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                                  - src[gp, rp])
                            + Lpsi[k] * eps2[k] * gpsi[k]) * dJxW
                     pk = porv[k] + pfloor
-                    r_t = (Na * (pk * (sigma * vals[gp, rp + 1]
-                                       - hist[gp, rp + 1])
-                                 - src[gp, rp + 1])
-                           + pk * ceff[k] * gth[k]) * dJxW
+                    if wp.static(TH_FROZEN):
+                        r_t = (Na * (sigma * vals[gp, rp + 1]
+                                     - hist[gp, rp + 1]
+                                     - src[gp, rp + 1])) * dJxW
+                    else:
+                        r_t = (Na * (pk * (sigma * vals[gp, rp + 1]
+                                           - hist[gp, rp + 1])
+                                     - src[gp, rp + 1])
+                               + pk * ceff[k] * gth[k]) * dJxW
                     wp.atomic_add(be, e, ndof * a + rp, -r_s)
                     wp.atomic_add(be, e, ndof * a + rp + 1, -r_t)
                 # Jacobian blocks
@@ -888,15 +905,19 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                         # frozen-|g| sense; see docstring)
                         rt = rs + 1
                         pk = porv[k] + pfloor
-                        wp.atomic_add(Ae, e, rt, ndof * b + rp + 1,
-                                      pk * sigma * NN
-                                      + pk * ceff[k] * lapw)
-                        wp.atomic_add(
-                            Ae, e, rt, ndof * b + rp,
-                            porp[k] * Nb
-                            * (Na * (sigma * vals[gp, rp + 1]
-                                     - hist[gp, rp + 1])
-                               + ceff[k] * gth[k]) * dJxW)
+                        if wp.static(TH_FROZEN):
+                            wp.atomic_add(Ae, e, rt, ndof * b + rp + 1,
+                                          sigma * NN)
+                        else:
+                            wp.atomic_add(Ae, e, rt, ndof * b + rp + 1,
+                                          pk * sigma * NN
+                                          + pk * ceff[k] * lapw)
+                            wp.atomic_add(
+                                Ae, e, rt, ndof * b + rp,
+                                porp[k] * Nb
+                                * (Na * (sigma * vals[gp, rp + 1]
+                                         - hist[gp, rp + 1])
+                                   + ceff[k] * gth[k]) * dJxW)
 
     _kernel_cache[key] = mpf_k
     return mpf_k
@@ -961,6 +982,11 @@ class MultiPhaseStepper:
         self.alpha_th = pad(alpha_th, 0.0)
         self.beta_th = pad(beta_th, 0.0)
         self.L_th = pad(L_th, 1.0)
+        # KWC coefficients all zero => the theta rows are pure
+        # bookkeeping: compile the EXACT frozen form (factory docstring;
+        # the degenerate-KWC garbage-dx finding, 2026-07-11)
+        self.theta_mode = "frozen" if (self.alpha_th == 0.0).all() \
+            and (self.beta_th == 0.0).all() else "kwc"
         self.T, self.T_fn = float(T), T_fn
         self.bulk, self.mob = bulk, mob
         assert bulk in ("p1", "r14")
@@ -1223,7 +1249,8 @@ class MultiPhaseStepper:
                 be = wp.zeros((ne, nd * nbf), dtype=wp.float64,
                               device=d)
                 kk = make_mpf_newton(nbf, nqp, self.dm.dim, self.M,
-                                     self.K, self.bulk, self.mob)
+                                     self.K, self.bulk, self.mob,
+                                     self.theta_mode)
                 p = self._par
                 wp.launch(kk, dim=ne, inputs=[
                     b["conn"], b["h"], b["N"], b["dN"], b["w"],
@@ -1271,7 +1298,23 @@ class MultiPhaseStepper:
         A, r = assemble(x)
         for it in range(self.newton_max):
             dx = self._solve(A, r)
-            if not np.isfinite(dx).all() or np.abs(dx).max() > 1e6:
+            if not np.isfinite(dx).all():
+                return None, it + 1, False               # diverged
+            if self.line_search:
+                # globalized path: NEVER abort on a finite oversized
+                # direction — near-degenerate blocks (an inert
+                # crystallinity/orientation row whose residual is
+                # roundoff-zero) yield garbage-SCALED directions
+                # (measured 2026-07-11: |dx| = 4.9e13 at |r| = 1e-19,
+                # dt-INDEPENDENT; the hard 1e6 guard then underflowed
+                # the ladder).  Rescale to the trust size and let the
+                # backtracking judge; a zero-residual state then
+                # correctly CONVERGES on the applied-increment
+                # criterion instead of dying.
+                mx = np.abs(dx).max()
+                if mx > 2.0:
+                    dx = dx * (2.0 / mx)
+            elif np.abs(dx).max() > 1e6:
                 return None, it + 1, False               # diverged
             if self.guards:
                 # trust clamp on the physical (phi, psi) increments
