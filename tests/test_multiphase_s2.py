@@ -743,16 +743,28 @@ def test_s2d_grain_statistics(device):
 
 
 # ---------------------------------------------------------------------
-# S2c — THE INTERPLAY REPLICATION (in-suite anchors + campaign verdicts)
+# S2c — THE INTERPLAY REPLICATION
 # ---------------------------------------------------------------------
-def _run_case(device, level, l0, mpsi, seed, t1, tend, dtmax2,
-              noise=True, record_every=5):
-    """Fig-4-class march (binary M=1, K=1, PCBM crystallizing) at the
-    16390 deck parameters; returns the (t, X_mat, crich_int, cpoor,
-    ncr, ndrop) record list.  crich_int = interior purity (90th pct of
-    phi over amorphous PCBM-rich nodes) — the interface-diluted mean
-    under-reads small droplets."""
-    dm, mesh, cons = _dm(level, device, periodic=True)
+# VERDICT DISCIPLINE (the Negi/S1c template).  Their STOCHASTIC
+# nucleation onsets are budget-unreachable at fidelity:
+# wall-to-first-nucleus ~ (T_onset/dt) x nodes with T_onset ~ 1/area
+# gives wall ~ 1/(dt dx^2) INDEPENDENT of domain size; their onsets
+# (54.5 s NDL at dt cap 0.0304 s; 3.4 s DL at 3.04e-4 s) cost
+# 1e4-5e4 implicit steps of a 4M-dof system x 20 runs (cluster
+# budgets).  Measured suppressed-run bounds: L6/128 nm NDL no
+# nucleation to t = 266 s (dt_max 0.5); DL no nucleation to t = 7
+# (dt 0.05) / t = 4 (their-cap-class dt 5e-3).  ONSET NUMBERS: not
+# reproduced at our budget (mechanism-consistent suppression:
+# rate x area x dt-resolution; the noise MACHINERY itself is gated
+# quantitatively in S2a3 + the S1c FDT statistics gate).
+# The in-suite gates below anchor the DETERMINISTIC phenomenology —
+# which is exactly the paper's mechanistic claims list (their Sec 5
+# conclusions 1-4): AAPS-first ordering, binodal purities, growth-
+# dominated vs diffusion-limited contrast, crystallite quench of
+# coarsening, PCE11 dissolution at PCBM growth fronts.
+
+
+def _mk_fig4_stepper(dm, mesh, cons, l0, mpsi, noise, seed=11):
     pars = _fig4_pars(l0, mpsi=mpsi)
     st = MultiPhaseStepper(dm, dt=1e-3, newton_tol=1e-6, newton_max=60,
                            linsolver="cudss", noise_seed=seed,
@@ -760,91 +772,243 @@ def _run_case(device, level, l0, mpsi, seed, t1, tend, dtmax2,
                            alpha_th=[0.0], beta_th=[0.0],
                            L_th=[pars["L_psi"][0]], kg_delta=0.2,
                            **pars)
-    rng = np.random.default_rng(4)
-    phi0 = 0.45 + 1e-3 * rng.standard_normal(len(st.free_coords))
-    th0 = _smooth_theta(mesh, cons, seed=7)
-    st.set_initial([lambda x: phi0], [lambda x: np.zeros(len(x))],
-                   [lambda x: th0])
     if not noise:
         st.noise_psi = 0.0
+    rng = np.random.default_rng(4)
+    phi0 = 0.45 + 1e-3 * rng.standard_normal(len(st.free_coords))
+    st.set_initial([lambda x: phi0], [lambda x: np.zeros(len(x))],
+                   [lambda x: _smooth_theta(mesh, cons, 7)])
+    return st
+
+
+def _fig4_metrics(st, cons, mesh, i=0):
     full = lambda v: np.asarray(cons.T @ v)
-    rec, cnt = [], [0]
+    phi = full(st.phi(i))
+    psi = full(st.psi(i))
+    Xm = float((phi * psi).mean() / phi.mean())
+    am = psi < 0.5
+    rich = phi > 0.5
+    cri = float(np.percentile(phi[am & rich], 90)) \
+        if (am & rich).any() else np.nan
+    cpo = float(phi[am & ~rich].mean()) if (am & ~rich).any() else np.nan
+    _, sz = grain_labels(mesh.node_coords, psi, np.zeros(len(psi)),
+                         psi_th=0.5, theta_tol=np.inf, periodic=True)
+    ncr = int((sz >= 8).sum())
+    _, dsz = grain_labels(mesh.node_coords,
+                          ((phi > 0.5) & am).astype(float),
+                          np.zeros(len(phi)), psi_th=0.5,
+                          theta_tol=np.inf, periodic=True)
+    return Xm, cri, cpo, ncr, int((dsz >= 8).sum())
+
+
+def test_s2c_order_aaps_first(device):
+    """WHICH PROCESS INITIATES FIRST (their pathway steps 1-3 +
+    conclusion 2): at the Fig-4 deck parameters with FDT noise at
+    their sigma_AC = 1, AAPS develops within a second (their wave
+    pattern at 0.43 s; measured droplet pattern by t = 0.5) and both
+    amorphous phases purify to the binodal plateaus, while NO
+    crystallization occurs on the 60 s horizon (their large-box onset
+    50-55 s; suppressed here — bound recorded above).  Purity targets:
+    their PCBM-rich plateau 0.968, PCE11-rich 0.21-0.243 (their own
+    LiqConc curves).  MEASURED (locks with >= 2x-class headroom in
+    parens): see print."""
+    dm, mesh, cons = _dm(6, device, periodic=True)
+    st = _mk_fig4_stepper(dm, mesh, cons, 128e-9, 0.1, noise=True)
+    rec = []
 
     def cb(s, dt, iters):
-        cnt[0] += 1
-        if cnt[0] % record_every:
-            return
-        phi = full(s.phi(0))
-        psi = full(s.psi(0))
-        Xm = float((phi * psi).mean() / phi.mean())
-        am = psi < 0.5
-        rich = phi > 0.5
-        cri = float(np.percentile(phi[am & rich], 90)) \
-            if (am & rich).any() else np.nan
-        cpo = float(phi[am & ~rich].mean()) if (am & ~rich).any() \
-            else np.nan
-        _, sizes = grain_labels(mesh.node_coords, psi,
-                                np.zeros(len(psi)), psi_th=0.5,
-                                theta_tol=np.inf, periodic=True)
-        ncr = int((sizes >= 8).sum())
-        ndrop = 0
-        if ncr == 0:
-            _, dsz = grain_labels(mesh.node_coords,
-                                  (phi > 0.5).astype(float),
-                                  np.zeros(len(phi)), psi_th=0.5,
-                                  theta_tol=np.inf, periodic=True)
-            ndrop = int((dsz >= 8).sum())
-        rec.append((s.t, Xm, cri, cpo, ncr, ndrop))
-    r1 = st.march(t_end=t1, dt_max=0.02, callback=cb, dt_min=1e-9,
+        if len(rec) == 0 or s.t - rec[-1][0] > 0.4:
+            rec.append((s.t,) + _fig4_metrics(s, cons, mesh))
+    r1 = st.march(t_end=3.0, dt_max=0.02, callback=cb, dt_min=1e-9,
                   grow_iters=45, max_steps=3000)
-    r2 = st.march(t_end=tend, dt_max=dtmax2, callback=cb, dt_min=1e-9,
-                  grow_iters=45, max_steps=8000)
+    r2 = st.march(t_end=60.0, dt_max=0.1, callback=cb, dt_min=1e-9,
+                  grow_iters=45, max_steps=3000)
     assert r1 == "t_end" and r2 == "t_end", (r1, r2)
-    return np.array(rec)
+    r = np.array(rec)
+    nd05 = int(r[np.argmax(r[:, 0] >= 0.5), 5])
+    tail = r[r[:, 0] > 20.0]
+    pur = float(np.nanmean(tail[:, 2]))
+    cpo = float(np.nanmean(tail[:, 3]))
+    print(f"S2c order: droplets(0.5 s) = {nd05}, purity90(t>20) = "
+          f"{pur:.3f} (theirs 0.968), cpoor = {cpo:.3f} (theirs "
+          f"0.21-0.243), X_max = {r[:, 1].max():.4f}, ncr_max = "
+          f"{int(r[:, 4].max())}")
+    # MEASURED (2026-07-10 calibration, this config): droplets(0.5 s)
+    # = 4; purity90 = 0.973 (theirs 0.968 — 0.5%); cpoor = 0.246
+    # (theirs 0.243 — 1.2%); X_max = 0.019 noise band; ncr_max = 0.
+    assert nd05 >= 2, nd05                      # measured 4
+    assert pur > 0.93, pur                      # measured 0.973
+    assert 0.17 < cpo < 0.31, cpo               # measured 0.246
+    assert r[:, 1].max() < 0.05 and int(r[:, 4].max()) == 0
 
 
-def test_s2c_interplay_order_and_dl_contrast(device):
-    """THE IN-SUITE INTERPLAY GATE (128 nm box, dx = 2 nm; the 256 nm
-    campaign verdicts live in the module docstring + the S2 ledger
-    docs/dev/2026-07-10-m5-s2-16390-replication.md).  Two marches at
-    the paper's exact deck parameters, seed 11:
-    (i)  NDL (their Fig-4/SI-7 M_psi = 0.1) to t = 60 s: AAPS
-         INITIATES FIRST — droplet pattern within ~0.5 s (their wave
-         pattern at 0.43 s; measured droplets >= 3 by t = 0.5), both
-         phases purify to the binodal plateaus (measured interior
-         purity and PCE11-rich-phase composition vs their 0.968 /
-         0.21-0.243), and NO crystallization on the whole horizon
-         (their onset in large boxes 50.3-54.5 s; the 128 nm box
-         SUPPRESSES nucleation — measured no-nucleation to 266 s in
-         the calibration run: finite-size gap, mechanism recorded).
-    (ii) DL (their SI-7 M_psi = 10) same horizon: crystallization DOES
-         occur (measured onset in the print), i.e. the DL/NDL onset
-         ORDERING and a >= [measured] onset-ratio bound replicate
-         their 3.4 s vs 50.3 s (14.8x) contrast INTENSIVELY even at
-         the reduced domain."""
-    ndl = _run_case(device, 6, 128e-9, 0.1, 11, t1=3.0, tend=60.0,
-                    dtmax2=0.5)
-    dl = _run_case(device, 6, 128e-9, 10.0, 11, t1=3.0, tend=60.0,
-                   dtmax2=0.05)
-    t_dl = dl[np.argmax(dl[:, 4] >= 1), 0] if (dl[:, 4] >= 1).any() \
-        else np.inf
-    i5 = np.argmax(ndl[:, 0] >= 5.0)
-    tail = ndl[ndl[:, 0] > 20.0]
-    print(f"S2c order/DL: NDL droplets at t=0.5 "
-          f"{int(ndl[np.argmax(ndl[:, 0] >= 0.5), 5])}, purity "
-          f"plateaus (t>20) crich_int {np.nanmean(tail[:, 2]):.3f} "
-          f"cpoor {np.nanmean(tail[:, 3]):.3f} (theirs 0.968/0.21-0.24), "
-          f"X_max {ndl[:, 1].max():.4f}, ncr_max {int(ndl[:, 4].max())}; "
-          f"DL first crystal t = {t_dl:.1f} s, X_end {dl[-1, 1]:.3f}, "
-          f"ncr_end {int(dl[-1, 4])}")
-    # (i) AAPS first, no crystallization in NDL on this box/horizon
-    assert int(ndl[np.argmax(ndl[:, 0] >= 0.5), 5]) >= 3
-    assert np.nanmean(tail[:, 2]) > 0.90, np.nanmean(tail[:, 2])
-    assert 0.17 < np.nanmean(tail[:, 3]) < 0.30, np.nanmean(tail[:, 3])
-    assert ndl[:, 1].max() < 0.05 and int(ndl[:, 4].max()) == 0
-    # (ii) DL crystallizes on the same horizon => ordering + ratio
-    assert np.isfinite(t_dl), "DL case did not nucleate by 60 s"
-    assert dl[-1, 1] > 0.3, dl[-1, 1]
+def test_s2c_growth_mode_contrast(device):
+    """GROWTH-DOMINATED vs DIFFUSION-LIMITED (their conclusions 3-4 +
+    SI-7): deterministic seeded-growth contrast at the deck M_psi pair
+    (0.1 vs 10, their NDL/DL).  A noise-free march to t = 5 forms the
+    purified droplet pattern; ONE PCBM nucleus (8 nm) is implanted at
+    the largest droplet's centroid; both mobilities run the same
+    +12 s.  Their measured contrast at 512 nm: full-domain
+    crystallization t50 100.9 s (NDL) vs 5.8 s (DL) = 17.4x; DL leaves
+    the PCBM-rich liquid depleted (their stuck 0.24 plateau) while NDL
+    consumes it near-pure (0.946-0.968).  MEASURED here: see print."""
+    dm, mesh, cons = _dm(6, device, periodic=True)
+    base = _mk_fig4_stepper(dm, mesh, cons, 128e-9, 0.1, noise=False)
+    rb = base.march(t_end=5.0, dt_max=0.05, dt_min=1e-9, grow_iters=45,
+                    max_steps=3000)
+    assert rb == "t_end", rb
+    xb = base.x.copy()
+    full = lambda v: np.asarray(cons.T @ v)
+    phi = base.phi(0)
+    lab, _ = grain_labels(mesh.node_coords,
+                          full((phi > 0.5).astype(float)),
+                          np.zeros(dm.n_nodes), psi_th=0.5,
+                          theta_tol=np.inf, periodic=True)
+    m = lab[cons.free_nodes] == 0
+    pts = base.free_coords[m][:, :2]
+    d = pts - pts[0]
+    d -= np.round(d)
+    ctr = (pts[0] + d.mean(axis=0)) % 1.0
+    res = {}
+    for mpsi in (0.1, 10.0):
+        st = _mk_fig4_stepper(dm, mesh, cons, 128e-9, mpsi, noise=False)
+        st.x = xb.copy()
+        dd = st.free_coords[:, :2] - ctr[None, :]
+        dd -= np.round(dd)
+        rr = np.sqrt((dd ** 2).sum(axis=1))
+        disc = 0.5 * (1.0 - np.tanh((rr - 8.0 / 128.0) / (2.0 / 128.0)))
+        st.x[2::st.ndof] = np.maximum(st.x[2::st.ndof], disc)
+        st.hist = st.x.copy()
+        st.t, st.dt = 5.0, 1e-3
+        rm = st.march(t_end=17.0, dt_max=0.05, dt_min=1e-9,
+                      grow_iters=45, max_steps=3500)
+        assert rm == "t_end", rm
+        res[mpsi] = _fig4_metrics(st, cons, mesh)
+    Xn, Xd = res[0.1][0], res[10.0][0]
+    print(f"S2c growth contrast (+12 s from one seed): X_NDL = {Xn:.4f} "
+          f"vs X_DL = {Xd:.4f} (ratio {Xd / max(Xn, 1e-9):.1f}x; their "
+          f"whole-domain t50 ratio 17.4x); DL purity90 "
+          f"{res[10.0][1]:.3f} vs NDL {res[0.1][1]:.3f}")
+    # MEASURED (calibration): X_DL = 0.9586 already at +3 s (their
+    # plateau 96.1% of material!), X_NDL = 0.0319 at +12 s; ratio 30x.
+    # The DL depletion-zone liquid signature (their stuck 0.24) does
+    # NOT manifest at single-crystal/128 nm scale — multi-crystal
+    # competition is its mechanism; recorded as a domain-size gap.
+    assert Xd > 0.5, Xd                         # measured 0.9586
+    assert Xd / max(Xn, 1e-9) > 8.0, (Xn, Xd)   # measured 30x
+
+
+def _iface_density(mesh, rich):
+    """Rich-phase boundary edges / rich nodes (4-conn periodic grid)."""
+    coords = mesh.node_coords
+    xs = np.unique(np.round(coords[:, 0], 12))
+    n = len(xs)
+    ix = np.searchsorted(xs, np.round(coords[:, 0], 12))
+    iy = np.searchsorted(xs, np.round(coords[:, 1], 12))
+    g = np.zeros((n, n), bool)
+    g[ix, iy] = rich
+    edges = (g != np.roll(g, 1, 0)).sum() + (g != np.roll(g, 1, 1)).sum()
+    return edges / max(g.sum(), 1)
+
+
+def _mk_fig6_stepper(dm, mesh, cons, seeded, mpsi=2.5e-2, seed=11):
+    pars = _fig6_pars(128e-9, mpsi=mpsi)
+    st = MultiPhaseStepper(dm, dt=1e-3, newton_tol=1e-6, newton_max=60,
+                           linsolver="cudss", noise_seed=seed,
+                           b_reg=3e-4, line_search=True,
+                           alpha_th=[0.0, 0.0], beta_th=[0.0, 0.0],
+                           L_th=[1e-8, 1e-8], kg_delta=0.2, **pars)
+    st.noise_psi = 0.0
+    rng = np.random.default_rng(4)
+    nf = len(st.free_coords)
+    if seeded:
+        psi_seed, _ = _seed_discs(st.free_coords, 15, r0=7.3 / 128.0,
+                                  w=1.5 / 128.0, seed=111)
+    else:
+        psi_seed = np.zeros(nf)
+    tr = 0.02
+    p1 = 0.45 * (1 - tr) * (1 - psi_seed) + 0.97 * psi_seed \
+        + 1e-3 * rng.standard_normal(nf)
+    p2 = 0.55 * (1 - tr) * (1 - psi_seed) + 0.01 * psi_seed \
+        + 1e-3 * rng.standard_normal(nf)
+    st.set_initial([lambda x: p1, lambda x: p2],
+                   [lambda x: psi_seed, lambda x: np.zeros(len(x))],
+                   [lambda x: _smooth_theta(mesh, cons, 7)] * 2)
+    return st
+
+
+def test_s2c_crystallite_quench_and_dissolution(device):
+    """THE FIG-6 MECHANISMS (their conclusions 1 + 3; ternary-trace
+    M = 2, K = 2 at the Fig-6 deck, 15 seeds = their 948 at the same
+    33 nm spacing, r_eff = 7.3 nm = their t = 0 crystal volume):
+    (a) QUENCH: PCE11 crystallites pin the amorphous demixing pattern —
+        measured amorphous-PCBM-phase interface density at t = 10:
+        seeded 0.160 vs unseeded 0.069 (2.3x), the paper's
+        'crystallites prevent relaxation to round configurations /
+        freeze the pattern' claim as a number;
+    (b) crystallite volume stays put pre-crystallization (their
+        conclusion 1 'not actively affected'; our phi psi integral
+        0.133 -> 0.139 over t = 0..10 — NOTE their CrystVol metric
+        shows an early 0.151 -> 0.12 equilibration our integral
+        metric does not reproduce; metric-definition gap recorded);
+    (c) DISSOLUTION AT PCBM GROWTH FRONTS (their PCE11 CrystVol
+        0.103 -> 0.078 across the PCBM crystallization window):
+        an implanted PCBM nucleus grown at M_psi = 0.5 (their SI-9
+        result — end-state morphology decoupled from M_psi over 25x —
+        licenses the acceleration; recorded) consumes amorphous PCBM
+        AND dissolves PCE11 crystallites it reaches."""
+    dm, mesh, cons = _dm(6, device, periodic=True)
+    full = lambda v: np.asarray(cons.T @ v)
+    ifd, states = {}, {}
+    for seeded in (True, False):
+        st = _mk_fig6_stepper(dm, mesh, cons, seeded)
+        r1 = st.march(t_end=3.0, dt_max=0.02, dt_min=1e-9,
+                      grow_iters=45, max_steps=3000)
+        r2 = st.march(t_end=10.0, dt_max=0.4, dt_min=1e-9,
+                      grow_iters=45, max_steps=3000)
+        assert r1 == "t_end" and r2 == "t_end", (r1, r2)
+        s1, s2 = full(st.psi(0)), full(st.psi(1))
+        am = (s1 < 0.5) & (s2 < 0.5)
+        rich = (full(st.phi(1)) > 0.5) & am
+        ifd[seeded] = _iface_density(mesh, rich)
+        states[seeded] = st
+    X1_10 = float((full(states[True].phi(0))
+                   * full(states[True].psi(0))).mean())
+    print(f"S2c quench: iface density seeded {ifd[True]:.4f} vs "
+          f"unseeded {ifd[False]:.4f} (ratio "
+          f"{ifd[True] / ifd[False]:.2f}); Xpce(10) = {X1_10:.4f}")
+    assert ifd[True] > 1.5 * ifd[False], ifd     # measured 2.32x
+    assert 0.10 < X1_10 < 0.20, X1_10            # measured 0.139
+    # (c) accelerated dissolution
+    st = states[True]
+    st2 = _mk_fig6_stepper(dm, mesh, cons, True, mpsi=0.5)
+    st2.x = st.x.copy()
+    st2.hist = st.x.copy()
+    st2.t = st.t
+    cand = int(np.argmax(st2.phi(1) * (st2.psi(0) < 0.3)))
+    ctr = st2.free_coords[cand, :2]
+    dd = st2.free_coords[:, :2] - ctr[None, :]
+    dd -= np.round(dd)
+    rr = np.sqrt((dd ** 2).sum(axis=1))
+    disc = 0.5 * (1.0 - np.tanh((rr - 8.0 / 128.0) / (2.0 / 128.0)))
+    st2.x[2 * st2.M + 2::st2.ndof] = \
+        np.maximum(st2.x[2 * st2.M + 2::st2.ndof], disc)
+    st2.hist = st2.x.copy()
+    st2.dt = 1e-3
+    r3 = st2.march(t_end=st2.t + 40.0, dt_max=0.02, dt_min=1e-9,
+                   grow_iters=45, max_steps=5000)
+    X1_e = float((full(st2.phi(0)) * full(st2.psi(0))).mean())
+    X2_e = float((full(st2.phi(1)) * full(st2.psi(1))).mean())
+    print(f"S2c dissolution (+40 s at M_psi 0.5): {r3}; Xpcb -> "
+          f"{X2_e:.4f}, Xpce {X1_10:.4f} -> {X1_e:.4f}")
+    # MEASURED (2026-07-10): Xpcb -> 0.4408 (the implanted crystal
+    # consumes ~80% of the amorphous PCBM), Xpce 0.1391 -> 0.1287
+    # (crystallite dissolution at the growth front; their CrystVol
+    # 0.103 -> 0.078 across full consumption).  2x-headroom locks:
+    assert r3 == "t_end", r3
+    assert X2_e > 0.2, X2_e                      # measured 0.4408
+    assert X1_e < X1_10 - 0.005, (X1_10, X1_e)   # measured -0.0104
+
 
 
 def test_s2d_grain_labels_100_grains():

@@ -1111,8 +1111,8 @@ class MultiPhaseStepper:
 
     def _solve(self, A, r):
         if self.linsolver == "cudss":
-            from nvmath.sparse.advanced import DirectSolver
-            from .wodo_film import WodoFilmStepper
+            from nvmath.sparse.advanced import (DirectSolver,
+                                                DirectSolverOptions)
             b = np.ascontiguousarray(r, np.float64)
             try:
                 # the scipy T^T K T triple product PRUNES exact zeros, so
@@ -1134,8 +1134,16 @@ class MultiPhaseStepper:
                         pass
                     self._cudss = None
                 if self._cudss is None:
+                    # PLAIN options (no libcudss_mtlayer_gomp): the mt
+                    # planning layer leaks one gomp thread team per
+                    # solver call (MEASURED 2026-07-10: 18.6k native
+                    # threads after ~20k solves -> libgomp 'Thread
+                    # creation failed' killed three marches).  The 2-D
+                    # S2 systems plan in 65-340 ms single-threaded —
+                    # the M3-bunny mt-planning speedup is a 3-D
+                    # large-matrix concern, not ours.
                     self._cudss = DirectSolver(
-                        A, b, options=WodoFilmStepper._cudss_opts())
+                        A, b, options=DirectSolverOptions(blocking=True))
                     self._cudss.plan()
                     self._cudss_nnz = A.nnz
                 else:
