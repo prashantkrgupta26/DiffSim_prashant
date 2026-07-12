@@ -225,3 +225,94 @@ def test_a1_dt_hook(device):
     assert abs(r_inert - 1.0) < 1e-12, r_inert
     assert 0.7 * mT < r_hook < 1.4 * mT, (r_hook, mT)
 
+
+# ---------------------------------------------------------------------
+# A2 — SUBSTRATE SURFACE ENERGY (wall free-energy natural term)
+# ---------------------------------------------------------------------
+def _a2_stepper(dm, g1, h1=0.0, jit=0.0):
+    """Miscible binary (M=1, K=0; chi = 1.5 < chi_c = 2 at N = (1,1)):
+    the uniform phi = 0.5 state is bulk-stable AND the exact g = 0
+    steady state, so any stratification is the WALL term's doing.
+    g scaled to kappa (the natural BC slope is -f_w'/kappa): g = 0.005,
+    kappa = 1e-3 -> boundary-layer contrast O(0.1) without saturating
+    the [1e-3, 1-1e-3] projection (measured phi_max 0.647)."""
+    chi_aa = np.array([[0.0, 1.5], [1.5, 0.0]])
+    st = MultiPhaseStepper(dm, M=1, K=0, chi_aa=chi_aa, N=[1.0, 1.0],
+                           onsager=[[1.0]], kappa=[1e-3], dt=1e-3,
+                           newton_tol=1e-8, newton_max=40,
+                           wall_g=None if g1 is None else [g1],
+                           wall_h=[h1] if h1 else None)
+    st.set_initial([lambda x: np.full(len(x), 0.5) + jit])
+    return st
+
+
+def test_a2_wall_enrichment_and_sign_flip(device):
+    """(i) energetic consistency: g < 0 (wall attracts species 0)
+    enriches the substrate band vs the g = 0 baseline (uniform 0.5 is
+    the exact baseline steady state); (ii) SIGN FLIP: g > 0 depletes
+    and the vertical stratification reverses (deterministic, no
+    noise).  Near-wall excess = mean phi over the y < 1/16 band minus
+    the bulk 0.5.  MEASURED (2026-07-12, L6, t = 0.5, 0 rejects):
+    g = -0.005 -> bottom +0.07821, top -0.004723 (mass balance);
+    g = +0.005 -> EXACT mirror -0.07821/+0.004723 (the phi -> 1-phi
+    symmetry of this config).  Locks >= 2x headroom."""
+    dm, mesh, cons = _dm(6, device)
+    coords = mesh.node_coords[cons.free_nodes]
+    bot = coords[:, 1] < 1.0 / 16.0
+    top = coords[:, 1] > 1.0 - 1.0 / 16.0
+    exc = {}
+    for g in (-0.005, 0.005):
+        st = _a2_stepper(dm, g)
+        r = st.march(t_end=0.5, dt_max=0.02, max_steps=300, dt_min=1e-9)
+        assert r == "t_end", r
+        exc[g] = (float(st.phi(0)[bot].mean() - 0.5),
+                  float(st.phi(0)[top].mean() - 0.5))
+    print(f"A2 wall: g=-0.005 bottom/top excess {exc[-0.005][0]:+.4f}/"
+          f"{exc[-0.005][1]:+.5f}; g=+0.005 {exc[0.005][0]:+.4f}/"
+          f"{exc[0.005][1]:+.5f}")
+    eb_n, et_n = exc[-0.005]
+    eb_p, et_p = exc[0.005]
+    assert eb_n > 0.03, exc          # measured +0.07821 (2.6x)
+    assert eb_p < -0.03, exc         # sign flip, measured -0.07821
+    assert eb_n > et_n and eb_p < et_p, exc   # stratification flips
+    assert abs(eb_n + eb_p) < 0.5 * abs(eb_n), exc  # measured 0 exact
+
+
+def test_a2_wall_quadratic_and_regression(device):
+    """(iii) g = 0 REGRESSION: explicit wall_g = [0.0] takes the
+    UNMODIFIED path (wall_on False, no face assembly) — 3-step
+    trajectory parity vs the no-arg stepper from a jittered IC.
+    Plus the quadratic h_i term: f_w' = g + 2 h phi vanishes at
+    phi* = -g/(2h) — the wall RESTORES phi toward phi*, from ABOVE
+    (phi* = 0.125 < 0.5: depletion) and from BELOW (phi* = 0.75 >
+    0.5: enrichment); exercises the -2 h Mw Jacobian block both ways.
+    MEASURED (2026-07-12, L5, t = 0.5, 0 rejects): parity 0.0 exactly
+    (same code path); phi* = 0.125 -> bottom excess -0.13045;
+    phi* = 0.75 -> +0.08867."""
+    dm, mesh, cons = _dm(5, device)
+    coords = mesh.node_coords[cons.free_nodes]
+    rng = np.random.default_rng(7)
+    jit = 1e-3 * rng.standard_normal(len(coords))
+    stA = _a2_stepper(dm, None, jit=jit)     # no wall args at all
+    stB = _a2_stepper(dm, 0.0, jit=jit)      # explicit g = 0
+    assert not stA.wall_on and not stB.wall_on
+    errs = []
+    for _ in range(3):
+        xa = stA.step()
+        xb = stB.step()
+        errs.append(float(np.abs(xa - xb).max()))
+    print(f"A2 g=0 regression parity: {[f'{e:.2e}' for e in errs]}")
+    assert max(errs) < 1e-13, errs   # measured 0.0 exactly
+
+    bot = coords[:, 1] < 1.0 / 16.0
+    exc = {}
+    for g1 in (-0.005, -0.03):       # phi* = 0.125 / 0.75
+        st = _a2_stepper(dm, g1, h1=0.02)
+        r = st.march(t_end=0.5, dt_max=0.02, max_steps=300, dt_min=1e-9)
+        assert r == "t_end", r
+        exc[g1] = float(st.phi(0)[bot].mean() - 0.5)
+    print(f"A2 quadratic restoring: phi*=0.125 excess {exc[-0.005]:+.4f}"
+          f" (pull-down), phi*=0.75 excess {exc[-0.03]:+.4f} (pull-up)")
+    assert exc[-0.005] < -0.05, exc  # measured -0.13045 (2.6x)
+    assert exc[-0.03] > +0.04, exc   # measured +0.08867 (2.2x)
+
