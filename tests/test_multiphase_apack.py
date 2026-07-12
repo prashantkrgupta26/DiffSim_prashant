@@ -316,3 +316,104 @@ def test_a2_wall_quadratic_and_regression(device):
     assert exc[-0.005] < -0.05, exc  # measured -0.13045 (2.6x)
     assert exc[-0.03] > +0.04, exc   # measured +0.08867 (2.2x)
 
+
+# ---------------------------------------------------------------------
+# A3 — ANISOTROPIC CRYSTAL GROWTH
+# ---------------------------------------------------------------------
+def _a3_stepper(dm, delta, theta0, m=2.0, T=333.0):
+    """s1b-class PCBM r14 config, frozen-marker theta (KWC coeffs 0 —
+    the A3 contract; theta holds the orientation as pure bookkeeping),
+    single centered seed, deterministic (no noise)."""
+    chi_aa = np.array([[0.0, 0.7248], [0.7248, 0.0]])
+    chi_ca = np.array([[0.0, 1.0836], [0.0, 0.0]])
+    kw = {} if delta is None else dict(delta_a=[delta], m_a=[m])
+    st = MultiPhaseStepper(
+        dm, M=1, K=1, chi_aa=chi_aa, chi_ac=chi_ca.T.copy(),
+        chi_ca=chi_ca, N=[5.0298, 1.0], onsager=[[0.1]], kappa=[2e-4],
+        dsig=[2.6355], dh=[1.3072], Tm=[558.0], eps2=[1e-3],
+        L_psi=[5.0], alpha_th=[0.0], beta_th=[0.0], L_th=[5.0],
+        T=T, dt=2e-3, bulk="r14", newton_tol=1e-7, newton_max=60, **kw)
+    st.set_initial([lambda x: np.full(len(x), 0.6)],
+                   [_disc((0.5, 0.5), 0.08, 0.02)],
+                   [lambda x: np.full(len(x), theta0)])
+    return st
+
+
+def _shape_weighted(st):
+    """psi-WEIGHTED second-moment tensor: aspect ratio
+    sqrt(l_max/l_min) + principal-axis angle in [0, pi).  Weighted
+    moments smooth the ~170-node pixelation that makes the
+    THRESHOLDED estimator axis-degenerate at weak anisotropy
+    (measured: thresholded axis 45.0 deg at delta = 0.05 from
+    Ixx ~ Iyy; weighted axis 29.89 deg at every delta > 0)."""
+    w = np.clip(st.psi(0), 0.0, None)
+    pts = st.free_coords[:, :2]
+    W = w.sum()
+    c = (pts * w[:, None]).sum(0) / W
+    d = pts - c
+    Ixx = (w * d[:, 0] ** 2).sum() / W
+    Iyy = (w * d[:, 1] ** 2).sum() / W
+    Ixy = (w * d[:, 0] * d[:, 1]).sum() / W
+    tr, det = Ixx + Iyy, Ixx * Iyy - Ixy ** 2
+    dsc = np.sqrt(max(tr ** 2 / 4 - det, 0.0))
+    l1, l2 = tr / 2 + dsc, tr / 2 - dsc
+    ang = 0.5 * np.arctan2(2 * Ixy, Ixx - Iyy)
+    return float(np.sqrt(l1 / max(l2, 1e-30))), float(ang % np.pi)
+
+
+def test_a3_delta_zero_regression(device):
+    """delta_a = 0 REGRESSION: the factory compiles the ISOTROPIC
+    kernel (aniso = False -> identical cache key), so parity vs the
+    no-delta stepper is same-kernel/same-inputs — assembly-atomics
+    class only.  MEASURED (2026-07-12, L5, 3 steps): 0.0 exactly."""
+    dm, mesh, cons = _dm(5, device)
+    stA = _a3_stepper(dm, None, 0.0)
+    stB = _a3_stepper(dm, 0.0, 0.0)
+    assert not stA.aniso and not stB.aniso
+    errs = []
+    for _ in range(3):
+        xa = stA.step()
+        xb = stB.step()
+        errs.append(float(np.abs(xa - xb).max()))
+    print(f"A3 delta=0 regression parity: {[f'{e:.2e}' for e in errs]}")
+    assert max(errs) < 1e-13, errs   # measured 0.0 exactly
+
+
+def test_a3_single_seed_anisotropy(device):
+    """Single seed at fixed theta = 30 deg, m = 2 (2-fold: needle
+    class): aspect ratio increases MONOTONICALLY in delta_a with a
+    floor on the contrast, and the grown long axis aligns with theta
+    (orientation locking), including at a second theta = 60 deg (grid
+    independence).  MEASURED (2026-07-12, L6, t = 0.5, 0 rejects at
+    every delta): ARw = 1.0000 / 1.0284 / 1.0726 / 1.1506 at delta =
+    0 / 0.02 / 0.05 / 0.1; axis 29.89 deg at ALL delta > 0 (theta
+    30); axis 60.11 deg at theta 60, delta 0.1 — |axis error|
+    0.11 deg.  Locks >= 2x headroom."""
+    dm, mesh, cons = _dm(6, device)
+    th0 = np.pi / 6.0
+    res = {}
+    for delta in (0.0, 0.02, 0.05, 0.1):
+        st = _a3_stepper(dm, delta, th0)
+        r = st.march(t_end=0.5, dt_max=0.02, max_steps=500,
+                     dt_min=1e-8)
+        assert r == "t_end", (delta, r)
+        res[delta] = _shape_weighted(st)
+    st = _a3_stepper(dm, 0.1, np.pi / 3.0)
+    r = st.march(t_end=0.5, dt_max=0.02, max_steps=500, dt_min=1e-8)
+    assert r == "t_end", r
+    ar60, ax60 = _shape_weighted(st)
+    print(f"A3 anisotropy: ARw {[f'{res[d][0]:.4f}' for d in res]}, "
+          f"axis(0.02/0.05/0.1) "
+          f"{[f'{np.degrees(res[d][1]):.2f}' for d in (0.02, 0.05, 0.1)]}"
+          f" deg vs theta 30; theta=60 run: ARw {ar60:.4f} axis "
+          f"{np.degrees(ax60):.2f} deg")
+    # monotone AR (measured gaps 0.0284 / 0.0442 / 0.0780)
+    assert res[0.0][0] < res[0.02][0] < res[0.05][0] < res[0.1][0], res
+    # contrast floor (measured 0.1506; 2.15x)
+    assert res[0.1][0] - res[0.0][0] > 0.07, res
+    # orientation locking (measured |err| 0.11 deg; locked 2 deg)
+    for d in (0.02, 0.05, 0.1):
+        e = abs(res[d][1] - th0)
+        assert min(e, np.pi - e) < np.radians(2.0), (d, res[d])
+    e60 = abs(ax60 - np.pi / 3.0)
+    assert min(e60, np.pi - e60) < np.radians(2.0), ax60
