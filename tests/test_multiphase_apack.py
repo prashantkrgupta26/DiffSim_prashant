@@ -417,3 +417,225 @@ def test_a3_single_seed_anisotropy(device):
         assert min(e, np.pi - e) < np.radians(2.0), (d, res[d])
     e60 = abs(ax60 - np.pi / 3.0)
     assert min(e60, np.pi - e60) < np.radians(2.0), ax60
+
+
+# ---------------------------------------------------------------------
+# A4a — QUADRATIC BASIS (biquadratic nbf = 9; the factory is nbf/nqp
+# generic — these gates verify the WHOLE chain at p = 2)
+# ---------------------------------------------------------------------
+def _quad_integral(dm, mesh, cons, vec_free):
+    """Quadrature integral Int u dV of a free-node field — the
+    discretization-comparable observable (node means are NOT
+    comparable across p1/p2 node sets)."""
+    full = np.asarray(cons.T @ vec_free)
+    tot = 0.0
+    for pv, eids in mesh.bins.items():
+        tb = dm.tables_by_p[pv]
+        conn = mesh.conn_of[pv]
+        hh = mesh.tree.h()[eids]
+        wJ = tb.w[None, :] * ((hh / 2.0) ** dm.dim)[:, None]
+        tot += float((np.einsum("qa,ea->eq", tb.N, full[conn])
+                      * wJ).sum())
+    return tot
+
+
+def test_a4a_mms_quadratic(device):
+    """S1a-class coupled MMS (M=1, K=1, p1 bulk, KWC theta) at
+    BIQUADRATIC basis: expect L2 order ~3 for phi/psi/theta (p+1).
+    MEASURED (2026-07-12, L3->L4, dt=1e-3 x 4): phi 3.06, psi 2.99,
+    theta 2.87 — no structural obstacle anywhere in the chain
+    (factory kernels, constraints, assembly, projections all
+    nbf-generic already).  Locked > 2.5."""
+    Mons, kap, dt = 1.0, 0.02, 1e-3
+    Ninv = np.array([1.0, 1.0])
+    dsig, drive_v = 1.5, -0.8
+    Tm, Tq = 1.0, 0.5
+    dh = drive_v / (1 - Tq / Tm)
+    eps2, Lpsi = 5e-3, 1.0
+    alpha, beta, Lth = 0.4, 0.1, 1.0
+    kgd, pfl = 1e-2, 1e-3
+    chi_aa = np.array([[0.0, 1.2], [1.2, 0.0]])
+    chi_ac = np.array([[0.0, 0.7], [0.4, 0.0]])
+    chi_ca = chi_ac.T.copy()
+    chi_cc = np.array([[0.0, 0.9], [0.9, 0.0]])
+    from diffsim.physics.multiphase import np_potentials
+    pars = dict(chi_aa=chi_aa, chi_ac=chi_ac, chi_ca=chi_ca,
+                chi_cc=chi_cc, Ninv=Ninv, dsig=[dsig], drive=[drive_v],
+                breg=0.0, bulk="p1")
+    pi = np.pi
+    E = lambda t: np.exp(-t)
+    phis = lambda x, t: 0.5 + 0.1 * np.cos(pi * x[:, 0]) \
+        * np.cos(pi * x[:, 1]) * E(t)
+    mus = lambda x, t: np.sin(pi * x[:, 0]) * np.sin(pi * x[:, 1]) * E(t)
+    psis = lambda x, t: 0.5 + 0.25 * np.cos(pi * x[:, 0]) \
+        * np.cos(2 * pi * x[:, 1]) * E(t)
+    ths = lambda x, t: 0.5 + 0.2 * np.sin(pi * x[:, 0]) \
+        * np.cos(pi * x[:, 1]) * E(t)
+
+    def th_grad(x, t):
+        gx = 0.2 * pi * np.cos(pi * x[:, 0]) * np.cos(pi * x[:, 1]) * E(t)
+        gy = -0.2 * pi * np.sin(pi * x[:, 0]) * np.sin(pi * x[:, 1]) * E(t)
+        return gx, gy
+
+    def psi_grad(x, t):
+        gx = -0.25 * pi * np.sin(pi * x[:, 0]) * np.cos(2 * pi * x[:, 1]) * E(t)
+        gy = -0.5 * pi * np.cos(pi * x[:, 0]) * np.sin(2 * pi * x[:, 1]) * E(t)
+        return gx, gy
+
+    pori = lambda s: s ** 2 * (3 - 2 * s)
+    porip = lambda s: 6 * s * (1 - s)
+
+    def f_phi(x, t):
+        return -(phis(x, t) - 0.5) - Mons * (-2 * pi ** 2 * mus(x, t))
+
+    def f_mu(x, t):
+        mu_b, _ = np_potentials([phis(x, t)], [psis(x, t)], pars)
+        return mus(x, t) - mu_b[0] + kap * (-2 * pi ** 2 * (phis(x, t) - 0.5))
+
+    def f_psi(x, t):
+        _, dfs = np_potentials([phis(x, t)], [psis(x, t)], pars)
+        gx, gy = th_grad(x, t)
+        g2 = gx ** 2 + gy ** 2
+        S = np.sqrt(g2 + kgd ** 2)
+        Eori = 0.5 * alpha * S + 0.5 * beta * g2
+        return (-(psis(x, t) - 0.5)
+                + Lpsi * (dfs[0] + porip(psis(x, t)) * Eori)
+                - Lpsi * eps2 * (-5 * pi ** 2 * (psis(x, t) - 0.5)))
+
+    def f_th(x, t):
+        s = psis(x, t)
+        th = ths(x, t)
+        gx, gy = th_grad(x, t)
+        g2 = gx ** 2 + gy ** 2
+        S = np.sqrt(g2 + kgd ** 2)
+        c = (pori(s) + pfl) * Lth * (0.5 * alpha / S + beta)
+        sx, sy = psi_grad(x, t)
+        Hxx = -pi ** 2 * (th - 0.5)
+        Hyy = -pi ** 2 * (th - 0.5)
+        Hxy = -0.2 * pi ** 2 * np.cos(pi * x[:, 0]) \
+            * np.sin(pi * x[:, 1]) * E(t)
+        Hgx = Hxx * gx + Hxy * gy
+        Hgy = Hxy * gx + Hyy * gy
+        cf = 0.5 * alpha / S + beta
+        cx = Lth * (porip(s) * sx * cf
+                    - (pori(s) + pfl) * 0.5 * alpha * Hgx / S ** 3)
+        cy = Lth * (porip(s) * sy * cf
+                    - (pori(s) + pfl) * 0.5 * alpha * Hgy / S ** 3)
+        return (pori(s) + pfl) * (-(th - 0.5)) \
+            - (cx * gx + cy * gy + c * (-2 * pi ** 2 * (th - 0.5)))
+
+    errs = {f: [] for f in ("phi", "psi", "theta")}
+    for lv in (3, 4):
+        dm, mesh, cons = _dm(lv, device, p=2)
+        coords = mesh.node_coords[cons.free_nodes]
+        st = MultiPhaseStepper(
+            dm, M=1, K=1, chi_aa=chi_aa, chi_ac=chi_ac, chi_ca=chi_ca,
+            chi_cc=chi_cc, N=1.0 / Ninv, onsager=[[Mons]], kappa=[kap],
+            dsig=[dsig], dh=[dh], Tm=[Tm], eps2=[eps2], L_psi=[Lpsi],
+            alpha_th=[alpha], beta_th=[beta], L_th=[Lth], T=Tq,
+            dt=dt, bulk="p1", kg_delta=kgd, p_floor=pfl,
+            newton_tol=1e-10, newton_max=80,
+            dirichlet=np.where(_bdry(coords))[0],
+            g_fns=[phis, mus, psis, ths],
+            src_fns=[f_phi, f_mu, f_psi, f_th])
+        st.set_initial([lambda x: phis(x, 0.0)],
+                       [lambda x: psis(x, 0.0)],
+                       [lambda x: ths(x, 0.0)])
+        st.x[1::st.ndof] = mus(st.free_coords, 0.0)
+        for _ in range(4):
+            st.step()
+        from diffsim.physics.poisson import l2_error
+        errs["phi"].append(l2_error(dm, np.asarray(cons.T @ st.phi(0)),
+                                    lambda x: phis(x, st.t)))
+        errs["psi"].append(l2_error(dm, np.asarray(cons.T @ st.psi(0)),
+                                    lambda x: psis(x, st.t)))
+        errs["theta"].append(l2_error(dm, np.asarray(cons.T @ st.theta(0)),
+                                      lambda x: ths(x, st.t)))
+    orders = {f: np.log2(errs[f][0] / errs[f][1]) for f in errs}
+    print(f"A4a p2 MMS: " + "; ".join(
+        f"{f} errs {[f'{e:.2e}' for e in errs[f]]} "
+        f"order {orders[f]:.2f}" for f in errs))
+    # measured 3.06 / 2.99 / 2.87 (2026-07-12)
+    for f in errs:
+        assert orders[f] > 2.5, (f, errs[f], orders[f])
+
+
+def test_a4a_richardson_sanity(device):
+    """Linear-vs-quadratic at the SAME h on an S1-class crystallization
+    observable: seeded growth (s1b r14 PCBM config, fixed dt so the
+    temporal error is common-mode), observable = Int psi dV at t = 0.1.
+    Quadratic at h must beat linear at h against a fine reference
+    (L6-p2).  Measured values in the print; ratio locked from
+    measured with >= 2x headroom."""
+    chi_aa = np.array([[0.0, 0.7248], [0.7248, 0.0]])
+    chi_ca = np.array([[0.0, 1.0836], [0.0, 0.0]])
+
+    def run(level, p):
+        dm, mesh, cons = _dm(level, device, p=p)
+        st = MultiPhaseStepper(
+            dm, M=1, K=1, chi_aa=chi_aa, chi_ac=chi_ca.T.copy(),
+            chi_ca=chi_ca, N=[5.0298, 1.0], onsager=[[0.1]],
+            kappa=[2e-4], dsig=[2.6355], dh=[1.3072], Tm=[558.0],
+            eps2=[1e-3], L_psi=[5.0], alpha_th=[0.0], beta_th=[0.0],
+            L_th=[5.0], T=333.0, dt=2e-3, bulk="r14",
+            newton_tol=1e-8, newton_max=60)
+        st.set_initial([lambda x: np.full(len(x), 0.6)],
+                       [_disc((0.5, 0.5), 0.15, 0.02)],
+                       [lambda x: np.zeros(len(x))])
+        for _ in range(50):
+            st.step()
+        return _quad_integral(dm, mesh, cons, st.psi(0))
+
+    ref = run(6, 2)
+    e1 = abs(run(4, 1) - ref)
+    e2 = abs(run(4, 2) - ref)
+    print(f"A4a Richardson: Int psi ref(L6-p2) = {ref:.6f}; "
+          f"|err| L4-p1 = {e1:.2e}, L4-p2 = {e2:.2e}, ratio "
+          f"{e1 / max(e2, 1e-16):.1f}x")
+    # MEASURED (2026-07-12): ref 0.076717, e1 = 6.11e-3, e2 = 8.49e-4
+    # — quadratic beats linear at the same h by 7.2x; locked 2x.
+    assert e2 < 0.5 * e1, (e1, e2)
+
+
+# ---------------------------------------------------------------------
+# A4 cross-matrix (basis column): A1 + A2 off the bilinear default
+# ---------------------------------------------------------------------
+def test_a4x_a1_parity_quadratic(device):
+    """A1 isothermal parity at BIQUADRATIC basis (matrix item (i)):
+    2 jittered repeats x 20 fixed steps at L4-p2, scalar vs field."""
+    dm, mesh, cons = _dm(4, device, p=2)
+    nf = len(mesh.node_coords[cons.free_nodes])
+    devs = []
+    for rep in range(2):
+        jit = 1e-3 * np.random.default_rng(rep).standard_normal(nf)
+        sts = _a1_stepper(dm, "scalar", jit)
+        stf = _a1_stepper(dm, "field", jit)
+        d_run = 0.0
+        for _ in range(20):
+            xs = sts.step()
+            xf = stf.step()
+            d_run = max(d_run, float(np.abs(xs - xf).max()))
+        devs.append(d_run)
+    print(f"A4x A1 parity at p2: {[f'{e:.2e}' for e in devs]}")
+    # measured 6.22e-15 / 6.44e-15 (2026-07-12); locked 5e-14 (7.8x)
+    assert max(devs) < 5e-14, devs
+
+
+def test_a4x_a2_signflip_quadratic(device):
+    """A2 sign flip at BIQUADRATIC basis (matrix item (iii)): the
+    p-generic 1-D edge mass (Simpson-consistent le/30 [[4,2,-1],...])
+    drives the same enrichment/depletion mirror at p = 2."""
+    dm, mesh, cons = _dm(5, device, p=2)
+    coords = mesh.node_coords[cons.free_nodes]
+    bot = coords[:, 1] < 1.0 / 16.0
+    exc = {}
+    for g in (-0.005, 0.005):
+        st = _a2_stepper(dm, g)
+        r = st.march(t_end=0.5, dt_max=0.02, max_steps=300, dt_min=1e-9)
+        assert r == "t_end", r
+        exc[g] = float(st.phi(0)[bot].mean() - 0.5)
+    print(f"A4x A2 sign flip at p2: g<0 {exc[-0.005]:+.4f}, "
+          f"g>0 {exc[0.005]:+.4f}")
+    assert exc[-0.005] > 0.03, exc
+    assert exc[0.005] < -0.03, exc
+    assert abs(exc[-0.005] + exc[0.005]) < 0.5 * abs(exc[-0.005]), exc

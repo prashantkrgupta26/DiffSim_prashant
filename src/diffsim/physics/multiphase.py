@@ -1395,13 +1395,19 @@ class MultiPhaseStepper:
 
     # -- A2 wall-face topology (wodo _build_top_faces pattern) -----------
     def _build_wall_faces(self):
-        """Substrate-face node lists + CONSISTENT P1 face mass matrices
+        """Substrate-face node lists + CONSISTENT face mass matrices
         for the wall free-energy natural term: tensor product of the
-        1-D edge mass le [[1/3, 1/6], [1/6, 1/3]] over the in-face
-        dims (dim = 2: 2-node edges of length h).  wall_face =
+        1-D CONSISTENT edge mass over the in-face dims (dim = 2:
+        edges of length h).  BASIS-GENERIC (A4a): the 1-D edge mass
+        is built from the tabulated 1-D Lagrange basis by quadrature
+        (exact at the (p+1)-point Gauss rule for the degree-2p
+        integrand), so p = 1 reproduces le [[1/3, 1/6], [1/6, 1/3]]
+        exactly and p = 2 the Simpson-consistent le/30
+        [[4, 2, -1], [2, 16, 2], [-1, 2, 4]].  wall_face =
         (axis, side): side 0 = the min face (y = 0 substrate default),
         1 = the max face (face-generic per the A2 contract)."""
         from ..mesh.nodes import _local_offsets
+        from ..mesh.basis import gauss_1d, lagrange_1d
         vax, side = self.wall_face
         assert 0 <= vax < self.dm.dim, self.wall_face
         assert not self.mesh.tree.periodic[vax], \
@@ -1410,14 +1416,14 @@ class MultiPhaseStepper:
         target = (coords[:, vax].min() if side == 0
                   else coords[:, vax].max())
         tol = 1e-12
-        m1 = np.array([[1.0 / 3.0, 1.0 / 6.0],
-                       [1.0 / 6.0, 1.0 / 3.0]])
         faces, fmass = [], []
         for pv, conn in self.mesh.conn_of.items():
-            assert pv == 1, \
-                "wall energy: P1 face mass only (p2 = tensor-rule " \
-                "extension, recorded)"
-            offs = _local_offsets(pv, self.dm.dim)
+            # 1-D consistent edge mass on the UNIT interval:
+            # m1[a, b] = Int_0^1 N_a N_b (reference [-1, 1] halved)
+            pts, wts = gauss_1d(int(pv))
+            Nq = np.array([lagrange_1d(int(pv), x)[0] for x in pts])
+            m1 = 0.5 * np.einsum("q,qa,qb->ab", wts, Nq, Nq)
+            offs = _local_offsets(int(pv), self.dm.dim)
             loc = np.where(offs[:, vax] == (0 if side == 0
                                             else pv))[0]
             of = np.delete(offs[loc], vax, axis=1)  # in-face offsets
