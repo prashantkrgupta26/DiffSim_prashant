@@ -252,6 +252,24 @@ schedule hook (annealing protocols); drive_k is refreshed per attempt
 — OR a nodal field (T_mode="field", A1 above): the segregated
 TemperatureField advances first within each attempt and commits only
 with the accepted step.
+
+TIME SCHEME (A4b).  tstep="bdf1" (default, existing behavior
+bit-identically) | "bdf2": VARIABLE-STEP BDF2 with the standard
+variable coefficients — for step ratio r = dt_n/dt_{n-1},
+
+  [ a x^{n+1} - b x^n + c x^{n-1} ] / dt_n = f(x^{n+1}, t^{n+1}),
+  a = (1+2r)/(1+r),   b = 1+r,   c = r^2/(1+r)   (a = b - c),
+
+first step bootstrapped with BDF1 (no x^{n-1}).  BDF2 rides the SAME
+kernel: the kernel's time term is sigma*x - hist per GP, so the host
+passes sigma = a/dt_n and hist = (b x^n - c x^{n-1})/dt_n — no kernel
+change, and the frozen-theta bookkeeping row remains the EXACT
+identity (equal histories give theta^{n+1} = theta^n since a = b - c).
+LADDER CONSISTENCY: rejected attempts never mutate the history, and
+the coefficients are recomputed from the ACTUAL (dt_n, dt_{n-1}) per
+attempt, so dt rescaling on rejects is automatically consistent.
+SCOPE LIMIT (recorded): BDF2 is DETERMINISTIC-ONLY (asserted noise
+off) — the FDT-noise weak order under BDF2 is out of scope.
 Linear solve: splu (default) | cudss (wodo DirectSolver pattern).
 blockch_pairs integration NOT wired (the AC blocks need the per-psi
 scalar-block extension of the "pairs" meta — recorded follow-up).
@@ -1216,7 +1234,7 @@ class MultiPhaseStepper:
                  clip_psi=True, line_search=False,
                  T_mode="scalar", T_field=None, D_T=None,
                  wall_g=None, wall_h=None, wall_face=(1, 0),
-                 delta_a=None, m_a=None, a_reg=1e-8):
+                 delta_a=None, m_a=None, a_reg=1e-8, tstep="bdf1"):
         from ..physics.poisson import gauss_points
         self.dm = dm
         self.M, self.K = int(M), int(K)
@@ -1316,6 +1334,17 @@ class MultiPhaseStepper:
                 "CHC noise with a matrix Onsager mobility needs a " \
                 "flux-space factorization (not carried; docstring)"
         self.dt = float(dt)
+        # A4b time scheme (module docstring): bdf1 default; bdf2 =
+        # variable-step, deterministic-only (noise weak order out of
+        # scope — recorded), BDF1 bootstrap on the first step
+        assert tstep in ("bdf1", "bdf2"), tstep
+        self.tstep = tstep
+        if tstep == "bdf2":
+            assert noise_psi == 0.0 and noise_phi == 0.0, \
+                "BDF2 is deterministic-only (FDT-noise weak order " \
+                "under BDF2 is a recorded scope limit)"
+        self.hist2 = None       # x^{n-1} (None => BDF1 bootstrap)
+        self.dt_prev = None     # dt_{n-1} of the last ACCEPTED step
         self.newton_tol, self.newton_max = newton_tol, newton_max
         self.linsolver = linsolver
         self._cudss = None
@@ -1457,6 +1486,8 @@ class MultiPhaseStepper:
                 self.x[2 * self.M + 2 * k + 1::self.ndof] = \
                     theta_fns[k](xc)
         self.hist = self.x.copy()
+        self.hist2 = None       # restart the BDF2 bootstrap
+        self.dt_prev = None
         self.t = 0.0
 
     def _gp(self, vec):
@@ -1596,7 +1627,20 @@ class MultiPhaseStepper:
                      for pv, b in self.dm.bins.items()}
         dtea, dtref = self.D_T if self.D_T is not None else (0.0, 1.0)
         hv, _ = self._pack_fields(self.hist)
-        hist_gp = {pv: sigma * hv[pv] for pv in hv}
+        if self.tstep == "bdf2" and self.hist2 is not None:
+            # A4b variable-step BDF2 (module docstring): sigma = a/dt,
+            # hist = (b x^n - c x^{n-1})/dt — same kernel time term.
+            # Coefficients from the ACTUAL (dt, dt_prev) per attempt:
+            # ladder rejects rescale dt without touching the history.
+            rr = dt / self.dt_prev
+            sigma = (1.0 + 2.0 * rr) / (1.0 + rr) / dt
+            bv = 1.0 + rr
+            cv = rr * rr / (1.0 + rr)
+            hv2, _ = self._pack_fields(self.hist2)
+            hist_gp = {pv: (bv * hv[pv] - cv * hv2[pv]) / dt
+                       for pv in hv}
+        else:                       # BDF1 (default + BDF2 bootstrap)
+            hist_gp = {pv: sigma * hv[pv] for pv in hv}
         for pv in hist_gp:          # mu rows carry no time derivative
             for i in range(self.M):
                 hist_gp[pv][:, 2 * i + 1] = 0.0
@@ -1801,6 +1845,9 @@ class MultiPhaseStepper:
         x, iters, ok = self._attempt(self.dt)
         assert ok, f"Newton failed at fixed dt (iters={iters})"
         self.x = x
+        if self.tstep == "bdf2":       # shift the two-level history
+            self.hist2 = self.hist
+            self.dt_prev = self.dt
         self.hist = x.copy()
         self.t += self.dt
         if self.T_mode == "field":
@@ -1831,6 +1878,9 @@ class MultiPhaseStepper:
                     break
                 continue
             self.x = x_new
+            if self.tstep == "bdf2":   # shift the two-level history
+                self.hist2 = self.hist
+                self.dt_prev = dt_eff
             self.hist = x_new.copy()
             self.t += dt_eff
             if self.T_mode == "field":

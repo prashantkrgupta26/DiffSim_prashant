@@ -320,13 +320,14 @@ def test_a2_wall_quadratic_and_regression(device):
 # ---------------------------------------------------------------------
 # A3 — ANISOTROPIC CRYSTAL GROWTH
 # ---------------------------------------------------------------------
-def _a3_stepper(dm, delta, theta0, m=2.0, T=333.0):
+def _a3_stepper(dm, delta, theta0, m=2.0, T=333.0, tstep="bdf1"):
     """s1b-class PCBM r14 config, frozen-marker theta (KWC coeffs 0 —
     the A3 contract; theta holds the orientation as pure bookkeeping),
     single centered seed, deterministic (no noise)."""
     chi_aa = np.array([[0.0, 0.7248], [0.7248, 0.0]])
     chi_ca = np.array([[0.0, 1.0836], [0.0, 0.0]])
     kw = {} if delta is None else dict(delta_a=[delta], m_a=[m])
+    kw["tstep"] = tstep
     st = MultiPhaseStepper(
         dm, M=1, K=1, chi_aa=chi_aa, chi_ac=chi_ca.T.copy(),
         chi_ca=chi_ca, N=[5.0298, 1.0], onsager=[[0.1]], kappa=[2e-4],
@@ -639,3 +640,134 @@ def test_a4x_a2_signflip_quadratic(device):
     assert exc[-0.005] > 0.03, exc
     assert exc[0.005] < -0.03, exc
     assert abs(exc[-0.005] + exc[0.005]) < 0.5 * abs(exc[-0.005]), exc
+
+
+# ---------------------------------------------------------------------
+# A4b — BDF2 (variable-step, deterministic; module docstring A4b)
+# ---------------------------------------------------------------------
+def _a4b_stepper(dm, tstep, dt):
+    """s1b-class deterministic seeded growth; TIGHT Newton (1e-10) so
+    the solver error sits far below the temporal errors compared."""
+    chi_aa = np.array([[0.0, 0.7248], [0.7248, 0.0]])
+    chi_ca = np.array([[0.0, 1.0836], [0.0, 0.0]])
+    st = MultiPhaseStepper(
+        dm, M=1, K=1, chi_aa=chi_aa, chi_ac=chi_ca.T.copy(),
+        chi_ca=chi_ca, N=[5.0298, 1.0], onsager=[[0.1]], kappa=[2e-4],
+        dsig=[2.6355], dh=[1.3072], Tm=[558.0], eps2=[1e-3],
+        L_psi=[5.0], alpha_th=[0.0], beta_th=[0.0], L_th=[5.0],
+        T=333.0, dt=dt, bulk="r14", newton_tol=1e-10, newton_max=80,
+        tstep=tstep)
+    st.set_initial([lambda x: np.full(len(x), 0.6)],
+                   [_disc((0.5, 0.5), 0.15, 0.02)],
+                   [lambda x: np.zeros(len(x))])
+    return st
+
+
+def test_a4b_temporal_orders(device):
+    """(i) BDF2 temporal self-convergence ~2 on the S1-class coupled
+    system (fixed mesh L5 — the spatial error cancels; reference =
+    BDF2 at dt = 2.5e-4); (ii) CONSISTENCY: BDF2 at dt matches/beats
+    BDF1 at dt/2 (the dt/2-class accuracy criterion).  The order
+    study branches from a SETTLED state (BDF1 at dt = 2.5e-4 to
+    t = 0.02 from the tanh-seed IC): the seed-relaxation transient is
+    not smooth-in-time and pollutes the large-dt asymptotics
+    (MEASURED without settling: BDF2 tail order 1.62 — mechanism
+    recorded in the ledger)."""
+    dm, mesh, cons = _dm(5, device)
+    settle = _a4b_stepper(dm, "bdf1", 2.5e-4)
+    for _ in range(80):
+        settle.step()
+    x0 = settle.x.copy()
+    t_end = 0.032
+
+    def run(tstep, dt):
+        st = _a4b_stepper(dm, tstep, dt)
+        st.x = x0.copy()
+        st.hist = x0.copy()
+        st.t = 0.0
+        st.dt = dt
+        for _ in range(int(round(t_end / dt))):
+            st.step()
+        return st.x
+
+    ref = run("bdf2", 2.5e-4)
+    e2 = [float(np.abs(run("bdf2", dt) - ref).max())
+          for dt in (4e-3, 2e-3, 1e-3)]
+    o21 = np.log2(e2[0] / e2[1])
+    o22 = np.log2(e2[1] / e2[2])
+    e1 = [float(np.abs(run("bdf1", dt) - ref).max())
+          for dt in (2e-3, 1e-3)]
+    print(f"A4b orders: BDF2 errs {[f'{e:.3e}' for e in e2]} orders "
+          f"{o21:.2f}/{o22:.2f}; BDF1 errs {[f'{e:.3e}' for e in e1]}; "
+          f"BDF2(2e-3) vs BDF1(1e-3): {e2[1]:.3e} vs {e1[1]:.3e}")
+    # MEASURED (2026-07-12, settled): BDF2 errs 3.187e-3 / 6.665e-4 /
+    # 1.481e-4, orders 2.26 / 2.17; BDF1 8.256e-3 / 4.003e-3 (order
+    # 1.04); BDF2(2e-3) = 6.665e-4 vs BDF1(1e-3) = 4.003e-3 — BDF2 at
+    # dt beats BDF1 at dt/2 by 6.0x.
+    assert o21 > 1.7 and o22 > 1.7, (e2, o21, o22)
+    # (ii) dt/2-class accuracy: BDF2 at dt beats BDF1 at dt/2
+    assert e2[1] < e1[1], (e2[1], e1[1])
+    assert e2[0] < e1[0], (e2[0], e1[0])
+
+
+def test_a4b_regression_and_frozen_theta(device):
+    """(iii) REGRESSION: tstep='bdf1' (and the default) take the
+    UNCHANGED code path — 3-step parity vs the default stepper; the
+    full-suite parity locks (S0 8.27e-15 class) are the deeper
+    evidence.  Plus the frozen-theta bookkeeping identity under BDF2
+    (a = b - c: equal histories reproduce theta exactly), checked on
+    an anisotropic march WITH the dt ladder active (reject/rescale
+    consistency: coefficients recomputed from the actual dt pair)."""
+    dm, mesh, cons = _dm(5, device)
+    stA = _a4b_stepper(dm, "bdf1", 2e-3)
+    stB = MultiPhaseStepper(
+        dm, M=1, K=1,
+        chi_aa=np.array([[0.0, 0.7248], [0.7248, 0.0]]),
+        chi_ac=np.array([[0.0, 0.0], [1.0836, 0.0]]),
+        chi_ca=np.array([[0.0, 1.0836], [0.0, 0.0]]),
+        N=[5.0298, 1.0], onsager=[[0.1]], kappa=[2e-4],
+        dsig=[2.6355], dh=[1.3072], Tm=[558.0], eps2=[1e-3],
+        L_psi=[5.0], alpha_th=[0.0], beta_th=[0.0], L_th=[5.0],
+        T=333.0, dt=2e-3, bulk="r14", newton_tol=1e-10, newton_max=80)
+    stB.set_initial([lambda x: np.full(len(x), 0.6)],
+                    [_disc((0.5, 0.5), 0.15, 0.02)],
+                    [lambda x: np.zeros(len(x))])
+    errs = []
+    for _ in range(3):
+        xa = stA.step()
+        xb = stB.step()
+        errs.append(float(np.abs(xa - xb).max()))
+    print(f"A4b bdf1-vs-default parity: {[f'{e:.2e}' for e in errs]}")
+    assert max(errs) < 1e-13, errs   # same code path
+
+    th0 = np.pi / 6.0
+    st = _a3_stepper(dm, 0.1, th0, tstep="bdf2")
+    r = st.march(t_end=0.2, dt_max=0.02, max_steps=300, dt_min=1e-8)
+    assert r == "t_end", r
+    dth = float(np.abs(st.theta(0) - th0).max())
+    dpsi = float(st.psi(0).max())
+    print(f"A4b frozen theta under BDF2 (ladder march): max|dtheta| "
+          f"= {dth:.2e}, psi_max {dpsi:.3f}, rejects {st.n_reject}")
+    assert dth < 1e-12, dth          # exact bookkeeping identity
+    assert dpsi > 0.8                # the crystal actually evolved
+
+
+# ---------------------------------------------------------------------
+# A4 cross-matrix (tstep column): A3 anisotropy under BDF2
+# ---------------------------------------------------------------------
+def test_a4x_a3_aniso_bdf2(device):
+    """A3 single-seed anisotropy under BDF2 (matrix item (ii)),
+    deterministic: same L6 config as the A3 gate at delta = 0.1,
+    theta = 30 deg — aspect ratio and orientation locking must
+    survive the time-scheme change."""
+    dm, mesh, cons = _dm(6, device)
+    th0 = np.pi / 6.0
+    st = _a3_stepper(dm, 0.1, th0, tstep="bdf2")
+    r = st.march(t_end=0.5, dt_max=0.02, max_steps=500, dt_min=1e-8)
+    assert r == "t_end", r
+    ar, ax = _shape_weighted(st)
+    print(f"A4x A3 aniso under BDF2: ARw {ar:.4f} (bdf1 1.1506), axis "
+          f"{np.degrees(ax):.2f} deg vs theta 30")
+    assert ar > 1.10, ar             # bdf1 measured 1.1506
+    e = abs(ax - th0)
+    assert min(e, np.pi - e) < np.radians(2.0), ax
