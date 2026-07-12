@@ -241,10 +241,91 @@ ratio, end states equal) is the recorded license.
   the L6/L7 hero carries the morphology claim; in-suite gates lock
   growth/dissolution/contrast, not confinement).
 
-GATES: tests/test_multiphase_s3.py::test_s3b_* — measured table
-below (Sec 2.3).
+### 2.3 S3b gate design + campaign measurements + HANDOFF STATE
+
+GATE FILE: tests/test_multiphase_s3.py::test_s3b_mechanism_dissolve_
+vs_grow + test_s3b_coupling_contrast_and_variants (in the working
+tree, NOT yet committed — commit-on-green pending, below).  Design:
+
+- (i) MECHANISM (deterministic): identical psi = 0.5 embryos
+  (r0 = 0.15, periodic-wrapped discs) implanted WET (t = 1, phi_s =
+  0.836) dissolve; implanted DRY (t = 15 via a shared pre-marched
+  state, phi_s ~ 0.15, domains phi_f ~ 0.8) grow — the ordering is
+  the r14 solubility thermodynamics.  Design iterations (measured):
+  psi = 0.95 discs make the wet dissolution impulsive enough to
+  grind the ladder (dt reset to 2e-3 after the implant impulse also
+  added); a NON-periodic box puts the phi_f-richest sites against
+  the walls and wall-clipped half-discs are Gibbs-Thomson-
+  subcritical (dry seeds dissolved — measured) => the gates run the
+  laterally-PERIODIC film mesh with periodic-wrapped implant
+  distances.
+- (ii)+(iii) COUPLING + VARIANTS: one shared 15-unit pre-march
+  feeds the deterministic leg, its repeat, and 3 noise-ON-at-implant
+  growth variants (noise_psi 1e-2; growth-stage stochasticity —
+  recorded honestly: the distribution lock is over GROWTH, not
+  nucleation); K = 0 twin marched to the same horizon; contrast
+  locks on crystalline area, phi_f purification (K1 phi_f_max vs
+  K0) and max|phi_f(K1) - phi_f(K0)|.
+
+CAMPAIGN MEASUREMENTS backing the locks (healthy-clock era, L5
+periodic, chi_ca 1.6 unless noted):
+- wet dissolution: r0 0.08/psi 0.95 seeds at phi_s 0.836: psi_max
+  0.95 -> 7e-2 by +0.5, 8e-4 by +2 (chi 1.0836); r0 0.15 wall-
+  clipped at chi 1.6: area 0.1625 -> 0.0, psi_max 2.2e-2, 1 reject.
+- dry growth (t_implant 14, r0 0.15, psi 0.95): area 0.168 ->
+  saturation, X -> 0.961 at full dry (t 20.5), 0 rejects (dry5b);
+  end state matches the 2310/16390 near-total-crystallization
+  plateau class (their 96%).
+- K0 twin end state: phi_f_max 0.852, iface 0.309, X = 0 — the
+  coupling contrast is structural (K1 purifies to phi_f ~ 0.94-0.98
+  and crystallizes ~all f).
+- L6 hero (seeded at quench + noise texture): 6 seeds -> 4 resolved
+  crystals -> impingement merge, X 0.95 by t = 17.6.
+
+BLOCKED-ON-HARDWARE (the ONLY missing piece): the pytest run of the
+two S3b gates.  The WSL2 clock-governor pathology (Sec 3) pinned
+both cards at idle clocks through the evening; every GPU-touching
+path (warp assembly copies AND cuDSS) runs 10-50x slow, so the gate
+suite could not complete within the session (it ran > 2 h in three
+attempts; the identical marches took minutes in the healthy-clock
+window).  HANDOFF: when the box recovers (host reboot likely),
+  CUDA_VISIBLE_DEVICES=1 python -m pytest tests/test_multiphase_s3.py -k s3b -s
+(~15-25 min healthy), read the printed measured values, tighten the
+in-comment locks per house rules if the windows allow, and commit
+(the S3a commit 645d10c carries the ledger; the gate file +
+this section are the S3b delta).  FLAGGED LOCK: the deterministic-
+repeat lock (rep_dev < 1e-8) may need the FP-fate treatment (house
+assembly-atomics lesson) — if the repeat deviates at amplified-
+roundoff scale, lock from the measured distribution instead.
+
+SNAPSHOTS (Baskar's README request) — DELIVERED:
+/tmp/claude-1000/-home-bglab-Baskar-DiffSim/de8f9b3d-9dd7-48ec-8acc-
+9f5aeb605975/scratchpad/s3_renders_L6/: 38 npz field dumps
+(coords, t, h, phi_f, phi_p, psi, theta; phi_s = 1 - phi_f - phi_p)
++ 38 preview pngs + config.json (exact config, seeds, script line).
+Arc: t = 0 wet film (h = 1) -> drying + surface-directed layering
+(polymer-rich skin) + lateral AAPS columns (t 2.5-13) -> implant/
+nucleation in the f-rich columns (t = 14, 6 seeds, distinct theta
+markers) -> growth (t 14.5, 4 crystals, area 0.375) -> impingement
++ near-full crystallization of the f phase (t 17.6, X 0.95) in the
+dried film (h 0.156).  The t ~ 14.5 frame shows fullerene pillars
+crystallizing under a polymer skin — production-quality.
 
 ## 3. Solver notes (S3 build)
+
+- WSL2 GPU CLOCK-GOVERNOR PATHOLOGY (measured 2026-07-12 evening,
+  FLAGGED for the supervisor): both RTX 6000 Ada cards
+  intermittently pin at idle SM clocks (210-255 MHz vs 3105 max)
+  UNDER 40-55% load (power 22 W, temp 43 C) — identical marches run
+  10-15x slower in those windows (measured: the same L5 wet-leg
+  march 7.2 s at boosted clocks vs > 7 min pinned; profiles show
+  the time inside warp copies + cuDSS calls, i.e. GPU-side).
+  nvidia-smi clock locking needs root (denied on the shared box);
+  persistence mode already on.  S3b gate wall times in the suite
+  are therefore CLOCK-STATE DEPENDENT; the gate LOCKS are physics
+  quantities and unaffected.  First suspected as a pytest
+  interaction (gates crawled while scripts flew) — disproved by a
+  direct-call A/B; the governor state was the variable.
 
 - cuDSS vs splu at L6 (25k dof, fastmode_n film march, line search):
   8.3 s/step vs 1.35 s/step at 4-7 iters — cuDSS is the production
@@ -268,7 +349,21 @@ S3a stage (2026-07-12, this workstation):
   test_s2c_crystallite_quench_and_dissolution (the known multi-hour
   march; the ONLY deselect): 9 passed, 1 deselected in 2355.8 s.
 
-S3b stage: TBD.
+S3b stage: gate file written and physics-calibrated (Sec 2.3); the
+pytest confirmation run is BLOCKED on the GPU clock-governor state
+(Sec 3) — handoff protocol in Sec 2.3.  S3b therefore UNCOMMITTED
+per commit-on-green.
+
+## 4b. S3c — front-end integration: HANDOFF (not started)
+
+Per the spec's own contingency: S3a/S3b consumed the session.  The
+S3c work items stand as specified: FilmParams species list (role
+active|solvent, crystallizable flag, N_i, dh_i, Tm_i, dsig_i, eps_i,
+D_i, k_e_i) + chi matrices per P1 Sec 5; RunLog preflight
+crystallization rules (undercooling sign, psi interface resolution
+eps_i/h, noise-vs-barrier magnitude); a config YAML for the S3b
+case.  The S3b production config is fully specified in Sec 2.1 +
+the snapshots' config.json — the YAML is a transliteration.
 
 ## 5. Frontiers recorded
 
