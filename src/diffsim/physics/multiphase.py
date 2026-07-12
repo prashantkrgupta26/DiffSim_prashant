@@ -254,6 +254,61 @@ schedule hook (annealing protocols); drive_k is refreshed per attempt
 TemperatureField advances first within each attempt and commits only
 with the accepted step.
 
+S3a — FILM MODE (film=dict(...); the Landau-mapped moving frame of
+wodo_film brought into the (M, K) factory; formulation contract P1
+Sec 4 stage S3: psi/theta ride the frame EXACTLY as phi — mapped
+gradients + frame advection on every field; the top-flux term is
+phi-only, solvent evaporates AMORPHOUS).  The computational strip
+[0, Xcomp] x [0, Ycomp] represents a physical domain
+(lat_scale Xcomp) x h_curr(t); vertical = LAST axis (vax = dim-1),
+theta_map = xi_y / Ycomp, physical z = h_curr theta_map.  Mapped
+gradient factors (applied to test AND trial/field gradients — 1/h^2
+on vertical grad.grad blocks): mlat = 1/lat_scale,
+mvert = Ycomp/h_curr.  The wodo v1.1 generalized-metric convention is
+kept verbatim: the kernel works in RAW computational coordinates, the
+advection coefficient is K xi_y (1/h) on the raw xi_y-derivative
+(Ycomp cancels), and volume/boundary integrals carry computational
+measure (the mu rows are the physical rows divided by the constant-
+in-space ratio lat_scale h/Ycomp — same solutions; boundary naturals
+pick up Ycomp/h, see below).  WEAK FORM ADDITIONS (test v; per
+retained species i, crystallizable k; term-to-code labels inline):
+
+  R_phi_i += Int v (K xi_y/h) d(phi_i)/dxi_y dV        (frame advection)
+           - ((K - k_e_i)/h) Ycomp Int_top v phi_i dS  (enrichment flux)
+  R_psi_k += Int v (K xi_y/h) d(psi_k)/dxi_y dV        (psi advects as phi;
+                                                        NO top flux — the
+                                                        S3 contract)
+  R_th_k  += Int v (p+pf) (K xi_y/h) d(th_k)/dxi_y dV  (KWC; frozen mode
+                                                        drops the (p+pf))
+
+with K = SUM_i k_e_i avg(phi_i^top) >= 0 frozen at t_n per attempt
+(k_e a FULL-species vector; scalar input = the eliminated solvent's
+rate, the exact wodo Bi semantics — S3 configs translate 1:1; per-
+RETAINED-species k_e_i > 0 is the S4a hook, carried but not gated:
+its avg-vs-pointwise flux closure is recorded there), and
+h_curr -= dt K on ACCEPTED steps (explicit, wodo contract).  The
+enrichment-flux/advection sign pairing conserves the physical solute
+content h Int phi_i dtheta EXACTLY per BDF1 step (wodo SIGN NOTE;
+partition of unity + the implicit-advection/explicit-h cancellation);
+the psi analogue h Int psi_k dtheta is conserved exactly while
+psi^top = 0 (pure advection).  Under BDF2 the pairing is no longer
+telescoping-exact: the content drift is the BDF2 global error on
+P' = (K/h) P (O(dt^2), measured in the S3 gates — a discretization-
+order drift, not a leak).  march() gains the evaporation dt-cap
+dt <= dh_cap/K and h_min/phis_stop criteria.  The A2 wall energy
+stays on the SUBSTRATE face (assert: not the moving face) and its
+natural term picks up the mapped boundary measure factor Ycomp/h.
+FDT/CHC noise normalization stays in COMPUTATIONAL measure (the
+amplitude is the anchor's calibration knob — recorded).  A1 T-field
+in film mode: TemperatureField splits the stiffness into lateral +
+vertical blocks scaled per attempt by mlat^2/mvert^2, adds the frame
+advection rho_cp (K/h) Int N_a xi_y dN_b/dxi_y, and the EVAPORATIVE
+COOLING natural load  - L_vap K (Ycomp/h) Int_top N_a dS  (latent
+heat sink at the receding surface; L_vap = 0 default OFF).  film
+dict keys: k_e (scalar | (M+1)-vector), h0, lat_scale, dh_cap, K_fn
+(manufactured-frame override for MMS: K(t) callable, replaces the
+k_e closure).
+
 TIME SCHEME (A4b).  tstep="bdf1" (default, existing behavior
 bit-identically) | "bdf2": VARIABLE-STEP BDF2 with the standard
 variable coefficients — for step ratio r = dt_n/dt_{n-1},
@@ -397,7 +452,8 @@ def np_potentials(phis, psis, pars):
 def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                     bulk: str = "p1", mob: str = "const",
                     theta: str = "kwc", tfield: bool = False,
-                    dth: bool = False, aniso: bool = False):
+                    dth: bool = False, aniso: bool = False,
+                    film: bool = False):
     """Monolithic Newton kernel for the 2M+2K node-major system.
     (M, K, bulk, mob, theta, tfield, dth, aniso) compile-time; see
     module docstring.
@@ -414,9 +470,13 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
     crystal driving in-kernel (A1); dth=True applies the Arrhenius
     D(T) mobility factor per GP (A1 hook); aniso=True compiles the
     anisotropic psi gradient flux (A3; dim = 2 + frozen theta only).
-    All three default False = the pre-A-pack kernel bit-identically."""
+    film=True compiles the Landau-mapped moving-frame terms (S3a,
+    module docstring): mapped gradient factors mlat/mvert on test AND
+    field gradients, and the frame advection kadv xiy madv d/dxi_y on
+    the phi/psi/theta rows (vertical = dim-1).
+    All flags default False = the pre-A-pack kernel bit-identically."""
     key = ("mpf_newton", nbf, nqp, dim, M, K, bulk, mob, theta,
-           tfield, dth, aniso)
+           tfield, dth, aniso, film)
     if key in _kernel_cache:
         return _kernel_cache[key]
     assert bulk in ("p1", "r14"), bulk
@@ -434,6 +494,8 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
     TFIELD = bool(tfield)
     DTH = bool(dth)
     ANISO = bool(aniso)
+    FILM = bool(film)
+    vax = dim - 1               # film vertical = LAST axis (wodo)
     dim_pow = float(dim)
     Kp = max(K, 1)
     ndof = 2 * M + 2 * K
@@ -492,6 +554,9 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
               da: wp.array(dtype=wp.float64),        # [Kp] aniso delta_a
               ma: wp.array(dtype=wp.float64),        # [Kp] aniso m-fold
               areg: wp.float64,                      # aniso |g| guard
+              xiy: wp.array(dtype=wp.float64),       # [ngp] film xi_y
+              mlat: wp.float64, mvert: wp.float64,   # film metric (S3a)
+              madv: wp.float64, kadv: wp.float64,    # film 1/h, K
               sigma: wp.float64, breg: wp.float64,
               kgd: wp.float64, pfloor: wp.float64,
               Ae: wp.array3d(dtype=wp.float64),
@@ -503,6 +568,12 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
         for q in range(nqp):
             dJxW = wtab[q] * jac
             gp = e * nqp + q
+            # S3a film frame: advection coefficient on the RAW xi_y
+            # derivative, K * xi_y * (1/h) (wodo pattern: the Ycomp
+            # factors cancel; module docstring S3a)
+            adv = wp.float64(0.0)
+            if wp.static(FILM):
+                adv = kadv * xiy[gp] * madv
             # ---- unpack fields -----------------------------------------
             phiv = VecSp()
             ssum = wp.float64(0.0)
@@ -618,6 +689,12 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                 g2 = wp.float64(0.0)
                 for dd in range(dim):
                     gtd = grads[gp, 2 * M + 2 * k + 1, dd]
+                    if wp.static(FILM):
+                        # mapped |grad~ theta| (S3a): 1/h on vertical
+                        if dd == vax:
+                            gtd = gtd * mvert
+                        else:
+                            gtd = gtd * mlat
                     g2 += gtd * gtd
                 Sd[k] = wp.sqrt(g2 + kgd * kgd)
                 Eori[k] = wp.float64(0.5) * alpha[k] * Sd[k] \
@@ -649,6 +726,11 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                 for k in range(K):
                     gpx = grads[gp, 2 * M + 2 * k, 0]
                     gpy = grads[gp, 2 * M + 2 * k, 1]
+                    if wp.static(FILM):
+                        # anisotropy acts on the PHYSICAL gradient
+                        # (S3a: mapped components; dim=2, vax=1)
+                        gpx = gpx * mlat
+                        gpy = gpy * mvert
                     g2p = gpx * gpx + gpy * gpy
                     deff = da[k] * g2p / (g2p + areg * areg)
                     ang = ma[k] * (wp.atan2(gpy, gpx)
@@ -935,17 +1017,48 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                     grot[k] = wp.float64(0.0)
                 for dd in range(dim):
                     gNa = dNtab[q, a, dd] * dscale
-                    for i in range(M):
-                        gmu[i] += gNa * grads[gp, 2 * i + 1, dd]
-                        gphi[i] += gNa * grads[gp, 2 * i, dd]
-                        gq[i] += gNa * qphi[gp, i, dd]
-                    for k in range(K):
-                        gpsi[k] += gNa * grads[gp, 2 * M + 2 * k, dd]
-                        gth[k] += gNa * grads[gp, 2 * M + 2 * k + 1, dd]
+                    if wp.static(FILM):
+                        # mapped gradient grad~ (S3a): the factor ms
+                        # rides on BOTH the test and the field gradient
+                        # (1/h^2 on vertical grad.grad blocks); the
+                        # stochastic flux q is a physical flux — test
+                        # side only (the wodo convention)
+                        ms = mlat
+                        if dd == vax:
+                            ms = mvert
+                        gNa = gNa * ms
+                        for i in range(M):
+                            gmu[i] += gNa * (grads[gp, 2 * i + 1, dd]
+                                             * ms)
+                            gphi[i] += gNa * (grads[gp, 2 * i, dd] * ms)
+                            gq[i] += gNa * qphi[gp, i, dd]
+                        for k in range(K):
+                            gpsi[k] += gNa * (grads[gp, 2 * M + 2 * k,
+                                                    dd] * ms)
+                            gth[k] += gNa * (grads[gp,
+                                                   2 * M + 2 * k + 1,
+                                                   dd] * ms)
+                    else:
+                        for i in range(M):
+                            gmu[i] += gNa * grads[gp, 2 * i + 1, dd]
+                            gphi[i] += gNa * grads[gp, 2 * i, dd]
+                            gq[i] += gNa * qphi[gp, i, dd]
+                        for k in range(K):
+                            gpsi[k] += gNa * grads[gp, 2 * M + 2 * k, dd]
+                            gth[k] += gNa * grads[gp,
+                                                  2 * M + 2 * k + 1, dd]
                 if wp.static(ANISO):
                     for k in range(K):
-                        grot[k] = (dNtab[q, a, 0] * Rgx[k]
-                                   + dNtab[q, a, 1] * Rgy[k]) * dscale
+                        if wp.static(FILM):
+                            # mapped test gradient . R grad~ psi (Rg is
+                            # built from mapped components above)
+                            grot[k] = (dNtab[q, a, 0] * mlat * Rgx[k]
+                                       + dNtab[q, a, 1] * mvert
+                                       * Rgy[k]) * dscale
+                        else:
+                            grot[k] = (dNtab[q, a, 0] * Rgx[k]
+                                       + dNtab[q, a, 1] * Rgy[k]) \
+                                * dscale
                 # residual rows (be = -r)
                 for i in range(M):
                     tr = wp.float64(0.0)
@@ -970,6 +1083,10 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                     r_p = (Na * (sigma * vals[gp, 2 * i]
                                  - hist[gp, 2 * i] - src[gp, 2 * i])
                            + tr + sm * gq[i]) * dJxW
+                    if wp.static(FILM):
+                        # frame advection Int v (K xi_y/h) dphi/dxi_y
+                        # (S3a; raw xi_y-derivative, coefficient adv)
+                        r_p += Na * adv * grads[gp, 2 * i, vax] * dJxW
                     r_m = (Na * (vals[gp, 2 * i + 1] - mub[i]
                                  - src[gp, 2 * i + 1])) * dJxW \
                         - kap[i] * gphi[i] * dJxW
@@ -989,32 +1106,63 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                                  + Lpsi[k] * Fpsi[k] + qpsi[gp, k]
                                  - src[gp, rp])
                            + flx) * dJxW
+                    if wp.static(FILM):
+                        # psi advects EXACTLY as phi (S3 contract);
+                        # no top flux (crystallinity does not evaporate)
+                        r_s += Na * adv * grads[gp, rp, vax] * dJxW
                     pk = porv[k] + pfloor
                     if wp.static(TH_FROZEN):
                         r_t = (Na * (sigma * vals[gp, rp + 1]
                                      - hist[gp, rp + 1]
                                      - src[gp, rp + 1])) * dJxW
+                        if wp.static(FILM):
+                            # frozen theta in the film: the bookkeeping
+                            # row becomes MARKER ADVECTION (theta rides
+                            # the frame; k_e = 0 restores the identity)
+                            r_t += Na * adv * grads[gp, rp + 1, vax] \
+                                * dJxW
                     else:
                         r_t = (Na * (pk * (sigma * vals[gp, rp + 1]
                                            - hist[gp, rp + 1])
                                      - src[gp, rp + 1])
                                + pk * ceff[k] * gth[k]) * dJxW
+                        if wp.static(FILM):
+                            # KWC film: (p+pf)(theta_t + adv theta_y)
+                            r_t += Na * pk * adv \
+                                * grads[gp, rp + 1, vax] * dJxW
                     wp.atomic_add(be, e, ndof * a + rp, -r_s)
                     wp.atomic_add(be, e, ndof * a + rp + 1, -r_t)
                 # Jacobian blocks
                 for b in range(nbf):
                     Nb = Ntab[q, b]
                     lap = wp.float64(0.0)
-                    for dd in range(dim):
-                        lap += dNtab[q, a, dd] * dNtab[q, b, dd] \
-                            * dscale * dscale
+                    if wp.static(FILM):
+                        # mapped grad~.grad~ (S3a): ms^2 per direction
+                        for dd in range(dim):
+                            ms = mlat
+                            if dd == vax:
+                                ms = mvert
+                            lap += dNtab[q, a, dd] * dNtab[q, b, dd] \
+                                * dscale * dscale * ms * ms
+                    else:
+                        for dd in range(dim):
+                            lap += dNtab[q, a, dd] * dNtab[q, b, dd] \
+                                * dscale * dscale
                     NN = Na * Nb * dJxW
                     lapw = lap * dJxW
+                    advw = wp.float64(0.0)
+                    if wp.static(FILM):
+                        # d/dx of the frame-advection term (S3a)
+                        advw = Na * adv * dNtab[q, b, vax] * dscale \
+                            * dJxW
                     for i in range(M):
                         ra = ndof * a + 2 * i
                         # phi_i row: time + transport
                         wp.atomic_add(Ae, e, ra, ndof * b + 2 * i,
                                       sigma * NN)
+                        if wp.static(FILM):
+                            wp.atomic_add(Ae, e, ra, ndof * b + 2 * i,
+                                          advw)
                         if wp.static(FASTMODE):
                             wp.atomic_add(Ae, e, ra, ndof * b + 1,
                                           lam * lapw)
@@ -1073,11 +1221,18 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                             rotw = (dNtab[q, a, 1] * dNtab[q, b, 0]
                                     - dNtab[q, a, 0] * dNtab[q, b, 1]) \
                                 * dscale * dscale * dJxW
+                            if wp.static(FILM):
+                                # grad~Na . R grad~Nb = mlat mvert x
+                                # the unmapped rotation pairing (S3a)
+                                rotw = rotw * (mlat * mvert)
                             gj = A2k[k] * lapw + AAk[k] * rotw
                         wp.atomic_add(Ae, e, rs, ndof * b + rp,
                                       sigma * NN
                                       + Lpsi[k] * (d2pp[k, k] * NN
                                                    + gj))
+                        if wp.static(FILM):
+                            wp.atomic_add(Ae, e, rs, ndof * b + rp,
+                                          advw)
                         for l in range(K):
                             if l != k:
                                 wp.atomic_add(Ae, e, rs,
@@ -1093,10 +1248,22 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                         if wp.static(TH_FROZEN):
                             wp.atomic_add(Ae, e, rt, ndof * b + rp + 1,
                                           sigma * NN)
+                            if wp.static(FILM):
+                                wp.atomic_add(Ae, e, rt,
+                                              ndof * b + rp + 1, advw)
                         else:
                             wp.atomic_add(Ae, e, rt, ndof * b + rp + 1,
                                           pk * sigma * NN
                                           + pk * ceff[k] * lapw)
+                            if wp.static(FILM):
+                                wp.atomic_add(Ae, e, rt,
+                                              ndof * b + rp + 1,
+                                              pk * advw)
+                                # psi-col of the (p+pf) adv theta_y term
+                                wp.atomic_add(
+                                    Ae, e, rt, ndof * b + rp,
+                                    porp[k] * Nb * Na * adv
+                                    * grads[gp, rp + 1, vax] * dJxW)
                             wp.atomic_add(
                                 Ae, e, rt, ndof * b + rp,
                                 porp[k] * Nb
@@ -1106,6 +1273,53 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
 
     _kernel_cache[key] = mpf_k
     return mpf_k
+
+
+# ---------------------------------------------------------------------
+# generic boundary-face consistent mass (A2/A4a builder, factored for
+# reuse: wall energy, film top flux, evaporative-cooling load)
+# ---------------------------------------------------------------------
+def _face_mass(dm, face):
+    """Boundary-face node lists + CONSISTENT face mass matrices:
+    tensor product of the 1-D consistent edge mass over the in-face
+    dims.  BASIS-GENERIC (A4a): the 1-D edge mass is built from the
+    tabulated 1-D Lagrange basis by quadrature (exact at the (p+1)-
+    point Gauss rule for the degree-2p integrand), so p = 1 reproduces
+    le [[1/3, 1/6], [1/6, 1/3]] exactly and p = 2 the Simpson-
+    consistent le/30 [[4, 2, -1], [2, 16, 2], [-1, 2, 4]].
+    face = (axis, side): side 0 = the min face, 1 = the max face.
+    Returns (faces [nf, nfn] int64, fmass [nf, nfn, nfn])."""
+    from ..mesh.nodes import _local_offsets
+    from ..mesh.basis import gauss_1d, lagrange_1d
+    mesh = dm.mesh
+    vax, side = int(face[0]), int(face[1])
+    assert 0 <= vax < dm.dim, face
+    assert not mesh.tree.periodic[vax], "face on a periodic axis"
+    coords = mesh.node_coords
+    target = (coords[:, vax].min() if side == 0
+              else coords[:, vax].max())
+    tol = 1e-12
+    faces, fmass = [], []
+    for pv, conn in mesh.conn_of.items():
+        # 1-D consistent edge mass on the UNIT interval:
+        # m1[a, b] = Int_0^1 N_a N_b (reference [-1, 1] halved)
+        pts, wts = gauss_1d(int(pv))
+        Nq = np.array([lagrange_1d(int(pv), x)[0] for x in pts])
+        m1 = 0.5 * np.einsum("q,qa,qb->ab", wts, Nq, Nq)
+        offs = _local_offsets(int(pv), dm.dim)
+        loc = np.where(offs[:, vax] == (0 if side == 0 else pv))[0]
+        of = np.delete(offs[loc], vax, axis=1)      # in-face offsets
+        Mu = np.ones((len(loc), len(loc)))
+        for dd in range(dm.dim - 1):
+            Mu *= m1[of[:, None, dd], of[None, :, dd]]
+        nn = conn[:, loc]                           # [ne, nfn]
+        on_w = np.all(np.abs(coords[nn, vax] - target) < tol, axis=1)
+        h_el = mesh.tree.h()[mesh.bins[pv]]
+        for e in np.where(on_w)[0]:
+            faces.append(nn[e])
+            fmass.append(h_el[e] ** (dm.dim - 1) * Mu)
+    assert faces, "no elements on the requested face"
+    return np.asarray(faces, np.int64), np.asarray(fmass, np.float64)
 
 
 # ---------------------------------------------------------------------
@@ -1140,10 +1354,23 @@ class TemperatureField:
     host scipy in FULL node space, then the constraint triple product
     (hanging nodes ride the same Tc as the multiphase system).
     attempt() does NOT commit — the caller owns T^n (the stepper
-    commits on accepted steps only, matching the reject ladder)."""
+    commits on accepted steps only, matching the reject ladder).
+
+    FILM MODE (film=True; S3a, module docstring): the strip is the
+    Landau-mapped frame — the stiffness splits into lateral + vertical
+    blocks recombined per attempt as mlat^2 Klat + mvert^2 Kvert
+    (mlat = 1/lat_scale, mvert = Ycomp/h), the frame advection adds
+    rho_cp (K/h) Adv with Adv = Int N_a xi_y dN_b/dxi_y (raw xi_y,
+    wodo convention), and the EVAPORATIVE-COOLING natural load
+    k_th dT/dn = -L_vap J_evap at the receding surface enters as
+    rhs -= L_vap K (Ycomp/h) Int_top N_a dS (L_vap = 0 default OFF).
+    The factorization cache keys on (dt, h, K) — h moves every step,
+    so film marches refactorize per accepted-dt change (the scalar
+    T system is small next to the multiphase solve)."""
 
     def __init__(self, dm, rho_cp=1.0, k_th=1.0, src_fn=None,
-                 dirichlet=None, g_fn=None):
+                 dirichlet=None, g_fn=None, film=False, lat_scale=1.0,
+                 L_vap=0.0):
         from .poisson import gauss_points
         self.dm = dm
         self.rho_cp, self.k_th = float(rho_cp), float(k_th)
@@ -1151,11 +1378,15 @@ class TemperatureField:
         self.dirichlet = None if dirichlet is None \
             else np.asarray(dirichlet, np.int64)
         self.g_fn = g_fn
+        self.film = bool(film)
+        self.lat_scale = float(lat_scale)
+        self.L_vap = float(L_vap)
         mesh, cons = dm.mesh, dm.constraints
         self.Tc = cons.T.tocsr()
         self.free_coords = mesh.node_coords[cons.free_nodes]
         self.xq = gauss_points(mesh, dm.tables_by_p)
-        rows, cols, mv, kv = [], [], [], []
+        vax = dm.dim - 1
+        rows, cols, mv, kv, kvv, av = [], [], [], [], [], []
         self._wJ = {}
         for pv, eids in mesh.bins.items():
             tb = dm.tables_by_p[pv]
@@ -1172,6 +1403,16 @@ class TemperatureField:
             mv.append((jac[:, None, None] * Mref[None]).ravel())
             kv.append((ksc[:, None, None] * Kref[None]).ravel())
             self._wJ[pv] = np.tile(tb.w, ne) * np.repeat(jac, tb.nqp)
+            # film split (S3a): vertical-only stiffness + advection
+            Kvref = np.einsum("q,qa,qb->ab", tb.w, tb.dN[:, :, vax],
+                              tb.dN[:, :, vax])
+            kvv.append((ksc[:, None, None] * Kvref[None]).ravel())
+            if self.film:
+                xv = self.xq[pv][:, vax].reshape(ne, tb.nqp)
+                Aev = np.einsum("q,qa,qb,eq->eab", tb.w, tb.N,
+                                tb.dN[:, :, vax], xv) \
+                    * (jac * (2.0 / hh))[:, None, None]
+                av.append(Aev.ravel())
         n = len(mesh.node_coords)
         r = np.concatenate(rows)
         c = np.concatenate(cols)
@@ -1181,6 +1422,21 @@ class TemperatureField:
                               shape=(n, n)).tocsr()
         self.Mfree = (self.Tc.T @ Mfull @ self.Tc).tocsr()
         self.Kfree = (self.Tc.T @ Kfull @ self.Tc).tocsr()
+        if self.film:
+            Kvfull = sp.coo_matrix((np.concatenate(kvv), (r, c)),
+                                   shape=(n, n)).tocsr()
+            self.Kv_free = (self.Tc.T @ Kvfull @ self.Tc).tocsr()
+            self.Klat_free = (self.Kfree - self.Kv_free).tocsr()
+            Afull = sp.coo_matrix((np.concatenate(av), (r, c)),
+                                  shape=(n, n)).tocsr()
+            self.Adv_free = (self.Tc.T @ Afull @ self.Tc).tocsr()
+            self.y_comp = float(mesh.node_coords[:, vax].max())
+            # top-face lumped load Int_top N_a dS (consistent face
+            # mass @ 1) for the evaporative-cooling natural term
+            faces, fM = _face_mass(dm, (vax, 1))
+            Fe = np.zeros(n)
+            np.add.at(Fe, faces.ravel(), fM.sum(axis=2).ravel())
+            self._evap_free = np.asarray(self.Tc.T @ Fe)
         self._lu, self._lu_dt = None, None
 
     def _load(self, t):
@@ -1194,20 +1450,37 @@ class TemperatureField:
                           Fa.ravel())
         return np.asarray(self.Tc.T @ F)
 
-    def attempt(self, T_old, dt, t_new):
+    def attempt(self, T_old, dt, t_new, h=None, K_evap=0.0):
         """One BDF1 solve [t_new - dt, t_new] from T_old (free vector);
-        returns T_new WITHOUT committing (linear: always 'converged')."""
+        returns T_new WITHOUT committing (linear: always 'converged').
+        Film mode passes the frozen frame state (h, K_evap)."""
         from scipy.sparse.linalg import splu
         a = self.rho_cp / dt
         rhs = a * (self.Mfree @ T_old) + self._load(t_new)
-        if self._lu is None or self._lu_dt != dt:
-            A = (a * self.Mfree + self.k_th * self.Kfree).tolil()
+        key = (dt, h, K_evap) if self.film else dt
+        if self._lu is None or self._lu_dt != key:
+            if self.film:
+                assert h is not None and h > 0.0, h
+                mlat = 1.0 / self.lat_scale
+                mvert = self.y_comp / h
+                A = (a * self.Mfree
+                     + self.k_th * (mlat * mlat * self.Klat_free
+                                    + mvert * mvert * self.Kv_free)
+                     + self.rho_cp * (K_evap / h)
+                     * self.Adv_free).tolil()
+            else:
+                A = (a * self.Mfree + self.k_th * self.Kfree).tolil()
             if self.dirichlet is not None:
                 for i in self.dirichlet:
                     A.rows[i] = [int(i)]
                     A.data[i] = [1.0]
             self._lu = splu(A.tocsr().tocsc())
-            self._lu_dt = dt
+            self._lu_dt = key
+        if self.film and self.L_vap != 0.0 and K_evap > 0.0:
+            # evaporative cooling s_evap = -L_vap J_evap at the top
+            # face (natural term; mapped boundary measure Ycomp/h)
+            rhs -= (self.L_vap * K_evap * self.y_comp / h) \
+                * self._evap_free
         if self.dirichlet is not None:
             rhs[self.dirichlet] = self.g_fn(
                 self.free_coords[self.dirichlet], t_new)
@@ -1235,7 +1508,8 @@ class MultiPhaseStepper:
                  clip_psi=True, line_search=False,
                  T_mode="scalar", T_field=None, D_T=None,
                  wall_g=None, wall_h=None, wall_face=(1, 0),
-                 delta_a=None, m_a=None, a_reg=1e-8, tstep="bdf1"):
+                 delta_a=None, m_a=None, a_reg=1e-8, tstep="bdf1",
+                 film=None):
         from ..physics.poisson import gauss_points
         self.dm = dm
         self.M, self.K = int(M), int(K)
@@ -1314,6 +1588,32 @@ class MultiPhaseStepper:
         self.wall_on = bool((self.wall_g != 0.0).any()
                             or (self.wall_h != 0.0).any())
         self.wall_face = (int(wall_face[0]), int(wall_face[1]))
+        # S3a — film mode (Landau-mapped moving frame; module docstring)
+        self.film_on = film is not None
+        if self.film_on:
+            f = dict(film)
+            ke = f.pop("k_e", 0.0)
+            self.h_curr = float(f.pop("h0", 1.0))
+            self.lat_scale = float(f.pop("lat_scale", 1.0))
+            self.dh_cap = float(f.pop("dh_cap", 0.004))
+            self.K_fn = f.pop("K_fn", None)
+            assert not f, f"unknown film keys: {sorted(f)}"
+            if np.ndim(ke) == 0:
+                # scalar k_e = the eliminated solvent's rate (the
+                # exact wodo Bi semantics — configs translate 1:1)
+                kev = np.zeros(n_sp)
+                kev[self.M] = float(ke)
+            else:
+                kev = np.asarray(ke, np.float64).reshape(n_sp)
+            assert (kev >= 0.0).all(), kev
+            self.k_e = kev
+            self.vax = dm.dim - 1       # vertical = LAST axis (wodo)
+            assert not dm.mesh.tree.periodic[self.vax], \
+                "film: the vertical axis must be non-periodic"
+            if self.wall_on:
+                assert self.wall_face != (self.vax, 1), \
+                    "A2 wall energy on the MOVING (top) face is " \
+                    "unsupported (substrate face only in film mode)"
         self.bulk, self.mob = bulk, mob
         assert bulk in ("p1", "r14")
         assert mob in ("const", "fastmode", "fastmode_n", "slowmode_n")
@@ -1403,6 +1703,22 @@ class MultiPhaseStepper:
         # dummy per-GP T array (compile-time dead unless tfield/dth)
         self._tq_dummy = wp.array(np.zeros(1), dtype=wp.float64,
                                   device=d)
+        # S3a film topology: top faces (basis-generic consistent face
+        # mass), top-node row (K closure), xi_y at GPs (advection)
+        if self.film_on:
+            coords = self.mesh.node_coords
+            self.y_comp = float(coords[:, self.vax].max())
+            tol = 1e-12
+            self.top_nodes = np.where(
+                coords[:, self.vax] > self.y_comp - tol)[0]
+            self.top_faces, self.top_face_M = _face_mass(
+                dm, (self.vax, 1))
+            self._xiy_wp = {
+                pv: wp.array(np.ascontiguousarray(
+                    self.xq[pv][:, self.vax]), dtype=wp.float64,
+                    device=d)
+                for pv in self.xq}
+            self._K_pend = 0.0
         # A1 field mode: segregated TemperatureField + nodal state
         if self.T_mode == "field":
             tf = dict(T_field or {})
@@ -1412,7 +1728,10 @@ class MultiPhaseStepper:
                 k_th=tf.pop("k_th", 1.0),
                 src_fn=tf.pop("src", None),
                 dirichlet=tf.pop("dirichlet", None),
-                g_fn=tf.pop("g", None))
+                g_fn=tf.pop("g", None),
+                film=self.film_on,
+                lat_scale=(self.lat_scale if self.film_on else 1.0),
+                L_vap=tf.pop("L_vap", 0.0))
             assert not tf, f"unknown T_field keys: {sorted(tf)}"
             self.T_nodes = (np.full(self.nfree, float(T0))
                             if np.isscalar(T0)
@@ -1426,50 +1745,12 @@ class MultiPhaseStepper:
     # -- A2 wall-face topology (wodo _build_top_faces pattern) -----------
     def _build_wall_faces(self):
         """Substrate-face node lists + CONSISTENT face mass matrices
-        for the wall free-energy natural term: tensor product of the
-        1-D CONSISTENT edge mass over the in-face dims (dim = 2:
-        edges of length h).  BASIS-GENERIC (A4a): the 1-D edge mass
-        is built from the tabulated 1-D Lagrange basis by quadrature
-        (exact at the (p+1)-point Gauss rule for the degree-2p
-        integrand), so p = 1 reproduces le [[1/3, 1/6], [1/6, 1/3]]
-        exactly and p = 2 the Simpson-consistent le/30
-        [[4, 2, -1], [2, 16, 2], [-1, 2, 4]].  wall_face =
-        (axis, side): side 0 = the min face (y = 0 substrate default),
-        1 = the max face (face-generic per the A2 contract)."""
-        from ..mesh.nodes import _local_offsets
-        from ..mesh.basis import gauss_1d, lagrange_1d
-        vax, side = self.wall_face
-        assert 0 <= vax < self.dm.dim, self.wall_face
-        assert not self.mesh.tree.periodic[vax], \
-            "wall face on a periodic axis"
-        coords = self.mesh.node_coords
-        target = (coords[:, vax].min() if side == 0
-                  else coords[:, vax].max())
-        tol = 1e-12
-        faces, fmass = [], []
-        for pv, conn in self.mesh.conn_of.items():
-            # 1-D consistent edge mass on the UNIT interval:
-            # m1[a, b] = Int_0^1 N_a N_b (reference [-1, 1] halved)
-            pts, wts = gauss_1d(int(pv))
-            Nq = np.array([lagrange_1d(int(pv), x)[0] for x in pts])
-            m1 = 0.5 * np.einsum("q,qa,qb->ab", wts, Nq, Nq)
-            offs = _local_offsets(int(pv), self.dm.dim)
-            loc = np.where(offs[:, vax] == (0 if side == 0
-                                            else pv))[0]
-            of = np.delete(offs[loc], vax, axis=1)  # in-face offsets
-            Mu = np.ones((len(loc), len(loc)))
-            for dd in range(self.dm.dim - 1):
-                Mu *= m1[of[:, None, dd], of[None, :, dd]]
-            nn = conn[:, loc]                       # [ne, nfn]
-            on_w = np.all(np.abs(coords[nn, vax] - target) < tol,
-                          axis=1)
-            h_el = self.mesh.tree.h()[self.mesh.bins[pv]]
-            for e in np.where(on_w)[0]:
-                faces.append(nn[e])
-                fmass.append(h_el[e] ** (self.dm.dim - 1) * Mu)
-        assert faces, "no elements on the requested wall face"
-        self.wall_faces = np.asarray(faces, np.int64)   # [nwf, nfn]
-        self.wall_face_M = np.asarray(fmass, np.float64)
+        for the wall free-energy natural term (basis-generic builder
+        _face_mass, A4a).  wall_face = (axis, side): side 0 = the min
+        face (y = 0 substrate default), 1 = the max face (face-generic
+        per the A2 contract)."""
+        self.wall_faces, self.wall_face_M = _face_mass(self.dm,
+                                                       self.wall_face)
 
     # -- initial state ---------------------------------------------------
     def set_initial(self, phi_fns, psi_fns=None, theta_fns=None):
@@ -1545,6 +1826,20 @@ class MultiPhaseStepper:
             return self.dh * (T / self.Tm - 1.0)
         return self.dh * (1.0 - T / self.Tm)
 
+    def _film_K(self):
+        """S3a evaporation velocity K = SUM_i k_e_i avg(phi_i^top)
+        >= 0, frozen at t_n from the COMMITTED state (wodo pattern;
+        the eliminated solvent's avg closes the simplex).  A K_fn
+        manufactured-frame override (MMS) replaces the closure."""
+        if self.K_fn is not None:
+            return float(self.K_fn(self.t))
+        tv = [np.asarray(self.Tc @ self.hist[2 * i::self.ndof])
+              [self.top_nodes] for i in range(self.M)]
+        avg = [float(np.mean(v)) for v in tv]
+        avg.append(float(np.mean(1.0 - sum(tv))))
+        return max(sum(self.k_e[i] * max(a, 0.0)
+                       for i, a in enumerate(avg)), 0.0)
+
     def _solve(self, A, r):
         if self.linsolver == "cudss":
             from nvmath.sparse.advanced import (DirectSolver,
@@ -1614,12 +1909,25 @@ class MultiPhaseStepper:
         arr = lambda a_: wp.array(np.ascontiguousarray(a_),
                                   dtype=wp.float64, device=d)
         drive_d = arr(drive)
+        # S3a film frame state, FROZEN per attempt (wodo pattern):
+        # K from the committed state at t_n, metric from h_curr
+        if self.film_on:
+            K_tot = self._film_K()
+            self._K_pend = K_tot
+            minv = 1.0 / self.h_curr
+            mlat = 1.0 / self.lat_scale
+            mvert = self.y_comp * minv
+        else:
+            K_tot, minv, mlat, mvert = 0.0, 0.0, 1.0, 1.0
         # A1: per-GP temperature (field mode: segregated linear T
         # advance FIRST — Lie split, O(dt); committed only on accept.
         # Scalar mode with the D(T) hook: uniform T(t_new) at GPs.)
         tq_gp = None
         if self.T_mode == "field":
-            self._T_pend = self._Tdiff.attempt(self.T_nodes, dt, t_new)
+            self._T_pend = self._Tdiff.attempt(
+                self.T_nodes, dt, t_new,
+                h=(self.h_curr if self.film_on else None),
+                K_evap=K_tot)
             tq_gp, _ = self._gp(self._T_pend)
         elif self.D_T is not None:
             Tsc = self.T_fn(t_new) if self.T_fn is not None else self.T
@@ -1694,10 +2002,13 @@ class MultiPhaseStepper:
                                      self.K, self.bulk, self.mob,
                                      self.theta_mode,
                                      self.T_mode == "field",
-                                     self.D_T is not None, self.aniso)
+                                     self.D_T is not None, self.aniso,
+                                     self.film_on)
                 p = self._par
                 tq_d = (arr(tq_gp[pv]) if tq_gp is not None
                         else self._tq_dummy)
+                xiy_d = (self._xiy_wp[pv] if self.film_on
+                         else self._tq_dummy)
                 wp.launch(kk, dim=ne, inputs=[
                     b["conn"], b["h"], b["N"], b["dN"], b["w"],
                     arr(vals[pv]), arr(grads[pv]), arr(hist_gp[pv]),
@@ -1711,6 +2022,8 @@ class MultiPhaseStepper:
                     p["alpha"], p["beta"], p["Lth"],
                     p["Tm"], tq_d, wp.float64(dtea), wp.float64(dtref),
                     p["da"], p["ma"], wp.float64(self.a_reg),
+                    xiy_d, wp.float64(mlat), wp.float64(mvert),
+                    wp.float64(minv), wp.float64(K_tot),
                     wp.float64(sigma), wp.float64(self.b_reg),
                     wp.float64(self.kg_delta), wp.float64(self.p_floor),
                     Ae, be], device=d)
@@ -1732,13 +2045,20 @@ class MultiPhaseStepper:
                 # mass; assembled in FULL node space (constraints ride
                 # the Tn triple product below).
                 nfn = self.wall_faces.shape[1]
+                # S3a: the wall natural term picks up the mapped
+                # boundary measure factor Ycomp/h in film mode (the
+                # computational mu rows are the physical ones divided
+                # by lat_scale h/Ycomp — module docstring S3a);
+                # wf = 1.0 outside film mode (bitwise identity)
+                wf = (self.y_comp / self.h_curr) if self.film_on \
+                    else 1.0
                 for i in range(self.M):
                     gi, hi = self.wall_g[i], self.wall_h[i]
                     if gi == 0.0 and hi == 0.0:
                         continue
                     fv = np.asarray(self.Tc @ x[2 * i::nd])
                     gd = nd * self.wall_faces + (2 * i + 1)
-                    fw = gi + 2.0 * hi * fv[self.wall_faces]
+                    fw = wf * (gi + 2.0 * hi * fv[self.wall_faces])
                     np.add.at(F_full, gd.ravel(),
                               np.einsum("fab,fb->fa",
                                         self.wall_face_M, fw).ravel())
@@ -1746,8 +2066,32 @@ class MultiPhaseStepper:
                         cd = nd * self.wall_faces + 2 * i
                         rows.append(np.repeat(gd, nfn, axis=1).ravel())
                         cols.append(np.tile(cd, (1, nfn)).ravel())
-                        valsK.append((-2.0 * hi)
+                        valsK.append((-2.0 * hi * wf)
                                      * self.wall_face_M.ravel())
+            if self.film_on and K_tot > 0.0:
+                # S3a TOP-SURFACE ENRICHMENT FLUX — phi rows ONLY
+                # (solvent evaporates AMORPHOUS; psi/theta carry no
+                # flux — the S3 contract).  Weak term per retained i:
+                # R_phi_i -= coef_i Int_top N_a phi_i dS, coef_i =
+                # (K - k_e_i)(1/h) Ycomp (wodo v1.1 metric; k_e_i = 0
+                # for nonvolatile species gives the exact wodo pair
+                # that conserves h Int phi_i dtheta per step).
+                # F (= -R) += +coef_i Mf phi_i; Jacobian -coef_i Mf on
+                # the (phi_i row, phi_i col) face block.
+                nfn = self.top_faces.shape[1]
+                for i in range(self.M):
+                    coef = (K_tot - self.k_e[i]) * minv * self.y_comp
+                    if coef == 0.0:
+                        continue
+                    fv = np.asarray(self.Tc @ x[2 * i::nd])
+                    gd = nd * self.top_faces + 2 * i
+                    Mf = coef * self.top_face_M
+                    np.add.at(F_full, gd.ravel(),
+                              np.einsum("fab,fb->fa", Mf,
+                                        fv[self.top_faces]).ravel())
+                    rows.append(np.repeat(gd, nfn, axis=1).ravel())
+                    cols.append(np.tile(gd, (1, nfn)).ravel())
+                    valsK.append(-Mf.ravel())
             Kmat = sp.coo_matrix(
                 (np.concatenate(valsK),
                  (np.concatenate(rows), np.concatenate(cols))),
@@ -1853,23 +2197,47 @@ class MultiPhaseStepper:
         self.t += self.dt
         if self.T_mode == "field":
             self.T_nodes = self._T_pend    # commit the segregated T
+        if self.film_on:
+            # explicit h-update with the SAME frozen K the attempt
+            # used (wodo contract; exact BDF1 content pairing)
+            self.h_curr -= self.dt * self._K_pend
         return x
 
     def march(self, t_end, max_steps=100000, dt_min=1e-12, dt_max=None,
-              callback=None, grow_iters=20):
-        """Appendix-A ladder (wodo pattern, no evaporation): reject
-        (no convergence/divergence) => dt *= 0.25 retry; accept with
-        iters < grow_iters => dt *= 1.25 (capped).  grow_iters default
-        20 (the wodo constant); KWC grain-boundary states carry the
-        KG-Picard LINEAR Newton tail (measured 0.5-0.9 contraction),
-        where 20 starves dt growth — raise it there.  Returns stop
-        reason."""
+              callback=None, grow_iters=20, h_min=None,
+              phis_stop=None):
+        """Appendix-A ladder (wodo pattern): reject (no convergence/
+        divergence) => dt *= 0.25 retry; accept with iters <
+        grow_iters => dt *= 1.25 (capped).  grow_iters default 20 (the
+        wodo constant); KWC grain-boundary states carry the KG-Picard
+        LINEAR Newton tail (measured 0.5-0.9 contraction), where 20
+        starves dt growth — raise it there.  FILM MODE (S3a): the
+        evaporation dt-cap dt <= dh_cap/K bounds the per-step height
+        decrement (the h-update is explicit), and the optional film
+        stop criteria h_min (physical height floor) / phis_stop (avg
+        solvent fraction = dryness) apply.  Returns stop reason."""
         reason = "max_steps"
         for _ in range(max_steps):
             if self.t >= t_end - 1e-14:
                 reason = "t_end"
                 break
+            if self.film_on:
+                if h_min is not None and self.h_curr <= h_min:
+                    reason = "h_min"
+                    break
+                if phis_stop is not None:
+                    phis = 1.0 - sum(
+                        np.asarray(self.Tc @ self.x[2 * i::self.ndof])
+                        for i in range(self.M))
+                    if float(np.mean(phis)) <= phis_stop:
+                        reason = "phis_stop"
+                        break
             dt_eff = min(self.dt, t_end - self.t)
+            if self.film_on:
+                # evaporation dt-cap (wodo dh_cap): bound dh per step
+                Kt = self._film_K()
+                if Kt > 0.0:
+                    dt_eff = min(dt_eff, self.dh_cap / Kt)
             x_new, iters, ok = self._attempt(dt_eff)
             if not ok:
                 self.n_reject += 1
@@ -1886,6 +2254,8 @@ class MultiPhaseStepper:
             self.t += dt_eff
             if self.T_mode == "field":
                 self.T_nodes = self._T_pend    # commit segregated T
+            if self.film_on:
+                self.h_curr -= dt_eff * self._K_pend
             if iters < grow_iters:
                 self.dt = dt_eff * 1.25
                 if dt_max is not None:
