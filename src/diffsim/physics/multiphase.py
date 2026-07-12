@@ -217,7 +217,8 @@ preference is the exchange shift g_i -> g_i - g_s).  Variation adds
 the NATURAL boundary term to the mu_i equation: the total-variation
 boundary condition is kap_i dphi_i/dn = -f_w'(phi_i) on Gamma_w, so
 the mu_i residual gains  - Int_w N_a (g_i + 2 h_i phi_i) dS
-(consistent P1 face mass, host-assembled — the wodo top-flux pattern;
+(consistent basis-generic face mass, host-assembled — the wodo
+top-flux pattern;
 Jacobian block -2 h_i Mw on (mu_i row, phi_i col)).  Default face
 (1, 0) = the y = 0 substrate edge; face-generic by construction.
 g_i < 0 attracts species i to the wall (f_w decreases with phi_i).
