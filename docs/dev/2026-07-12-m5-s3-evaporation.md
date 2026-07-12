@@ -282,8 +282,40 @@ periodic, chi_ca 1.6 unless noted):
 - L6 hero (seeded at quench + noise texture): 6 seeds -> 4 resolved
   crystals -> impingement merge, X 0.95 by t = 17.6.
 
-BLOCKED-ON-HARDWARE (the ONLY missing piece): the pytest run of the
-two S3b gates.  The WSL2 clock-governor pathology (Sec 3) pinned
+GATE-CONFIRMATION SESSION 2 (2026-07-12 late, after the supervisor
+sync): the pytest confirmation was pushed through under the keep-
+boost workaround and produced a NEW MEASURED FINDING that blocks the
+commit honestly: the dry-implant leg is GIBBS-THOMSON KNIFE-EDGED.
+Measured matrix (all L5, chi_ca 1.6, r0 = 0.15, psi 0.95):
+- campaign script protocol (continuous march to t = 14, non-wrapped
+  discs, one seed seam-clipped): GROWS to X = 0.961 (dry5b);
+- gate protocol (shared pre-march to the BIT-CLASS-IDENTICAL state,
+  phi_s = 0.196 matches to 3 digits; save/restore; periodic-WRAPPED
+  full discs): DISSOLVES (psi_max -> 6.3e-2 by +3.5); at t = 15 the
+  same dissolves slower (psi_max 0.42) — by then drying has nearly
+  stopped and no deepening supersaturation rescues marginal discs;
+- psi_amp 0.5 embryos: subcritical everywhere (halved driving
+  doubles r*) — measured, reverted;
+- wet leg: robust in every variant (0.196 -> 0.0000, psi_max
+  1.8e-2, 0-1 rejects — the solubility mechanism gate-clean).
+The r* estimates put r0 = 0.15 within ~15% of critical in the dried
+domains — protocol details (disc wrap/clipping, restore-vs-
+continuous FP state) flip the fate.  HOUSE-RULE VERDICT: a gate on a
+knife edge is not lockable; the dry leg needs a margin pass —
+options measured/estimated: (i) chi_ca 1.4 (phi* = 0.62; campaign
+X = 0.897 measured) + r0 = 0.2 / n_seeds = 2 (r/r* ~ 1.6), (ii)
+implant mid-burst (t ~ 12.5-13) where drying still deepens the
+quench, (iii) verbatim-script-protocol gate.  ONE verification run
+at healthy hardware decides; not executable tonight (below).
+HARDWARE STATE (late evening): freshly started processes run GPU
+ops 10-100x slow REGARDLESS of the clock reading (measured: the
+identical pre-march 134 s in the afternoon vs > 80 min at 2.2-2.7
+GHz clocks at night; profiles show time in warp DtoH copies +
+cuDSS/cuda_call_ctx) — the box needs the host-side
+reboot/investigation already flagged in Sec 3.
+
+REMAINING (after hardware recovery): the pytest run of the
+two S3b gates, after the dry-leg margin pass above.  The WSL2 clock-governor pathology (Sec 3) pinned
 both cards at idle clocks through the evening; every GPU-touching
 path (warp assembly copies AND cuDSS) runs 10-50x slow, so the gate
 suite could not complete within the session (it ran > 2 h in three
@@ -326,6 +358,19 @@ crystallizing under a polymer skin — production-quality.
   quantities and unaffected.  First suspected as a pytest
   interaction (gates crawled while scripts flew) — disproved by a
   direct-call A/B; the governor state was the variable.
+  WORKAROUND (run condition of the S3b gate confirmation, per the
+  supervisor sync): a sustained saturating co-load ("keep-boost"
+  torch matmul loop on the same card) holds the governor at
+  1.8-2.5 GHz — the bursty solver workload alone sags back to idle
+  within minutes.  The co-load shares only scheduler slices
+  (separate CUDA context) and cannot perturb FP results, only wall
+  times.  Related measured detail: 0.5-amplitude psi embryos are
+  Gibbs-Thomson-SUBCRITICAL even in dried domains (halved bulk
+  driving doubles r*) — the gate seeds are psi = 0.95; the apparent
+  wet-leg 'grind' at 0.95 was the pinned-clock state, not physics
+  (healthy clocks: dt = 0.02 at 4 iters, with a documented
+  ~50-iteration Newton-tail endgame at the seed-ring collapse,
+  t ~ 4.3-5).
 
 - cuDSS vs splu at L6 (25k dof, fastmode_n film march, line search):
   8.3 s/step vs 1.35 s/step at 4-7 iters — cuDSS is the production
