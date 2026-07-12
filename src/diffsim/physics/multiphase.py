@@ -182,6 +182,61 @@ are unaffected — fixed-point of the exact residual):
   (iii) fastmode Lam(phi) is frozen (wodo pattern).
 The psi-column of the theta row and all phi/psi cross blocks are exact.
 
+M5 (a)-PACK REALISM EXTENSIONS (Track A of flow_film_formulation_p2;
+dev ledger docs/dev/2026-07-12-m5-apack.md):
+
+A1 — TEMPERATURE AS A FIELD (T_mode="field").  Nodal T(x, t) solved as
+a SEGREGATED linear step per attempt (TemperatureField below): the
+annealing stage has no flow, so rho_cp dT/dt = div(k_th grad T) + s
+with Dirichlet substrate/ambient BCs (annealing protocols become BCs).
+Lie (first-order) operator split per BDF1 step: T advances first on
+[t, t+dt] from the committed field, then the crystallization step
+reads T^{n+1} at quadrature points — splitting error O(dt), the SAME
+order as BDF1 itself, so no order degradation (recorded choice).  In
+field mode the kernel computes the crystal driving PER GP:
+  p1:  drive_k(x) = dh_k (1 - T(x)/Tm_k)
+  r14: drive_k(x) = dh_k (T(x)/Tm_k - 1)
+(the host passes dh in the drive slot + Tm and the GP-interpolated T).
+T_mode="scalar" (default) keeps the EXISTING host-side scalar drive
+path bit-identically (the field inputs are dummy, compile-time dead).
+chi(T) is NOT parameterized in this brick (chi matrices are constant
+inputs); when a chi(T) law lands it must read the same per-GP Tq array
+(plumbing exists).  FDT noise amplitude stays the global calibration
+knob (anchor Sec 2.2.1); spatially-varying kBT(x) noise is a recorded
+frontier.  D(T) HOOK (D_T=(Ea, T_ref), either T mode): multiplies the
+CH mobility by the Arrhenius factor exp(-Ea (1/T - 1/T_ref)) at each
+GP (fastmode lam, the _n-mode Vignes D_i, const-mob Ons) — mobility
+freeze-out across a T gradient.  T-independent AC prefactor M_psi(T)
+(WLF) is a recorded follow-up.
+
+A2 — SUBSTRATE SURFACE ENERGY (wall_g/wall_h, wall_face=(axis, side)).
+Wall free energy F_w = Int_{Gamma_w} f_w(phi) dS,
+f_w = SUM_i g_i phi_i + h_i phi_i^2 over RETAINED species (the
+eliminated solvent carries zero wall energy by convention; a solvent
+preference is the exchange shift g_i -> g_i - g_s).  Variation adds
+the NATURAL boundary term to the mu_i equation: the total-variation
+boundary condition is kap_i dphi_i/dn = -f_w'(phi_i) on Gamma_w, so
+the mu_i residual gains  - Int_w N_a (g_i + 2 h_i phi_i) dS
+(consistent P1 face mass, host-assembled — the wodo top-flux pattern;
+Jacobian block -2 h_i Mw on (mu_i row, phi_i col)).  Default face
+(1, 0) = the y = 0 substrate edge; face-generic by construction.
+g_i < 0 attracts species i to the wall (f_w decreases with phi_i).
+
+A3 — ANISOTROPIC CRYSTAL GROWTH (delta_a, m_a, a_reg; 2-D).  The psi
+gradient energy becomes  f_grad,k = (1/2) a_k(alpha)^2 |grad psi_k|^2
+with  a_k = eps_k (1 + delta_a,k cos(m_a,k (alpha - theta_k))),
+alpha = angle(grad psi_k), theta_k the EXISTING orientation field
+(frozen-marker mode REQUIRED — asserted; the KWC back-torque
+d f_grad/d theta on a DYNAMIC theta is a recorded extension).  The
+standard anisotropic Allen-Cahn variational flux (2-D):
+  q_k = a^2 grad psi_k + a a' R grad psi_k,   R g = (-g_y, g_x),
+  a' = d a/d alpha = -eps delta m sin(m (alpha - theta))
+(the d(eps^2)/d alpha rotation contribution).  |grad psi| -> 0 guard:
+delta_eff = delta_a g2/(g2 + a_reg^2) (smooth blend; atan2 itself is
+finite).  Coefficients (a^2, a a') are PICARD-FROZEN per iterate (the
+house KG pattern): residual exact, Jacobian quasi-Newton.  delta_a = 0
+compiles the ISOTROPIC kernel (same factory key) — exact regression.
+
 TIME STEPPING.  BDF1 + Newton with the house safeguards: trust clamp
 (+ OPTIONAL ||r||_2 backtracking line search, line_search=True — the S2
 globalization; measured on the 16390 SD purification: plain Newton
@@ -193,7 +248,10 @@ sum phi <= 1 - 1e-3 preserving ratios; psi clipped to [0, 1]; theta
 free), divergence detection.  march() = the wodo Appendix-A ladder
 (iters < 20 => dt *= 1.25 capped at dt_max; no convergence/divergence
 => dt *= 0.25, retry).  Temperature T is a parameter with a T_fn(t)
-schedule hook (annealing protocols); drive_k is refreshed per attempt.
+schedule hook (annealing protocols); drive_k is refreshed per attempt
+— OR a nodal field (T_mode="field", A1 above): the segregated
+TemperatureField advances first within each attempt and commits only
+with the accepted step.
 Linear solve: splu (default) | cudss (wodo DirectSolver pattern).
 blockch_pairs integration NOT wired (the AC blocks need the per-psi
 scalar-block extension of the "pairs" meta — recorded follow-up).
@@ -319,9 +377,11 @@ def np_potentials(phis, psis, pars):
 # ---------------------------------------------------------------------
 def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                     bulk: str = "p1", mob: str = "const",
-                    theta: str = "kwc"):
+                    theta: str = "kwc", tfield: bool = False,
+                    dth: bool = False, aniso: bool = False):
     """Monolithic Newton kernel for the 2M+2K node-major system.
-    (M, K, bulk, mob, theta) compile-time; see module docstring.
+    (M, K, bulk, mob, theta, tfield, dth, aniso) compile-time; see
+    module docstring.
     theta="frozen" replaces the KWC theta rows by the EXACT bookkeeping
     identity theta = theta_old (mass-matrix row) — the anchor's marker
     semantics, and the well-posed form of the alpha = beta = 0 limit:
@@ -330,8 +390,14 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
     theta increments (MEASURED 2026-07-11: |dx_theta| 4.9e13 at
     |r_theta| 1e-19, dt-INDEPENDENT — the divergence guard then
     underflows the ladder; whether the garbage crosses the 1e6 guard
-    is an assembly-atomics coin flip, the house FP-fate lesson)."""
-    key = ("mpf_newton", nbf, nqp, dim, M, K, bulk, mob, theta)
+    is an assembly-atomics coin flip, the house FP-fate lesson).
+    tfield=True reads the per-GP temperature Tq and computes the
+    crystal driving in-kernel (A1); dth=True applies the Arrhenius
+    D(T) mobility factor per GP (A1 hook); aniso=True compiles the
+    anisotropic psi gradient flux (A3; dim = 2 + frozen theta only).
+    All three default False = the pre-A-pack kernel bit-identically."""
+    key = ("mpf_newton", nbf, nqp, dim, M, K, bulk, mob, theta,
+           tfield, dth, aniso)
     if key in _kernel_cache:
         return _kernel_cache[key]
     assert bulk in ("p1", "r14"), bulk
@@ -340,7 +406,15 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
         assert M == 1, "fastmode Onsager closure: M = 1 only " \
             "(fastmode_n is the generic-M mode)"
     assert theta in ("kwc", "frozen"), theta
+    if aniso:
+        assert dim == 2, "anisotropic growth: 2-D only (A3 contract)"
+        assert theta == "frozen", \
+            "anisotropy requires marker (frozen) theta: the KWC " \
+            "back-torque d f_grad/d theta is a recorded extension"
     TH_FROZEN = theta == "frozen"
+    TFIELD = bool(tfield)
+    DTH = bool(dth)
+    ANISO = bool(aniso)
     dim_pow = float(dim)
     Kp = max(K, 1)
     ndof = 2 * M + 2 * K
@@ -393,6 +467,12 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
               alpha: wp.array(dtype=wp.float64),     # [Kp] KWC |g| coeff
               beta: wp.array(dtype=wp.float64),      # [Kp] KWC quad coeff
               Lth: wp.array(dtype=wp.float64),       # [Kp] theta mobility
+              Tmv: wp.array(dtype=wp.float64),       # [Kp] Tm (tfield law)
+              Tq: wp.array(dtype=wp.float64),        # [ngp] T at GPs
+              ea: wp.float64, tref: wp.float64,      # D(T) Arrhenius
+              da: wp.array(dtype=wp.float64),        # [Kp] aniso delta_a
+              ma: wp.array(dtype=wp.float64),        # [Kp] aniso m-fold
+              areg: wp.float64,                      # aniso |g| guard
               sigma: wp.float64, breg: wp.float64,
               kgd: wp.float64, pfloor: wp.float64,
               Ae: wp.array3d(dtype=wp.float64),
@@ -472,26 +552,37 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                 Wppv[k] = wp.float64(0.0)
             for k in range(K):
                 s_ = psiv[k]
+                # A1 field mode: the crystal driving is a FIELD quantity
+                # — drive slot carries dh_k, the T law applies per GP
+                # (scalar mode: drive[k] is host-precomputed, unchanged)
+                drv = drive[k]
+                if wp.static(TFIELD):
+                    if wp.static(R14):
+                        drv = drive[k] * (Tq[gp] / Tmv[k]
+                                          - wp.float64(1.0))
+                    else:
+                        drv = drive[k] * (wp.float64(1.0)
+                                          - Tq[gp] / Tmv[k])
                 if wp.static(R14):
                     om = wp.float64(1.0) - s_
                     Wv[k] = s_ * s_ * om * om * dsig[k] \
                         + s_ * s_ * (wp.float64(3.0)
-                                     - wp.float64(2.0) * s_) * drive[k]
+                                     - wp.float64(2.0) * s_) * drv
                     Wpv[k] = wp.float64(2.0) * s_ * om \
                         * (wp.float64(1.0) - wp.float64(2.0) * s_) \
-                        * dsig[k] + wp.float64(6.0) * s_ * om * drive[k]
+                        * dsig[k] + wp.float64(6.0) * s_ * om * drv
                     Wppv[k] = wp.float64(2.0) \
                         * (wp.float64(1.0) - wp.float64(6.0) * s_
                            + wp.float64(6.0) * s_ * s_) * dsig[k] \
                         + (wp.float64(6.0) - wp.float64(12.0) * s_) \
-                        * drive[k]
+                        * drv
                 else:
                     Wv[k] = s_ * (wp.float64(1.0) - s_) * dsig[k] \
-                        + s_ * s_ * drive[k]
+                        + s_ * s_ * drv
                     Wpv[k] = (wp.float64(1.0) - wp.float64(2.0) * s_) \
-                        * dsig[k] + wp.float64(2.0) * s_ * drive[k]
+                        * dsig[k] + wp.float64(2.0) * s_ * drv
                     Wppv[k] = wp.float64(-2.0) * dsig[k] \
-                        + wp.float64(2.0) * drive[k]
+                        + wp.float64(2.0) * drv
             # ---- orientation (KG-regularized KWC) ----------------------
             Sd = VecKp()      # |grad theta|_delta
             Eori = VecKp()    # (a/2)|g|_d + (b/2)|g|^2
@@ -518,6 +609,37 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                 porp[k] = wp.float64(6.0) * s_ * (wp.float64(1.0) - s_)
                 ceff[k] = Lth[k] * (wp.float64(0.5) * alpha[k] / Sd[k]
                                     + beta[k])
+            # ---- anisotropic psi gradient coefficients (A3) -------------
+            # f_grad,k = (1/2) a_k(alpha)^2 |grad psi_k|^2 with
+            # a_k = eps_k (1 + d cos(m (alpha - theta_k))), alpha =
+            # angle(grad psi_k); variational flux (weak: Int grad(N_a)
+            # . q_k):  q_k = a^2 grad psi + (a a') R grad psi,
+            # R g = (-g_y, g_x),  a a' = -eps2 (1 + d c) d m s.
+            # |grad psi| -> 0 guard: d_eff = d g2/(g2 + areg^2).
+            # PICARD-FROZEN coefficients (module docstring A3).
+            A2k = VecKp()     # a(alpha)^2            (isotropic: eps2)
+            AAk = VecKp()     # a a'                  (isotropic: 0)
+            Rgx = VecKp()     # (R grad psi)_x = -psi_y
+            Rgy = VecKp()     # (R grad psi)_y = +psi_x
+            for k in range(Kp):
+                A2k[k] = eps2[k]
+                AAk[k] = wp.float64(0.0)
+                Rgx[k] = wp.float64(0.0)
+                Rgy[k] = wp.float64(0.0)
+            if wp.static(ANISO):
+                for k in range(K):
+                    gpx = grads[gp, 2 * M + 2 * k, 0]
+                    gpy = grads[gp, 2 * M + 2 * k, 1]
+                    g2p = gpx * gpx + gpy * gpy
+                    deff = da[k] * g2p / (g2p + areg * areg)
+                    ang = ma[k] * (wp.atan2(gpy, gpx)
+                                   - vals[gp, 2 * M + 2 * k + 1])
+                    fac = wp.float64(1.0) + deff * wp.cos(ang)
+                    A2k[k] = eps2[k] * fac * fac
+                    AAk[k] = -eps2[k] * fac * deff * ma[k] \
+                        * wp.sin(ang)
+                    Rgx[k] = -gpy
+                    Rgy[k] = gpx
             # ---- exchange potentials + derivatives ---------------------
             # S_m = SUM_{l != m} phi_l chi_eff(m, l)
             Ssp = VecSp()
@@ -629,6 +751,16 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                     else:
                         d2pf[k, j] = phiv[k] * (D1[k, j] - D1[k, M])
             # ---- mobility ----------------------------------------------
+            # A1 D(T) hook: Arrhenius factor mT = exp(-Ea (1/T - 1/Tref))
+            # multiplies the CH mobility (per GP; T from the field or
+            # the scalar schedule — the host fills Tq either way when
+            # the hook is on).  mT is phi/psi-INDEPENDENT, so all the
+            # exact dLam/dphi, dLam/dpsi blocks below scale through it
+            # unchanged (homogeneity).
+            mT = wp.float64(1.0)
+            if wp.static(DTH):
+                mT = wp.exp(ea * (wp.float64(1.0) / tref
+                                  - wp.float64(1.0) / Tq[gp]))
             lam = wp.float64(0.0)
             if wp.static(FASTMODE):
                 pc = wp.min(wp.max(phiv[0], wp.float64(1e-6)),
@@ -638,6 +770,8 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                 d2s = wp.pow(dlo[1], pc) * wp.pow(dhi[1], omp)
                 lam = omp * omp * pc / Ninv[0] * d1s \
                     + pc * pc * omp / Ninv[1] * d2s
+                if wp.static(DTH):
+                    lam *= mT
             lamM = MatMM()
             dLamT = MatMD()      # dLamT[i, jp*M + j] = d Lam_{i,jp}/d phi_j
             dlnf = VecKp()       # d ln(f_drop) / d psi_k
@@ -675,6 +809,8 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                 somv = wp.float64(0.0)
                 for i0 in range(n_sp):
                     dsi = fdrop
+                    if wp.static(DTH):
+                        dsi = fdrop * mT      # Vignes D_i x Arrhenius
                     for j0 in range(n_sp):
                         pj = wp.min(wp.max(phiv[j0], wp.float64(0.0)),
                                     wp.float64(1.0))
@@ -775,6 +911,9 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                 for k in range(Kp):
                     gpsi[k] = wp.float64(0.0)
                     gth[k] = wp.float64(0.0)
+                grot = VecKp()   # grad Na . R grad psi_k (aniso)
+                for k in range(Kp):
+                    grot[k] = wp.float64(0.0)
                 for dd in range(dim):
                     gNa = dNtab[q, a, dd] * dscale
                     for i in range(M):
@@ -784,6 +923,10 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                     for k in range(K):
                         gpsi[k] += gNa * grads[gp, 2 * M + 2 * k, dd]
                         gth[k] += gNa * grads[gp, 2 * M + 2 * k + 1, dd]
+                if wp.static(ANISO):
+                    for k in range(K):
+                        grot[k] = (dNtab[q, a, 0] * Rgx[k]
+                                   + dNtab[q, a, 1] * Rgy[k]) * dscale
                 # residual rows (be = -r)
                 for i in range(M):
                     tr = wp.float64(0.0)
@@ -802,6 +945,9 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                                 tr += Ons[i, j] * gmu[j]
                             sm = wp.sqrt(wp.max(Ons[i, i],
                                                 wp.float64(0.0)))
+                            if wp.static(DTH):
+                                tr *= mT
+                                sm *= wp.sqrt(mT)
                     r_p = (Na * (sigma * vals[gp, 2 * i]
                                  - hist[gp, 2 * i] - src[gp, 2 * i])
                            + tr + sm * gq[i]) * dJxW
@@ -812,10 +958,18 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                     wp.atomic_add(be, e, ndof * a + 2 * i + 1, -r_m)
                 for k in range(K):
                     rp = 2 * M + 2 * k
+                    # gradient flux: isotropic eps2 grad psi, or the
+                    # anisotropic q_k = a^2 grad psi + a a' R grad psi
+                    # (isotropic branch keeps the ORIGINAL association
+                    # Lpsi*eps2*gpsi — bit-identical S0/S1 arithmetic)
+                    flx = Lpsi[k] * eps2[k] * gpsi[k]
+                    if wp.static(ANISO):
+                        flx = Lpsi[k] * (A2k[k] * gpsi[k]
+                                         + AAk[k] * grot[k])
                     r_s = (Na * (sigma * vals[gp, rp] - hist[gp, rp]
                                  + Lpsi[k] * Fpsi[k] + qpsi[gp, k]
                                  - src[gp, rp])
-                           + Lpsi[k] * eps2[k] * gpsi[k]) * dJxW
+                           + flx) * dJxW
                     pk = porv[k] + pfloor
                     if wp.static(TH_FROZEN):
                         r_t = (Na * (sigma * vals[gp, rp + 1]
@@ -870,9 +1024,12 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                                         dlnf[k] * trm * Nb * dJxW)
                             else:
                                 for j in range(M):
+                                    ov = Ons[i, j] * lapw
+                                    if wp.static(DTH):
+                                        ov *= mT
                                     wp.atomic_add(Ae, e, ra,
                                                   ndof * b + 2 * j + 1,
-                                                  Ons[i, j] * lapw)
+                                                  ov)
                         # mu_i row
                         rm = ra + 1
                         wp.atomic_add(Ae, e, rm, ndof * b + 2 * i + 1,
@@ -889,10 +1046,19 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                     for k in range(K):
                         rp = 2 * M + 2 * k
                         rs = ndof * a + rp
+                        # gradient-flux Jacobian: d/dpsi_b of
+                        # Int grad(Na).q_k with FROZEN (a^2, a a'):
+                        # a^2 grad(Na).grad(Nb) + a a' grad(Na).R grad(Nb)
+                        gj = eps2[k] * lapw
+                        if wp.static(ANISO):
+                            rotw = (dNtab[q, a, 1] * dNtab[q, b, 0]
+                                    - dNtab[q, a, 0] * dNtab[q, b, 1]) \
+                                * dscale * dscale * dJxW
+                            gj = A2k[k] * lapw + AAk[k] * rotw
                         wp.atomic_add(Ae, e, rs, ndof * b + rp,
                                       sigma * NN
                                       + Lpsi[k] * (d2pp[k, k] * NN
-                                                   + eps2[k] * lapw))
+                                                   + gj))
                         for l in range(K):
                             if l != k:
                                 wp.atomic_add(Ae, e, rs,
@@ -924,6 +1090,112 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
 
 
 # ---------------------------------------------------------------------
+# A1 — segregated temperature field (annealing stage: no flow)
+# ---------------------------------------------------------------------
+class TemperatureField:
+    r"""Linear scalar diffusion solve for the nodal temperature field
+    (A1; module docstring).  Strong form on the annealing stage:
+
+        rho_cp dT/dt = div(k_th grad T) + s(x, t),
+
+    BDF1 weak form (test function N_a, integrate the divergence by
+    parts; natural BCs are INSULATED faces, Dirichlet faces by row
+    replacement):
+
+        Int N_a rho_cp (T^{n+1} - T^n)/dt dV
+      + Int grad(N_a) . k_th grad(T^{n+1}) dV
+      - Int N_a s(x, t^{n+1}) dV                       = 0.
+
+    Term-to-code map: the mass matrix M (Int N_a N_b, element-exact
+    (h/2)^dim scaling of the reference einsum) carries the time term;
+    the stiffness Kst (Int grad N_a . grad N_b, extra (2/h)^2 metric)
+    carries the conduction term; _load carries the consistent source
+    Int N_a s via the per-bin GP tables.  System per attempt:
+
+        (rho_cp/dt M + k_th Kst) T^{n+1} = rho_cp/dt M T^n + load,
+
+    LINEAR — one factorization per dt value (cached; the Appendix-A
+    ladder re-tries at scaled dt, so the cache keys on dt).  Dirichlet:
+    row-replaced identity rows, rhs = g(x, t^{n+1}) (substrate/ambient
+    annealing protocols are exactly these g functions).  Assembly is
+    host scipy in FULL node space, then the constraint triple product
+    (hanging nodes ride the same Tc as the multiphase system).
+    attempt() does NOT commit — the caller owns T^n (the stepper
+    commits on accepted steps only, matching the reject ladder)."""
+
+    def __init__(self, dm, rho_cp=1.0, k_th=1.0, src_fn=None,
+                 dirichlet=None, g_fn=None):
+        from .poisson import gauss_points
+        self.dm = dm
+        self.rho_cp, self.k_th = float(rho_cp), float(k_th)
+        self.src_fn = src_fn
+        self.dirichlet = None if dirichlet is None \
+            else np.asarray(dirichlet, np.int64)
+        self.g_fn = g_fn
+        mesh, cons = dm.mesh, dm.constraints
+        self.Tc = cons.T.tocsr()
+        self.free_coords = mesh.node_coords[cons.free_nodes]
+        self.xq = gauss_points(mesh, dm.tables_by_p)
+        rows, cols, mv, kv = [], [], [], []
+        self._wJ = {}
+        for pv, eids in mesh.bins.items():
+            tb = dm.tables_by_p[pv]
+            conn = mesh.conn_of[pv].astype(np.int64)
+            hh = mesh.tree.h()[eids]
+            ne, nbf = conn.shape
+            # reference element matrices (exact for the affine map)
+            Mref = np.einsum("q,qa,qb->ab", tb.w, tb.N, tb.N)
+            Kref = np.einsum("q,qad,qbd->ab", tb.w, tb.dN, tb.dN)
+            jac = (hh / 2.0) ** dm.dim
+            ksc = jac * (2.0 / hh) ** 2
+            rows.append(np.repeat(conn, nbf, axis=1).ravel())
+            cols.append(np.tile(conn, (1, nbf)).ravel())
+            mv.append((jac[:, None, None] * Mref[None]).ravel())
+            kv.append((ksc[:, None, None] * Kref[None]).ravel())
+            self._wJ[pv] = np.tile(tb.w, ne) * np.repeat(jac, tb.nqp)
+        n = len(mesh.node_coords)
+        r = np.concatenate(rows)
+        c = np.concatenate(cols)
+        Mfull = sp.coo_matrix((np.concatenate(mv), (r, c)),
+                              shape=(n, n)).tocsr()
+        Kfull = sp.coo_matrix((np.concatenate(kv), (r, c)),
+                              shape=(n, n)).tocsr()
+        self.Mfree = (self.Tc.T @ Mfull @ self.Tc).tocsr()
+        self.Kfree = (self.Tc.T @ Kfull @ self.Tc).tocsr()
+        self._lu, self._lu_dt = None, None
+
+    def _load(self, t):
+        F = np.zeros(self.Tc.shape[0])
+        if self.src_fn is not None:
+            for pv, conn in self.dm.mesh.conn_of.items():
+                tb = self.dm.tables_by_p[pv]
+                s = self.src_fn(self.xq[pv], t) * self._wJ[pv]
+                Fa = s.reshape(len(conn), tb.nqp) @ tb.N
+                np.add.at(F, np.asarray(conn, np.int64).ravel(),
+                          Fa.ravel())
+        return np.asarray(self.Tc.T @ F)
+
+    def attempt(self, T_old, dt, t_new):
+        """One BDF1 solve [t_new - dt, t_new] from T_old (free vector);
+        returns T_new WITHOUT committing (linear: always 'converged')."""
+        from scipy.sparse.linalg import splu
+        a = self.rho_cp / dt
+        rhs = a * (self.Mfree @ T_old) + self._load(t_new)
+        if self._lu is None or self._lu_dt != dt:
+            A = (a * self.Mfree + self.k_th * self.Kfree).tolil()
+            if self.dirichlet is not None:
+                for i in self.dirichlet:
+                    A.rows[i] = [int(i)]
+                    A.data[i] = [1.0]
+            self._lu = splu(A.tocsr().tocsc())
+            self._lu_dt = dt
+        if self.dirichlet is not None:
+            rhs[self.dirichlet] = self.g_fn(
+                self.free_coords[self.dirichlet], t_new)
+        return self._lu.solve(rhs)
+
+
+# ---------------------------------------------------------------------
 # stepper
 # ---------------------------------------------------------------------
 class MultiPhaseStepper:
@@ -941,7 +1213,10 @@ class MultiPhaseStepper:
                  noise_damp=None,
                  b_reg=0.0, kg_delta=1e-3, p_floor=1e-6,
                  dirichlet=None, g_fns=None, src_fns=None, guards=True,
-                 clip_psi=True, line_search=False):
+                 clip_psi=True, line_search=False,
+                 T_mode="scalar", T_field=None, D_T=None,
+                 wall_g=None, wall_h=None, wall_face=(1, 0),
+                 delta_a=None, m_a=None, a_reg=1e-8):
         from ..physics.poisson import gauss_points
         self.dm = dm
         self.M, self.K = int(M), int(K)
@@ -988,6 +1263,38 @@ class MultiPhaseStepper:
         self.theta_mode = "frozen" if (self.alpha_th == 0.0).all() \
             and (self.beta_th == 0.0).all() else "kwc"
         self.T, self.T_fn = float(T), T_fn
+        # A1 — temperature mode + D(T) hook (module docstring)
+        assert T_mode in ("scalar", "field"), T_mode
+        self.T_mode = T_mode
+        if T_mode == "field":
+            assert T_fn is None, \
+                "field mode replaces the T_fn schedule (annealing " \
+                "protocols become Dirichlet BCs)"
+        self.D_T = None if D_T is None \
+            else (float(D_T[0]), float(D_T[1]))
+        if self.D_T is not None:
+            assert self.D_T[1] > 0.0, "D_T = (Ea, T_ref), T_ref > 0"
+        # A3 — anisotropic crystal growth (module docstring)
+        self.delta_a = pad(delta_a, 0.0)
+        self.m_a = pad(m_a, 4.0)
+        self.a_reg = float(a_reg)
+        self.aniso = bool((self.delta_a != 0.0).any())
+        if self.aniso:
+            assert dm.dim == 2, "anisotropy: 2-D only (A3 contract)"
+            assert self.theta_mode == "frozen", \
+                "anisotropy requires marker (frozen) theta " \
+                "(alpha_th = beta_th = 0); the KWC back-torque is a " \
+                "recorded extension"
+        # A2 — substrate surface energy (module docstring)
+        self.wall_g = (np.zeros(self.M) if wall_g is None
+                       else np.asarray(wall_g, np.float64
+                                       ).reshape(self.M))
+        self.wall_h = (np.zeros(self.M) if wall_h is None
+                       else np.asarray(wall_h, np.float64
+                                       ).reshape(self.M))
+        self.wall_on = bool((self.wall_g != 0.0).any()
+                            or (self.wall_h != 0.0).any())
+        self.wall_face = (int(wall_face[0]), int(wall_face[1]))
         self.bulk, self.mob = bulk, mob
         assert bulk in ("p1", "r14")
         assert mob in ("const", "fastmode", "fastmode_n", "slowmode_n")
@@ -1061,7 +1368,72 @@ class MultiPhaseStepper:
             dlo=self.D_lo, dhi=self.D_hi, Dslf=self.D_self,
             kap=self.kap, dsig=self.dsig,
             eps2=self.eps2, Lpsi=self.L_psi, alpha=self.alpha_th,
-            beta=self.beta_th, Lth=self.L_th).items()}
+            beta=self.beta_th, Lth=self.L_th, Tm=self.Tm,
+            da=self.delta_a, ma=self.m_a).items()}
+        # dummy per-GP T array (compile-time dead unless tfield/dth)
+        self._tq_dummy = wp.array(np.zeros(1), dtype=wp.float64,
+                                  device=d)
+        # A1 field mode: segregated TemperatureField + nodal state
+        if self.T_mode == "field":
+            tf = dict(T_field or {})
+            T0 = tf.pop("T0", self.T)
+            self._Tdiff = TemperatureField(
+                dm, rho_cp=tf.pop("rho_cp", 1.0),
+                k_th=tf.pop("k_th", 1.0),
+                src_fn=tf.pop("src", None),
+                dirichlet=tf.pop("dirichlet", None),
+                g_fn=tf.pop("g", None))
+            assert not tf, f"unknown T_field keys: {sorted(tf)}"
+            self.T_nodes = (np.full(self.nfree, float(T0))
+                            if np.isscalar(T0)
+                            else np.asarray(T0(self.free_coords),
+                                            np.float64))
+            self._T_pend = self.T_nodes
+        # A2 wall face mass (built only when the wall energy is on)
+        if self.wall_on:
+            self._build_wall_faces()
+
+    # -- A2 wall-face topology (wodo _build_top_faces pattern) -----------
+    def _build_wall_faces(self):
+        """Substrate-face node lists + CONSISTENT P1 face mass matrices
+        for the wall free-energy natural term: tensor product of the
+        1-D edge mass le [[1/3, 1/6], [1/6, 1/3]] over the in-face
+        dims (dim = 2: 2-node edges of length h).  wall_face =
+        (axis, side): side 0 = the min face (y = 0 substrate default),
+        1 = the max face (face-generic per the A2 contract)."""
+        from ..mesh.nodes import _local_offsets
+        vax, side = self.wall_face
+        assert 0 <= vax < self.dm.dim, self.wall_face
+        assert not self.mesh.tree.periodic[vax], \
+            "wall face on a periodic axis"
+        coords = self.mesh.node_coords
+        target = (coords[:, vax].min() if side == 0
+                  else coords[:, vax].max())
+        tol = 1e-12
+        m1 = np.array([[1.0 / 3.0, 1.0 / 6.0],
+                       [1.0 / 6.0, 1.0 / 3.0]])
+        faces, fmass = [], []
+        for pv, conn in self.mesh.conn_of.items():
+            assert pv == 1, \
+                "wall energy: P1 face mass only (p2 = tensor-rule " \
+                "extension, recorded)"
+            offs = _local_offsets(pv, self.dm.dim)
+            loc = np.where(offs[:, vax] == (0 if side == 0
+                                            else pv))[0]
+            of = np.delete(offs[loc], vax, axis=1)  # in-face offsets
+            Mu = np.ones((len(loc), len(loc)))
+            for dd in range(self.dm.dim - 1):
+                Mu *= m1[of[:, None, dd], of[None, :, dd]]
+            nn = conn[:, loc]                       # [ne, nfn]
+            on_w = np.all(np.abs(coords[nn, vax] - target) < tol,
+                          axis=1)
+            h_el = self.mesh.tree.h()[self.mesh.bins[pv]]
+            for e in np.where(on_w)[0]:
+                faces.append(nn[e])
+                fmass.append(h_el[e] ** (self.dm.dim - 1) * Mu)
+        assert faces, "no elements on the requested wall face"
+        self.wall_faces = np.asarray(faces, np.int64)   # [nwf, nfn]
+        self.wall_face_M = np.asarray(fmass, np.float64)
 
     # -- initial state ---------------------------------------------------
     def set_initial(self, phi_fns, psi_fns=None, theta_fns=None):
@@ -1192,12 +1564,31 @@ class MultiPhaseStepper:
         nd = self.ndof
         sigma = 1.0 / dt
         t_new = self.t + dt
-        drive = np.concatenate([self._drive(t_new)[:self.K],
-                                np.zeros(self.Kp - self.K)]) \
-            if self.K else np.zeros(self.Kp)
+        if self.T_mode == "field":
+            # A1: the drive slot carries dh_k; the kernel applies the
+            # T law per GP (drive is refreshed through Tq instead)
+            drive = self.dh.copy()
+            drive[self.K:] = 0.0
+        else:
+            drive = np.concatenate([self._drive(t_new)[:self.K],
+                                    np.zeros(self.Kp - self.K)]) \
+                if self.K else np.zeros(self.Kp)
         arr = lambda a_: wp.array(np.ascontiguousarray(a_),
                                   dtype=wp.float64, device=d)
         drive_d = arr(drive)
+        # A1: per-GP temperature (field mode: segregated linear T
+        # advance FIRST — Lie split, O(dt); committed only on accept.
+        # Scalar mode with the D(T) hook: uniform T(t_new) at GPs.)
+        tq_gp = None
+        if self.T_mode == "field":
+            self._T_pend = self._Tdiff.attempt(self.T_nodes, dt, t_new)
+            tq_gp, _ = self._gp(self._T_pend)
+        elif self.D_T is not None:
+            Tsc = self.T_fn(t_new) if self.T_fn is not None else self.T
+            tq_gp = {pv: np.full(len(self.mesh.conn_of[pv]) * b["nqp"],
+                                 Tsc)
+                     for pv, b in self.dm.bins.items()}
+        dtea, dtref = self.D_T if self.D_T is not None else (0.0, 1.0)
         hv, _ = self._pack_fields(self.hist)
         hist_gp = {pv: sigma * hv[pv] for pv in hv}
         for pv in hist_gp:          # mu rows carry no time derivative
@@ -1250,8 +1641,12 @@ class MultiPhaseStepper:
                               device=d)
                 kk = make_mpf_newton(nbf, nqp, self.dm.dim, self.M,
                                      self.K, self.bulk, self.mob,
-                                     self.theta_mode)
+                                     self.theta_mode,
+                                     self.T_mode == "field",
+                                     self.D_T is not None, self.aniso)
                 p = self._par
+                tq_d = (arr(tq_gp[pv]) if tq_gp is not None
+                        else self._tq_dummy)
                 wp.launch(kk, dim=ne, inputs=[
                     b["conn"], b["h"], b["N"], b["dN"], b["w"],
                     arr(vals[pv]), arr(grads[pv]), arr(hist_gp[pv]),
@@ -1263,6 +1658,8 @@ class MultiPhaseStepper:
                     wp.float64(self.ls_drop[2]), p["kap"],
                     p["dsig"], drive_d, p["eps2"], p["Lpsi"],
                     p["alpha"], p["beta"], p["Lth"],
+                    p["Tm"], tq_d, wp.float64(dtea), wp.float64(dtref),
+                    p["da"], p["ma"], wp.float64(self.a_reg),
                     wp.float64(sigma), wp.float64(self.b_reg),
                     wp.float64(self.kg_delta), wp.float64(self.p_floor),
                     Ae, be], device=d)
@@ -1274,6 +1671,32 @@ class MultiPhaseStepper:
                 cols.append(np.tile(gdof, (1, nd * nbf)).ravel())
                 valsK.append(Aeh.ravel())
                 np.add.at(F_full, gdof.ravel(), beh.ravel())
+            if self.wall_on:
+                # A2 WALL FREE ENERGY natural term (module docstring):
+                # r_mu_i(a) += - Int_w N_a (g_i + 2 h_i phi_i) dS
+                # (the kap dphi/dn = -f_w' variational BC), so
+                # F (= -r) += + Mw @ (g_i + 2 h_i phi_i)|_face and the
+                # Jacobian gains d r/d phi_i = -2 h_i Mw on the
+                # (mu_i row, phi_i col) block.  Consistent P1 face
+                # mass; assembled in FULL node space (constraints ride
+                # the Tn triple product below).
+                nfn = self.wall_faces.shape[1]
+                for i in range(self.M):
+                    gi, hi = self.wall_g[i], self.wall_h[i]
+                    if gi == 0.0 and hi == 0.0:
+                        continue
+                    fv = np.asarray(self.Tc @ x[2 * i::nd])
+                    gd = nd * self.wall_faces + (2 * i + 1)
+                    fw = gi + 2.0 * hi * fv[self.wall_faces]
+                    np.add.at(F_full, gd.ravel(),
+                              np.einsum("fab,fb->fa",
+                                        self.wall_face_M, fw).ravel())
+                    if hi != 0.0:
+                        cd = nd * self.wall_faces + 2 * i
+                        rows.append(np.repeat(gd, nfn, axis=1).ravel())
+                        cols.append(np.tile(cd, (1, nfn)).ravel())
+                        valsK.append((-2.0 * hi)
+                                     * self.wall_face_M.ravel())
             Kmat = sp.coo_matrix(
                 (np.concatenate(valsK),
                  (np.concatenate(rows), np.concatenate(cols))),
@@ -1374,6 +1797,8 @@ class MultiPhaseStepper:
         self.x = x
         self.hist = x.copy()
         self.t += self.dt
+        if self.T_mode == "field":
+            self.T_nodes = self._T_pend    # commit the segregated T
         return x
 
     def march(self, t_end, max_steps=100000, dt_min=1e-12, dt_max=None,
@@ -1402,6 +1827,8 @@ class MultiPhaseStepper:
             self.x = x_new
             self.hist = x_new.copy()
             self.t += dt_eff
+            if self.T_mode == "field":
+                self.T_nodes = self._T_pend    # commit segregated T
             if iters < grow_iters:
                 self.dt = dt_eff * 1.25
                 if dt_max is not None:
