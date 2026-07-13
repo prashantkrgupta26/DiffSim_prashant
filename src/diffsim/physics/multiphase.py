@@ -326,9 +326,17 @@ the coefficients are recomputed from the ACTUAL (dt_n, dt_{n-1}) per
 attempt, so dt rescaling on rejects is automatically consistent.
 SCOPE LIMIT (recorded): BDF2 is DETERMINISTIC-ONLY (asserted noise
 off) — the FDT-noise weak order under BDF2 is out of scope.
-Linear solve: splu (default) | cudss (wodo DirectSolver pattern).
-blockch_pairs integration NOT wired (the AC blocks need the per-psi
-scalar-block extension of the "pairs" meta — recorded follow-up).
+Linear solve: splu (default) | cudss (wodo DirectSolver pattern) |
+blockch / blockch_dev (B-track): the G4 per-pair two-factor Schur
+preconditioner extended to the full (M, K) system — M CH pairs get
+W1/W2 (pair m from _mob_ref, the committed-mean mirror of the kernel
+mobility; kappa per pair), K AC (psi, theta) blocks get extracted
+diagonal-block solves with the theta<-psi torque carried lower-
+triangularly (linsolve "pairs"/"ac" meta; _blockch_meta).  blockch_dev
+= device inners.  With assembly="device" both route to
+blockch_pairs_device (zero-copy on the slot-map CSR).  Solver failure
+(two-factor AND exact-Schur escalation) signals divergence to the
+reject ladder, matching cudss.
 
 DEVICE ASSEMBLY (D-track).  assembly="host" (default) keeps the scipy
 COO -> CSR -> T^T K T finalization bit-identically; assembly="device"
@@ -1527,7 +1535,7 @@ class MultiPhaseStepper:
                  T_mode="scalar", T_field=None, D_T=None,
                  wall_g=None, wall_h=None, wall_face=(1, 0),
                  delta_a=None, m_a=None, a_reg=1e-8, tstep="bdf1",
-                 film=None, assembly="host"):
+                 film=None, assembly="host", block_sparse=False):
         from ..physics.poisson import gauss_points
         self.dm = dm
         self.M, self.K = int(M), int(K)
@@ -1665,8 +1673,15 @@ class MultiPhaseStepper:
         self.hist2 = None       # x^{n-1} (None => BDF1 bootstrap)
         self.dt_prev = None     # dt_{n-1} of the last ACCEPTED step
         self.newton_tol, self.newton_max = newton_tol, newton_max
+        assert linsolver in ("splu", "cudss", "blockch", "blockch_dev"), \
+            linsolver
         self.linsolver = linsolver
         self._cudss = None
+        # B-track blockch: per-mesh symbolic setup + iteration records
+        # (('blockch_iters', key) contract) live here
+        self._solver_cache = {}
+        self._sigma = None      # stashed per attempt (blockch meta)
+        self._m_ref = None      # representative pair mobilities
         # D-track device-side assembly (module docstring DEVICE
         # ASSEMBLY): "host" = the existing scipy COO -> CSR -> T^T K T
         # path bit-identically; "device" = slot-map CSR scatter
@@ -1674,6 +1689,14 @@ class MultiPhaseStepper:
         # handoff.  Constructor flag => bit-class-parity testable.
         assert assembly in ("host", "device"), assembly
         self.assembly = assembly
+        # B5: block-masked device pattern = kron(G, blockmask) with the
+        # compile-time (M, K, mob, theta) live-block mask — drops the
+        # structural-zero couplings (cuDSS fill fix; int32-nnz and
+        # value-memory headroom for the capacity ladder).  Opt-in: the
+        # superset pattern stays the gated default.
+        self.block_sparse = bool(block_sparse)
+        assert not (block_sparse and assembly == "host"), \
+            "block_sparse is a device-assembly pattern option"
         self._asm = None            # DeviceNSAssembler (lazy, per mesh)
         self._cudss_dev = None      # device-CSR DirectSolver plan
         self._n_dev_plans = 0       # nnz-stability regression counter
@@ -1869,6 +1892,24 @@ class MultiPhaseStepper:
                        for i, a in enumerate(avg)), 0.0)
 
     def _solve(self, A, r):
+        if self.linsolver in ("blockch", "blockch_dev"):
+            # B1: per-pair two-factor Schur + AC diagonal blocks
+            # (linsolve "pairs"/"ac" meta).  Non-convergence of BOTH
+            # the two-factor form and the exact-Schur escalation
+            # signals divergence to the Appendix-A reject ladder,
+            # matching the cudss contract (nan return).
+            from ..solvers.linsolve import solve_linear
+            meta = self._blockch_meta()
+            if self.linsolver == "blockch_dev":
+                meta["inners"] = "device"
+            self._solver_cache[("blockch_meta", "mpf")] = meta
+            try:
+                return solve_linear(A, r, solver="blockch", tol=1e-10,
+                                    cache=self._solver_cache,
+                                    cache_key="mpf",
+                                    device=self.dm.device)
+            except RuntimeError:
+                return np.full(A.shape[0], np.nan)
         if self.linsolver == "cudss":
             from nvmath.sparse.advanced import (DirectSolver,
                                                 DirectSolverOptions)
@@ -2020,11 +2061,142 @@ class MultiPhaseStepper:
                     if fn is not None:
                         s[:, f] = fn(self.xq[pv], t_new)
             src_gp[pv] = s
+        # blockch meta scalars, FROZEN per attempt: sigma (the only
+        # per-attempt scalar of the two-factor recipe) and the
+        # representative pair mobilities at the committed mean
+        # composition (wodo precedent: constant reference M11/M22 under
+        # var_mob — the scalar only weights the W factors)
+        self._sigma = sigma
+        if self.linsolver in ("blockch", "blockch_dev"):
+            self._m_ref = self._mob_ref(t_new)
         return dict(sigma=sigma, t_new=t_new, drive_d=drive_d,
                     K_tot=K_tot, minv=minv, mlat=mlat, mvert=mvert,
                     tq_gp=tq_gp, dtea=dtea, dtref=dtref,
                     hist_gp=hist_gp, qpsi_gp=qpsi_gp, qphi_gp=qphi_gp,
                     src_gp=src_gp)
+
+    # -- blockch (B-track): representative scalars + pair/AC meta --------
+    def _mob_ref(self, t_new):
+        """Representative diagonal mobility per CH pair, evaluated at
+        the COMMITTED state's mean composition (numpy mirror of the
+        kernel's lam/lamM diagonal; the Eq. 13 drop and the D(T)
+        Arrhenius factor included).  A scalar per pair is all the
+        two-factor recipe needs (it weights W1/W2; the true variable
+        mobility rides in through the extracted Acm/Amc blocks) — the
+        wodo film uses its constant reference M11/M22 the same way
+        under var_mob."""
+        nd = self.ndof
+        ph = np.array([float(np.mean(self.hist[2 * i::nd]))
+                       for i in range(self.M)])
+        ps_solv = 1.0 - ph.sum()
+        phis = np.concatenate([ph, [ps_solv]])
+        psis = np.array([float(np.mean(
+            self.hist[2 * self.M + 2 * k::nd]))
+            for k in range(self.K)])
+        mT = 1.0
+        if self.D_T is not None:
+            if self.T_mode == "field":
+                Tv = float(np.mean(self.T_nodes))
+            else:
+                Tv = float(self.T_fn(t_new)) if self.T_fn is not None \
+                    else self.T
+            ea, tref = self.D_T
+            mT = float(np.exp(ea * (1.0 / tref - 1.0 / Tv)))
+        if self.mob == "const":
+            m = np.array([self.onsager[i, i] for i in range(self.M)])
+            return np.maximum(m * mT, 1e-14)
+        if self.mob == "fastmode":            # M = 1 closure
+            pc = float(np.clip(phis[0], 1e-6, 1.0 - 1e-6))
+            omp = 1.0 - pc
+            d1s = self.D_lo[0] ** omp * self.D_hi[0] ** pc
+            d2s = self.D_lo[1] ** pc * self.D_hi[1] ** omp
+            lam = (omp * omp * pc / self.Ninv[0] * d1s
+                   + pc * pc * omp / self.Ninv[1] * d2s)
+            return np.maximum(np.array([lam * mT]), 1e-14)
+        # fastmode_n / slowmode_n: Vignes omega + Eq. 13 drop (kernel
+        # mirror at the mean composition)
+        dsl, csl, wsl = self.ls_drop
+        pt = float(np.prod(1.0 - np.clip(psis, 0.0, 1.0))) \
+            if self.K else 1.0
+        fdrop = dsl ** (0.5 * (1.0 + np.tanh(wsl * (1.0 - pt - csl))))
+        n_sp = self.M + 1
+        omv = np.empty(n_sp)
+        for i in range(n_sp):
+            dsi = fdrop * mT
+            for j in range(n_sp):
+                dsi *= self.D_self[i, j] ** float(
+                    np.clip(phis[j], 0.0, 1.0))
+            pc0 = float(np.clip(phis[i], 1e-6, 1.0 - 1e-6))
+            omv[i] = pc0 / self.Ninv[i] * dsi
+        somv = omv.sum()
+        m = np.empty(self.M)
+        for i in range(self.M):
+            if self.mob == "slowmode_n":
+                m[i] = omv[i] * (1.0 - omv[i] / somv)
+            else:
+                opi = 1.0 - phis[i]
+                m[i] = (opi * opi * omv[i]
+                        + phis[i] * phis[i] * (somv - omv[i]))
+        return np.maximum(m, 1e-14)
+
+    def _block_mask(self):
+        """Compile-time dof-pair block sparsity of the mpf kernel (the
+        kron(G, blockmask) pattern, B5): exactly the (ca, cb) blocks
+        the kernel/face terms ever WRITE.  Mirrors make_mpf_newton's
+        Jacobian scatter (phi row: time/adv diag + mobility mu cols +
+        MATMOB dLam phi cols + dlnf psi cols; FASTMODE: mu_0 only;
+        const: mu cols only.  mu row: mass diag + dmudphi + dmudpsi.
+        psi row: diag + d2pp psi cols + d2pf phi cols.  theta row:
+        diag (+ psi col under KWC)).  Face terms (wall (mu_i, phi_i),
+        top flux (phi_i, phi_i)) and Dirichlet diagonals are inside.
+        Exactness masked-vs-unmasked is gated."""
+        nd = self.ndof
+        M, K = self.M, self.K
+        m = np.zeros((nd, nd), dtype=bool)
+        matmob = self.mob in ("fastmode_n", "slowmode_n")
+        for i in range(M):
+            rp, rm = 2 * i, 2 * i + 1
+            m[rp, rp] = True                     # time + advection
+            if self.mob == "fastmode":
+                m[rp, 1] = True                  # lam lap on mu_0
+            elif matmob:
+                for j in range(M):
+                    m[rp, 2 * j] = m[rp, 2 * j + 1] = True
+                for k in range(K):
+                    m[rp, 2 * M + 2 * k] = True  # dlnf drop cols
+            else:                                # const Onsager
+                for j in range(M):
+                    m[rp, 2 * j + 1] = True
+            m[rm, rm] = True                     # mass
+            for j in range(M):
+                m[rm, 2 * j] = True              # dmudphi (+kappa lap)
+            for k in range(K):
+                m[rm, 2 * M + 2 * k] = True      # dmudpsi
+        for k in range(K):
+            rs, rt = 2 * M + 2 * k, 2 * M + 2 * k + 1
+            for l in range(K):
+                m[rs, 2 * M + 2 * l] = True      # d2pp
+            for j in range(M):
+                m[rs, 2 * j] = True              # d2pf
+            m[rs, rs] = True
+            m[rt, rt] = True
+            if self.theta_mode == "kwc":
+                m[rt, rs] = True                 # p'(psi) torque col
+        return m
+
+    def _blockch_meta(self):
+        """The (M, K) blockch meta (linsolve _blockch_pairs contract):
+        M CH pairs {'off', 'm', 'kappa'} + K AC blocks {'off'} on the
+        2M+2K node-major layout.  sigma/m_ref are attempt-frozen by
+        _attempt_ctx."""
+        assert self._sigma is not None and self._m_ref is not None, \
+            "blockch meta requested before _attempt_ctx froze sigma/m"
+        return {"sigma": self._sigma, "ndof": self.ndof,
+                "pairs": [{"off": 2 * i, "m": float(self._m_ref[i]),
+                           "kappa": float(self.kap[i])}
+                          for i in range(self.M)],
+                "ac": [{"off": 2 * self.M + 2 * k}
+                       for k in range(self.K)]}
 
     # -- host-path assembly at one Newton iterate ------------------------
     def _assemble_host(self, x, ctx):
@@ -2298,7 +2470,9 @@ class MultiPhaseStepper:
         d = self.dm.device
         self._asm = DeviceNSAssembler(
             self.dm, ndof=nd,
-            node_pattern=getattr(self, "_node_pattern", None))
+            node_pattern=getattr(self, "_node_pattern", None),
+            blockmask=self._block_mask() if self.block_sparse
+            else None)
         asm = self._asm
         # persistent per-bin GP-field buffers (device _pack_fields
         # mirror) + zero buffers for compile-dead/inactive inputs
@@ -2523,6 +2697,21 @@ class MultiPhaseStepper:
         splu: host pull on the fixed pattern (the parity-gate
         solver)."""
         asm = self._asm
+        if self.linsolver in ("blockch", "blockch_dev"):
+            # B2: device-resident blockch — per-pair/AC-block values
+            # built by fill/gather kernels on the assembler's slot-map
+            # CSR (no host matrix ever exists); same divergence
+            # contract as the host branch.
+            from ..solvers.linsolve import blockch_pairs_device
+            asm.device_operator()      # ensures the _op_idx upload
+            try:
+                return blockch_pairs_device(
+                    asm.indptr, asm.indices, asm.vals_d,
+                    asm.F_d.numpy(), self._blockch_meta(), tol=1e-10,
+                    device=self.dm.device, cache=self._solver_cache,
+                    cache_key="mpf_dev", idx_dev=asm._op_idx)
+            except RuntimeError:
+                return np.full(asm.Nfull, np.nan)
         if self.linsolver == "cudss":
             import torch
             from nvmath.sparse.advanced import (DirectSolver,
@@ -2550,7 +2739,8 @@ class MultiPhaseStepper:
                 self._cudss_dev = None
                 return np.full(asm.Nfull, np.nan)
         assert self.linsolver == "splu", (
-            "assembly='device': linsolver in ('cudss', 'splu')")
+            "assembly='device': linsolver in ('cudss', 'splu', "
+            "'blockch', 'blockch_dev')")
         from scipy.sparse.linalg import splu
         A = sp.csr_matrix((asm.vals_d.numpy(), asm.indices,
                            asm.indptr), shape=(asm.Nfull,) * 2)

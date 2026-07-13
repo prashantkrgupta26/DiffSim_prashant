@@ -36,13 +36,25 @@ class DeviceNSAssembler:
     per step on device."""
 
     def __init__(self, dm, sigma_like=1.0, coloring=False, ndof=None,
-                 node_pattern=None):
+                 node_pattern=None, blockmask=None):
         # ndof: dofs per node (default dim+1 = the NS layout; 4 for the
         # ternary CH film system, 2 for binary CH — M4 device-bound)
+        # blockmask (B5): bool [ndof, ndof] compile-time dof-pair block
+        # sparsity — pattern = kron(G, blockmask) instead of
+        # kron(G, ones): the structural-zero couplings (the recorded
+        # cuDSS 3-D fill penalty, Sec 6 of the device-assembly note)
+        # never exist.  The element kernel MUST write only inside live
+        # blocks (masked-out scatter entries are skipped; exactness is
+        # gated masked-vs-unmasked).  Node-pattern mode only; the
+        # diagonal is forced live (strong rows need it).
         self.dm = dm
         self.coloring = coloring
         ndof = (dm.dim + 1) if ndof is None else int(ndof)
         self.ndof = ndof
+        if blockmask is not None:
+            blockmask = np.asarray(blockmask, bool).reshape(ndof, ndof) \
+                | np.eye(ndof, dtype=bool)
+        self._blockmask = blockmask
         T = dm.constraints.T.tocsr()
         n_free = T.shape[1]
         self.n_free = n_free
@@ -57,6 +69,10 @@ class DeviceNSAssembler:
             len(dm.mesh.conn_of[pv]) * (dm.mesh.conn_of[pv].shape[1]
                                         * ndof) ** 2
             for pv in dm.bins)
+        if blockmask is not None:
+            assert node_pattern is not False, (
+                "blockmask requires the node-graph pattern")
+            node_pattern = True
         if node_pattern is None:
             node_pattern = (identity_T and not coloring
                             and tot_entries > NODE_PATTERN_AUTO_ENTRIES)
@@ -276,14 +292,35 @@ class DeviceNSAssembler:
         Gind = G.indices.astype(np.int32)
         del G
         gnnz = int(Gptr[-1])
-        self.nnz = gnnz * ndof * ndof
+        mask = self._blockmask
+        deg = np.diff(Gptr)
+        if mask is None:
+            self.nnz = gnnz * ndof * ndof
+        else:
+            # B5 block-masked pattern = kron(G, mask): per dof row
+            # (na, ca) the live cols are deg(na) * rowcnt[ca]
+            rowcnt = mask.sum(axis=1).astype(np.int64)
+            rowoff = np.concatenate(([0], np.cumsum(rowcnt)))
+            lcols = np.concatenate(
+                [np.where(mask[ca])[0] for ca in range(ndof)])
+            colpos = np.full(ndof * ndof, -1, np.int64)
+            for ca in range(ndof):
+                colpos[ca * ndof + np.where(mask[ca])[0]] = \
+                    np.arange(rowcnt[ca])
+            self.nnz = gnnz * int(rowcnt.sum())
         assert self.nnz < 2 ** 31, (
             f"node-pattern dof nnz {self.nnz} >= 2^31: the int32 device "
             f"slot arithmetic overflows — needs an int64 kernel variant")
         # dof-level indptr in closed form (int64: values reach nnz)
-        deg = np.diff(Gptr)
-        self.indptr = np.concatenate(
-            ([0], np.cumsum(np.repeat(deg * ndof, ndof)))).astype(np.int64)
+        if mask is None:
+            self.indptr = np.concatenate(
+                ([0], np.cumsum(np.repeat(deg * ndof,
+                                          ndof)))).astype(np.int64)
+        else:
+            self.indptr = np.concatenate(
+                ([0], np.cumsum((deg[:, None]
+                                 * rowcnt[None, :]).ravel()))
+            ).astype(np.int64)
         assert self.indptr[-1] == self.nnz
         # dof-level indices by device kernel (one thread per dof row);
         # int32 mirror kept on host (blockch symbolic setup, csr_slots)
@@ -291,9 +328,21 @@ class DeviceNSAssembler:
                                 device=d)
         Gind_d = wp.array(Gind, dtype=wp.int32, device=d)
         ind_d = wp.zeros(self.nnz, dtype=wp.int32, device=d)
-        wp.launch(_dof_indices_kernel(), dim=self.Nfull,
-                  inputs=[self._Gptr_d, Gind_d, wp.int32(ndof), ind_d],
-                  device=d)
+        if mask is None:
+            self._mask_d = None
+            wp.launch(_dof_indices_kernel(), dim=self.Nfull,
+                      inputs=[self._Gptr_d, Gind_d, wp.int32(ndof),
+                              ind_d], device=d)
+        else:
+            i32 = lambda a_: wp.array(a_.astype(np.int32),
+                                      dtype=wp.int32, device=d)
+            self._mask_d = dict(rowoff=i32(rowoff), lcols=i32(lcols),
+                                colpos=i32(colpos),
+                                blocknnz=int(rowcnt.sum()))
+            wp.launch(_dof_indices_masked_kernel(), dim=self.Nfull,
+                      inputs=[self._Gptr_d, Gind_d, wp.int32(ndof),
+                              self._mask_d["rowoff"],
+                              self._mask_d["lcols"], ind_d], device=d)
         self.indices = ind_d.numpy()
         del ind_d, Gind_d
         # per-element node-pair slot in G via keyed searchsorted
@@ -493,11 +542,25 @@ class DeviceNSAssembler:
         nl = nbf * ndof
         npair = nl * nl
         if self.node_mode:
-            wp.launch(_scatter_node_kernel(), dim=nb * npair,
-                      inputs=[Ae_d.reshape((-1,)), self._gslot_d[k_bin],
-                              self._conn_d[k_bin], self._Gptr_d,
-                              wp.int32(e0), wp.int32(nbf),
-                              wp.int32(ndof), self.vals_d], device=d)
+            if self._blockmask is not None:
+                wp.launch(_scatter_node_masked_kernel(),
+                          dim=nb * npair,
+                          inputs=[Ae_d.reshape((-1,)),
+                                  self._gslot_d[k_bin],
+                                  self._conn_d[k_bin], self._Gptr_d,
+                                  wp.int32(e0), wp.int32(nbf),
+                                  wp.int32(ndof),
+                                  self._mask_d["rowoff"],
+                                  self._mask_d["colpos"],
+                                  self.vals_d], device=d)
+            else:
+                wp.launch(_scatter_node_kernel(), dim=nb * npair,
+                          inputs=[Ae_d.reshape((-1,)),
+                                  self._gslot_d[k_bin],
+                                  self._conn_d[k_bin], self._Gptr_d,
+                                  wp.int32(e0), wp.int32(nbf),
+                                  wp.int32(ndof), self.vals_d],
+                          device=d)
             wp.launch(_scatter_node_vec_kernel(), dim=nb * nl,
                       inputs=[be_d.reshape((-1,)), self._conn_d[k_bin],
                               wp.int32(e0), wp.int32(nbf),
@@ -813,6 +876,86 @@ def _dof_indices_kernel():
 
     _kernel_cache[key] = dik
     return dik
+
+
+def _dof_indices_masked_kernel():
+    """Masked variant of _dof_indices_kernel (pattern = kron(G, mask)):
+    dof row r = ndof*na + ca has deg(na) * rowcnt[ca] entries; the
+    entry for neighbor q and the j-th live col of block-row ca sits at
+    indptr[r] + rowcnt[ca]*q + j, indptr[r] = blocknnz*Gptr[na]
+    + rowoff[ca]*deg(na); blocknnz = rowoff[ndof]."""
+    key = ("dev_dof_indices_masked",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique")
+    def dikm(Gptr: wp.array(dtype=wp.int32),
+             Gind: wp.array(dtype=wp.int32),
+             ndof: wp.int32,
+             rowoff: wp.array(dtype=wp.int32),
+             lcols: wp.array(dtype=wp.int32),
+             out: wp.array(dtype=wp.int32)):
+        r = wp.tid()
+        na = r / ndof
+        ca = r % ndof
+        g0 = Gptr[na]
+        dnb = Gptr[na + 1] - g0
+        ro = rowoff[ca]
+        rc = rowoff[ca + 1] - ro
+        base = rowoff[ndof] * g0 + ro * dnb
+        for q in range(dnb):
+            col = ndof * Gind[g0 + q]
+            for j in range(rc):
+                out[base + rc * q + j] = col + lcols[ro + j]
+
+    _kernel_cache[key] = dikm
+    return dikm
+
+
+def _scatter_node_masked_kernel():
+    """Masked variant of _scatter_node_kernel: local pairs whose
+    (ca, cb) block is masked out are SKIPPED (the element kernel is
+    contractually zero there — exactness gated masked-vs-unmasked);
+    live pairs land at blocknnz*Gptr[na] + rowoff[ca]*deg(na)
+    + rowcnt[ca]*(s - g0) + colpos[ca, cb]."""
+    key = ("dev_scatter_node_masked",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique")
+    def scnm(vals_e: wp.array(dtype=wp.float64),
+             gslot: wp.array(dtype=wp.int32),
+             conn: wp.array2d(dtype=wp.int32),
+             Gptr: wp.array(dtype=wp.int32),
+             e0: wp.int32, nbf: wp.int32, ndof: wp.int32,
+             rowoff: wp.array(dtype=wp.int32),
+             colpos: wp.array(dtype=wp.int32),
+             out: wp.array(dtype=wp.float64)):
+        i = wp.tid()
+        nl = nbf * ndof
+        npair = nl * nl
+        el = i / npair
+        rem = i % npair
+        rl = rem / nl
+        cl = rem % nl
+        a = rl / ndof
+        ca = rl % ndof
+        bb = cl / ndof
+        cb = cl % ndof
+        j = colpos[ca * ndof + cb]
+        if j >= 0:
+            e = e0 + el
+            s = gslot[e * nbf * nbf + a * nbf + bb]
+            na = conn[e, a]
+            g0 = Gptr[na]
+            dnb = Gptr[na + 1] - g0
+            ro = rowoff[ca]
+            rc = rowoff[ca + 1] - ro
+            slot = rowoff[ndof] * g0 + ro * dnb + rc * (s - g0) + j
+            wp.atomic_add(out, slot, vals_e[i])
+
+    _kernel_cache[key] = scnm
+    return scnm
 
 
 def _scatter_node_kernel():
