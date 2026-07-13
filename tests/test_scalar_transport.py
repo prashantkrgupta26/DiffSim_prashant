@@ -345,3 +345,60 @@ def test_field_kappa_gradient_fd(device):
         rel = err / max(abs(fd), 1e-12)
         # low-sensitivity GPs: FD noise dominates rel — absolute backstop
         assert rel < 1e-5 or err < 1e-10, (int(gpi), rel, g[gpi], fd)
+
+
+def test_coupled_bdf2_variable_dt(device):
+    """Retrofit G3c gate (directive 2026-07-13): variable-coefficient
+    BDF2 on the scalar-transport stepper under an ADAPTIVE-dt sequence
+    (alternating dt0, dt0/2 — r = 2 and 0.5 every step).  Measured at
+    the retrofit: orders 2.40/2.68 vs a fine fixed-dt reference (lock
+    1.7); fixed-dt trajectories bit-identical pre/post (0.0)."""
+    from diffsim.steppers.coupled import ScalarTransportStepper
+    from diffsim.mesh.basis import basis_tables as bt
+
+    tree = build_uniform(4, dim=2)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, bt(1, dim=2), device)
+    xq = gauss_points(mesh, dm.tables_by_p)
+    aq = {pv: np.stack([-(xq[pv][:, 1] - 0.5), xq[pv][:, 0] - 0.5],
+                       axis=1) for pv in xq}
+    coords = mesh.node_coords[cons.free_nodes]
+    bdry = np.zeros(len(coords), bool)
+    for c in range(2):
+        bdry |= (np.abs(coords[:, c]) < 1e-12) | \
+                (np.abs(coords[:, c] - 1.0) < 1e-12)
+    dir_nodes = np.where(bdry)[0]
+    Ts = lambda x, t: (np.sin(np.pi * x[:, 0])
+                       * np.cos(np.pi * x[:, 1]) * np.cos(t))
+
+    def mk(dt):
+        st = ScalarTransportStepper(dm, 0.7, dt, g_fn=Ts,
+                                    dirichlet_nodes=dir_nodes, order=2)
+        st.set_initial(lambda x: Ts(x, 0.0))
+        return st
+
+    T_END = 0.48
+
+    def run_var(dt0):
+        st = mk(dt0)
+        for _ in range(round(T_END / (1.5 * dt0))):
+            st.dt = dt0
+            st.step(aq)
+            st.dt = dt0 / 2
+            Tn = st.step(aq)
+        assert abs(st.t - T_END) < 1e-12
+        return Tn
+
+    def run_fix(dt):
+        st = mk(dt)
+        for _ in range(round(T_END / dt)):
+            Tn = st.step(aq)
+        return Tn
+
+    ref = run_fix(0.005)
+    ev = [np.linalg.norm(run_var(d) - ref) for d in (0.04, 0.02, 0.01)]
+    ov = [np.log2(ev[i] / ev[i + 1]) for i in range(2)]
+    print(f"scalar var-dt errs {['%.2e' % e for e in ev]} orders "
+          f"{['%.2f' % o for o in ov]}")
+    assert min(ov) > 1.7, (ev, ov)

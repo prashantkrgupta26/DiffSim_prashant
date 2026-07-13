@@ -33,6 +33,7 @@ class ScalarTransportStepper:
         self.xq = gauss_points(dm.mesh, dm.tables_by_p)
         self.t = 0.0
         self.hist = []                       # [T_{n}, T_{n-1}] free vecs
+        self.dt_prev = None     # dt of the last completed step (G3c)
         # GP interpolation of a free-vector to bins (scalar)
         self._Tcsr = dm.constraints.T.tocsr()
 
@@ -40,12 +41,19 @@ class ScalarTransportStepper:
         T0 = T0_fn(self.free_coords)
         self.hist = [T0.copy(), T0.copy()]
         self.t = 0.0
+        self.dt_prev = None     # restart the BDF2 bootstrap (G3c)
         return T0
 
     def _bdf(self):
-        if self.order == 1 or self.t < self.dt / 2:
+        # retrofit G3c (A4b pattern): VARIABLE-COEFFICIENT BDF2 from
+        # the actual (dt, dt_prev); r = 1 reproduces 1.5/[2, -0.5]
+        # bit-exactly (see cahn_hilliard.step for the full note).
+        if self.order == 1 or self.dt_prev is None \
+                or self.t < self.dt / 2:
             return 1.0, [1.0], 1               # c0, hist coeffs
-        return 1.5, [2.0, -0.5], 2
+        rr = self.dt / self.dt_prev
+        return ((1.0 + 2.0 * rr) / (1.0 + rr),
+                [1.0 + rr, -rr * rr / (1.0 + rr)], 2)
 
     def gp_scalar(self, vec_free):
         """Free scalar vector -> GP values per bin."""
@@ -87,4 +95,5 @@ class ScalarTransportStepper:
         Tn = splu(A.tocsr().tocsc()).solve(b)
         self.hist = [Tn.copy(), self.hist[0]]
         self.t = t_new
+        self.dt_prev = self.dt      # history spacing for BDF2 (G3c)
         return Tn
