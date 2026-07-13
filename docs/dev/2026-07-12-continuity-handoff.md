@@ -26,12 +26,12 @@ Refreshed at push milestones; trust the newest git version.
 - M0-M4 (bricks, NS/VMS, heat, cahn_hilliard incl. FH energy,
   ternary_ch, wodo_film + film front-end + RunLog, blockch
   preconditioner G1-G5): DONE, pushed, dev notes under docs/dev/.
-- M5 "OrgElMorph" (multi-CH x multi-AC crystallization,
-  src/diffsim/physics/multiphase.py): S0/S1/S2 DONE + pushed; the
-  (a)-pack (T-field A1, substrate A2, anisotropy A3) + A4 (quadratic
-  basis, BDF2) DONE + pushed (fd2e3e7); S3a film frame DONE + pushed
-  (645d10c); S3b = the ONLY open M5 item (Sec 2); S4 (quaternary,
-  configs-only by design) queued after.
+- M5 "OrgElMorph" COMPLETE (2c14bc1, 2026-07-13): S0-S4 all green
+  with measured locks; S4 demonstrated the (M,K) factory is
+  config-only (zero code changes for quaternary). Also pushed:
+  device-assembly port (assembly="device", 7-11x 2-D; D4 no-flip
+  verdict — host default), S3-3D pilot kit
+  (cluster/wodo_campaign/a100_s3d_pilot.sbatch), README hero images.
 - Theory memos for ratified plans: docs/theory/
   crystallization_formulation_p1.md (M5), flow_film_formulation_p2.md
   (Track A done; Track B = M6 flow/film, rulings RB1-RB3 still open
@@ -48,14 +48,16 @@ Refreshed at push milestones; trust the newest git version.
   terminal-state locks; the whole knife-edge saga resolved — a
   missing **kw splat had built the gate stepper with Tm=1; ledger
   Sec 2.4 has the retraction + surviving findings + lesson).
-- IN FLIGHT: the device-assembly port agent (queue item 2 below),
-  launched ~21:15 CDT on stages D1 (pattern+scatter parity) -> D2
-  (cuDSS/blockch handoff, nnz-stability) -> D3 (host-vs-device
-  step-time table to the 48GB 3-D limit = the Nova hero-kit basis)
-  -> D4 (default flip if unambiguous). Its dev note:
-  docs/dev/2026-07-13-m5-device-assembly.md. If it died: check
-  git log for its commit-per-green chain and the dev note for the
-  last verified stage.
+- IN FLIGHT: blockch-(M,K) agent in a git WORKTREE
+  (.claude/worktrees/, branch worktree-agent-*), stages B1-B5:
+  per-pair W1/W2 + AC blocks + FGMRES; device inners on the
+  assembly="device" CSR; AMGX evaluated on the SPD W factors
+  (Baskar's device-only question); B4 = 128x128x64 measured on
+  48 GB; B5 = (M=3,K=2) capacity ladder 48-vs-80 GB + matrix-free
+  outer assessment for 256x256x128 (~366/161 GB stored = no card;
+  matrix-free ~45 GB = A100-80 yes). Dev note:
+  docs/dev/2026-07-13-blockch-mpf.md (worktree). If dead: check the
+  worktree's git log; supervisor merges after verification.
 
 ## 3. Task queue (order ratified by Baskar)
 
