@@ -431,3 +431,279 @@ def test_s3a_film_tfield_evap_cooling(device):
     assert res[0.0][1] < 1e-9, res[0.0][1]      # measured 2.0e-11
 
 
+# ---------------------------------------------------------------------
+# S3b — EVAPORATION-QUENCH CRYSTALLIZATION (film units; ledger Sec 2)
+# ---------------------------------------------------------------------
+N_F, N_P = 5.0298, 87.0
+DSIG_F, DH_F, TM_F = 2.6355, 1.3072, 558.0      # 2310 Table-1, RT/v0
+
+
+def _s3b_stepper(dm, K_on=True, noise_psi=0.0, mpsi=1.0, seed=11,
+                 eps2=4e-3, ic_seed=1011):
+    """The S3b production config (ledger Sec 2.0-2.2), FILM UNITS
+    (h0 = 1, D_s = 1, Bi = k_e = 0.1 from the Wodo validated set):
+    ternary (M=2, K=1): 0 = fullerene-class SM (crystallizable, 2310
+    dimensionless energetics at T = 333 K), 1 = polymer (N = 87),
+    eliminated solvent.  chi: fp 1.0 (Negi), fs 0.7248 (2310), ps 0.3
+    (Wodo); linsolver cudss (production, S2 Sec-3: splu on the
+    fastmode_n L5 Jacobian is 6-10x slower; NOTE the WSL2
+    clock-governor caveat in the ledger Sec 3 — cuDSS wall times
+    require boosted clocks);
+    r14 delta-chi chi_ca = 1.6 on both f-contacts — the
+    SOLUBILITY physics (crystallization forbidden below local phi_f =
+    1 - drive/chi_ca = 0.67; calibrated in the ledger: the 2310
+    literal 1.0836 under-confines at phi* = 0.51 — measured runaway
+    into p-rich domains — while the 16390-class 4.48/2.0 over-
+    confines at L5, dissolving seeds at the phi_f ~ 0.75 domains).
+    Vignes D_self at the SOFTENED dry-limit floors (2-decade
+    max contrast — the SD-burst Newton-wall deviation D-S3.1,
+    measured in the ledger); ls_drop (1e-6, .97, 35); b_reg 1e-3
+    (wodo Fig-6, stabilizes the 85%-solvent start).  Blend phi_f0 =
+    0.10, phi_p0 = 0.05, phi_s0 = 0.85 (Negi-dilute 2:1)."""
+    chi_aa = np.zeros((3, 3))
+    chi_aa[0, 1] = chi_aa[1, 0] = 1.0
+    chi_aa[0, 2] = chi_aa[2, 0] = 0.7248
+    chi_aa[1, 2] = chi_aa[2, 1] = 0.3
+    chi_ca = np.zeros((3, 3))
+    chi_ca[0, 1] = chi_ca[0, 2] = 1.6
+    Dslf = np.array([[1e-2, 1e-3, 0.5],
+                     [1e-4, 1e-4, 1e-2],
+                     [1e-2, 1e-3, 1.0]])
+    K = 1 if K_on else 0
+    kw = dict(dsig=[DSIG_F], dh=[DH_F], Tm=[TM_F], eps2=[eps2],
+              L_psi=[N_F * mpsi], noise_psi=noise_psi,
+              noise_damp=(1e-2, 0.85, 15.0), clip_psi=False) \
+        if K_on else {}
+    st = MultiPhaseStepper(
+        dm, M=2, K=K, chi_aa=chi_aa, chi_ac=chi_ca.T.copy(),
+        chi_ca=chi_ca, N=[N_F, N_P, 1.0], mob="fastmode_n",
+        D_self=Dslf, ls_drop=(1e-6, 0.97, 35.0), kappa=[2e-4] * 2,
+        T=333.0, dt=1e-4, bulk="r14", b_reg=1e-3, newton_tol=1e-8,
+        newton_max=50, linsolver="cudss", line_search=True,
+        noise_seed=seed, film=dict(k_e=0.1), **kw)
+    rng = np.random.default_rng(ic_seed)
+    nf = st.nfree
+    icf = 0.10 + 0.01 * rng.standard_normal(nf)
+    icp = 0.05 + 0.01 * rng.standard_normal(nf)
+    if K_on:
+        st.set_initial([lambda x: icf, lambda x: icp],
+                       [lambda x: np.zeros(len(x))],
+                       [lambda x: np.zeros(len(x))])
+    else:
+        st.set_initial([lambda x: icf, lambda x: icp])
+    return st
+
+
+def _s3b_implant(st, ctrs, r0=0.2, w=0.03, psi_amp=0.95):
+    """psi discs + theta markers at given centers; commits into
+    x AND hist (the implanted state is the new committed state).
+    r0 = 0.2 IS THE FATE-ROBUSTNESS MARGIN (measured scan,
+    2026-07-12): r0 = 0.15 sits AT the Gibbs-Thomson r* in the
+    developing domains and its fate is an assembly-atomics FP coin
+    flip — the identical dry5b command grew (X = 0.961) in one run
+    and dissolved (X = 0) in its replica; aggregate pre-implant
+    metrics match to print precision while the field wobbles below
+    it, reshuffling the phi_f-richest sites and the growth-leg
+    fate.  Measured fate matrix (campaign script, correct physics):
+    r0 0.15 dissolves 4/4 (t_implant 12.5 and 13); r0 0.2 GROWS 6/6
+    with X = 0.9612 repeat-stable to 4-5 digits.  HISTORY (ledger
+    Sec 2.3-2.4): all earlier "gate protocol dissolves" claims —
+    restore-vs-continuous, wrapped-vs-non-wrapped discs, the margin
+    variant chi_ca 1.4 / r0 0.2 — were measured on a MIS-BUILT
+    stepper (the kw splat was missing from the MultiPhaseStepper
+    call, so Tm defaulted to 1.0 and dh(1 - T/Tm) was a -332x
+    MELTING drive at T = 333); with the parameters actually passed,
+    this configuration grows exactly as the campaign measured.
+    Continuous march through the implant, non-wrapped discs
+    (campaign-verbatim geometry).  psi_amp = 0.95 (REQUIRED:
+    0.5-amplitude embryos halve the bulk driving and double r* —
+    measured subcritical everywhere)."""
+    nd = st.ndof
+    coords = st.free_coords
+    psi = st.x[2 * st.M::nd]
+    th = st.x[2 * st.M + 1::nd]
+    for k, c in enumerate(ctrs):
+        r = np.hypot(coords[:, 0] - c[0], coords[:, 1] - c[1])
+        disc = psi_amp * 0.5 * (1.0 - np.tanh((r - r0) / w))
+        m = disc > psi
+        psi[m] = disc[m]
+        th[r < r0 + 3 * w] = 0.3 + 0.4 * k
+    st.hist = st.x.copy()
+    st.hist2 = None
+
+
+def _s3b_sites(st, n_seeds=3, min_sep=0.3):
+    """phi_f-richest well-separated sites (off the moving face;
+    campaign-verbatim NON-periodic separation)."""
+    coords = st.free_coords
+    order = np.argsort(st.phi(0))[::-1]
+    ctrs = []
+    for i in order:
+        c = coords[i]
+        if c[1] > 0.85:
+            continue
+        ok = True
+        for cc in ctrs:
+            if np.hypot(c[0] - cc[0], c[1] - cc[1]) < min_sep:
+                ok = False
+                break
+        if ok:
+            ctrs.append((float(c[0]), float(c[1])))
+        if len(ctrs) >= n_seeds:
+            break
+    return ctrs
+
+
+def _cry_area(st, cons):
+    return float(np.mean(np.asarray(cons.T @ st.psi(0)) > 0.5))
+
+
+def _phis_mean(st, cons):
+    phis = 1.0 - sum(np.asarray(cons.T @ st.phi(i)) for i in range(2))
+    return float(np.mean(phis))
+
+
+# CAMPAIGN-VERBATIM growth leg (option (iii), ledger Sec 2.3): each
+# growth leg pays its own continuous march through t_implant = 14 —
+# NO shared save/restore cache.  Measured (2026-07-12): the restore
+# protocol dissolves the same seeds that the continuous march grows
+# (dry5b X = 0.961), and margin parameters do not rescue restore
+# (chi_ca 1.4 / r0 0.2: area 0.244 -> 0.0).  The ~134 s premarch per
+# leg (healthy clocks) is the price of a lockable gate.
+def _s3b_grow_leg(dm, cons, t_implant=12.5, t_end=30.0,
+                  noise_psi=0.0, seed=11):
+    """Continuous march to t_implant, implant, march to t_end (the
+    phis_stop = 0.02 dryness criterion terminates ~t = 21-23, so the
+    locks sit on the TERMINAL X-plateau, not a mid-growth snapshot).
+    t_implant = 12.5 (mid-burst): drying still deepens the quench
+    after the implant — the physics margin that, with r0 = 0.2,
+    makes the fate deterministic in practice (4/4 measured).
+    Returns (stepper, phis_at_implant, area_at_implant)."""
+    st = _s3b_stepper(dm)
+    r = st.march(t_end=t_implant, dt_max=0.02, max_steps=40000,
+                 dt_min=1e-11, grow_iters=45, h_min=0.14,
+                 phis_stop=0.02)
+    assert r == "t_end", r
+    if noise_psi:
+        st.noise_psi = float(noise_psi)
+        st._nrng = np.random.default_rng(seed)
+    phis_imp = _phis_mean(st, cons)
+    ctrs = _s3b_sites(st)
+    _s3b_implant(st, ctrs)
+    a0 = _cry_area(st, cons)
+    print(f"S3b grow-leg implant t={st.t:g} ctrs={ctrs} a0={a0:.4f}")
+    st.march(t_end=t_end, dt_max=0.02, max_steps=40000,
+             dt_min=1e-11, grow_iters=45, h_min=0.14,
+             phis_stop=0.02)
+    return st, phis_imp, a0
+
+
+def test_s3b_mechanism_dissolve_vs_grow(device):
+    """S3b gate (i) — THE EVAPORATION-QUENCH MECHANISM, deterministic
+    (no noise): identical psi = 0.95 seeds (r0 = 0.2, the measured
+    fate-robustness margin — see _s3b_implant) implanted in the WET
+    film (t = 1, phi_s = 0.836 — below the r14 solubility: the
+    chi_ca crystal-contact penalty beats the undercooling at low
+    phi_f) DISSOLVE; the same seeds implanted mid-drying-burst
+    (t = 12.5, f-rich domains above the 0.67 solubility crossing at
+    chi_ca = 1.6, and the continuing solvent loss DEEPENS the quench
+    after the implant) GROW to the terminal X ~ 0.96 plateau
+    (measured 4/4 across implant times and repeats).
+    Crystallization onset strictly AFTER significant solvent loss —
+    thermodynamic ordering (2310's below-solubility anchor operating
+    in the film frame).  LATERALLY-PERIODIC mesh (the film
+    convention; measured: on a walled box the phi_f-richest sites hug
+    the walls and the clipped half-discs are subcritical — ledger).
+    Measured (2026-07-12, L5): see print."""
+    dm, mesh, cons = _dm(5, device, periodic=(True, False))
+    # wet leg
+    st = _s3b_stepper(dm)
+    r = st.march(t_end=1.0, dt_max=0.02, max_steps=20000,
+                 dt_min=1e-11, grow_iters=45, h_min=0.14,
+                 phis_stop=0.02)
+    assert r == "t_end", r
+    phis_wet = _phis_mean(st, cons)
+    _s3b_implant(st, _s3b_sites(st))
+    a0w = _cry_area(st, cons)
+    st.march(t_end=5.0, dt_max=0.02, max_steps=20000, dt_min=1e-11,
+             grow_iters=45, h_min=0.14, phis_stop=0.02)
+    a1w = _cry_area(st, cons)
+    pmw = float(np.asarray(cons.T @ st.psi(0)).max())
+    print(f"S3b mechanism [wet]: implant at phi_s={phis_wet:.3f}, "
+          f"area {a0w:.4f} -> {a1w:.4f}, psi_max {pmw:.3e}, "
+          f"rejects {st.n_reject}")
+    # dry leg (campaign-verbatim continuous march)
+    st, phis_dry, a0d = _s3b_grow_leg(dm, cons)
+    a1d = _cry_area(st, cons)
+    pmd = float(np.asarray(cons.T @ st.psi(0)).max())
+    print(f"S3b mechanism [dry]: implant at phi_s={phis_dry:.3f}, "
+          f"area {a0d:.4f} -> {a1d:.4f}, psi_max {pmd:.3e}, "
+          f"rejects {st.n_reject}")
+    # wet: dissolution; dry: growth; ordering via phi_s
+    assert a1w < 0.2 * a0w, (a0w, a1w)
+    assert pmw < 0.3, pmw
+    assert a1d > 1.5 * a0d, (a0d, a1d)
+    assert pmd > 0.9, pmd
+    assert phis_dry < 0.5 * phis_wet, (phis_dry, phis_wet)
+
+
+def test_s3b_coupling_contrast_and_variants(device):
+    """S3b gates (ii)+(iii) — coupling contrast + variants:
+    (ii) the crystallization-ON dried film differs measurably from
+    the K = 0 twin at the same config/horizon (crystals purify
+    phi_f in cores and re-shape the amorphous pattern);
+    (iii) the seeded variant is fate-and-observable reproducible
+    (full independent repeat, continuous marches, no noise): the
+    trajectory is FP-CHAOTIC at bit level (assembly-atomics noise
+    reshuffles site selection and iterate tails — measured, see
+    _s3b_implant), so the gate asserts the TERMINAL OBSERVABLES
+    (crystalline area, phi_f max), which the fate-robust config
+    reproduces to 4-5 digits (measured X spread 4.5e-5 over 4 runs);
+    the noise variant switches FDT noise_psi = 1e-2 ON at the
+    implant (growth-stage stochasticity; distribution lock from 3
+    noise seeds).  Each leg pays its own continuous premarch.
+    Measured (2026-07-12, L5): see print."""
+    dm, mesh, cons = _dm(5, device, periodic=(True, False))
+
+    def grow(noise_psi=0.0, seed=11):
+        st, _, _ = _s3b_grow_leg(dm, cons, noise_psi=noise_psi,
+                                 seed=seed)
+        return st.x.copy()
+    xa = grow()
+    xb = grow()
+    pf_a = np.asarray(cons.T @ xa[0::6])
+    pf_b = np.asarray(cons.T @ xb[0::6])
+    ar_a = float(np.mean(np.asarray(cons.T @ xa[4::6]) > 0.5))
+    ar_b = float(np.mean(np.asarray(cons.T @ xb[4::6]) > 0.5))
+    rep_dev = max(abs(ar_a - ar_b),
+                  abs(float(pf_a.max()) - float(pf_b.max())))
+    k1_phif = pf_a
+    k1_area = ar_a
+    # K0 twin at the same config, to the same dryness criterion
+    st0 = _s3b_stepper(dm, K_on=False)
+    r0 = st0.march(t_end=30.0, dt_max=0.02, max_steps=40000,
+                   dt_min=1e-11, grow_iters=45, h_min=0.14,
+                   phis_stop=0.02)
+    k0_phif = np.asarray(cons.T @ st0.phi(0))
+    dphi = float(np.abs(k1_phif - k0_phif).max())
+    print(f"S3b coupling: K1 phi_f_max {k1_phif.max():.3f} area "
+          f"{k1_area:.4f} vs K0 phi_f_max {k0_phif.max():.3f}; "
+          f"max|dphi_f| {dphi:.3f}; repeat max|dx| {rep_dev:.2e}")
+    areas = [k1_area]
+    for ns in (21, 22, 23):
+        xn = grow(noise_psi=1e-2, seed=ns)
+        areas.append(float(np.mean(
+            np.asarray(cons.T @ xn[4::6]) > 0.5)))
+    print(f"S3b variants: noise-growth areas "
+          f"{[f'{a:.4f}' for a in areas[1:]]} (deterministic "
+          f"{areas[0]:.4f})")
+    assert k1_area > 0.2, k1_area
+    assert k1_phif.max() > k0_phif.max() + 0.02, \
+        (k1_phif.max(), k0_phif.max())
+    assert dphi > 0.2, dphi
+    # observable-level repeat lock: measured spread 4.5e-5-class
+    # over the 4-run fate scan (X and phif_max); 100x-class headroom
+    # because two samples only sketch the tail
+    assert rep_dev < 5e-3, rep_dev
+    assert min(areas[1:]) > 0.5 * areas[0], areas
+    assert max(areas[1:]) < 1.5 * areas[0] + 0.1, areas

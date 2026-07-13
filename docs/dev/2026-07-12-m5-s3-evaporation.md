@@ -422,3 +422,48 @@ the snapshots' config.json — the YAML is a transliteration.
 - wodo_film 3-D cudss mt-layer thread leak (S2 ledger Sec 8) remains
   open for the film stack; multiphase film mode uses the plain
   options already.
+
+## 2.4 Gate closure: the "knife-edge gate protocol" was a mis-built
+stepper (supervisor session, 2026-07-12 evening)
+
+RETRACTION + RESOLUTION of Sec 2.3's gate-protocol matrix.  The gate
+file's _s3b_stepper BUILT the crystallization kwargs dict (dsig, dh,
+Tm, eps2, L_psi, noise_damp, clip_psi) and NEVER PASSED IT — the
+**kw splat was missing from the MultiPhaseStepper call.  Every
+"gate protocol" run therefore executed with DEFAULT energetics:
+Tm = 1.0 at T = 333 makes dh(1 - T/Tm) a -332x MELTING drive, and
+L_psi = 1.0 (not 5.03).  All gate-side dissolutions — restore
+protocol, continuous protocol, wrapped/non-wrapped discs, the
+chi_ca 1.4 / r0 0.2 margin variant — were correct behavior for the
+wrong physics.  Found by a mechanical stepper-attribute diff after
+protocol/site/machine-state/callback theories were each eliminated
+by experiment (5/5 gate dissolve vs 6/6 script grow with matching
+implant states and, in one pair, IDENTICAL seed sites).
+
+WHAT SURVIVES (script-side, correct physics):
+- The r0 = 0.15 Gibbs-Thomson knife edge is REAL: dry5b grew
+  (X = 0.961), its exact-command replica dissolved (X = 0) —
+  aggregate pre-implant metrics identical to print precision, the
+  field FP-wobble reshuffles the phi_f-richest sites (all in the
+  y = 0.406 f-rich band; lateral wobble only) and the fate.
+- Fate-robustness scan (8 runs + 2 controls): r0 0.15 dissolves 4/4
+  (t_implant 12.5, 13); r0 0.2 grows 6/6, X = 0.9612 stable to 4-5
+  digits across different lateral site-sets.
+
+FINAL GATE (test_multiphase_s3.py -k s3b, both PASSED, 24 min):
+- mechanism: wet implant at phi_s = 0.836: area 0.3002 -> 0.0000,
+  psi_max 8.3e-6; dry implant at t = 12.5 (phi_s = 0.297, mid-burst,
+  quench deepens post-implant): area 0.2869 -> 1.0000, psi_max
+  0.974; 0 rejects both legs.
+- coupling: K1 phi_f_max 0.977 / area 1.0 vs K0 0.942; max|dphi_f|
+  0.299; observable-level repeat deviation 1.92e-3 (lock 5e-3,
+  2.6x); noise-growth areas 1.0/1.0/1.0 (deterministic 1.0).
+- Determinism is asserted at OBSERVABLE level (terminal area,
+  phi_f max): bit-level trajectories are FP-chaotic (atomics), the
+  physics observables of the fate-robust config are not.
+
+LESSON (house rules): when two "identical" code paths diverge
+systematically, mechanically diff the CONSTRUCTED OBJECTS
+(attribute-by-attribute) before trajectory forensics — the stepper
+diff found in minutes what five theory-elimination experiments
+narrowed but could not name.
