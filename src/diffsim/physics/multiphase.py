@@ -329,6 +329,24 @@ off) — the FDT-noise weak order under BDF2 is out of scope.
 Linear solve: splu (default) | cudss (wodo DirectSolver pattern).
 blockch_pairs integration NOT wired (the AC blocks need the per-psi
 scalar-block extension of the "pairs" meta — recorded follow-up).
+
+DEVICE ASSEMBLY (D-track).  assembly="host" (default) keeps the scipy
+COO -> CSR -> T^T K T finalization bit-identically; assembly="device"
+replaces it with the wodo v1.2 slot-map pattern (DeviceNSAssembler,
+ndof = 2M + 2K generic, nbf/nqp from the factory tabulation — p = 1
+and p = 2 ride the same machinery): the CSR pattern is built ONCE per
+mesh from the element graph, each Newton iterate evaluates the GP
+fields ON DEVICE (gp_multifield — the _pack_fields mirror), launches
+the SAME mpf kernel in element batches (Ae transient capped ~2 GB) and
+atomic-scatters the blocks straight into the device CSR values; the
+A2 wall / S3a top-flux natural face terms keep host-computed O(surface)
+values slot-added per iterate (the wodo documented hybrid), Dirichlet
+rows are applied in-kernel (strong-row plan), and the solve consumes
+the buffers zero-copy (cudss: plan-once + refactorize on the FIXED
+pattern — nnz never flaps, curing the S2 plan-flapping; plain options,
+explicit .free()).  Identity constraints REQUIRED (all uniform meshes,
+periodic included — asserted); adapted meshes stay on the host path.
+See _init_device_assembly for the weak-form -> scatter identity map.
 """
 import numpy as np
 import scipy.sparse as sp
@@ -1509,7 +1527,7 @@ class MultiPhaseStepper:
                  T_mode="scalar", T_field=None, D_T=None,
                  wall_g=None, wall_h=None, wall_face=(1, 0),
                  delta_a=None, m_a=None, a_reg=1e-8, tstep="bdf1",
-                 film=None):
+                 film=None, assembly="host"):
         from ..physics.poisson import gauss_points
         self.dm = dm
         self.M, self.K = int(M), int(K)
@@ -1649,6 +1667,16 @@ class MultiPhaseStepper:
         self.newton_tol, self.newton_max = newton_tol, newton_max
         self.linsolver = linsolver
         self._cudss = None
+        # D-track device-side assembly (module docstring DEVICE
+        # ASSEMBLY): "host" = the existing scipy COO -> CSR -> T^T K T
+        # path bit-identically; "device" = slot-map CSR scatter
+        # (DeviceNSAssembler, wodo v1.2 pattern) with zero-copy solver
+        # handoff.  Constructor flag => bit-class-parity testable.
+        assert assembly in ("host", "device"), assembly
+        self.assembly = assembly
+        self._asm = None            # DeviceNSAssembler (lazy, per mesh)
+        self._cudss_dev = None      # device-CSR DirectSolver plan
+        self._n_dev_plans = 0       # nnz-stability regression counter
         self.noise_psi = float(noise_psi)
         self.noise_phi = float(noise_phi)
         self._nrng = np.random.default_rng(noise_seed)
@@ -1891,8 +1919,14 @@ class MultiPhaseStepper:
         from scipy.sparse.linalg import splu
         return splu(A.tocsc()).solve(r)
 
-    # -- one implicit BDF1 solve at frozen dt; does NOT commit -----------
-    def _attempt(self, dt):
+    # -- per-attempt frozen inputs (shared host/device assembly) ---------
+    def _attempt_ctx(self, dt):
+        """Everything FROZEN over one implicit solve: BDF coefficients
+        and combined history, crystal driving, film frame state, per-GP
+        temperature, FDT/CHC noise draws, MMS sources.  Code motion
+        from the head of _attempt (host path bit-identical: same
+        computations, same RNG draw order); the device-assembly path
+        consumes the same ctx so both paths freeze the same physics."""
         d = self.dm.device
         nd = self.ndof
         sigma = 1.0 / dt
@@ -1986,131 +2020,162 @@ class MultiPhaseStepper:
                     if fn is not None:
                         s[:, f] = fn(self.xq[pv], t_new)
             src_gp[pv] = s
-        def assemble(x):
-            vals, grads = self._pack_fields(x)
-            rows, cols, valsK = [], [], []
-            F_full = np.zeros(self.dm.n_nodes * nd)
-            for pv, b in self.dm.bins.items():
-                conn = self.mesh.conn_of[pv].astype(np.int64)
-                ne, nbf = conn.shape
-                nqp = b["nqp"]
-                Ae = wp.zeros((ne, nd * nbf, nd * nbf),
-                              dtype=wp.float64, device=d)
-                be = wp.zeros((ne, nd * nbf), dtype=wp.float64,
-                              device=d)
-                kk = make_mpf_newton(nbf, nqp, self.dm.dim, self.M,
-                                     self.K, self.bulk, self.mob,
-                                     self.theta_mode,
-                                     self.T_mode == "field",
-                                     self.D_T is not None, self.aniso,
-                                     self.film_on)
-                p = self._par
-                tq_d = (arr(tq_gp[pv]) if tq_gp is not None
-                        else self._tq_dummy)
-                xiy_d = (self._xiy_wp[pv] if self.film_on
-                         else self._tq_dummy)
-                wp.launch(kk, dim=ne, inputs=[
-                    b["conn"], b["h"], b["N"], b["dN"], b["w"],
-                    arr(vals[pv]), arr(grads[pv]), arr(hist_gp[pv]),
-                    arr(src_gp[pv]), arr(qpsi_gp[pv]), arr(qphi_gp[pv]),
-                    p["chi_aa"], p["chi_ac"], p["chi_ca"], p["chi_cc"],
-                    p["Ninv"], p["Ons"], p["dlo"], p["dhi"], p["Dslf"],
-                    wp.float64(self.ls_drop[0]),
-                    wp.float64(self.ls_drop[1]),
-                    wp.float64(self.ls_drop[2]), p["kap"],
-                    p["dsig"], drive_d, p["eps2"], p["Lpsi"],
-                    p["alpha"], p["beta"], p["Lth"],
-                    p["Tm"], tq_d, wp.float64(dtea), wp.float64(dtref),
-                    p["da"], p["ma"], wp.float64(self.a_reg),
-                    xiy_d, wp.float64(mlat), wp.float64(mvert),
-                    wp.float64(minv), wp.float64(K_tot),
-                    wp.float64(sigma), wp.float64(self.b_reg),
-                    wp.float64(self.kg_delta), wp.float64(self.p_floor),
-                    Ae, be], device=d)
-                Aeh, beh = Ae.numpy(), be.numpy()
-                gdof = (conn[:, :, None] * nd
-                        + np.arange(nd)[None, None, :]
-                        ).reshape(ne, nd * nbf)
-                rows.append(np.repeat(gdof, nd * nbf, axis=1).ravel())
-                cols.append(np.tile(gdof, (1, nd * nbf)).ravel())
-                valsK.append(Aeh.ravel())
-                np.add.at(F_full, gdof.ravel(), beh.ravel())
-            if self.wall_on:
-                # A2 WALL FREE ENERGY natural term (module docstring):
-                # r_mu_i(a) += - Int_w N_a (g_i + 2 h_i phi_i) dS
-                # (the kap dphi/dn = -f_w' variational BC), so
-                # F (= -r) += + Mw @ (g_i + 2 h_i phi_i)|_face and the
-                # Jacobian gains d r/d phi_i = -2 h_i Mw on the
-                # (mu_i row, phi_i col) block.  Consistent P1 face
-                # mass; assembled in FULL node space (constraints ride
-                # the Tn triple product below).
-                nfn = self.wall_faces.shape[1]
-                # S3a: the wall natural term picks up the mapped
-                # boundary measure factor Ycomp/h in film mode (the
-                # computational mu rows are the physical ones divided
-                # by lat_scale h/Ycomp — module docstring S3a);
-                # wf = 1.0 outside film mode (bitwise identity)
-                wf = (self.y_comp / self.h_curr) if self.film_on \
-                    else 1.0
-                for i in range(self.M):
-                    gi, hi = self.wall_g[i], self.wall_h[i]
-                    if gi == 0.0 and hi == 0.0:
-                        continue
-                    fv = np.asarray(self.Tc @ x[2 * i::nd])
-                    gd = nd * self.wall_faces + (2 * i + 1)
-                    fw = wf * (gi + 2.0 * hi * fv[self.wall_faces])
-                    np.add.at(F_full, gd.ravel(),
-                              np.einsum("fab,fb->fa",
-                                        self.wall_face_M, fw).ravel())
-                    if hi != 0.0:
-                        cd = nd * self.wall_faces + 2 * i
-                        rows.append(np.repeat(gd, nfn, axis=1).ravel())
-                        cols.append(np.tile(cd, (1, nfn)).ravel())
-                        valsK.append((-2.0 * hi * wf)
-                                     * self.wall_face_M.ravel())
-            if self.film_on and K_tot > 0.0:
-                # S3a TOP-SURFACE ENRICHMENT FLUX — phi rows ONLY
-                # (solvent evaporates AMORPHOUS; psi/theta carry no
-                # flux — the S3 contract).  Weak term per retained i:
-                # R_phi_i -= coef_i Int_top N_a phi_i dS, coef_i =
-                # (K - k_e_i)(1/h) Ycomp (wodo v1.1 metric; k_e_i = 0
-                # for nonvolatile species gives the exact wodo pair
-                # that conserves h Int phi_i dtheta per step).
-                # F (= -R) += +coef_i Mf phi_i; Jacobian -coef_i Mf on
-                # the (phi_i row, phi_i col) face block.
-                nfn = self.top_faces.shape[1]
-                for i in range(self.M):
-                    coef = (K_tot - self.k_e[i]) * minv * self.y_comp
-                    if coef == 0.0:
-                        continue
-                    fv = np.asarray(self.Tc @ x[2 * i::nd])
-                    gd = nd * self.top_faces + 2 * i
-                    Mf = coef * self.top_face_M
-                    np.add.at(F_full, gd.ravel(),
-                              np.einsum("fab,fb->fa", Mf,
-                                        fv[self.top_faces]).ravel())
+        return dict(sigma=sigma, t_new=t_new, drive_d=drive_d,
+                    K_tot=K_tot, minv=minv, mlat=mlat, mvert=mvert,
+                    tq_gp=tq_gp, dtea=dtea, dtref=dtref,
+                    hist_gp=hist_gp, qpsi_gp=qpsi_gp, qphi_gp=qphi_gp,
+                    src_gp=src_gp)
+
+    # -- host-path assembly at one Newton iterate ------------------------
+    def _assemble_host(self, x, ctx):
+        """The ORIGINAL host assembly (code motion from the _attempt
+        closure — bit-identical computations): device element kernel
+        -> host Ae/be pull -> scipy COO -> CSR -> constraint triple
+        product -> Dirichlet row surgery.  Returns (A, r) free-space."""
+        d = self.dm.device
+        nd = self.ndof
+        arr = lambda a_: wp.array(np.ascontiguousarray(a_),
+                                  dtype=wp.float64, device=d)
+        sigma, t_new = ctx["sigma"], ctx["t_new"]
+        drive_d, K_tot = ctx["drive_d"], ctx["K_tot"]
+        minv, mlat, mvert = ctx["minv"], ctx["mlat"], ctx["mvert"]
+        tq_gp, dtea, dtref = ctx["tq_gp"], ctx["dtea"], ctx["dtref"]
+        hist_gp, src_gp = ctx["hist_gp"], ctx["src_gp"]
+        qpsi_gp, qphi_gp = ctx["qpsi_gp"], ctx["qphi_gp"]
+        vals, grads = self._pack_fields(x)
+        rows, cols, valsK = [], [], []
+        F_full = np.zeros(self.dm.n_nodes * nd)
+        for pv, b in self.dm.bins.items():
+            conn = self.mesh.conn_of[pv].astype(np.int64)
+            ne, nbf = conn.shape
+            nqp = b["nqp"]
+            Ae = wp.zeros((ne, nd * nbf, nd * nbf),
+                          dtype=wp.float64, device=d)
+            be = wp.zeros((ne, nd * nbf), dtype=wp.float64,
+                          device=d)
+            kk = make_mpf_newton(nbf, nqp, self.dm.dim, self.M,
+                                 self.K, self.bulk, self.mob,
+                                 self.theta_mode,
+                                 self.T_mode == "field",
+                                 self.D_T is not None, self.aniso,
+                                 self.film_on)
+            p = self._par
+            tq_d = (arr(tq_gp[pv]) if tq_gp is not None
+                    else self._tq_dummy)
+            xiy_d = (self._xiy_wp[pv] if self.film_on
+                     else self._tq_dummy)
+            wp.launch(kk, dim=ne, inputs=[
+                b["conn"], b["h"], b["N"], b["dN"], b["w"],
+                arr(vals[pv]), arr(grads[pv]), arr(hist_gp[pv]),
+                arr(src_gp[pv]), arr(qpsi_gp[pv]), arr(qphi_gp[pv]),
+                p["chi_aa"], p["chi_ac"], p["chi_ca"], p["chi_cc"],
+                p["Ninv"], p["Ons"], p["dlo"], p["dhi"], p["Dslf"],
+                wp.float64(self.ls_drop[0]),
+                wp.float64(self.ls_drop[1]),
+                wp.float64(self.ls_drop[2]), p["kap"],
+                p["dsig"], drive_d, p["eps2"], p["Lpsi"],
+                p["alpha"], p["beta"], p["Lth"],
+                p["Tm"], tq_d, wp.float64(dtea), wp.float64(dtref),
+                p["da"], p["ma"], wp.float64(self.a_reg),
+                xiy_d, wp.float64(mlat), wp.float64(mvert),
+                wp.float64(minv), wp.float64(K_tot),
+                wp.float64(sigma), wp.float64(self.b_reg),
+                wp.float64(self.kg_delta), wp.float64(self.p_floor),
+                Ae, be], device=d)
+            Aeh, beh = Ae.numpy(), be.numpy()
+            gdof = (conn[:, :, None] * nd
+                    + np.arange(nd)[None, None, :]
+                    ).reshape(ne, nd * nbf)
+            rows.append(np.repeat(gdof, nd * nbf, axis=1).ravel())
+            cols.append(np.tile(gdof, (1, nd * nbf)).ravel())
+            valsK.append(Aeh.ravel())
+            np.add.at(F_full, gdof.ravel(), beh.ravel())
+        if self.wall_on:
+            # A2 WALL FREE ENERGY natural term (module docstring):
+            # r_mu_i(a) += - Int_w N_a (g_i + 2 h_i phi_i) dS
+            # (the kap dphi/dn = -f_w' variational BC), so
+            # F (= -r) += + Mw @ (g_i + 2 h_i phi_i)|_face and the
+            # Jacobian gains d r/d phi_i = -2 h_i Mw on the
+            # (mu_i row, phi_i col) block.  Consistent P1 face
+            # mass; assembled in FULL node space (constraints ride
+            # the Tn triple product below).
+            nfn = self.wall_faces.shape[1]
+            # S3a: the wall natural term picks up the mapped
+            # boundary measure factor Ycomp/h in film mode (the
+            # computational mu rows are the physical ones divided
+            # by lat_scale h/Ycomp — module docstring S3a);
+            # wf = 1.0 outside film mode (bitwise identity)
+            wf = (self.y_comp / self.h_curr) if self.film_on \
+                else 1.0
+            for i in range(self.M):
+                gi, hi = self.wall_g[i], self.wall_h[i]
+                if gi == 0.0 and hi == 0.0:
+                    continue
+                fv = np.asarray(self.Tc @ x[2 * i::nd])
+                gd = nd * self.wall_faces + (2 * i + 1)
+                fw = wf * (gi + 2.0 * hi * fv[self.wall_faces])
+                np.add.at(F_full, gd.ravel(),
+                          np.einsum("fab,fb->fa",
+                                    self.wall_face_M, fw).ravel())
+                if hi != 0.0:
+                    cd = nd * self.wall_faces + 2 * i
                     rows.append(np.repeat(gd, nfn, axis=1).ravel())
-                    cols.append(np.tile(gd, (1, nfn)).ravel())
-                    valsK.append(-Mf.ravel())
-            Kmat = sp.coo_matrix(
-                (np.concatenate(valsK),
-                 (np.concatenate(rows), np.concatenate(cols))),
-                shape=(self.dm.n_nodes * nd,) * 2).tocsr()
-            A = (self.Tn.T @ Kmat @ self.Tn).tocsr()
-            r = np.asarray(self.Tn.T @ F_full)
-            if self.dirichlet is not None:
-                A = A.tolil()
-                for f, gfn in enumerate(self.g_fns):
-                    if gfn is None:
-                        continue
-                    gv = gfn(self.free_coords[self.dirichlet], t_new)
-                    for k2, i in enumerate(self.dirichlet):
-                        rr = i * nd + f
-                        A.rows[rr] = [int(rr)]
-                        A.data[rr] = [1.0]
-                        r[rr] = gv[k2] - x[rr]
-                A = A.tocsr()
-            return A, r
+                    cols.append(np.tile(cd, (1, nfn)).ravel())
+                    valsK.append((-2.0 * hi * wf)
+                                 * self.wall_face_M.ravel())
+        if self.film_on and K_tot > 0.0:
+            # S3a TOP-SURFACE ENRICHMENT FLUX — phi rows ONLY
+            # (solvent evaporates AMORPHOUS; psi/theta carry no
+            # flux — the S3 contract).  Weak term per retained i:
+            # R_phi_i -= coef_i Int_top N_a phi_i dS, coef_i =
+            # (K - k_e_i)(1/h) Ycomp (wodo v1.1 metric; k_e_i = 0
+            # for nonvolatile species gives the exact wodo pair
+            # that conserves h Int phi_i dtheta per step).
+            # F (= -R) += +coef_i Mf phi_i; Jacobian -coef_i Mf on
+            # the (phi_i row, phi_i col) face block.
+            nfn = self.top_faces.shape[1]
+            for i in range(self.M):
+                coef = (K_tot - self.k_e[i]) * minv * self.y_comp
+                if coef == 0.0:
+                    continue
+                fv = np.asarray(self.Tc @ x[2 * i::nd])
+                gd = nd * self.top_faces + 2 * i
+                Mf = coef * self.top_face_M
+                np.add.at(F_full, gd.ravel(),
+                          np.einsum("fab,fb->fa", Mf,
+                                    fv[self.top_faces]).ravel())
+                rows.append(np.repeat(gd, nfn, axis=1).ravel())
+                cols.append(np.tile(gd, (1, nfn)).ravel())
+                valsK.append(-Mf.ravel())
+        Kmat = sp.coo_matrix(
+            (np.concatenate(valsK),
+             (np.concatenate(rows), np.concatenate(cols))),
+            shape=(self.dm.n_nodes * nd,) * 2).tocsr()
+        A = (self.Tn.T @ Kmat @ self.Tn).tocsr()
+        r = np.asarray(self.Tn.T @ F_full)
+        if self.dirichlet is not None:
+            A = A.tolil()
+            for f, gfn in enumerate(self.g_fns):
+                if gfn is None:
+                    continue
+                gv = gfn(self.free_coords[self.dirichlet], t_new)
+                for k2, i in enumerate(self.dirichlet):
+                    rr = i * nd + f
+                    A.rows[rr] = [int(rr)]
+                    A.data[rr] = [1.0]
+                    r[rr] = gv[k2] - x[rr]
+            A = A.tocsr()
+        return A, r
+
+    # -- one implicit BDF1 solve at frozen dt; does NOT commit -----------
+    def _attempt(self, dt):
+        if self.assembly == "device":
+            return self._attempt_device(dt)
+        nd = self.ndof
+        ctx = self._attempt_ctx(dt)
+
+        def assemble(x):
+            return self._assemble_host(x, ctx)
 
         x = self.x.copy()
         A, r = assemble(x)
@@ -2184,6 +2249,405 @@ class MultiPhaseStepper:
             if conv < self.newton_tol:
                 return x, it + 1, True
         return x, self.newton_max, False                 # no convergence
+
+    # ==================================================================
+    # DEVICE-SIDE ASSEMBLY (D-track; the wodo_film v1.2 model)
+    # ==================================================================
+    def _init_device_assembly(self):
+        """Once per mesh: slot-map CSR pattern (DeviceNSAssembler,
+        ndof = 2M + 2K), face-term slot/dof arrays, strong-row plan,
+        and per-bin device GP-field buffers.
+
+        WEAK-FORM -> SCATTER MAP (the assembly identity): the global
+        Jacobian is A[ga, gb] = SUM_e Ae[e, la, lb] over all element
+        local pairs whose global dofs coincide (ga = conn[e, a] * ndof
+        + ca).  The host path realizes the sum by scipy COO -> CSR
+        dedup + T^T K T; the device path precomputes ONCE per mesh
+        epoch the CSR value slot of every (e, la, lb) pair and
+        realizes the SAME sum as atomicAdd(vals[slot], Ae) — summation
+        ORDER is the only difference (FP-chaos class; parity gates on
+        canonicalized matrices / observables per the house rules).
+
+        CONSTRAINTS: every multiphase production mesh (uniform 2-D/
+        3-D, p = 1/2, periodic included — build_mesh bakes periodic
+        seams into the connectivity) has IDENTITY constraints,
+        asserted here, so the host triple products are numeric no-ops
+        that merely PRUNE exact zeros (the measured S2 cuDSS
+        plan-flapping source).  The device pattern is the FIXED
+        element-graph superset: nnz never changes across noise steps
+        — the cuDSS plan becomes nnz-stable (bonus fix, gated).
+        Adapted/hanging-node meshes: assembly="host" (the constraint-
+        aware weighted scatter exists in DeviceNSAssembler but the
+        multiphase face terms and the node-graph pattern are not
+        wired through constraint weights — recorded frontier).
+
+        FACE TERMS (A2 wall energy, S3a top flux): natural-BC
+        enrichments of interior equations; every (row, col) pair
+        lives inside a boundary element block, hence inside the
+        element pattern.  Their O(surface) values are computed on
+        host (tiny closed-form face-mass products — the wodo v1.2
+        documented hybrid) and folded in by slot scatter-add."""
+        from ..assembly.device_assembly import DeviceNSAssembler
+        n = self.Tc.shape[0]
+        assert self.Tc.shape[0] == self.Tc.shape[1] and \
+            (self.Tc - sp.identity(n, format="csr")).nnz == 0, (
+                "assembly='device' requires identity constraints "
+                "(uniform meshes; periodicity rides the connectivity)."
+                "  Adapted meshes with hanging nodes: assembly='host'.")
+        nd = self.ndof
+        d = self.dm.device
+        self._asm = DeviceNSAssembler(
+            self.dm, ndof=nd,
+            node_pattern=getattr(self, "_node_pattern", None))
+        asm = self._asm
+        # persistent per-bin GP-field buffers (device _pack_fields
+        # mirror) + zero buffers for compile-dead/inactive inputs
+        self._vals_dev, self._grads_dev = {}, {}
+        self._zsrc_d, self._zqpsi_d, self._zqphi_d = {}, {}, {}
+        for pv, b in self.dm.bins.items():
+            ngp = len(self.mesh.conn_of[pv]) * b["nqp"]
+            self._vals_dev[pv] = wp.zeros((ngp, nd), dtype=wp.float64,
+                                          device=d)
+            self._grads_dev[pv] = wp.zeros((ngp, nd, self.dm.dim),
+                                           dtype=wp.float64, device=d)
+            if self.src_fns is None:
+                self._zsrc_d[pv] = wp.zeros((ngp, nd),
+                                            dtype=wp.float64, device=d)
+            if not (self.noise_psi > 0.0 and self.K):
+                self._zqpsi_d[pv] = wp.zeros((ngp, self.Kp),
+                                             dtype=wp.float64, device=d)
+            if not self.noise_phi > 0.0:
+                self._zqphi_d[pv] = wp.zeros(
+                    (ngp, self.M, self.dm.dim), dtype=wp.float64,
+                    device=d)
+        # A2 wall slots: Jacobian (mu_i row, phi_i col) face blocks for
+        # species with h_i != 0; rhs rows for any active species
+        # (host-order concatenation — values built per attempt)
+        if self.wall_on:
+            nfn = self.wall_faces.shape[1]
+            jr, jc, jbase, rr_ = [], [], [], []
+            for i in range(self.M):
+                gi, hi = self.wall_g[i], self.wall_h[i]
+                if gi == 0.0 and hi == 0.0:
+                    continue
+                gd = nd * self.wall_faces + (2 * i + 1)
+                rr_.append(gd.ravel())
+                if hi != 0.0:
+                    cd = nd * self.wall_faces + 2 * i
+                    jr.append(np.repeat(gd, nfn, axis=1).ravel())
+                    jc.append(np.tile(cd, (1, nfn)).ravel())
+                    jbase.append(-2.0 * hi * self.wall_face_M.ravel())
+            self._wall_rhs_dof_d = wp.array(
+                np.concatenate(rr_).astype(np.int32), dtype=wp.int32,
+                device=d)
+            if jr:
+                slots = asm.csr_slots(np.concatenate(jr),
+                                      np.concatenate(jc))
+                self._wall_slots_d = wp.array(slots.astype(np.int32),
+                                              dtype=wp.int32, device=d)
+                self._wall_jbase = np.concatenate(jbase)  # x wf/attempt
+            else:
+                self._wall_slots_d = None
+        # S3a top-flux slots (all retained species — per-attempt coefs
+        # may vanish per species; zero adds are numeric no-ops)
+        if self.film_on:
+            nfn = self.top_faces.shape[1]
+            fr = [np.repeat(nd * self.top_faces + 2 * i, nfn,
+                            axis=1).ravel() for i in range(self.M)]
+            fc = [np.tile(nd * self.top_faces + 2 * i,
+                          (1, nfn)).ravel() for i in range(self.M)]
+            slots = asm.csr_slots(np.concatenate(fr),
+                                  np.concatenate(fc))
+            self._flux_slots_d = wp.array(slots.astype(np.int32),
+                                          dtype=wp.int32, device=d)
+            self._flux_gdof_d = wp.array(np.concatenate(
+                [(nd * self.top_faces + 2 * i).ravel()
+                 for i in range(self.M)]).astype(np.int32),
+                dtype=wp.int32, device=d)
+        # Dirichlet strong rows (host nesting order: field f outer,
+        # node inner — b_vals per iterate must match)
+        if self.dirichlet is not None:
+            rows = [i * nd + f for f, gfn in enumerate(self.g_fns)
+                    if gfn is not None for i in self.dirichlet]
+            asm.set_strong_rows(np.asarray(rows, np.int64))
+        # element-batch buffers (Ae transient capped ~2 GB, G5 rung c)
+        self._dev_bufs = {}
+
+    def _assemble_device(self, x, ctx):
+        """Device-path assembly at one Newton iterate: device GP-field
+        eval (gp_multifield, the _pack_fields mirror), BATCHED element
+        launches scattered through the slot maps into the device CSR
+        values, host-valued O(surface) face terms slot-added, strong
+        rows applied in-kernel.  Fills asm.vals_d / asm.F_d in place
+        (free dofs == full dofs: identity constraints asserted)."""
+        from ..assembly.gp_field import make_gp_multifield
+        asm = self._asm
+        d = self.dm.device
+        nd = self.ndof
+        arr = lambda a_: wp.array(np.ascontiguousarray(a_),
+                                  dtype=wp.float64, device=d)
+        sigma, t_new = ctx["sigma"], ctx["t_new"]
+        drive_d, K_tot = ctx["drive_d"], ctx["K_tot"]
+        minv, mlat, mvert = ctx["minv"], ctx["mlat"], ctx["mvert"]
+        tq_gp, dtea, dtref = ctx["tq_gp"], ctx["dtea"], ctx["dtref"]
+        # per-attempt GP inputs: uploaded ONCE per ctx (iterate-
+        # independent; zero buffers reused when the input is inactive)
+        dev = ctx.get("_dev")
+        if dev is None:
+            dev = dict(
+                hist={pv: arr(v) for pv, v in ctx["hist_gp"].items()},
+                src=({pv: arr(v) for pv, v in ctx["src_gp"].items()}
+                     if self.src_fns is not None else self._zsrc_d),
+                qpsi=({pv: arr(v) for pv, v in ctx["qpsi_gp"].items()}
+                      if (self.noise_psi > 0.0 and self.K)
+                      else self._zqpsi_d),
+                qphi=({pv: arr(v) for pv, v in ctx["qphi_gp"].items()}
+                      if self.noise_phi > 0.0 else self._zqphi_d),
+                tq=(None if tq_gp is None
+                    else {pv: arr(v) for pv, v in tq_gp.items()}))
+            ctx["_dev"] = dev
+        # iterate upload: [n_nodes, ndof] node-major view of x
+        X_d = arr(x.reshape(self.dm.n_nodes, nd))
+        asm.zero_fill()
+        p = self._par
+        for k_bin, (pv, b, ne, nbf, _gd) in enumerate(asm._bins):
+            nqp = b["nqp"]
+            gpk = make_gp_multifield(nbf, nqp, self.dm.dim, nd)
+            wp.launch(gpk, dim=ne,
+                      inputs=[b["conn"], b["h"], b["N"], b["dN"], X_d,
+                              self._vals_dev[pv], self._grads_dev[pv]],
+                      device=d)
+            nl = nd * nbf
+            if k_bin not in self._dev_bufs:
+                nb_cap = min(ne, max(1, (2 << 30) // (nl * nl * 8)))
+                self._dev_bufs[k_bin] = (
+                    nb_cap,
+                    wp.zeros((nb_cap, nl, nl), dtype=wp.float64,
+                             device=d),
+                    wp.zeros((nb_cap, nl), dtype=wp.float64, device=d))
+            nb_cap, Ae, be = self._dev_bufs[k_bin]
+            kk = make_mpf_newton(nbf, nqp, self.dm.dim, self.M,
+                                 self.K, self.bulk, self.mob,
+                                 self.theta_mode,
+                                 self.T_mode == "field",
+                                 self.D_T is not None, self.aniso,
+                                 self.film_on)
+            tq_full = dev["tq"][pv] if dev["tq"] is not None else None
+            xiy_full = self._xiy_wp[pv] if self.film_on else None
+            for e0 in range(0, ne, nb_cap):
+                nb = min(nb_cap, ne - e0)
+                s0, s1 = e0 * nqp, (e0 + nb) * nqp
+                Ae.zero_()
+                be.zero_()
+                wp.launch(kk, dim=nb, inputs=[
+                    b["conn"], b["h"][e0:e0 + nb], b["N"], b["dN"],
+                    b["w"],
+                    self._vals_dev[pv][s0:s1],
+                    self._grads_dev[pv][s0:s1],
+                    dev["hist"][pv][s0:s1], dev["src"][pv][s0:s1],
+                    dev["qpsi"][pv][s0:s1], dev["qphi"][pv][s0:s1],
+                    p["chi_aa"], p["chi_ac"], p["chi_ca"], p["chi_cc"],
+                    p["Ninv"], p["Ons"], p["dlo"], p["dhi"], p["Dslf"],
+                    wp.float64(self.ls_drop[0]),
+                    wp.float64(self.ls_drop[1]),
+                    wp.float64(self.ls_drop[2]), p["kap"],
+                    p["dsig"], drive_d, p["eps2"], p["Lpsi"],
+                    p["alpha"], p["beta"], p["Lth"],
+                    p["Tm"],
+                    (tq_full[s0:s1] if tq_full is not None
+                     else self._tq_dummy),
+                    wp.float64(dtea), wp.float64(dtref),
+                    p["da"], p["ma"], wp.float64(self.a_reg),
+                    (xiy_full[s0:s1] if xiy_full is not None
+                     else self._tq_dummy),
+                    wp.float64(mlat), wp.float64(mvert),
+                    wp.float64(minv), wp.float64(K_tot),
+                    wp.float64(sigma), wp.float64(self.b_reg),
+                    wp.float64(self.kg_delta),
+                    wp.float64(self.p_floor),
+                    Ae, be], device=d)
+                asm.scatter_batch(k_bin, e0, Ae, be, nb)
+        # A2 wall face terms (host-valued; same weak terms as the
+        # host path — module docstring A2)
+        if self.wall_on:
+            wf = (self.y_comp / self.h_curr) if self.film_on else 1.0
+            if self._wall_slots_d is not None:
+                asm.add_matrix_values(self._wall_slots_d,
+                                      arr(wf * self._wall_jbase))
+            loads = []
+            for i in range(self.M):
+                gi, hi = self.wall_g[i], self.wall_h[i]
+                if gi == 0.0 and hi == 0.0:
+                    continue
+                fv = x[2 * i::nd]      # identity constraints: Tc@x = x
+                fw = wf * (gi + 2.0 * hi * fv[self.wall_faces])
+                loads.append(np.einsum("fab,fb->fa", self.wall_face_M,
+                                       fw).ravel())
+            asm.add_rhs_values(self._wall_rhs_dof_d,
+                               arr(np.concatenate(loads)))
+        # S3a top-surface enrichment flux (host-valued; docstring S3a)
+        if self.film_on and K_tot > 0.0:
+            jv, loads = [], []
+            for i in range(self.M):
+                coef = (K_tot - self.k_e[i]) * minv * self.y_comp
+                Mf = coef * self.top_face_M
+                jv.append(-Mf.ravel())
+                fv = x[2 * i::nd]
+                loads.append(np.einsum("fab,fb->fa", Mf,
+                                       fv[self.top_faces]).ravel())
+            asm.add_matrix_values(self._flux_slots_d,
+                                  arr(np.concatenate(jv)))
+            asm.add_rhs_values(self._flux_gdof_d,
+                               arr(np.concatenate(loads)))
+        # Dirichlet strong rows LAST (host order): identity row,
+        # rhs = g - x (Newton-increment form)
+        if self.dirichlet is not None:
+            bv = []
+            for f, gfn in enumerate(self.g_fns):
+                if gfn is None:
+                    continue
+                gv = gfn(self.free_coords[self.dirichlet], t_new)
+                for k2, i in enumerate(self.dirichlet):
+                    bv.append(gv[k2] - x[i * nd + f])
+            asm.apply_strong_rows(np.asarray(bv, np.float64))
+
+    def _solve_dev(self):
+        """Linear solve on the device-resident CSR.  cudss: zero-copy
+        torch CSR (dlpack over asm.vals_d) with STABLE operands — plan
+        ONCE (the pattern is fixed by the mesh graph, so nnz NEVER
+        flaps, unlike the host T^T K T which prunes exact zeros — the
+        S2 plan-flapping finding), refactorize per iterate; PLAIN
+        DirectSolverOptions (no mt layer — the gomp thread-leak
+        finding, replication ledger Sec 9); explicit .free() when a
+        plan is dropped (the discarded-plan double-free finding).
+        splu: host pull on the fixed pattern (the parity-gate
+        solver)."""
+        asm = self._asm
+        if self.linsolver == "cudss":
+            import torch
+            from nvmath.sparse.advanced import (DirectSolver,
+                                                DirectSolverOptions)
+            try:
+                if self._cudss_dev is None:
+                    A_t, F_t = asm.device_csr()
+                    self._F_view = F_t     # zero-copy over asm.F_d
+                    self._b_t = torch.empty_like(F_t)
+                    self._b_t.copy_(self._F_view)
+                    self._cudss_dev = DirectSolver(
+                        A_t, self._b_t,
+                        options=DirectSolverOptions(blocking=True))
+                    self._cudss_dev.plan()
+                    self._n_dev_plans += 1
+                else:
+                    self._b_t.copy_(self._F_view)
+                self._cudss_dev.factorize()
+                return np.asarray(self._cudss_dev.solve().cpu())
+            except Exception:
+                try:
+                    self._cudss_dev.free()
+                except Exception:
+                    pass
+                self._cudss_dev = None
+                return np.full(asm.Nfull, np.nan)
+        assert self.linsolver == "splu", (
+            "assembly='device': linsolver in ('cudss', 'splu')")
+        from scipy.sparse.linalg import splu
+        A = sp.csr_matrix((asm.vals_d.numpy(), asm.indices,
+                           asm.indptr), shape=(asm.Nfull,) * 2)
+        return splu(A.tocsc()).solve(asm.F_d.numpy())
+
+    def _attempt_device(self, dt):
+        """One implicit solve with DEVICE-BOUND assembly (wodo v1.2
+        model): the same ctx-frozen physics and the same Newton
+        safeguards as the host _attempt; assembly fills the device
+        CSR in place, the solve consumes it zero-copy.  Line-search
+        difference (documented): the device buffers hold the LAST
+        evaluated trial, so when the accepted trial is not the last
+        one it is re-assembled (same accepted point; one extra
+        assembly on the rare non-monotone backtrack)."""
+        if self._asm is None:
+            self._init_device_assembly()
+        ctx = self._attempt_ctx(dt)
+        asm = self._asm
+        ls = self.line_search
+
+        def assemble(x):
+            self._assemble_device(x, ctx)
+            return asm.F_d.numpy() if ls else None
+
+        x = self.x.copy()
+        r = assemble(x)
+        for it in range(self.newton_max):
+            dx = self._solve_dev()
+            if not np.isfinite(dx).all():
+                return None, it + 1, False               # diverged
+            if ls:
+                # rescale finite oversized directions (host semantics;
+                # the degenerate-row garbage-direction finding)
+                mx = np.abs(dx).max()
+                if mx > 2.0:
+                    dx = dx * (2.0 / mx)
+            elif np.abs(dx).max() > 1e6:
+                return None, it + 1, False               # diverged
+            if self.guards:
+                inc = max(np.abs(dx[2 * i::self.ndof]).max()
+                          for i in range(self.M))
+                for k in range(self.K):
+                    inc = max(inc, np.abs(
+                        dx[2 * self.M + 2 * k::self.ndof]).max())
+                if inc > 2.0:
+                    dx = dx * (2.0 / inc)
+            if ls:
+                rn0 = float(np.linalg.norm(r))
+                best_x, best_rn, last_best = None, np.inf, False
+                for s in (1.0, 0.5, 0.25, 0.125, 0.0625):
+                    xt = x + s * dx
+                    if self.guards:
+                        xt = self._project(xt)
+                    rt = assemble(xt)
+                    rnt = float(np.linalg.norm(rt))
+                    if rnt < best_rn:
+                        best_x, best_rn, r = xt, rnt, rt
+                        last_best = True
+                    else:
+                        last_best = False
+                    if rnt < rn0 * (1.0 - 1e-4):
+                        break
+                if not last_best:
+                    r = assemble(best_x)   # buffers -> accepted point
+                conv = np.abs(best_x - x).max()
+                x = best_x
+            elif self.guards:
+                xn = self._project(x + dx)
+                conv = np.abs(xn - x).max()
+                x = xn
+                r = assemble(x)
+            else:
+                x = x + dx
+                conv = np.abs(dx).max()
+                r = assemble(x)
+            if conv < self.newton_tol:
+                return x, it + 1, True
+        return x, self.newton_max, False                 # no convergence
+
+    def _debug_assemble(self, dt):
+        """Parity instrumentation (D1 gates): ONE assembly at the
+        current committed iterate self.x with attempt-frozen inputs;
+        returns (A, r) on the free dofs for the ACTIVE assembly mode
+        (host: pruned scipy CSR; device: CSR over the pulled device
+        values — the fixed superset pattern, canonicalize before
+        comparing).  Consumes the same RNG draws as one attempt —
+        seed-align the steppers before calling."""
+        ctx = self._attempt_ctx(dt)
+        if self.assembly == "device":
+            if self._asm is None:
+                self._init_device_assembly()
+            self._assemble_device(self.x.copy(), ctx)
+            asm = self._asm
+            A = sp.csr_matrix((asm.vals_d.numpy(), asm.indices,
+                               asm.indptr), shape=(asm.Nfull,) * 2)
+            return A, asm.F_d.numpy().copy()
+        return self._assemble_host(self.x.copy(), ctx)
 
     def step(self):
         """One FIXED-dt BDF1 step (gates/MMS/parity path — no ladder)."""

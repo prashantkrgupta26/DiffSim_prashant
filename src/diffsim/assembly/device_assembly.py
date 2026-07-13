@@ -437,20 +437,7 @@ class DeviceNSAssembler:
         if extra_rhs is not None:
             self.add_rhs_values(*extra_rhs)
         if getattr(self, "_strong", None) is not None:
-            st = self._strong
-            zk = _zero_slots_kernel()
-            wp.launch(zk, dim=st["n_spans"],
-                      inputs=[st["spans_d"], self.vals_d],
-                      device=self.dm.device)
-            dk = _diag_one_kernel()
-            bv = wp.array(np.ascontiguousarray(
-                strong_b_vals if strong_b_vals is not None
-                else np.zeros(st["n_rows"])), dtype=wp.float64,
-                device=self.dm.device)
-            wp.launch(dk, dim=st["n_rows"],
-                      inputs=[st["diag_d"], st["rows_d"], bv,
-                              self.vals_d, self.F_d],
-                      device=self.dm.device)
+            self.apply_strong_rows(strong_b_vals)
         if getattr(self, "_return_device", False) == "raw":
             return None                    # fill-only (assemble_fill)
         if getattr(self, "_return_device", False):
@@ -564,6 +551,28 @@ class DeviceNSAssembler:
             wp.launch(_scatter_vec_kernel(), dim=ne * nbf * self.ndof,
                       inputs=[be_d.reshape((-1,)), self._gdof_d[k_bin],
                               self.F_d], device=d)
+
+    def apply_strong_rows(self, b_vals=None):
+        """Apply the set_strong_rows plan to the CURRENT fill (device):
+        zero the strong-row slot spans, write unit diagonals, and set
+        F[row] = b_vals[i] (replacement, not add — the row equation
+        becomes x_row = b_val exactly).  Part of the generic fill API
+        (zero_fill / scatter_bin / add_* / apply_strong_rows /
+        device_csr) so physics steppers with their OWN element kernels
+        (the M5 multiphase Newton) realize the same strong-row
+        semantics as assemble()."""
+        st = self._strong
+        wp.launch(_zero_slots_kernel(), dim=st["n_spans"],
+                  inputs=[st["spans_d"], self.vals_d],
+                  device=self.dm.device)
+        bv = wp.array(np.ascontiguousarray(
+            b_vals if b_vals is not None
+            else np.zeros(st["n_rows"])), dtype=wp.float64,
+            device=self.dm.device)
+        wp.launch(_diag_one_kernel(), dim=st["n_rows"],
+                  inputs=[st["diag_d"], st["rows_d"], bv,
+                          self.vals_d, self.F_d],
+                  device=self.dm.device)
 
     def csr_slots(self, rows, cols):
         """CSR value index per (row, col) pair. Entries MUST exist in

@@ -120,6 +120,46 @@ def make_gp_grad_scalar(nbf: int, nqp: int, dim: int):
     return gp_grad_scalar
 
 
+def make_gp_multifield(nbf: int, nqp: int, dim: int, ndof: int):
+    """Node-major MULTIFIELD GP eval (the M4/M5 monolithic steppers'
+    layout): X [n_nodes, ndof] -> vals [ne*nqp, ndof] and grads
+    [ne*nqp, ndof, dim] (reference dN scaled by 2/he — the affine-cube
+    metric).  This is the device mirror of the multiphase host
+    _pack_fields einsums; ndof is compile-time (the (M, K) factory
+    pattern) and nbf/nqp come from the basis tabulation (A4a: p = 1
+    and p = 2 both ride the same factory)."""
+    key = ("gp_multifield", nbf, nqp, dim, ndof)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique", enable_backward=False,
+               module_options={"max_unroll": 0})
+    def gp_multi(conn: wp.array2d(dtype=wp.int32),
+                 h: wp.array(dtype=wp.float64),
+                 Ntab: wp.array2d(dtype=wp.float64),
+                 dNtab: wp.array3d(dtype=wp.float64),
+                 X: wp.array2d(dtype=wp.float64),
+                 vals: wp.array2d(dtype=wp.float64),
+                 grads: wp.array3d(dtype=wp.float64)):
+        e = wp.tid()
+        dscale = wp.float64(2.0) / h[e]
+        for q in range(nqp):
+            gp = e * nqp + q
+            for f in range(ndof):
+                acc = wp.float64(0.0)
+                for a in range(nbf):
+                    acc += Ntab[q, a] * X[conn[e, a], f]
+                vals[gp, f] = acc
+                for d in range(dim):
+                    g = wp.float64(0.0)
+                    for a in range(nbf):
+                        g += dNtab[q, a, d] * X[conn[e, a], f]
+                    grads[gp, f, d] = g * dscale
+
+    _kernel_cache[key] = gp_multi
+    return gp_multi
+
+
 def make_csr_spmv_ncomp(ncomp: int):
     """Multi-component CSR SpMV: y[row, c] = sum_j A[row, j] x[j, c] —
     the constraint application T @ node_vals per velocity component."""
