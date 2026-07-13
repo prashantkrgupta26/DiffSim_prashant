@@ -149,11 +149,13 @@ class AllenCahnStepper:
         self.xq = gauss_points(self.mesh, dm.tables_by_p)
         self.t = 0.0
         self.hist = []
+        self.dt_prev = None     # dt of the last completed step (G3)
 
     def set_initial(self, c0_fn):
         c0 = c0_fn(self.free_coords)
         self.hist = [c0.copy(), c0.copy()]
         self.t = 0.0
+        self.dt_prev = None     # restart the BDF2 bootstrap (G3)
         return c0
 
     def _gp(self, vec):
@@ -175,8 +177,16 @@ class AllenCahnStepper:
         from scipy.sparse.linalg import splu
         d = self.dm.device
         t_new = self.t + self.dt
-        c0_, ch = ((1.0, [1.0]) if (self.order == 1 or self.t < self.dt/2)
-                   else (1.5, [2.0, -0.5]))
+        # retrofit G3 (A4b pattern): VARIABLE-COEFFICIENT BDF2 from the
+        # actual (dt, dt_prev); r = 1 reproduces 1.5/[2, -0.5]
+        # bit-exactly (see cahn_hilliard.step for the full note).
+        if self.order == 1 or self.dt_prev is None \
+                or self.t < self.dt / 2:
+            c0_, ch = 1.0, [1.0]
+        else:
+            rr = self.dt / self.dt_prev
+            c0_ = (1.0 + 2.0 * rr) / (1.0 + rr)
+            ch = [1.0 + rr, -rr * rr / (1.0 + rr)]
         sigma = c0_ / self.dt
         hist_gp = None
         for k, cc in enumerate(ch):
@@ -241,4 +251,5 @@ class AllenCahnStepper:
                 break
         self.hist = [c.copy(), self.hist[0]]
         self.t = t_new
+        self.dt_prev = self.dt      # history spacing for BDF2 (G3)
         return c

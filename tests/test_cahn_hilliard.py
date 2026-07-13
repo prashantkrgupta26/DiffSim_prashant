@@ -255,3 +255,94 @@ def test_ch_adaptive_dt(device):
           f"({growth:.1f}x), c in [{c.min():.2f},{c.max():.2f}]")
     assert growth > 4.0, (dts[0], dts[-1])
     assert np.isfinite(c).all() and c.max() > 0.6 and c.min() < -0.6
+
+
+# ---------------------------------------------------------------------
+# Retrofit G3 (2026-07-13): VARIABLE-COEFFICIENT BDF2 (A4b pattern) —
+# coefficients from the actual (dt, dt_prev); r = 1 reproduces the
+# constant-step 1.5/[2, -0.5] bit-exactly (fixed-dt parity measured 0.0
+# at the retrofit).  Pre-fix baseline (audit doc): the constant-
+# coefficient form measured order 0.90/0.95 on an alternating-dt
+# sequence with errors 4-20x the fixed-dt run.
+# ---------------------------------------------------------------------
+_G3_IC = lambda x: (0.8 + 0.05 * np.cos(np.pi * x[:, 0])
+                    * np.cos(np.pi * x[:, 1]))
+
+
+def _ch_march(dm, dt0, var, T=0.096, p_kwargs=()):
+    st = CahnHilliardStepper(dm, 1.0, 5e-4, dt0, order=2)
+    st.set_initial(_G3_IC, mu_init="consistent")
+    if var:
+        for _ in range(round(T / (1.5 * dt0))):
+            st.dt = dt0
+            st.step()
+            st.dt = dt0 / 2
+            st.step()
+    else:
+        for _ in range(round(T / dt0)):
+            st.step()
+    assert abs(st.t - T) < 1e-12
+    return st.x[0::2].copy()
+
+
+def test_ch_bdf2_variable_dt_order(device):
+    """G3 gate (directive 2026-07-13): ADAPTIVE-dt order study — the
+    alternating (dt0, dt0/2) sequence exercises r = 2 and r = 0.5 on
+    every step.  Measured at the retrofit: variable-coefficient orders
+    2.02/2.01 (constant-coefficient pre-fix: 0.90/0.95); fixed-dt
+    control unchanged (2.18/2.07).  Cross cell: p2 x variable-dt
+    (measured 2.02)."""
+    dm, _, _ = _dm(4, 1, device)
+    ref = _ch_march(dm, 2e-4, False)
+    ev = [np.abs(_ch_march(dm, d, True) - ref).max()
+          for d in (8e-3, 4e-3, 2e-3)]
+    ov = [np.log2(ev[i] / ev[i + 1]) for i in range(2)]
+    print(f"CH var-dt errs {['%.2e' % e for e in ev]} orders "
+          f"{['%.2f' % o for o in ov]}")
+    assert min(ov) > 1.7, (ev, ov)
+    # cross-matrix cell: p2 x variable-dt BDF2
+    dm2, _, _ = _dm(4, 2, device)
+    ref2 = _ch_march(dm2, 2e-4, False)
+    e2 = [np.abs(_ch_march(dm2, d, True) - ref2).max()
+          for d in (8e-3, 4e-3)]
+    o2 = np.log2(e2[0] / e2[1])
+    print(f"CH p2 x var-dt order {o2:.2f}")
+    assert o2 > 1.7, (e2, o2)
+
+
+def test_ch_adaptive_march_reject_consistency(device):
+    """G3 gate (directive 2026-07-13): LTE rejects never corrupt the
+    BDF2 history — a march WITH rejects must equal the replay of its
+    ACCEPTED dt sequence (half-step pairs) on a fresh stepper,
+    bit-identically.  Measured at the retrofit: 27 accepted / 5
+    rejected, replay dev 0.0."""
+    from diffsim.physics.cahn_hilliard import adaptive_march
+
+    def mk():
+        dm, _, _ = _dm(4, 1, device)
+        st = CahnHilliardStepper(dm, 1.0, 5e-4, 0.02, order=2)
+        st.set_initial(_G3_IC, mu_init="consistent")
+        return st
+
+    st = mk()                    # dt0 = 0.02: LTE rejects at the start
+    ncall = {"n": 0}
+    orig = st.step
+
+    def counting():
+        ncall["n"] += 1
+        return orig()
+
+    st.step = counting
+    ts, dts = adaptive_march(st, 0.15, tol=1e-6, dt_min=1e-5,
+                             dt_max=0.05)
+    n_rej = (ncall["n"] - 3 * len(dts)) // 3
+    assert n_rej >= 1, "protocol produced no reject — raise dt0"
+    st2 = mk()
+    for dtf in dts:              # replay the accepted sequence
+        st2.dt = dtf / 2
+        st2.step()
+        st2.step()
+    dev = np.abs(st2.x - st.x).max()
+    print(f"CH reject-consistency: {len(dts)} accepted / {n_rej} "
+          f"rejected, replay dev {dev:.1e}")
+    assert dev == 0.0, dev

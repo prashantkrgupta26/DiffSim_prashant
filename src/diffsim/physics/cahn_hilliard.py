@@ -194,6 +194,7 @@ class CahnHilliardStepper:
         self.xq = gauss_points(self.mesh, dm.tables_by_p)
         self.nfree = self.Tc.shape[1]
         self.t = 0.0
+        self.dt_prev = None     # dt of the last completed step (G3)
 
     def set_initial(self, c0_fn, mu_init="zero"):
         """mu_init='consistent' seeds mu0 from the lumped weak potential
@@ -208,6 +209,7 @@ class CahnHilliardStepper:
         if mu_init == "consistent":
             self.x[1::2] = self._consistent_mu(c0)
         self.t = 0.0
+        self.dt_prev = None     # restart the BDF2 bootstrap (G3)
         return c0
 
     def _fprime_np(self, c):
@@ -267,8 +269,22 @@ class CahnHilliardStepper:
         from scipy.sparse.linalg import splu
         d = self.dm.device
         t_new = self.t + self.dt
-        c0_, ch = ((1.0, [1.0]) if (self.order == 1 or self.t < self.dt/2)
-                   else (1.5, [2.0, -0.5]))
+        # retrofit G3 (A4b pattern): VARIABLE-COEFFICIENT BDF2 — the
+        # coefficients come from the ACTUAL (dt, dt_prev): r = dt/dt_p,
+        # c0 = (1+2r)/(1+r), ch = [1+r, -r^2/(1+r)].  r = 1 reproduces
+        # the constant-step 1.5/[2, -0.5] bit-exactly (fixed-dt
+        # trajectories unchanged); under adaptive_march (dt varies,
+        # incl. the accepted half-step history spacing) the scheme
+        # stays consistent — the constant-coefficient form measured
+        # order 0.90/0.95 on an alternating-dt sequence (retrofit
+        # audit doc, G3 baseline).
+        if self.order == 1 or self.dt_prev is None \
+                or self.t < self.dt / 2:
+            c0_, ch = 1.0, [1.0]
+        else:
+            rr = self.dt / self.dt_prev
+            c0_ = (1.0 + 2.0 * rr) / (1.0 + rr)
+            ch = [1.0 + rr, -rr * rr / (1.0 + rr)]
         sigma = c0_ / self.dt
         hist_gp = None
         for k, cc in enumerate(ch):
@@ -367,6 +383,7 @@ class CahnHilliardStepper:
         self.x = x
         self.hist = [x[0::2].copy(), self.hist[0]]
         self.t = t_new
+        self.dt_prev = self.dt      # history spacing for BDF2 (G3)
         return x[0::2], x[1::2]
 
 
@@ -390,8 +407,10 @@ def adaptive_march(stepper, t_end, tol=1e-4, dt_min=1e-5, dt_max=0.5,
     p_ord = stepper.order
     ts, dts = [], []
     while stepper.t < t_end - 1e-12:
+        # G3: dt_prev joins the rewind state — rejects/replays must
+        # restore the BDF2 history spacing (reject consistency)
         state = (stepper.x.copy(), [h.copy() for h in stepper.hist],
-                 stepper.t)
+                 stepper.t, stepper.dt_prev)
         # one full step
         c1, _ = stepper.step()
         x1 = stepper.x.copy()
@@ -399,6 +418,7 @@ def adaptive_march(stepper, t_end, tol=1e-4, dt_min=1e-5, dt_max=0.5,
         stepper.x, stepper.hist, stepper.t = (state[0].copy(),
                                               [h.copy() for h in state[1]],
                                               state[2])
+        stepper.dt_prev = state[3]
         dt_full = stepper.dt
         stepper.dt = dt_full / 2
         stepper.step()
@@ -425,10 +445,11 @@ def adaptive_march(stepper, t_end, tol=1e-4, dt_min=1e-5, dt_max=0.5,
                 print(f"  t={stepper.t:.3f} dt={dt_full:.4f} "
                       f"lte={lte:.2e}", flush=True)
         else:
-            # reject: rewind, halve
+            # reject: rewind, halve (dt_prev restored — G3)
             stepper.x, stepper.hist, stepper.t = (state[0].copy(),
                                                   [h.copy()
                                                    for h in state[1]],
                                                   state[2])
+            stepper.dt_prev = state[3]
             stepper.dt = max(dt_min, dt_full / 2)
     return ts, dts

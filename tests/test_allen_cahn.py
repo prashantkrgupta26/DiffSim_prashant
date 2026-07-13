@@ -108,3 +108,37 @@ def test_ac_energy_decay_and_circle(device):
     rel = abs(Rm - Rth) / Rth
     print(f"circle: R={Rm:.4f} vs theory {Rth:.4f} rel={rel:.3f}")
     assert rel < 0.05, (Rm, Rth)
+
+
+def test_ac_bdf2_variable_dt_order(device):
+    """Retrofit G3 gate (directive 2026-07-13): variable-coefficient
+    BDF2 under an ADAPTIVE-dt sequence (alternating dt0, dt0/2 — r = 2
+    and 0.5 every step).  Measured at the retrofit: orders 2.01/2.01
+    (constant-coefficient CH baseline pre-fix: 0.90/0.95); fixed-dt
+    trajectories bit-identical (r = 1 coefficients exact)."""
+    T = 0.096
+    ic = lambda x: (0.8 + 0.05 * np.cos(np.pi * x[:, 0])
+                    * np.cos(np.pi * x[:, 1]))
+
+    def run(dt0, var):
+        dm, _, _ = _dm(4, 1, device)
+        st = AllenCahnStepper(dm, 1.0, 1e-3, dt0, order=2)
+        st.set_initial(ic)
+        if var:
+            for _ in range(round(T / (1.5 * dt0))):
+                st.dt = dt0
+                st.step()
+                st.dt = dt0 / 2
+                c = st.step()
+        else:
+            for _ in range(round(T / dt0)):
+                c = st.step()
+        assert abs(st.t - T) < 1e-12
+        return c.copy()
+
+    ref = run(2e-4, False)
+    ev = [np.abs(run(d, True) - ref).max() for d in (8e-3, 4e-3, 2e-3)]
+    ov = [np.log2(ev[i] / ev[i + 1]) for i in range(2)]
+    print(f"AC var-dt errs {['%.2e' % e for e in ev]} orders "
+          f"{['%.2f' % o for o in ov]}")
+    assert min(ov) > 1.7, (ev, ov)
