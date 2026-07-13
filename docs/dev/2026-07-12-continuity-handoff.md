@@ -43,25 +43,19 @@ Refreshed at push milestones; trust the newest git version.
 
 ## 2. Exact in-flight state (as of this snapshot)
 
-- S3b evaporation-quench gates: tests/test_multiphase_s3.py is
-  MODIFIED in the gpubox working tree (uncommitted) — rewritten to
-  the campaign-verbatim protocol (option (iii) of the S3 ledger Sec
-  2.3: continuous march through the t=14 implant, non-wrapped discs,
-  chi_ca 1.6 / r0 0.15 / 3 seeds). A pytest verification run
-  (`-k s3b`) was in flight. MEASURED so far: restore-protocol gates
-  dissolve the dry seeds even at margin parameters (chi_ca 1.4 /
-  r0 0.2 — area 0.244 -> 0.0, 2026-07-12); the continuous protocol
-  grew at the original parameters in two independent runs (dry5b
-  X=0.961, L6 hero X=0.95). If the box died mid-run: the rewritten
-  gate file's latest backup is the working tree itself; re-run
-  `python -m pytest tests/test_multiphase_s3.py -k s3b -s`, lock
-  tolerances from the prints (>=2x headroom; the determinism-repeat
-  lock rep_dev may need a distribution-based re-lock — two fully
-  independent 17.5-unit marches now), run the standard suites
-  (test_multiphase.py, test_multiphase_apack.py, test_multiphase_s3.py,
-  test_multiphase_s2.py deselecting ONLY
-  test_s2c_crystallite_quench_and_dissolution), commit, push.
-- After S3b: task queue Sec 3.
+- S3 COMPLETE and pushed (8149edb, 2026-07-12 ~21:10 CDT): S3b
+  gates green at the fate-robust config (r0=0.2, t_implant=12.5,
+  terminal-state locks; the whole knife-edge saga resolved — a
+  missing **kw splat had built the gate stepper with Tm=1; ledger
+  Sec 2.4 has the retraction + surviving findings + lesson).
+- IN FLIGHT: the device-assembly port agent (queue item 2 below),
+  launched ~21:15 CDT on stages D1 (pattern+scatter parity) -> D2
+  (cuDSS/blockch handoff, nnz-stability) -> D3 (host-vs-device
+  step-time table to the 48GB 3-D limit = the Nova hero-kit basis)
+  -> D4 (default flip if unambiguous). Its dev note:
+  docs/dev/2026-07-13-m5-device-assembly.md. If it died: check
+  git log for its commit-per-green chain and the dev note for the
+  last verified stage.
 
 ## 3. Task queue (order ratified by Baskar)
 
