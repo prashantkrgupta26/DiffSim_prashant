@@ -18,7 +18,12 @@ Solute-content accounting (flight recorder): content_i =
 h_curr * Int phi_i dtheta with the integral taken by CORNER-AVERAGE
 quadrature — exact for bilinear/trilinear P1 fields on tensor cells, so
 the recorded drift is the true conservation identity at machine
-precision (measured class 1e-15, wodo campaign).
+precision (measured class 1e-15, wodo campaign).  RETROFIT G5 CAVEAT:
+at p = 2 the corner-average rule is no longer exact for the Q2 field
+(it samples only the 2^dim vertices), so the recorded content drift
+becomes a DIAGNOSTIC APPROXIMATION rather than the exact identity —
+the conservation itself is unchanged (it lives in the volume kernel +
+top-face flux), only this monitor's quadrature is P1-calibrated.
 """
 import os
 import time
@@ -70,10 +75,11 @@ class FilmRun:
             keep &= cen[:, d] < c * r.hc
         tree = Octree(tree0.keys[keep], tree0.levels[keep], dim=p.dim,
                       periodic=tree0.periodic)
-        mesh = build_mesh(tree, p=1)
+        # retrofit G5: basis order + time scheme from the config
+        mesh = build_mesh(tree, p=p.p)
         cons = build_constraints(mesh)
         dm = DeviceMesh.from_mesh(mesh, cons,
-                                  basis_tables(1, dim=p.dim), p.device)
+                                  basis_tables(p.p, dim=p.dim), p.device)
         st = WodoFilmStepper(
             dm, chi=tuple(p.chi), N=tuple(float(n) for n in p.N),
             M=(r.M11, 0.0, r.M22), kappa=r.kappa, k_e=p.Bi, dt=p.dt0,
@@ -82,7 +88,7 @@ class FilmRun:
             noise=p.noise, noise_seed=p.noise_seed,
             var_mob=r.var_mob, D_ratio=r.D_pair, b_reg=p.b_reg,
             mob_model=("negi" if p.mobility == "negi" else "wodo"),
-            f_cheb=tuple(p.f_cheb),
+            f_cheb=tuple(p.f_cheb), tstep=p.tstep,
             use_device_assembly=p.device_assembly)
         st._solver_cache = _IterCache()
         rng = np.random.default_rng(p.ic_seed)

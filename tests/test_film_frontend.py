@@ -87,6 +87,74 @@ def test_params_roundtrip(tmp_path):
 
 
 # ---------------------------------------------------------------------
+# Retrofit G5: basis-order (p) + time-scheme (tstep) front-end exposure.
+# The stepper is basis-generic since G1 and BDF2-capable since G2; the
+# front end now surfaces both.  p1/bdf1 defaults are UNCHANGED — the
+# generalized sizing formulas reduce to the old p1 closed forms
+# integer-identically (guarded below).
+# ---------------------------------------------------------------------
+def test_g5_p1_sizing_unchanged():
+    """The generalized Q_p node/CSR-pair counts reproduce the old p1
+    closed forms bit-for-bit (nodes = c+1, pairs = 3(c+1)-2 per axis)."""
+    for cells in [(96, 48), (32, 24), (128, 64), (250, 100)]:
+        r = FilmParams(resolution=cells, phi_p0=0.125,
+                       phi_f0=0.125).resolve()
+        nodes_old, pairs_old = 1, 1
+        for c in cells:
+            nodes_old *= c + 1
+            pairs_old *= 3 * (c + 1) - 2
+        assert r.nodes == nodes_old, (cells, r.nodes, nodes_old)
+        assert r.nnz == 16 * pairs_old, (cells, r.nnz, 16 * pairs_old)
+
+
+def test_g5_p2_sizing_and_roundtrip(tmp_path):
+    """p2 sizing: nodes = prod(2c+1), pairs = prod(9c-(c-1)); and p +
+    tstep survive the YAML round-trip."""
+    p = FilmParams(resolution=(4, 4), phi_p0=0.125, phi_f0=0.125,
+                   p=2, tstep="bdf2", noise=0.0)
+    r = p.resolve()
+    assert r.nodes == (2 * 4 + 1) ** 2
+    assert r.nnz == 16 * (4 * 9 - 3) ** 2
+    path = tmp_path / "p2.yaml"
+    p.to_yaml(path)
+    q = FilmParams.from_yaml(path)
+    assert q.p == 2 and q.tstep == "bdf2"
+    assert q.resolve() == r
+
+
+def test_g5_validate_guards():
+    """tstep=bdf2 forbids noise (deterministic-only); p and tstep are
+    range-checked."""
+    for bad in (dict(tstep="bdf2", noise=1e-3), dict(p=3),
+                dict(tstep="bdf3")):
+        with pytest.raises((AssertionError, ValueError)):
+            FilmParams(phi_p0=0.2, phi_f0=0.2, **bad).validate()
+
+
+def test_g5_p2_bdf2_end_to_end(tmp_path, device):
+    """VERIFY CONSTRUCTED OBJECTS: a p2 + BDF2 config builds a p2 mesh
+    (nbf=9) and a tstep=bdf2 stepper, and drives fixed-dt film steps
+    that stay finite with BDF2 engaged after the bootstrap."""
+    p = FilmParams(
+        resolution=(4, 4), phi_p0=0.2, phi_f0=0.2, p=2, tstep="bdf2",
+        noise=0.0, dim=2, Lx=1.0, Bi=1.0, dt0=1e-3, mobility="variable",
+        linsolver="splu", device_assembly=False, ic_noise=0.0,
+        b_reg=1e-3, preflight="warn", device=device)
+    run = FilmRun(p)
+    st = run.build()
+    assert run.mesh.p == 2
+    assert st.tstep == "bdf2"
+    assert st.dm.tables_by_p[2].nbf == 9
+    for _ in range(3):
+        p1n, p2n = st.hist[0]
+        K = max(st.k_e * st._top_phis_avg(p1n, p2n), 0.0)
+        x, iters, ok = st._attempt(1e-3, K)
+        assert ok and np.isfinite(x).all(), (iters, ok)
+        st._commit(x, 1e-3, K)
+    assert st.hist2 is not None and st.dt_prev == 1e-3
+
+
+# ---------------------------------------------------------------------
 # preflight unit: a deliberately under-resolved config must FAIL with
 # the interface-resolution rule (and strict mode must refuse to run)
 # ---------------------------------------------------------------------

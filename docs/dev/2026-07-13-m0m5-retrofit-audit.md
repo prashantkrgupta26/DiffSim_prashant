@@ -259,6 +259,65 @@ docstring anticipates has never been executable.  Not introduced by
 this retrofit; recorded, deferred (the G3b variable-dt gate drives the
 stepper with a prescribed dt sequence instead).
 
+### G5 — film front-end p / tstep exposure (FIXED)
+
+CHANGE (film/params.py, film/run.py): FilmParams gains `p` (domain,
+default 1) and `tstep` (numerics, default "bdf1"); validate() range-
+checks both and forbids tstep=bdf2 + noise (matching the stepper's
+deterministic-only assert); resolve() sizing generalized to the tensor
+Q_p grid (nodes = prod(p·c+1), CSR pairs = prod(c(p+1)²−(c−1))) — p=1
+reduces to the old closed forms INTEGER-IDENTICALLY; FilmRun.build
+threads p into build_mesh/basis_tables and tstep into WodoFilmStepper.
+Content-diagnostic caveat recorded (corner-average quadrature is
+P1-exact; a diagnostic approximation at p2 — the conservation itself
+lives in the volume kernel + top-face flux, unchanged).
+
+GATES (measured 2026-07-13):
+
+| gate | measured | lock | verdict |
+|---|---|---|---|
+| (i) p1 sizing bit-identity (nodes + nnz vs the old formula, 4 configs incl. 250x100) | integer-identical | exact | PASS |
+| (ii) p2 sizing + YAML round-trip (p, tstep survive) | nodes/nnz match the Q2 closed form; round-trip preserved | exact | PASS |
+| (iii) validate guards | bdf2+noise, p=3, bad tstep all rejected | — | PASS |
+| (iv) VERIFY CONSTRUCTED OBJECTS: p2+bdf2 end-to-end | mesh.p=2, nbf=9, stepper.tstep=bdf2 reached; 3 fixed-dt steps finite, BDF2 engaged (hist2 set, dt_prev=1e-3) | — | PASS |
+
+SUITES: tests/test_film_frontend.py G5+param subset 7/7 (2.3 s); the
+full Negi end-to-end gate (4 marches) re-ran green earlier this session
+(5 passed, 43:47) on the byte-identical default path.
+
 ## R3 — verdict
 
-(filled at close)
+RESOLVED AUDIT TABLE (all originally-flagged cells closed; the "no"/
+"partial" verdicts of R1 are now "yes" except where honestly deferred
+with a mechanism).
+
+| unit | basis-agnostic? | BDF2? | face-terms | resolution |
+|---|---|---|---|---|
+| shared infra (basis/faces/nodes/constraints/operators/matvec/gp_field/device_assembly/equation) | yes | n/a | yes | unchanged — already compliant |
+| poisson / bratu / SBM static bricks | yes | n/a static | yes | unchanged |
+| scalar transport + coupled stepper | yes | **yes (G3c: variable-coeff)** | yes | FIXED |
+| NS linearized + Leray (+ device assembler + taped adjoint twins) | **yes (G4: complete p2 residual)** | yes (constant-dt; variable-dt NS march deferred w/ mechanism) | n/a | FIXED |
+| Cahn-Hilliard (poly+FH) | yes | **yes (G3a: variable-coeff, reject-consistent)** | n/a | FIXED |
+| Allen-Cahn | yes | **yes (G3a)** | n/a | FIXED |
+| ternary CH | yes | **yes (G3b)** | n/a | FIXED |
+| **wodo film** | **yes (G1: quadrature face mass, p-generic)** | **yes (G2: tstep=bdf2 variable-coeff)** | **yes (G1)** | FIXED — top priority closed |
+| film front-end | **yes (G5: p knob)** | **yes (G5: tstep knob)** | (inherits stepper) | FIXED |
+| multiphase (M5) | yes | yes | yes | reference — unchanged |
+
+CROSS-MATRIX SUMMARY (one off-diagonal cell per fixed feature, all PASS):
+- G1 wodo p2 × device-assembly parity 3.0e-16
+- G2 wodo p2 × BDF2 order 1.98; device-assembly × BDF2 6.3e-16
+- G3a CH p2 × variable-dt BDF2 order 2.02
+- G4 NS p2 × device-assembly parity 8.7e-14; p2 × taped adjoint (tape-FD dnu 1e-5)
+- G5 p2 × BDF2 end-to-end (constructed-object verified)
+
+DEFERRED (with mechanism, recorded above):
+- NS steppers under VARIABLE dt (G-note): a coherent feature (extrapolation + fine-scale history + tau all assume uniform spacing), not a coefficient patch; BDF1+BDF2 met at constant dt.
+- Fine-scale advecting-field correction keeps the nu-lap drop (modeling choice on the extrapolated field; the order-cap mechanism was in the operator residual, now complete).
+- SBM NS adjoint twins at p2 beyond the tape-FD gate's reach — completed for consistency here; a full p2 adjoint optimization chain is untested (no gate exists).
+- adaptive_march + ternary tuple-hist incompatibility (pre-existing).
+- G7: _face_mass unification into mesh/faces.py (multiphase imports FROM wodo_film; costs the full multiphase suite for zero functional gain).
+
+FRONTIERS: p3+ would need gauss_1d/lagrange_1d extended past p2 (leggauss
+fallback exists in faces.py); variable-dt NS march; p2 content diagnostic
+in the film recorder.

@@ -107,7 +107,9 @@ _SCHEMA = [
     ("mobility", "D_p", "D_p"), ("mobility", "D_f", "D_f"),
     ("domain", "dim", "dim"), ("domain", "Lx", "Lx"),
     ("domain", "Ly", "Ly"), ("domain", "resolution", "resolution"),
-    ("numerics", "dt0", "dt0"), ("numerics", "noise", "noise"),
+    ("domain", "p", "p"),
+    ("numerics", "dt0", "dt0"), ("numerics", "tstep", "tstep"),
+    ("numerics", "noise", "noise"),
     ("numerics", "noise_seed", "noise_seed"),
     ("numerics", "ic_noise", "ic_noise"),
     ("numerics", "ic_seed", "ic_seed"),
@@ -150,8 +152,10 @@ class FilmParams:
     Lx: float = 2.5                       # lateral extent, units of h0
     Ly: float | None = None               # second lateral (3-D only)
     resolution: tuple = (96, 48)          # cells; vertical axis LAST
+    p: int = 1                            # basis order (retrofit G5; 1|2)
     # -- numerics --------------------------------------------------------
     dt0: float = 1e-4
+    tstep: str = "bdf1"                   # retrofit G5: bdf1 | bdf2
     noise: float = 1e-3                   # CHC conserved-flux amplitude
     noise_seed: int = 0
     ic_noise: float = 0.01
@@ -185,6 +189,14 @@ class FilmParams:
         assert len(self.resolution) == self.dim, (
             f"resolution needs {self.dim} entries (vertical last)")
         assert self.preflight in ("strict", "warn"), self.preflight
+        # retrofit G5: basis order + time scheme (the stepper is
+        # basis-generic since G1 and BDF2-capable since G2)
+        assert int(self.p) in (1, 2), f"p must be 1 or 2 (got {self.p})"
+        assert self.tstep in ("bdf1", "bdf2"), self.tstep
+        if self.tstep == "bdf2" and float(self.noise) != 0.0:
+            raise ValueError(
+                "tstep=bdf2 is deterministic-only (set noise: 0) — the "
+                "FDT-noise weak order under BDF2 is out of scope (A4b)")
         if self.linsolver == "splu" and self.device_assembly:
             raise ValueError("device_assembly requires cudss/blockch* "
                              "(the device path has no splu)")
@@ -246,11 +258,19 @@ class FilmParams:
                     "the mapped metric carries ONE lateral scale: need "
                     f"Lx/nx == Ly/ny (got {lat_scale} vs {ls_y})")
         y_comp = cells[-1] * hc
+        # retrofit G5: basis-order-generic node + CSR-pair counts on the
+        # tensor Q_p grid.  1-D: p*c+1 nodes; node-pair count per axis =
+        # c*(p+1)^2 - (c-1) (each element's (p+1)^2 pairs, minus the one
+        # shared-vertex pair double-counted between adjacent elements);
+        # d-D CSR pairs = product over axes (the adjacency graph is the
+        # Cartesian product).  p = 1 reproduces c+1 nodes and 3(c+1)-2
+        # pairs EXACTLY (integer-identical), so p1 forecasts are unchanged.
+        pp = int(self.p)
         nodes = 1
         pairs = 1
         for c in cells:
-            nodes *= c + 1
-            pairs *= 3 * (c + 1) - 2
+            nodes *= pp * c + 1
+            pairs *= c * (pp + 1) ** 2 - (c - 1)
         return ResolvedFilm(
             phi_p0=pp0, phi_f0=pf0, phi_s0=ps0, kappa=kap,
             M11=M11, M22=M22, var_mob=(self.mobility == "variable"),
