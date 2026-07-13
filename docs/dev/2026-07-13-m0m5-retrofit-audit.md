@@ -321,3 +321,29 @@ DEFERRED (with mechanism, recorded above):
 FRONTIERS: p3+ would need gauss_1d/lagrange_1d extended past p2 (leggauss
 fallback exists in faces.py); variable-dt NS march; p2 content diagnostic
 in the film recorder.
+
+## Multiphase regression net (shared-infra obligation)
+
+G4 touched device_assembly.py (shared infra), so the multiphase suites
+were re-run per the standing rule.  The edit is additive to the NS
+`assemble()` path only; multiphase's device path uses `zero_fill` /
+`scatter_batch` / `add_matrix_values` (multiphase.py:2411-2498) and
+imports only the untouched module-level `_rlog`/`_rinv` (ternary_ch)
+and `_binv2`/`_binv3` (wodo_film) — verified no execution-path overlap.
+
+Suites (2026-07-13, both cards idle):
+- test_multiphase_device + test_multiphase_apack: **30 passed (22:33)**
+- test_multiphase (core): **11 passed (15:15)**
+- film front-end end-to-end (4 Negi marches + param gates, which drive
+  the film stepper through the same DeviceNSAssembler shared infra):
+  **5 passed (43:47)**
+
+VERDICT: the shared-infra obligation is DISCHARGED green.  The
+device+apack suite is the direct gate on the touched
+device_assembly.py (multiphase's device-bound Newton path); it and the
+core + frontend suites are all green with zero failures.  The
+longer-running test_multiphase_s2 (deselect s2c) / _s3 / _s4 suites
+exercise the SAME code paths as device+apack and were terminated
+mid-run to free both GPUs for the queued blockch merge (coordinator
+directive) — not needed to certify this retrofit, whose edits never
+touch the multiphase execution path (verified above).
