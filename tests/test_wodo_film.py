@@ -66,18 +66,16 @@ def test_wodo_film_evaporation(device):
 # < 1e-11 vs the host COO+scipy path.
 # ---------------------------------------------------------------------
 def _march_fixed_dt(st, nsteps, dt):
-    """March at FIXED dt via _attempt + manual commit (removes the
-    Appendix-A heuristic from the parity comparison)."""
+    """March at FIXED dt via _attempt + the canonical commit (removes
+    the Appendix-A heuristic from the parity comparison; _commit keeps
+    the BDF2 two-level history consistent — retrofit G2)."""
     xs = []
     for _ in range(nsteps):
         p1n, p2n = st.hist[0]
         K = max(st.k_e * st._top_phis_avg(p1n, p2n), 0.0)
         x, iters, ok = st._attempt(dt, K)
         assert ok, iters
-        st.x = x
-        st.hist = [(x[0::4].copy(), x[2::4].copy()), st.hist[0]]
-        st.t += dt
-        st.h_curr -= dt * K
+        st._commit(x, dt, K)
         xs.append(x.copy())
     return xs
 
@@ -142,7 +140,154 @@ def test_wodo_device_parity_spinodal(device):
 # mass (multiphase A4a pattern), p == 1 assert lifted.  Measured at the
 # retrofit: p1 trajectory parity vs the pre-change hardcoded-P1 code
 # 5.9e-16 over 10 steps (face-mass ulp noise only), h_curr bit-identical.
+# Retrofit G2 (2026-07-13): tstep="bdf2" — VARIABLE-COEFFICIENT BDF2
+# (multiphase A4b sigma/hist rewiring, zero kernel change).  Measured at
+# the retrofit: bdf1 default trajectory BIT-IDENTICAL to pre-G2 (0.0 dev).
 # ---------------------------------------------------------------------
+def _strip_dm(p, level, width_cells, device):
+    tree0 = build_uniform(level, dim=2)
+    keep = tree0.centers()[:, 0] < width_cells / 2 ** level
+    tree = Octree(tree0.keys[keep], tree0.levels[keep], dim=2,
+                  periodic=tree0.periodic)
+    mesh = build_mesh(tree, p=p)
+    cons = build_constraints(mesh)
+    return DeviceMesh.from_mesh(mesh, cons, basis_tables(p, dim=2),
+                                device)
+
+
+def _mk_smooth(dm, k_e, tstep, dt=1e-3):
+    st = WodoFilmStepper(dm, chi=(1.0, 0.3, 0.3), N=(5.0, 5.0, 1.0),
+                         M=(0.225, 0.0, 0.225), kappa=(2e-4, 2e-4),
+                         k_e=k_e, dt=dt, tstep=tstep)
+    st.set_initial(lambda x: 0.2 + 0.02 * np.cos(np.pi * x[:, 1]),
+                   lambda x: 0.2 - 0.02 * np.cos(np.pi * x[:, 1]))
+    return st
+
+
+def test_wodo_bdf2_temporal_order(device):
+    """G2 gate: BDF2 temporal order ~2 at k_e = 0 (h frozen — the
+    explicit h-update is O(dt) by construction, a recorded limit), BDF1
+    control ~1, and the BDF1-vs-BDF2 consistency e_bdf2(dt) <
+    e_bdf1(dt/2).  Measured at the retrofit: BDF2 2.01/2.13
+    (errs 5.4e-8/1.3e-8/3.1e-9), BDF1 0.99/1.00, consistency 158x.
+    Locks follow the A4b pattern (orders > 1.7).  Cross cell: p2 x
+    BDF2 (measured 1.98)."""
+    T = 0.064
+
+    def run(tstep, dt, p=1):
+        st = _mk_smooth(_strip_dm(p, 4, 2, device), 0.0, tstep, dt=dt)
+        _march_fixed_dt(st, round(T / dt), dt)
+        assert abs(st.t - T) < 1e-12
+        return st.x.copy()
+
+    ref = run("bdf2", 2.5e-4)
+    e2 = [np.abs(run("bdf2", dt) - ref).max()
+          for dt in (4e-3, 2e-3, 1e-3)]
+    e1 = [np.abs(run("bdf1", dt) - ref).max()
+          for dt in (4e-3, 2e-3, 1e-3)]
+    o2 = [np.log2(e2[i] / e2[i + 1]) for i in range(2)]
+    o1 = [np.log2(e1[i] / e1[i + 1]) for i in range(2)]
+    print(f"wodo BDF2 errs {['%.2e' % e for e in e2]} orders "
+          f"{['%.2f' % o for o in o2]}; BDF1 orders "
+          f"{['%.2f' % o for o in o1]}")
+    assert min(o2) > 1.7, (e2, o2)
+    assert max(o1) < 1.3, (e1, o1)              # mechanism live
+    assert e2[1] < e1[2], (e2[1], e1[2])        # BDF2(dt) < BDF1(dt/2)
+    ref_p2 = run("bdf2", 2.5e-4, p=2)
+    e2p = [np.abs(run("bdf2", dt, p=2) - ref_p2).max()
+           for dt in (4e-3, 2e-3)]
+    o2p = np.log2(e2p[0] / e2p[1])
+    print(f"wodo p2 x BDF2 order {o2p:.2f}")
+    assert o2p > 1.7, (e2p, o2p)
+
+
+def test_wodo_bdf2_adaptive_dt_and_rejects(device):
+    """G2 gate (directive 2026-07-13): (a) ADAPTIVE-dt order study —
+    prescribed alternating (dt0, dt0/2) sequence exercises r = 2 and
+    r = 0.5 variable coefficients on every step; BDF2 order ~2 where
+    the scheme without variable coefficients sits at ~1 (measured
+    1.96/1.97 vs BDF1 0.99/0.99).  (b) reject-consistency: DISCARDED
+    attempts (the Appendix-A ladder's rejects) between accepted steps
+    leave the accepted trajectory BIT-IDENTICAL (measured 0.0).
+    (c) device-assembly x BDF2 parity (measured 6.3e-16, lock 1e-11).
+    (d) BDF2 is deterministic-only (noise asserted off)."""
+    T = 0.06
+
+    def run_fix(tstep, dt):
+        st = _mk_smooth(_strip_dm(1, 4, 2, device), 0.0, tstep, dt=dt)
+        _march_fixed_dt(st, round(T / dt), dt)
+        return st.x.copy()
+
+    def run_var(tstep, dt0):
+        st = _mk_smooth(_strip_dm(1, 4, 2, device), 0.0, tstep, dt=dt0)
+        for _ in range(round(T / (1.5 * dt0))):
+            for dtk in (dt0, dt0 / 2):
+                x, iters, ok = st._attempt(dtk, 0.0)
+                assert ok, iters
+                st._commit(x, dtk, 0.0)
+        assert abs(st.t - T) < 1e-12, st.t
+        return st.x.copy()
+
+    ref = run_fix("bdf2", 2.5e-4)
+    ev2 = [np.abs(run_var("bdf2", d) - ref).max()
+           for d in (4e-3, 2e-3, 1e-3)]
+    ev1 = [np.abs(run_var("bdf1", d) - ref).max()
+           for d in (4e-3, 2e-3, 1e-3)]
+    ov2 = [np.log2(ev2[i] / ev2[i + 1]) for i in range(2)]
+    ov1 = [np.log2(ev1[i] / ev1[i + 1]) for i in range(2)]
+    print(f"wodo ADAPTIVE-dt BDF2 orders {['%.2f' % o for o in ov2]}; "
+          f"BDF1 orders {['%.2f' % o for o in ov1]}")
+    assert min(ov2) > 1.7, (ev2, ov2)
+    assert max(ov1) < 1.3, (ev1, ov1)
+
+    def run_rej(inject):
+        dm = _strip_dm(1, 4, 2, device)
+        st = WodoFilmStepper(dm, chi=(1.0, 0.3, 0.3), N=(5.0, 5.0, 1.0),
+                             M=(0.225, 0.0, 0.225), kappa=(2e-4, 2e-4),
+                             k_e=1.0, dt=1e-3, tstep="bdf2")
+        rng = np.random.default_rng(3)
+        st.set_initial(
+            lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)),
+            lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)))
+        xs = []
+        for k in range(8):
+            p1n, p2n = st.hist[0]
+            K = max(st.k_e * st._top_phis_avg(p1n, p2n), 0.0)
+            if inject and k in (2, 5):
+                st._attempt(4e-3, K)     # rejected attempt, DISCARDED
+            x, iters, ok = st._attempt(1e-3, K)
+            assert ok
+            st._commit(x, 1e-3, K)
+            xs.append(x.copy())
+        return xs
+
+    xa, xb = run_rej(False), run_rej(True)
+    rd = max(np.abs(a - b).max() for a, b in zip(xa, xb))
+    print(f"wodo reject-consistency dev {rd:.1e}")
+    assert rd == 0.0, rd
+
+    def run_dev(dev_asm):
+        dm = _strip_dm(1, 5, 4, device)
+        st = WodoFilmStepper(dm, chi=(1.0, 0.3, 0.3), N=(5.0, 5.0, 1.0),
+                             M=(0.225, 0.0, 0.225), kappa=(2e-4, 2e-4),
+                             k_e=1.0, dt=1e-3, tstep="bdf2",
+                             use_device_assembly=dev_asm)
+        rng = np.random.default_rng(3)
+        st.set_initial(
+            lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)),
+            lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)))
+        return _march_fixed_dt(st, 5, 1e-3)
+
+    perr = max(np.abs(a - b).max() / max(np.abs(a).max(), 1e-30)
+               for a, b in zip(run_dev(False), run_dev(True)))
+    print(f"wodo device x BDF2 parity {perr:.1e}")
+    assert perr < 1e-11, perr
+
+    with pytest.raises(AssertionError):
+        WodoFilmStepper(_strip_dm(1, 3, 2, device), tstep="bdf2",
+                        noise=1e-3)
+
+
 def test_wodo_face_mass_generic(device):
     """The quadrature-built 1-D edge mass reproduces the analytic
     consistent masses per degree: p1 le[[1/3,1/6],[1/6,1/3]] (1-ulp

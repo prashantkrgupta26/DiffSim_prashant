@@ -111,8 +111,11 @@ bilayer before the stop criterion; the paper's 'morphology frozen'
 regime needs D(phi). Langevin noise is scaled by sqrt(M_ii(phi))
 in-kernel (local FDT), so fluctuations freeze out with the mobility.
 
-TIME STEPPING: BDF1 + their Appendix-A heuristic (iters < 20 =>
-dt *= 1.25; no convergence in 50 (or divergence) => dt *= 0.25, retry).
+TIME STEPPING: BDF1 (default) + their Appendix-A heuristic (iters < 20
+=> dt *= 1.25; no convergence in 50 (or divergence) => dt *= 0.25,
+retry).  Retrofit G2: tstep="bdf2" = VARIABLE-COEFFICIENT BDF2 (the
+multiphase A4b pattern; deterministic-only, reject-consistent — see
+the __init__ comment).
 Per accepted step: h_curr -= dt * K, K frozen at t_n (also frozen over
 the Newton solve). No Langevin noise (CHC term) in v1 — separation is
 seeded by initial-condition noise only. No SUPG on the advection term
@@ -401,7 +404,8 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
 
 
 class WodoFilmStepper(TernaryCHStepper):
-    """Landau-mapped evaporating-film stepper (basis-generic; BDF1).
+    """Landau-mapped evaporating-film stepper (basis-generic;
+    BDF1 default / variable-coefficient BDF2 via tstep="bdf2").
 
     Extra state: h_curr (physical film height, starts at 1), k_e
     (evaporation rate; Bi = k_e in units D_s = L = 1), chain lengths
@@ -415,7 +419,7 @@ class WodoFilmStepper(TernaryCHStepper):
                  lat_scale=1.0, linsolver="splu", noise=0.0,
                  noise_seed=0, var_mob=False, D_ratio=1e-3, b_reg=0.0,
                  f_cheb=(0.0, 0.0, 0.0), use_device_assembly=False,
-                 mob_model="wodo"):
+                 mob_model="wodo", tstep="bdf1"):
         super().__init__(dm, chi=chi, M=M, kappa=kappa, dt=dt, order=1,
                          newton_tol=newton_tol, newton_max=newton_max)
         # retrofit G1 (2026-07-13): the p == 1 restriction is lifted —
@@ -433,6 +437,28 @@ class WodoFilmStepper(TernaryCHStepper):
         self._cudss_dev = None      # device-CSR DirectSolver plan
         self.noise = float(noise)
         self._nrng = np.random.default_rng(noise_seed)
+        # retrofit G2 (A4b pattern, multiphase apack Sec 4b): tstep =
+        # "bdf1" (default, existing behavior bit-identically) | "bdf2"
+        # = VARIABLE-COEFFICIENT BDF2, deterministic-only.  Per-attempt
+        # coefficients from the ACTUAL (dt, dt_prev): r = dt/dt_prev,
+        # a = (1+2r)/(1+r), b = 1+r, c = r^2/(1+r); sigma = a/dt and
+        # hist = (b x^n - c x^{n-1})/dt ride the UNCHANGED kernel time
+        # term sigma*x - hist.  hist2/dt_prev advance ONLY on accepted
+        # steps (_commit), so ladder rejects rescale dt without
+        # corrupting the history.  RECORDED LIMITS: the explicit h_curr
+        # update stays O(dt) (temporal-order gate runs at k_e = 0), and
+        # the advection/top-flux content pairing is telescoping-exact
+        # only under BDF1 — under BDF2 the content drift is the BDF2
+        # global error (order drift, not a leak; the same recorded
+        # limit as multiphase film mode).
+        assert tstep in ("bdf1", "bdf2"), tstep
+        if tstep == "bdf2":
+            assert float(noise) == 0.0, \
+                "BDF2 is deterministic-only (FDT-noise weak order " \
+                "under BDF2 is a recorded scope limit — A4b)"
+        self.tstep = tstep
+        self.hist2 = None       # (p1, p2) at t_{n-1}; None => bootstrap
+        self.dt_prev = None     # dt of the last ACCEPTED step
         self.var_mob = bool(var_mob)
         assert mob_model in ("wodo", "negi"), mob_model
         self.mob_model = mob_model
@@ -504,6 +530,49 @@ class WodoFilmStepper(TernaryCHStepper):
         f1 = np.asarray(self.Tc @ p1_free)
         f2 = np.asarray(self.Tc @ p2_free)
         return float(np.mean(1.0 - f1[self.top_nodes] - f2[self.top_nodes]))
+
+    def set_initial(self, p1_fn, p2_fn):
+        super().set_initial(p1_fn, p2_fn)
+        self.hist2 = None       # restart the BDF2 bootstrap (G2)
+        self.dt_prev = None
+
+    # -- BDF time term (retrofit G2: the A4b sigma/hist rewiring — the
+    #    kernel time term is sigma*phi - hist per GP for BOTH schemes,
+    #    zero kernel change) ----------------------------------------------
+    def _bdf_time(self, dt):
+        """(sigma, h1_gp, h2_gp) for one attempt at step size dt.
+        BDF1 (default + BDF2 bootstrap): sigma = 1/dt, hist = phi^n/dt.
+        BDF2: variable coefficients from the ACTUAL (dt, dt_prev);
+        rejects recompute from the rescaled dt, history untouched."""
+        v1, _ = self._gp(self.hist[0][0])
+        v2, _ = self._gp(self.hist[0][1])
+        if self.tstep == "bdf2" and self.hist2 is not None:
+            rr = dt / self.dt_prev
+            sigma = (1.0 + 2.0 * rr) / (1.0 + rr) / dt
+            bv, cv = 1.0 + rr, rr * rr / (1.0 + rr)
+            w1, _ = self._gp(self.hist2[0])
+            w2, _ = self._gp(self.hist2[1])
+            h1 = {pv: (bv * v1[pv] - cv * w1[pv]) / dt for pv in v1}
+            h2 = {pv: (bv * v2[pv] - cv * w2[pv]) / dt for pv in v2}
+        else:
+            sigma = 1.0 / dt
+            h1 = {pv: sigma * v1[pv] for pv in v1}
+            h2 = {pv: sigma * v2[pv] for pv in v2}
+        return sigma, h1, h2
+
+    def _commit(self, x_new, dt_eff, K):
+        """Canonical ACCEPTED-step commit (march + fixed-dt drivers):
+        the BDF2 two-level history and dt_prev shift BEFORE the hist
+        rotation (A4b ladder consistency — rejected attempts never
+        reach here)."""
+        self.x = x_new
+        if self.tstep == "bdf2":
+            self.hist2 = self.hist[0]
+            self.dt_prev = dt_eff
+        self.hist = [(x_new[0::4].copy(), x_new[2::4].copy()),
+                     self.hist[0]]
+        self.t += dt_eff
+        self.h_curr -= dt_eff * K
 
     # -- linear solve (per-Newton-iterate matrix; fixed sparsity) --------
     @staticmethod
@@ -608,12 +677,9 @@ class WodoFilmStepper(TernaryCHStepper):
         if self.use_device_assembly:
             return self._attempt_device(dt, K)
         d = self.dm.device
-        sigma = 1.0 / dt
+        # G2: BDF1/BDF2 time term via the A4b sigma/hist rewiring
+        sigma, h1_gp, h2_gp = self._bdf_time(dt)
         self._sigma = sigma      # _solve reads it for the blockch meta
-        v1, _ = self._gp(self.hist[0][0])
-        v2, _ = self._gp(self.hist[0][1])
-        h1_gp = {pv: sigma * v1[pv] for pv in v1}
-        h2_gp = {pv: sigma * v2[pv] for pv in v2}
         minv = 1.0 / self.h_curr
         mlat = 1.0 / self.lat_scale
         mvert = self.y_comp * minv
@@ -753,12 +819,9 @@ class WodoFilmStepper(TernaryCHStepper):
             self._init_device_assembly()
         asm = self._asm
         d = self.dm.device
-        sigma = 1.0 / dt
+        # G2: BDF1/BDF2 time term via the A4b sigma/hist rewiring
+        sigma, h1_gp, h2_gp = self._bdf_time(dt)
         self._sigma = sigma      # blockch meta (device-setup route)
-        v1, _ = self._gp(self.hist[0][0])
-        v2, _ = self._gp(self.hist[0][1])
-        h1_gp = {pv: sigma * v1[pv] for pv in v1}
-        h2_gp = {pv: sigma * v2[pv] for pv in v2}
         minv = 1.0 / self.h_curr
         mlat = 1.0 / self.lat_scale
         mvert = self.y_comp * minv
@@ -899,11 +962,7 @@ class WodoFilmStepper(TernaryCHStepper):
                     reason = "dt_underflow"
                     break
                 continue
-            self.x = x_new
-            self.hist = [(x_new[0::4].copy(), x_new[2::4].copy()),
-                         self.hist[0]]
-            self.t += dt_eff
-            self.h_curr -= dt_eff * K
+            self._commit(x_new, dt_eff, K)
             if iters < 20:
                 self.dt = dt_eff * 1.25
             else:
