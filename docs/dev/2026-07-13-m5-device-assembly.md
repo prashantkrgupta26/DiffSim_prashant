@@ -199,6 +199,35 @@ noise_psi 5e-3 + damp, line_search, cudss, assembly="device").
   ladder (fixed dt 1e-4 diverges at the first step, 1e-5 fails later
   steps at L5 — measured in the bench DNF trail).
 
+## 5b. D4 verdict — NO default flip (recorded with measurements)
+
+Performance alone justifies a flip (device never slower: 7.3-11.5x
+2-D steps, 1.07-3.9x 3-D, assembly 52-255x/call, parity machine-
+class, plan flapping cured).  The flip fails on GATE CLASS, not
+physics: the existing suites contain BIT-CLASS determinism gates
+that the host path satisfies only because host assembly is fully
+deterministic (one thread per element writes its own Ae block; the
+COO -> CSR fold is ordered).  The device scatter is cross-element
+atomicAdd — scheduling-dependent rounding by design (the house
+FP-chaos position).  MEASURED (quiet box, forced device):
+test_a1_dt_hook's inert-ratio lock |r - 1| < 1e-12 sees 2.43e-12
+deviation and FLAKES 5/10 (physics correct: active ratio 0.3660 vs
+Arrhenius 0.3657); the full-suite forced-device probe failed exactly
+that gate and nothing else in the portion that ran (first 20 items,
+two runs — one contended, one quiet-killed).  Same gate class:
+a3_delta_zero "exact regression", the a4b bit-identical regressions,
+the S0 fixed-dt 1e-13 lock.
+
+Path to a future flip (its own pass, per-gate measured-then-locked):
+(i) relock the bit-class gates as device-aware distribution locks —
+or pin assembly="host" inside those gates explicitly (they gate
+FORMULATION identities, which the host mode legitimately checks
+bit-wise); (ii) make the default assembly=None AUTO: "device" on
+identity-constraint meshes, "host" otherwise (a bare flip would turn
+the identity assert into a crash for adapted-mesh users).  Until
+then: production configs opt in with assembly="device" (the hero-kit
+setting, Sec 5); the default stays "host".
+
 ## 6. Frontiers
 
 - Weighted (hanging-node) constraints on the device path: fold the
