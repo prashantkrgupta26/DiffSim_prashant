@@ -191,6 +191,7 @@ class TernaryCHStepper:
         self.xq = gauss_points(self.mesh, dm.tables_by_p)
         self.nfree = self.Tc.shape[1]
         self.t = 0.0
+        self.dt_prev = None     # dt of the last completed step (G3b)
 
     def set_initial(self, p1_fn, p2_fn):
         p1 = p1_fn(self.free_coords)
@@ -200,6 +201,7 @@ class TernaryCHStepper:
         self.x[0::4] = p1
         self.x[2::4] = p2
         self.t = 0.0
+        self.dt_prev = None     # restart the BDF2 bootstrap (G3b)
 
     def _gp(self, vec):
         full = np.asarray(self.Tc @ vec)
@@ -219,8 +221,16 @@ class TernaryCHStepper:
     def step(self):
         from scipy.sparse.linalg import splu
         d = self.dm.device
-        c0_, ch = ((1.0, [1.0]) if (self.order == 1 or self.t < self.dt/2)
-                   else (1.5, [2.0, -0.5]))
+        # retrofit G3b (A4b pattern): VARIABLE-COEFFICIENT BDF2 from the
+        # actual (dt, dt_prev); r = 1 reproduces 1.5/[2, -0.5] bit-exactly
+        # (see cahn_hilliard.step for the full note).
+        if self.order == 1 or self.dt_prev is None \
+                or self.t < self.dt / 2:
+            c0_, ch = 1.0, [1.0]
+        else:
+            rr = self.dt / self.dt_prev
+            c0_ = (1.0 + 2.0 * rr) / (1.0 + rr)
+            ch = [1.0 + rr, -rr * rr / (1.0 + rr)]
         sigma = c0_ / self.dt
         h1_gp = h2_gp = None
         for k, cc in enumerate(ch):
@@ -300,4 +310,5 @@ class TernaryCHStepper:
         self.x = x
         self.hist = [(x[0::4].copy(), x[2::4].copy()), self.hist[0]]
         self.t += self.dt
+        self.dt_prev = self.dt      # history spacing for BDF2 (G3b)
         return x[0::4], x[2::4]

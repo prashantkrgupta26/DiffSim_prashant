@@ -54,3 +54,52 @@ def test_ternary_spinodal(device):
     assert sep > 0.5, sep                      # phases forming
     assert p1.min() > -0.02 and p2.min() > -0.02
     assert ps.min() > -0.05                    # simplex ~respected
+
+
+def test_tch_bdf2_variable_dt(device):
+    """Retrofit G3b gate (directive 2026-07-13): variable-coefficient
+    BDF2 under an ADAPTIVE-dt sequence (alternating dt0, dt0/2 — r = 2
+    and 0.5 every step) on the 4-dof ternary system.  Measured at the
+    retrofit: orders ~2 (values in the audit doc); fixed-dt
+    trajectories bit-identical pre/post (r = 1 coefficients exact).
+    NOTE (recorded): adaptive_march itself cannot drive this stepper —
+    its rewind copies hist entries with .copy(), and the ternary hist
+    holds (phi1, phi2) TUPLES (pre-existing; deferred in the audit)."""
+    from diffsim.octree.build import build_uniform
+    from diffsim.mesh.nodes import build_mesh
+    from diffsim.mesh.constraints import build_constraints
+    from diffsim.mesh.basis import basis_tables
+    from diffsim.assembly.operators import DeviceMesh
+
+    T = 0.096
+    tree = build_uniform(4, dim=2)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+
+    def run(dt0, var):
+        dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2),
+                                  device)
+        st = TernaryCHStepper(dm, chi=(1.0, 0.3, 0.3),
+                              M=(0.225, 0.0, 0.225),
+                              kappa=(2e-4, 2e-4), dt=dt0, order=2)
+        st.set_initial(
+            lambda x: 0.2 + 0.02 * np.cos(np.pi * x[:, 1]),
+            lambda x: 0.2 - 0.02 * np.cos(np.pi * x[:, 1]))
+        if var:
+            for _ in range(round(T / (1.5 * dt0))):
+                st.dt = dt0
+                st.step()
+                st.dt = dt0 / 2
+                st.step()
+        else:
+            for _ in range(round(T / dt0)):
+                st.step()
+        assert abs(st.t - T) < 1e-12
+        return st.x.copy()
+
+    ref = run(2e-4, False)
+    ev = [np.abs(run(d, True) - ref).max() for d in (8e-3, 4e-3, 2e-3)]
+    ov = [np.log2(ev[i] / ev[i + 1]) for i in range(2)]
+    print(f"TCH var-dt errs {['%.2e' % e for e in ev]} orders "
+          f"{['%.2f' % o for o in ov]}")
+    assert min(ov) > 1.7, (ev, ov)

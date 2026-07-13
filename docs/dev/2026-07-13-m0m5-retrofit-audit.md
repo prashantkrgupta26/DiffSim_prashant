@@ -165,7 +165,18 @@ GATES (measured 2026-07-13):
 
 SUITES: tests/test_wodo_film.py 8/8 (42.1 s).
 
-### G3 — CH / AC / ternary variable-coefficient BDF2 (FIXED; ternary = G3b)
+### G3b — ternary_ch variable-coefficient BDF2 (FIXED)
+
+Same (dt, dt_prev) rewiring as G3a (physics/ternary_ch.py, the 4-dof
+stepper).  Gates (measured 2026-07-13): fixed-dt 12-step trajectory
+bit-identical vs the pre-edit capture (0.0); ADAPTIVE-dt order study
+(alternating dt0, dt0/2) orders 2.00/2.01 (lock 1.7).  Suite:
+test_ternary_ch 2/2 (55 s).  NOTE (recorded, pre-existing): adaptive_
+march cannot drive this stepper — its `.copy()` rewind assumes flat
+hist arrays but ternary hist holds (phi1, phi2) tuples; the gate uses a
+prescribed alternating-dt sequence instead.
+
+### G3 — CH / AC / ternary variable-coefficient BDF2 (FIXED)
 
 CHANGE (cahn_hilliard.py, allen_cahn.py; ternary_ch.py in the G3b
 commit): (c0, ch) from r = dt/dt_prev per step (r = 1 reproduces
