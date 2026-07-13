@@ -60,11 +60,21 @@ and the [curriculum](tutorials/README.md) takes a student from "solve Poisson on
 a disk" to "recover a shape from sensor data" in an afternoon.
 
 <p align="center">
-  <img alt="Drying front descending through an evaporating film" src="docs/assets/img/drying_strip.png" width="90%">
+  <img alt="Evaporation-induced phase separation and crystallization in a drying film" src="docs/assets/img/hero_film_drying.png" width="97%">
   <br>
-  <em>An inverse problem in the making: a solvent front descends through a drying
-  film (four snapshots). Given sparse observations of a field like this, recover
-  the hidden physics by differentiating through the solver.</em>
+  <em>A film dries and structures itself (M5 OrgElMorph, verified run): a ternary
+  polymer/fullerene/solvent blend loses solvent through its moving free surface
+  (h: 1.00 &rarr; 0.16), stratifies into a polymer skin over a fullerene-rich
+  sublayer, and crystallizes on quench — colors in the last frames are individual
+  crystals tracked by their orientation markers.</em>
+</p>
+
+<p align="center">
+  <img alt="Dry-film morphology and individual crystal identification" src="docs/assets/img/hero_final_grains.png" width="85%">
+  <br>
+  <em>The dry film, two ways: composition with grain overlay (left) and the
+  individual impinged crystals (right) — the model carries a per-crystal
+  orientation field precisely so grains can be identified and counted.</em>
 </p>
 
 ## Solver projects
