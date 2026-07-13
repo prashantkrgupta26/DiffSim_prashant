@@ -401,7 +401,7 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
 
 
 class WodoFilmStepper(TernaryCHStepper):
-    """Landau-mapped evaporating-film stepper (linear elements, BDF1).
+    """Landau-mapped evaporating-film stepper (basis-generic; BDF1).
 
     Extra state: h_curr (physical film height, starts at 1), k_e
     (evaporation rate; Bi = k_e in units D_s = L = 1), chain lengths
@@ -418,7 +418,9 @@ class WodoFilmStepper(TernaryCHStepper):
                  mob_model="wodo"):
         super().__init__(dm, chi=chi, M=M, kappa=kappa, dt=dt, order=1,
                          newton_tol=newton_tol, newton_max=newton_max)
-        assert dm.mesh.p == 1, "Wodo film v1: linear elements only"
+        # retrofit G1 (2026-07-13): the p == 1 restriction is lifted —
+        # the volume kernel was already nbf/nqp-generic and the top-face
+        # mass is now quadrature-built per degree (_build_top_faces).
         self.N1, self.N2, self.Ns = (float(n) for n in N)
         self.k_e = float(k_e)
         self.h_curr = 1.0
@@ -459,10 +461,16 @@ class WodoFilmStepper(TernaryCHStepper):
 
     # -- top-surface topology -------------------------------------------
     def _build_top_faces(self):
-        """Top-face node lists + CONSISTENT P1 face mass matrices:
-        tensor product of the 1-D edge mass le * [[1/3,1/6],[1/6,1/3]]
-        over the lateral dims (dim=2: 2-node edges, the historical
-        le/6 [[2,1],[1,2]]; dim=3: 4-node quad faces)."""
+        """Top-face node lists + CONSISTENT face mass matrices: tensor
+        product of the 1-D consistent edge mass over the lateral dims.
+        BASIS-GENERIC (retrofit G1, the multiphase A4a pattern): the
+        1-D edge mass m1[a, b] = Int_0^1 N_a N_b is built from the
+        tabulated 1-D Lagrange basis by (p+1)-point Gauss quadrature
+        (exact for the degree-2p integrand), so p = 1 reproduces
+        le [[1/3,1/6],[1/6,1/3]] (to 1 ulp) and p = 2 the Simpson-
+        consistent le/30 [[4,2,-1],[2,16,2],[-1,2,4]].  dim=2:
+        (p+1)-node edges; dim=3: (p+1)^2-node quad faces."""
+        from ..mesh.basis import gauss_1d, lagrange_1d
         coords = self.mesh.node_coords
         vax = self.dm.dim - 1
         ymax = coords[:, vax].max()
@@ -470,12 +478,15 @@ class WodoFilmStepper(TernaryCHStepper):
         self.y_comp = float(ymax)     # computational vertical extent
         self.top_nodes = np.where(coords[:, vax] > ymax - tol)[0]
         assert len(self.top_nodes) > 0
-        m1 = np.array([[1.0 / 3.0, 1.0 / 6.0],
-                       [1.0 / 6.0, 1.0 / 3.0]])
         faces, fmass = [], []
         for pv, conn in self.mesh.conn_of.items():
+            # 1-D consistent edge mass on the unit interval, per degree
+            # (reference [-1, 1] halved) — quadrature-built, basis-generic
+            pts, wts = gauss_1d(int(pv))
+            Nq = np.array([lagrange_1d(int(pv), x)[0] for x in pts])
+            m1 = 0.5 * np.einsum("q,qa,qb->ab", wts, Nq, Nq)
             offs = _local_offsets(pv, self.dm.dim)
-            top_loc = np.where(offs[:, vax] == pv)[0]   # p=1: 2^(d-1)
+            top_loc = np.where(offs[:, vax] == pv)[0]   # (p+1)^(d-1) nodes
             of = offs[top_loc][:, :vax]                 # in-face offsets
             Mu = np.ones((len(top_loc), len(top_loc)))
             for dd in range(vax):

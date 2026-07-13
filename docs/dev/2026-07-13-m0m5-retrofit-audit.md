@@ -80,8 +80,17 @@ specific documented truncation/limit; **no** = hardcoded assumption;
   in the steppers, compute (c0, ch) from r = dt/dt_prev (constant-dt
   arithmetic is bit-identical: r=1 gives exactly 1.5/2.0/−0.5);
   adaptive_march saves/restores dt_prev with the rest of the rewind
-  state (reject consistency).
-- **G4 — NS p2 VMS residual completeness** (fix, operator side): add
+  state (reject consistency).  MEASURED PRE-FIX MECHANISM (CH poly,
+  stable c0 = 0.8 relaxation, L4-p1, T = 0.096, ref BDF2 dt = 2e-4):
+  alternating (dt, dt/2) sequence with the constant-step coefficients
+  converges at order 0.90/0.95 with errors 4-20x the fixed-dt run;
+  fixed-dt control is clean 2.18/2.07 — the inconsistency is real and
+  first-order, exactly the variable-coefficient gap.
+- **G4 — NS p2 VMS residual completeness** (fix, operator side).
+  MEASURED PRE-FIX MECHANISM (steady Oseen vortex MMS, nu = 0.01,
+  velocity L2): p1 orders 2.08/2.06 (correct), p2 orders 2.15/1.85 —
+  capped at 2 instead of 3, the same incomplete-residual mechanism
+  measured on the scalar brick (2.11 vs 3.00 complete).  Fix: add
   −nu·lapN(u_b)·(2/h)² to `resu` in make_linear_ns_Ae (lapN tables
   already on every bin); thread b["lapN"] through assemble_linear_ns and
   DeviceNSAssembler.assemble.  At p1 adds exact zeros (lapN ≡ 0) —
@@ -100,6 +109,31 @@ specific documented truncation/limit; **no** = hardcoded assumption;
   re-point multiphase + wodo; costs the full multiphase regression
   suite; do when multiphase is next open anyway.
 
-## R2/R3 — fix log and verdicts
+## R2 — fix log
 
-(filled per green stage below)
+### G1 — wodo_film basis-generic + generic face quadrature (FIXED)
+
+CHANGE (wodo_film.py only): `_build_top_faces` now builds the 1-D
+consistent edge mass per degree bin by (p+1)-point Gauss quadrature over
+the tabulated 1-D Lagrange basis (the A4a pattern; builder duplicated
+locally because multiphase.py imports FROM wodo_film — G7 unification
+frontier), tensor-producted over the lateral dims exactly as before; the
+`p == 1` assert is lifted.  Volume kernel unchanged (was already
+nbf/nqp-generic).
+
+GATES (measured 2026-07-13, RTX 6000 Ada cuda:0):
+
+| gate | measured | lock | verdict |
+|---|---|---|---|
+| (i) p1 regression parity (pre-change code vs post, fig67-class config, 10 fixed-dt steps, host path) | face-mass max dev 8.7e-19 (1-ulp class); trajectory rel dev max 5.9e-16; h_curr bit-identical | 1e-14 (17x headroom) | PASS |
+| (i') face-mass analytic reproduction | p1 vs le[[1/3,1/6],[1/6,1/3]] and p2 vs le/30[[4,2,-1],[2,16,2],[-1,2,4]]: < 1e-15 | 1e-15 | PASS (test_wodo_face_mass_generic) |
+| (ii) p2 capability — conservation mechanism | march to h=0.9 (L5 strip, k_e=1): content drift (1.4e-16, 0.0); enrichment + thinning clean, 0 rejects.  Mechanism: a p1-shaped face mass at p2 leaks solute at rate 2·K·Phi — exactness is the face-term correctness certificate | 1e-12 | PASS (test_wodo_film_p2) |
+| (ii') p2 measured accuracy (A4a Richardson pattern: smooth deterministic run, fixed-dt common-mode, ref L6-p2) | L4-p1 err 2.02e-3 vs L4-p2 1.93e-4 — p2 beats p1 at the same h by 10.5x | e_p2 < 0.5 e_p1 (5x headroom) | PASS (test_wodo_p2_beats_p1) |
+| (iii) cross-matrix: p2 x device assembly | 5-step host-vs-device trajectory parity 3.0e-16; h_curr identical | 1e-11 | PASS (folded into test_wodo_film_p2) |
+
+SUITES: tests/test_wodo_film.py 6/6 passed (32.9 s) incl. the three new
+gates; tests/test_ternary_ch.py + tests/test_film_frontend.py (below).
+
+## R3 — verdict
+
+(filled at close)
