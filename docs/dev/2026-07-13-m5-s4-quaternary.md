@@ -153,7 +153,7 @@ rejects.
 | cell | feature | measured |
 |---|---|---|
 | S4a x p=2 basis | moving-frame bookkeeping | L4 p=2: SM drift 0.0, poly drift 0.0 (EXACT); fast 0.302 slow 0.411 (same selective-evaporation signature as p=1) — the nbf/nqp-generic factory |
-| S4b x BDF2 tstep | K=3 crystallization | short anneal under BDF2: X_A > X_B > X_C ordering preserved, 0 rejects (deterministic) |
+| S4b x BDF2 tstep | K=3 crystallization | short anneal (t=1.0) under BDF2: X_A 0.405, X_B 0.428, X_C 0.269 — matches BDF1 at the same time to ~1%, 0 rejects (deterministic).  NOTE: at t=1.0 the fast-starting B still leads A; the X_A > X_B ordering is a PLATEAU property (crossover ~t=1.6 under BDF1) — the cell locks the early-time invariant (A, B both grow clear of laggard C) |
 
 ## Suite status
 
@@ -165,9 +165,20 @@ New: tests/test_multiphase_s4.py — 6 gates:
 - test_s4b_three_species_crystallization  (gates i+ii+iii)
 - test_s4b_bdf2_deterministic             (cross-matrix BDF2)
 
-Regression: test_multiphase.py, _apack.py, _s3.py, _s2.py (deselect
-only test_s2c_crystallite_quench_and_dissolution) — status recorded at
-commit time.
+S4 suite (2026-07-13, split GPU0/GPU1): 6/6 PASSED (S4a 4/4 in 7:23;
+S4b crystallization + BDF2 cell green, BDF2 re-run 97 s after the
+plateau-vs-early-time assertion fix).
+
+Regression net (2026-07-13, GPU0, HOST): test_multiphase.py +
+_apack.py + _s3.py + _s2.py (deselecting only
+test_s2c_crystallite_quench_and_dissolution, the standing exclusion):
+42 passed, 1 deselected in 5847 s (1:37:27) — GREEN.  Zero source
+changes in S4, so the baseline is untouched by construction.
+
+S4 GREEN => M5 (OrgElMorph) COMPLETE: S0 amorphous regression, S1
+binary annealing, S2 ternary annealing, S3 evaporation-induced film,
+S4 quaternary demonstrations — all stages delivered with measured
+gates; the (M, K) factory generality demonstrated config-only.
 
 ## Frontiers
 
