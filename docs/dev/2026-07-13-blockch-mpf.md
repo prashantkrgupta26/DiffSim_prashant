@@ -75,7 +75,7 @@ walls are host-inner walls — B2 is the performance path):
 |---|---|---|---|---|---|---|---|
 | film (M2, K1) frozen + FDT noise, 10 steps | 5.3e-14 | 0/0 | 60 | 4 / 3.0 | 0 | 289,530 | 22.5 / 19.9 s |
 | quench16390 (M2, K2, fig6 pars) frozen + noise, 10 steps | 2.3e-14 | 0/0 | 32 | 33 / 15.9 | 0 | 3,552,418 | 29.5 / 253 s |
-| kwc_grains (M2, K2 + KWC theta, 15 crystallites), 6 steps | KWC-ROW | | | | | | |
+| kwc_grains (M2, K2 + KWC theta, 15 crystallites) | HOST-INNER WALL: exceeded 25 min (10 steps) and 40 min (6 steps) caps — the KWC KG-Picard Newton tail x host GMRES inners; NOT a convergence failure.  Correctness gated by the KWC ONE-SOLVE parity (measured below); the march-scale path is device inners. | | | | | | |
 | bdf2 film deterministic, 10 steps | 3.0e-14 | 0/0 | 38 | 4 / 3.0 | 0 | 116,403 | 5.5 / 8.6 s |
 | fig4 annealing (M1, K1), 10 steps | 3.4e-14 | 0/0 | 31 | 4 / 3.0 | 0 | 77,764 | 3.7 / 7.3 s |
 | deepq chi12=3 (M2, K0, marginal, M12=-0.2), 6 steps | 1.2e-12 | 0/0 | 20 | 5 / 3.5 | 0 | 214,656 | 2.4 / 17.8 s |
@@ -107,9 +107,48 @@ boundary carries over 1:1; the failure mode is dt-penalty (not crash),
 matching cudss divergence semantics.  Gate:
 test_mpf_blockch_deepq_boundary_ladder.
 
-## 3. B2 — device-resident path
+## 3. B2 — device-resident path, measured (bench m5_device_assembly
+--solver blockch_dev; same protocol/case family as the D3 table —
+3 timed steps after setup, fixed dt, S3b film physics; RTX 6000 Ada,
+quiet box; cuDSS references from the D3 table + fresh masked rows)
 
-TABLE-B2
+| case | dofs | cuDSS-device s/step (s/call) | blockch_dev s/step (s/call) | blockch GPU MiB |
+|---|---|---|---|---|
+| 2d_l6 | 24,960 | 0.116 (0.091/step solve) | 60.1 (3.31) | 1,507 |
+| 2d_l7 | 99,072 | 0.389 | 90.4 (4.71) | 1,577 |
+| 2d_l8 | 394,752 | 2.116 | 136.6 (7.52) | 1,577 |
+| 3d_l4 | 26,112 | 0.790 | 11.5 (1.25) | 4,755 |
+| 3d_l5 | 202,752 | 28.3 (6.95/call) | **18.5 (1.44/call)** | 22,131* |
+| 3d_slab64 | 417,792 | 71.7 (**17.7**/call) | **27.1 (2.10/call)** | 22,131* |
+| 3d_slab64 + blockmask | 417,792 | 45.4 (3.70/call) | 27.0 (2.12/call) | — |
+| 3d_slab64z32 | 811,008 | CEILING (>16 min factorization crawl, 48.2 GB) | **28.6 (2.16/call)** | 22,131* |
+
+(* nvidia-smi global at end of run; warp mempool high-water class.
+2-D and 3d_l4 run noise ON at the production dt — the onset iterates
+carry the high inner counts; 3-D >= l5 rows are the noise-off fixed-dt
+protocol, matching D3.)
+
+Verdicts:
+- **The B2 gate target is met decisively in 3-D**: at slab64 the
+  blockch_dev solve is 2.10 s/call vs cuDSS's measured 17.7 (8.4x);
+  step time 27.1 vs 71.7 s (2.6x).  At the 811k-dof case that
+  CEILINGED cuDSS on this card, blockch_dev marches at 28.6 s/step —
+  the G3 "resurrection" carried to the multiphase (M, K) system.
+  Step scaling l5 -> slab64 -> z32 is 18.5 -> 27.1 -> 28.6 s (2x dofs
+  per rung): strongly sublinear because the outer/host FGMRES cost
+  and inner iteration counts stay flat (4 solve calls/step, outer <= 3
+  everywhere in these runs).
+- **2-D stays cuDSS territory** (blockch_dev 26-500x slower at
+  L6-L8): the device inners are LATENCY-bound at small n (kernel
+  launches + check_every readbacks dominate) and 2-D noisy onset
+  iterates carry thousands of inner its.  This was already the G-track
+  position; recorded with numbers.
+- **blockmask fixes the cuDSS 3-D fill penalty as predicted (Sec 6
+  follow-up)**: 3d_l5 6.95 -> 1.58 s/call (4.4x), slab64 17.7 -> 3.70
+  (4.8x) — masked cuDSS BEATS blockch at 3d_l5 (19.6 vs 18.5 s/step
+  a wash) and closes to 1.7x at slab64.  Under ~500k dofs, masked
+  cuDSS is a strong option; the memory ceiling above it is unchanged
+  in kind (factorization fill), where blockch owns the field.
 
 ## 4. B3 — AMGX verdict: measured NO for the inners, NO for the raw J
 
@@ -150,9 +189,51 @@ Readings:
   the fused stack on SBM systems.  Nova needs no AMGX install for
   this pipeline.
 
-## 5. B4 — the 128x128x64 target
+## 5. B4 — the 128x128x64 target: RUNS on one 48 GB card
 
-TABLE-B4
+The explicit ambition (`3d_film128` bench case, S3b film production
+energetics, (M=2, K=1), ndof = 6): 1,048,576 elements, 1,064,960
+nodes, **6,389,760 dofs**, superset nnz 1.02B (int32-safe; masked
+0.63B).  ONE RTX 6000 Ada 48 GB, device assembly + blockch_dev,
+fixed-dt bench protocol (dt 1e-5, noise off — the D3 3-D convention):
+
+| pattern | setup + first step | s/step (3 timed) | asm s/call | solve s/call | Newton its/step | GPU | host RSS |
+|---|---|---|---|---|---|---|---|
+| superset (1.02B nnz) | 939.9 s (13 Newton its at the noisy IC) | **146.6** | 2.80 | 9.46 | 4 | **22.0 GB** | 14.6 GB |
+| block-masked (0.63B) | 600.7 s | 168.6 | 3.33 | 10.7 | 4 | 18.3 GB | 11.3 GB |
+
+(Masked is ~15% slower per step — the masked scatter's per-entry
+colpos indirection costs more than the smaller full-A spmv saves,
+because the blockch inners run on the PAIR blocks, which are
+identical in both patterns — but it buys 3.7 GB GPU / 3.3 GB host and
+a 1.6x faster setup.  Use the mask when memory or cuDSS is the
+binder; superset when raw step time is.)
+
+- cuDSS CANNOT touch this size on any card class here — its measured
+  48 GB ceiling was 812k dofs (7.9x fewer): this is the deliverable
+  Baskar asked for, at less than HALF the card.
+- **Honest march caveat (measured)**: the full noisy-quench march
+  ladder at this size is NOT yet practical with the 2-D-calibrated
+  FDT amplitudes.  noise_psi = 5e-3 at dt 1e-5/2.5e-6: the attempt
+  DIVERGES in the linear solver after 3-5 Newton its (170-228
+  s/attempt) — and the ladder's dt collapse makes the FDT amplitude
+  LARGER (q ~ dt^-1/2 h^-3/2; at h = 1/128 3-D the per-GP forcing is
+  ~30x the 2-D-L6 value the 5e-3 knob was calibrated on).  At
+  noise_psi = 1e-3 (the G5-rung-c class) a single onset attempt ground
+  past 40 min without resolution (killed).  The noise amplitude is
+  the anchor's CALIBRATION knob (module docstring) — a 3-D
+  recalibration (or measure-scaled amplitude) is the recorded
+  frontier before noisy production marches at this size; the
+  deterministic quench marches fine (this table; 12 accepted
+  fixed-dt Newton solves, zero rejects).
+
+A100-80 (Nova) extrapolation basis, honest: the march is spmv/
+bandwidth-bound (solve = 78% of step; inners are Jacobi-Krylov on
+CSR blocks) -> HBM2e ~2.0 TB/s vs GDDR6 ~0.96 TB/s gives ~2x on the
+solve, ~1.9x on assembly (same class) => **~75-80 s/step expected at
+128x128x64 on A100-80**, with 80 GB clearing 3.6x the measured 22 GB
+footprint — headroom for ~192x192x96 (ndof 6, superset int32 limit
+1.47M nodes masked / int64 variant beyond) or the mk32 ladder below.
 
 ## 6. B5 — (M=3, K=2) capacity study (ndof = 10)
 
@@ -189,4 +270,38 @@ Standing facts this table forces:
   at full res — they fit).
   (ii) multi-GPU domain decomposition (out of scope here).
 
-TABLE-B5 (measured ladder)
+Measured ladder (bench `*_mk32` cases, S3b-family energetics extended
+to 3 retained species / 2 crystallizable, frozen theta, fastmode_n
+Vignes; device assembly + blockch_dev + block-masked pattern (54/100
+live); fixed-dt 1e-5, noise off; one 48 GB card):
+
+| rung | dofs | masked nnz | setup+first step | s/step | asm s/call | solve s/call | GPU | host |
+|---|---|---|---|---|---|---|---|---|
+| 64x64x32 | 1,351,680 | 0.193B | 88.4 s | 48.6 | 0.54 | 3.47 | 22.1 GB* | 2.8 GB |
+| 128x128x48 | 8,028,160 | 1.155B | 474.9 s | 128.2 | 3.06 | 7.33 | 22.1 GB* | 14.3 GB |
+| 128x128x64 | 10,649,600 | 1.537B | 612.1 s | 160.8 | 4.08 | 9.06 | 23.9 GB | 18.9 GB |
+| 128x128x88 (99% of int32) | 14,581,760 | 2.126B | 1125.2 s (3-reject onset ladder included) | NOT CAPTURED (run cut by an external task kill; observed running at 43.3 GB) | | | 43.3 GB obs | |
+
+(* global nvidia-smi at end of run.)  All completed rungs: 4 Newton
+its/step, zero fallbacks.  The (M=3, K=2) system at 10.6M dofs steps
+in ~2.7 min on one 48 GB card; the int32-ceiling rung (14.6M dofs)
+SETS UP AND STEPS within 43.3 GB but its steady s/step needs a
+re-run (recorded).
+
+**Matrix-free-outer assessment for 256x256x128 (84.5M dofs)** — the
+measured basis: the mk32 assembly fill costs 3.06-4.08 s/call at
+8-10.6M dofs (== 2.9-3.8 us/element at nl = 80); a batch-wise J.v
+through the SAME kernels (fill Ae per batch, apply Ae @ v_e, scatter
+— never store the CSR) costs one fill pass + O(cheap) per apply =>
+**~25-35 s per J.v at 8.39M elements** on this card (~12-17 s on
+A100-80 bandwidth-scaled).  A blockch-preconditioned outer needs
+~4-10 J.v per Newton solve (outer its measured 1-4 at production
+iterates, each outer it = 1 matvec + preconditioner) => ~2-6 min per
+Newton solve, ~10-25 min/step class on A100-80 — VIABLE but
+painful; the W-factor inners can stay stored (pair-block CSRs are
+node-pattern-sized, ~5.5 GB for 3 pairs + 2 AC at full res — they
+fit).  The stored-CSR road ends at ~1.47M nodes (int32) / ~19 GB
+values on this card; an int64 slot variant + 80 GB extends to ~3M
+nodes (~172x172x100).  256x256x128 therefore needs the matrix-free
+outer OR multi-GPU decomposition — recorded as the honest Nova
+answer; neither is implemented here.
