@@ -38,10 +38,14 @@ into the monolithic block this brick assembles:
   (energy-stable; the operator's (div a) uses the DISCRETE advecting field);
 - tau frozen at the advecting velocity (calc_tau at a), metric form,
   sigma = b0/dt into both the mass term and tau's transient part;
-- stabilization on the LINEARIZED strong residual
-      res_M = sigma u + a.grad u + grad p - f      (nu lap u_h dropped at
-  p1 — Q1 diagonal second derivatives vanish identically; production gates
-  the d2N term on elemOrder >= 2, same as the M1a shift rule);
+- stabilization on the LINEARIZED strong residual (retrofit G4,
+  2026-07-13: the COMPLETE form)
+      res_M = sigma u + a.grad u + grad p - nu lap u_h - f
+  The -nu lap u_h term rides the lapN tables: identically ZERO at p1
+  (Q1 diagonal second derivatives vanish — p1 assembly bit-identical to
+  the pre-G4 code) and REQUIRED at p2, where omitting it caps the
+  velocity L2 order at 2 (measured 2.15/1.85 pre-fix — the same
+  incomplete-residual mechanism measured on the scalar brick);
 - SUPG test (a.grad w) tau res_M, PSPG (grad q) tau res_M, grad-div
   tauC (div w)(div u); NO tauM^2 Reynolds terms (linearized operator drops
   them — conventions item 4).
@@ -78,6 +82,7 @@ def make_linear_ns_Ae(nbf: int, nqp: int, dim: int):
                   h: wp.array(dtype=wp.float64),
                   Ntab: wp.array2d(dtype=wp.float64),
                   dNtab: wp.array3d(dtype=wp.float64),
+                  lapNtab: wp.array2d(dtype=wp.float64),
                   wtab: wp.array(dtype=wp.float64),
                   aq: wp.array2d(dtype=wp.float64),
                   div_aq: wp.array(dtype=wp.float64),
@@ -118,8 +123,12 @@ def make_linear_ns_Ae(nbf: int, nqp: int, dim: int):
                             * fe_dN_s(dNtab, fe, b, d, dscale)
                     # generalized M_{a,s} convection (s runtime; default 1/2)
                     conv = agu + s_skew * diva * Nb
-                    # linearized momentum strong residual factor on u_b:
-                    resu = sigma * Nb + conv
+                    # linearized momentum strong residual factor on u_b —
+                    # COMPLETE (G4): sigma u + a.grad u - nu lap u.  The
+                    # lapN term is exactly 0 at p1 (bit-identical) and
+                    # restores order 3 at p2 (scalar-brick mechanism).
+                    resu = sigma * Nb + conv \
+                        - nu * lapNtab[fe.q, b] * dscale * dscale
                     diag = (sigma * Na * Nb + Na * conv + nu * lap
                             + tauM * agw * resu) * dJxW
                     for i in range(dim):
@@ -251,6 +260,7 @@ def assemble_linear_ns(dm, aq_by_bin, div_aq_by_bin, fq_by_bin, nu,
         kA = make_linear_ns_Ae(nbf, nqp, dim)
         kb = make_linear_ns_be(nbf, nqp, dim)
         wp.launch(kA, dim=ne, inputs=[b["conn"], b["h"], b["N"], b["dN"],
+                                      b["lapN"],       # G4: complete resu
                                       b["w"], aq, dq, gaq, wp.float64(nu),
                                       wp.float64(sigma), wp.float64(sig2tau),
                                       wp.float64(s_skew),

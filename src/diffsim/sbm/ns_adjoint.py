@@ -69,6 +69,7 @@ def make_lin_ns_residual(nbf: int, nqp: int, dim: int,
                    h: wp.array(dtype=wp.float64),
                    Ntab: wp.array2d(dtype=wp.float64),
                    dNtab: wp.array3d(dtype=wp.float64),
+                   lapNtab: wp.array2d(dtype=wp.float64),
                    wtab: wp.array(dtype=wp.float64),
                    aq: wp.array2d(dtype=wp.float64),        # DIFF
                    div_aq: wp.array(dtype=wp.float64),      # DIFF
@@ -102,10 +103,13 @@ def make_lin_ns_residual(nbf: int, nqp: int, dim: int,
             pv_ = wp.float64(0.0)
             gp0 = wp.float64(0.0)
             gp1 = wp.float64(0.0)
+            lap0 = wp.float64(0.0)    # lap(u0): G4 residual completion
+            lap1 = wp.float64(0.0)
             for b in range(nbf):
                 Nb = Ntab[q, b]
                 dnb0 = dNtab[q, b, 0] * dscale
                 dnb1 = dNtab[q, b, 1] * dscale
+                lnb = lapNtab[q, b] * dscale * dscale
                 xb0 = x[conn[e, b] * 3 + 0]
                 xb1 = x[conn[e, b] * 3 + 1]
                 pb = x[conn[e, b] * 3 + 2]
@@ -115,6 +119,8 @@ def make_lin_ns_residual(nbf: int, nqp: int, dim: int,
                 g01 += dnb1 * xb0
                 g10 += dnb0 * xb1
                 g11 += dnb1 * xb1
+                lap0 += lnb * xb0
+                lap1 += lnb * xb1
                 pv_ += Nb * pb
                 gp0 += dnb0 * pb
                 gp1 += dnb1 * pb
@@ -139,10 +145,14 @@ def make_lin_ns_residual(nbf: int, nqp: int, dim: int,
             tauC = wp.float64(1.0) / (tauM * wp.float64(2.0)
                                       * wp.float64(4.0) / (he * he))
             diva = div_aq[gp]
-            # strong linearized momentum residual (nu-lap dropped at p1)
+            # strong linearized momentum residual — COMPLETE (retrofit
+            # G4, matches ns_bricks make_linear_ns_Ae): the -nu lap(u)
+            # term is exactly 0 at p1 (lapN tables vanish) and required
+            # at p2; the taped twin MUST mirror the forward operator or
+            # the dnu cotangent diverges from FD at p2 (measured).
             sfac = sigma + s_skew * diva
-            rm0 = sfac * u0 + a0 * g00 + a1 * g01 + gp0
-            rm1 = sfac * u1 + a0 * g10 + a1 * g11 + gp1
+            rm0 = sfac * u0 + a0 * g00 + a1 * g01 + gp0 - nu * lap0
+            rm1 = sfac * u1 + a0 * g10 + a1 * g11 + gp1 - nu * lap1
             conv0 = a0 * g00 + a1 * g01
             conv1 = a0 * g10 + a1 * g11
             for a in range(nbf):
@@ -199,7 +209,9 @@ def ns_volume_cotangents(dm, aq_by_bin, div_aq_by_bin, nu, sigma, s_skew,
                      requires_grad=True)
         with tape:
             wp.launch(k, dim=len(b["eids"]),
-                      inputs=[b["conn"], b["h"], b["N"], b["dN"], b["w"],
+                      inputs=[b["conn"], b["h"], b["N"], b["dN"],
+                              b["lapN"],       # G4: complete residual
+                              b["w"],
                               aq, dq, aq_f, nu_a, wp.float64(sigma),
                               wp.float64(sig2tau), wp.float64(s_skew),
                               x_d, r], device=d)
@@ -318,6 +330,7 @@ def _make_lin_ns_residual_3d(nbf: int, nqp: int, tau_frozen: bool):
                     h: wp.array(dtype=wp.float64),
                     Ntab: wp.array2d(dtype=wp.float64),
                     dNtab: wp.array3d(dtype=wp.float64),
+                    lapNtab: wp.array2d(dtype=wp.float64),
                     wtab: wp.array(dtype=wp.float64),
                     aq: wp.array2d(dtype=wp.float64),       # DIFF
                     div_aq: wp.array(dtype=wp.float64),     # DIFF
@@ -351,11 +364,15 @@ def _make_lin_ns_residual_3d(nbf: int, nqp: int, tau_frozen: bool):
             gp0 = wp.float64(0.0)
             gp1 = wp.float64(0.0)
             gp2 = wp.float64(0.0)
+            lap0 = wp.float64(0.0)    # lap(u_c): G4 residual completion
+            lap1 = wp.float64(0.0)
+            lap2 = wp.float64(0.0)
             for b in range(nbf):
                 Nb = Ntab[q, b]
                 d0 = dNtab[q, b, 0] * dscale
                 d1 = dNtab[q, b, 1] * dscale
                 d2 = dNtab[q, b, 2] * dscale
+                lnb = lapNtab[q, b] * dscale * dscale
                 xb0 = x[conn[e, b] * 4 + 0]
                 xb1 = x[conn[e, b] * 4 + 1]
                 xb2 = x[conn[e, b] * 4 + 2]
@@ -372,6 +389,9 @@ def _make_lin_ns_residual_3d(nbf: int, nqp: int, tau_frozen: bool):
                 g20 += d0 * xb2
                 g21 += d1 * xb2
                 g22 += d2 * xb2
+                lap0 += lnb * xb0
+                lap1 += lnb * xb1
+                lap2 += lnb * xb2
                 pv_ += Nb * pb
                 gp0 += d0 * pb
                 gp1 += d1 * pb
@@ -397,10 +417,14 @@ def _make_lin_ns_residual_3d(nbf: int, nqp: int, tau_frozen: bool):
             tauC = wp.float64(1.0) / (tauM * wp.float64(3.0)
                                       * wp.float64(4.0) / (he * he))
             diva = div_aq[gp]
+            # COMPLETE residual (G4; see the 2-D twin's comment)
             sfac = sigma + s_skew * diva
-            rm0 = sfac * u0 + a0 * g00 + a1 * g01 + a2 * g02 + gp0
-            rm1 = sfac * u1 + a0 * g10 + a1 * g11 + a2 * g12 + gp1
-            rm2 = sfac * u2 + a0 * g20 + a1 * g21 + a2 * g22 + gp2
+            rm0 = sfac * u0 + a0 * g00 + a1 * g01 + a2 * g02 + gp0 \
+                - nu * lap0
+            rm1 = sfac * u1 + a0 * g10 + a1 * g11 + a2 * g12 + gp1 \
+                - nu * lap1
+            rm2 = sfac * u2 + a0 * g20 + a1 * g21 + a2 * g22 + gp2 \
+                - nu * lap2
             conv0 = a0 * g00 + a1 * g01 + a2 * g02
             conv1 = a0 * g10 + a1 * g11 + a2 * g12
             conv2 = a0 * g20 + a1 * g21 + a2 * g22

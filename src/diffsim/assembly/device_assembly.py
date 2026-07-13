@@ -385,7 +385,9 @@ class DeviceNSAssembler:
             kA = make_linear_ns_Ae(nbf, nqp, dm.dim)
             kb = make_linear_ns_be(nbf, nqp, dm.dim)
             wp.launch(kA, dim=ne,
-                      inputs=[b["conn"], b["h"], b["N"], b["dN"], b["w"],
+                      inputs=[b["conn"], b["h"], b["N"], b["dN"],
+                              b["lapN"],   # G4: complete SUPG/PSPG resu
+                              b["w"],
                               aq, dq, gaq, wp.float64(nu),
                               wp.float64(sigma), wp.float64(sig2tau),
                               wp.float64(s_skew), wp.int32(0), Ae],

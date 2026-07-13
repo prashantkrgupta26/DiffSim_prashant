@@ -45,7 +45,9 @@ def _r_dot_lam(dm, aq, dq, nu, sigma, s_skew, x_full, lam_full):
     k = make_lin_ns_residual(b["nbf"], b["nqp"], dim)
     r = wp.zeros(dm.n_nodes * 3, dtype=wp.float64, device=d)
     wp.launch(k, dim=len(b["eids"]),
-              inputs=[b["conn"], b["h"], b["N"], b["dN"], b["w"],
+              inputs=[b["conn"], b["h"], b["N"], b["dN"],
+                      b["lapN"],       # G4: complete residual
+                      b["w"],
                       wp.array(np.ascontiguousarray(aq[pv]),
                                dtype=wp.float64, device=d),
                       wp.array(np.ascontiguousarray(dq[pv]),
@@ -87,6 +89,7 @@ def test_tape_vs_kernel_fd(device):
             r = wp.zeros(dm.n_nodes * 3, dtype=wp.float64, device=d)
             wp.launch(k, dim=len(pvb["eids"]),
                       inputs=[pvb["conn"], pvb["h"], pvb["N"], pvb["dN"],
+                              pvb["lapN"],   # G4
                               pvb["w"],
                               wp.array(np.ascontiguousarray(afield),
                                        dtype=wp.float64, device=d),
@@ -124,7 +127,9 @@ def test_residual_matches_assembled(device):
     k = make_lin_ns_residual(b["nbf"], b["nqp"], dm.dim)
     r = wp.zeros(dm.n_nodes * 3, dtype=wp.float64, device=d)
     wp.launch(k, dim=len(b["eids"]),
-              inputs=[b["conn"], b["h"], b["N"], b["dN"], b["w"],
+              inputs=[b["conn"], b["h"], b["N"], b["dN"],
+                      b["lapN"],       # G4: complete residual
+                      b["w"],
                       wp.array(np.ascontiguousarray(aq[pv]),
                                dtype=wp.float64, device=d),
                       wp.array(np.ascontiguousarray(dq[pv]),
@@ -293,7 +298,9 @@ def test_dim3_kernels_consistency_and_tape(device):
     k = make_lin_ns_residual(b["nbf"], b["nqp"], 3)
     r = wp.zeros(dm.n_nodes * 4, dtype=wp.float64, device=d)
     wp.launch(k, dim=len(b["eids"]),
-              inputs=[b["conn"], b["h"], b["N"], b["dN"], b["w"],
+              inputs=[b["conn"], b["h"], b["N"], b["dN"],
+                      b["lapN"],       # G4: complete residual
+                      b["w"],
                       wp.array(np.ascontiguousarray(aq[pv]),
                                dtype=wp.float64, device=d),
                       wp.array(np.ascontiguousarray(dq[pv]),
@@ -319,7 +326,9 @@ def test_dim3_kernels_consistency_and_tape(device):
     def rdot(afield, nuv):
         rr = wp.zeros(dm.n_nodes * 4, dtype=wp.float64, device=d)
         wp.launch(k, dim=len(b["eids"]),
-                  inputs=[b["conn"], b["h"], b["N"], b["dN"], b["w"],
+                  inputs=[b["conn"], b["h"], b["N"], b["dN"],
+                      b["lapN"],       # G4: complete residual
+                      b["w"],
                           wp.array(np.ascontiguousarray(afield),
                                    dtype=wp.float64, device=d),
                           wp.array(np.ascontiguousarray(dq[pv]),

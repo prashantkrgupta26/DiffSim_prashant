@@ -103,3 +103,60 @@ def test_low_viscosity_stability(device):
     # advection-dominated: nu = 1e-3 at level 4 — SUPG keeps it clean
     hu, hp = _solve(4, 1e-3, True, device)
     assert np.isfinite(hu) and hu < 0.5, (hu, hp)
+
+
+# ---------------------------------------------------------------------
+# Retrofit G4 (2026-07-13): COMPLETE SUPG/PSPG strong residual — the
+# -nu lap(u_h) term rides the lapN tables (exactly zero at p1: p1
+# assembly bit-identical pre/post, measured 0.0 on 8-step linearized +
+# Leray trajectories).  Pre-fix the p2 velocity L2 order was CAPPED at
+# 2.15/1.85; complete residual restores 3.06/3.06 (the scalar-brick
+# mechanism, scalar_transport.py:92-96).
+# ---------------------------------------------------------------------
+def test_oseen_p2_order(device):
+    """G4 gate: steady Oseen MMS at p = 2 converges at order 3 in the
+    velocity L2 (quadrature norm).  Measured at the retrofit: errs
+    1.45e-2 / 1.74e-3 / 2.10e-4 at L2/L3/L4 — orders 3.06/3.06; lock
+    2.6 (the CH p2 lock class)."""
+    from diffsim.physics.poisson import l2_error
+
+    def solve_p2(level):
+        nu = 0.01
+        tree = build_uniform(level, dim=2)
+        mesh = build_mesh(tree, p=2)
+        cons = build_constraints(mesh)
+        dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(2, dim=2),
+                                  device)
+        ndof = 3
+        xq = gauss_points(mesh, dm.tables_by_p)
+        aq = {pv: u_star(xq[pv]) for pv in xq}
+        dq = {pv: np.zeros(len(xq[pv])) for pv in xq}
+        fq = {pv: f_star(xq[pv], nu, 0.0, True) for pv in xq}
+        A, b = assemble_linear_ns(dm, aq, dq, fq, nu, sigma=0.0)
+        nfree = cons.T.shape[1]
+        bdry = mesh.boundary_nodes[cons.free_nodes]
+        rows = []
+        for i in np.where(bdry)[0]:
+            rows += [i * ndof, i * ndof + 1]
+        rows.append(2)
+        A = A.tolil()
+        for r in rows:
+            A.rows[r] = [r]
+            A.data[r] = [1.0]
+        A = A.tocsr()
+        b[rows] = 0.0
+        coords0 = mesh.node_coords[cons.free_nodes][0:1]
+        b[2] = p_star(coords0)[0]
+        x = splu(A.tocsc()).solve(b).reshape(nfree, ndof)
+        e2 = 0.0
+        for c in range(2):
+            e = l2_error(dm, np.asarray(cons.T @ x[:, c]),
+                         lambda xx, c=c: u_star(xx)[:, c])
+            e2 += e * e
+        return np.sqrt(e2)
+
+    errs = [solve_p2(lv) for lv in (2, 3, 4)]
+    orders = [np.log2(errs[i] / errs[i + 1]) for i in range(2)]
+    print(f"NS Oseen p2: errs {['%.2e' % e for e in errs]} orders "
+          f"{['%.2f' % o for o in orders]}")
+    assert min(orders) > 2.6, (errs, orders)
