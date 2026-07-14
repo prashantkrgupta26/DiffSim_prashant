@@ -20,7 +20,9 @@ import numpy as np
 
 from adaptivity import (octree_refinement, transfer_error,
                         transfer_error_sweep, adaptive_time_stepping,
-                        adaptive_cost, bdf2_variable_order)
+                        adaptive_cost, bdf2_variable_order,
+                        fe_conservative_transfer, dynamic_amr_cycle,
+                        amr_error_vs_dofs, spacetime_order)
 
 FIGDIR = os.path.join(os.path.dirname(__file__),
                       "..", "..", "latex", "figures")
@@ -116,12 +118,92 @@ def cost_figure(ac, fname):
     print("wrote", fname)
 
 
+def amr_cycle_figure(cy, fname):
+    from matplotlib.collections import PatchCollection
+    from matplotlib.patches import Rectangle
+    out = cy["out"]
+    mesh = out["mesh"]
+    tree = mesh.tree
+    centers, hs, lev = tree.centers(), tree.h(), np.asarray(tree.levels)
+    cfull = np.asarray(out["cons"].T @ out["final_c"])
+    cc = cfull[mesh.conn_of[1]].mean(1)
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(9.0, 4.3), dpi=150)
+    r1 = [Rectangle((cx - h / 2, cy2 - h / 2), h, h)
+          for (cx, cy2), h in zip(centers, hs)]
+    pc = PatchCollection(r1, cmap="viridis", edgecolor="k", linewidth=0.15)
+    pc.set_array(lev.astype(float)); a1.add_collection(pc)
+    a1.set_xlim(0, 1); a1.set_ylim(0, 1); a1.set_aspect("equal")
+    a1.set_title("Adaptive mesh (color = octree level)")
+    plt.colorbar(pc, ax=a1, fraction=0.046)
+    r2 = [Rectangle((cx - h / 2, cy2 - h / 2), h, h)
+          for (cx, cy2), h in zip(centers, hs)]
+    pc2 = PatchCollection(r2, cmap="coolwarm")
+    pc2.set_array(cc); a2.add_collection(pc2)
+    a2.set_xlim(0, 1); a2.set_ylim(0, 1); a2.set_aspect("equal")
+    a2.set_title("c: refinement tracks the interface")
+    plt.colorbar(pc2, ax=a2, fraction=0.046)
+    fig.savefig(os.path.join(FIGDIR, fname), bbox_inches="tight",
+                facecolor="white")
+    plt.close(fig)
+    print("wrote", fname)
+
+
+def amr_conservation_figure(cy, fname):
+    rec = cy["out"]["rec"]
+    t = np.array(rec["t"]); mass = np.array(rec["mass"])
+    en = np.array(rec["energy"])
+    dm = np.abs(np.array(rec["remesh_mass_after"])
+                - np.array(rec["remesh_mass_before"]))
+    dE = np.abs(np.array(rec["remesh_E_after"])
+                - np.array(rec["remesh_E_before"]))
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(9.2, 3.8), dpi=150)
+    a1.plot(t, mass - mass[0], color="#11aa66")
+    for rt in rec["remesh_t"]:
+        a1.axvline(rt, color="#bbb", lw=0.6, ls="--")
+    a1.set_xlabel("t"); a1.set_ylabel(r"$\int c\,dV-\int c_0\,dV$")
+    a1.set_title(f"Mass drift (max remesh jump {dm.max():.0e})")
+    a1.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    a2.plot(t, en, color="#3366cc")
+    for rt in rec["remesh_t"]:
+        a2.axvline(rt, color="#bbb", lw=0.6, ls="--")
+    a2.set_xlabel("t"); a2.set_ylabel("free energy $F$")
+    a2.set_title(f"Energy (max remesh jump {dE.max():.1e})")
+    fig.savefig(os.path.join(FIGDIR, fname), bbox_inches="tight",
+                facecolor="white")
+    plt.close(fig)
+    print("wrote", fname)
+
+
+def amr_error_dofs_figure(ed, fname):
+    fig, ax = plt.subplots(figsize=(5.6, 4.2), dpi=150)
+    ud = np.array([u["dofs"] for u in ed["uniform"]], float)
+    ue = np.array([u["err"] for u in ed["uniform"]], float)
+    o = np.argsort(ud)
+    ax.loglog(ud[o], ue[o], "o-", color="#444", label="uniform mesh")
+    ax.loglog([ed["amr_dofs"]], [ed["amr_err"]], "*", ms=18, color="#c1272d",
+              label="dynamic AMR")
+    ax.axhline(ed["amr_err"], ls=":", color="#c1272d", lw=0.8)
+    ax.annotate(f"{ed['dof_ratio']:.1f}x fewer dofs\nat equal error",
+                xy=(ed["amr_dofs"], ed["amr_err"]),
+                xytext=(ed["amr_dofs"] * 1.35, ed["amr_err"] * 2.2),
+                fontsize=9, color="#c1272d")
+    ax.set_xlabel("degrees of freedom")
+    ax.set_ylabel(f"L2 error vs uniform-L{ed['ref_level']} reference")
+    ax.set_title("Error vs dofs: AMR reaches uniform-fine\naccuracy at fewer "
+                 "dofs")
+    ax.legend(); ax.grid(True, which="both", alpha=0.25)
+    fig.savefig(os.path.join(FIGDIR, fname), bbox_inches="tight",
+                facecolor="white")
+    plt.close(fig)
+    print("wrote", fname)
+
+
 def sci(val):
     m, e = f"{val:.1e}".split("e")
     return rf"\ensuremath{{{m}\times10^{{{int(e)}}}}}"
 
 
-def write_numbers(o, te, ac, t, b):
+def write_numbers(o, te, ac, t, b, ft=None, cy=None, ed=None, so=None):
     def mac(name, val):
         return rf"\newcommand{{\{name}}}{{{val}}}"
     ad, m = ac["adaptive"], ac["matched"]
@@ -157,6 +239,45 @@ def write_numbers(o, te, ac, t, b):
         mac("CthreeVarOrder", f"{b['order']:.2f}"),
         mac("CthreeConstOrder", f"{b['const_order']:.2f}"),
     ]
+    if ft is not None:
+        lines += [
+            # DYNAMIC AMR — conservative transfer core (A1)
+            mac("CthreeFeMassRefine", sci(max(ft["mass_refine"], 1e-18))),
+            mac("CthreeFeMassCoarsen", sci(max(ft["mass_coarsen"], 1e-18))),
+            mac("CthreeFeTransOrder", f"{ft['order']:.2f}"),
+            mac("CthreeFeConsErr", sci(max(ft["cons_coarsen_err"], 1e-18))),
+        ]
+    if cy is not None:
+        lines += [
+            # DYNAMIC AMR — driven cycle (A2)
+            mac("CthreeAmrRemeshes", f"{cy['remeshes']}"),
+            mac("CthreeAmrMassJump", sci(max(cy["mass_jump"], 1e-18))),
+            mac("CthreeAmrEnergyJump", sci(cy["energy_jump"])),
+            mac("CthreeAmrOverlap", f"{cy['overlap_min']:.2f}"),
+            mac("CthreeAmrDofsPeak", f"{cy['dofs_peak']:,}".replace(",", "{,}")),
+        ]
+    if ed is not None:
+        finest = max(ed["uniform"], key=lambda u: u["dofs"])
+        lines += [
+            mac("CthreeAmrErr", sci(ed["amr_err"])),
+            mac("CthreeAmrDofs", f"{ed['amr_dofs']:,}".replace(",", "{,}")),
+            mac("CthreeAmrRefLevel", f"{ed['ref_level']}"),
+            mac("CthreeAmrRefDofs",
+                f"{ed['ref_dofs']:,}".replace(",", "{,}")),
+            mac("CthreeAmrDofRatio", f"{ed['dof_ratio']:.1f}"),
+            mac("CthreeAmrWallRatio", f"{ed['wall_ratio']:.1f}"),
+            mac("CthreeAmrFineLevel", f"{finest['level']}"),
+            mac("CthreeAmrFineErr", sci(finest["err"])),
+            mac("CthreeAmrFineDofs",
+                f"{finest['dofs']:,}".replace(",", "{,}")),
+        ]
+    if so is not None:
+        lines += [
+            # DYNAMIC AMR — space-time interaction (A3)
+            mac("CthreeStBothOrder", f"{so['both_order']:.2f}"),
+            mac("CthreeStDropOrder", f"{so['drop_order']:.2f}"),
+            mac("CthreeStDropPenalty", f"{so['drop_err_penalty']:.1f}"),
+        ]
     os.makedirs(os.path.dirname(NUMTEX), exist_ok=True)
     with open(NUMTEX, "w") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -174,11 +295,19 @@ def main():
     t = adaptive_time_stepping(device=args.device)
     ac = adaptive_cost(device=args.device)
     b = bdf2_variable_order(device=args.device)
+    # dynamic (solution-adaptive) AMR — the Phase-3 deliverable
+    ft = fe_conservative_transfer()
+    cy = dynamic_amr_cycle(device=args.device)
+    ed = amr_error_vs_dofs(device=args.device)
+    so = spacetime_order(device=args.device)
     octree_figure(o, "c3_octree.png")
     transfer_figure(te, sweep, "c3_transfer.png")
     ladder_figure(t, "c3_ladder.png")
     cost_figure(ac, "c3_cost.png")
-    write_numbers(o, te, ac, t, b)
+    amr_cycle_figure(cy, "c3_amr_cycle.png")
+    amr_conservation_figure(cy, "c3_amr_conservation.png")
+    amr_error_dofs_figure(ed, "c3_amr_error_dofs.png")
+    write_numbers(o, te, ac, t, b, ft=ft, cy=cy, ed=ed, so=so)
 
 
 if __name__ == "__main__":
