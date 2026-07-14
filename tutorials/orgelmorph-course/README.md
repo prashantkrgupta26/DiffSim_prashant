@@ -34,11 +34,14 @@ Every tutorial folder contains:
 
 | file | what it is |
 |------|------------|
-| `README.md` | the one-paragraph orientation + how to run |
+| `README.md` | orientation + how to run + the **mandatory template** (learning objectives, prerequisites, expected cost, required deliverable) |
 | a core module | the importable physics (the object you read first) |
 | `run.py` | the driver **you** run; prints the self-check table |
 | `gen_figures.py` | regenerates the exact figures the document shows |
 | `EXPECTED.md` | the reference numbers your run should reproduce |
+| `INSTRUCTOR.md` | instructor companion: what it really teaches, typical incorrect conclusions, runtime ranges, common CUDA/solver errors |
+| `grading_rubric.md` | the course rubric specialised to this chapter |
+| `solutions/` | hints for every exploratory question + full solutions for the verification exercises (instructor-only) |
 
 The tutorials call the **same production bricks** the research code
 uses — there are no toy re-implementations. When a tutorial looks
@@ -118,6 +121,36 @@ that the chapters and the research code share. See
 
 ---
 
+## The mandatory template, assessment, and definition of done
+
+Every chapter follows one **mandatory tutorial template** so a student
+always knows what to learn, what it costs, and what to hand in. Each
+chapter README carries *learning objectives*, *prerequisites*, *expected
+cost* (GPU/memory/runtime), and an exact *required deliverable*, on top of
+the model → run → verify → explore body.
+
+- **`ASSESSMENT.md`** — the course-level student assessment model: the
+  standard eight-item deliverable and the weighted grading rubric every
+  chapter's `grading_rubric.md` inherits.
+- **`DEFINITION_OF_DONE.md`** — the completion checklist (scientific
+  specification / numerical verification / software + CUDA / reproducibility
+  / pedagogy) a chapter — and a submission — must satisfy.
+- **Instructor companion** — each chapter ships an `INSTRUCTOR.md`,
+  `grading_rubric.md`, and a `solutions/` directory (hints for all
+  questions, full solutions for the verification exercises only).
+
+**Foundations (opening each track).** Chapter 00 (`00_setup_and_smoke_test`)
+is the environment gate. Two conceptual foundation chapters open the
+Physics and Computational tracks and are the shared reference the rest
+build on: **P00** — the model hierarchy, thermodynamics, and
+nondimensionalization (symbol table, the p1-vs-r14 χ conventions, the
+dimensional / nondimensional / numerical / accelerated separation); and
+**C00** — weak-form → CUDA (strong form → integration by parts → element
+residual/Jacobian → quadrature → local-to-global → CSR → constraints →
+Newton → linear solve → device), mapped to the exact production files.
+Later chapters reference P00/C00 for symbols and conventions rather than
+re-deriving them.
+
 ## Materials
 
 The tutorials use real material systems where it matters — see
@@ -144,3 +177,15 @@ crystallization energetics) and their provenance in the literature.
 > the gradients are taken through the same operator the research code
 > marches, not a toy — so a student learns to differentiate the real
 > simulator.
+>
+> *Scientific-workflow overhaul (Phase 2).* Every Physics (P1–P9) and
+> Computational (C1–C5) chapter now carries the full **mandatory tutorial
+> template** (objectives, prerequisites, expected cost, required
+> deliverable) and a complete **instructor companion** (`INSTRUCTOR.md`,
+> `grading_rubric.md`, `solutions/`). The course-level **assessment model**
+> (`ASSESSMENT.md`) and **definition of done** (`DEFINITION_OF_DONE.md`)
+> make the deliverable and the completion bar explicit. The **P00/C00
+> foundation chapters** and the `common/` scientific-workflow harness
+> (`docs/dev/2026-07-14-course-phase0-foundation.md`) complete the
+> derive → implement → verify → profile → interpret → perturb → reproduce
+> loop.
