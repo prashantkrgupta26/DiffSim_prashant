@@ -7,7 +7,9 @@
 flow of a Ginzburg--Landau free energy; that free energy can only
 decrease in time, and it splits into a \emph{bulk} (mixing) part and an
 \emph{interfacial} (gradient) part whose competition sets the
-morphology and its length scale.
+morphology. Two quantitative predictions fall out of the same free
+energy and we \emph{measure} both: the interface width and the
+fastest-growing wavelength that the spinodal instability selects.
 \end{keybox}
 
 \section{The model}
@@ -25,13 +27,35 @@ with two contributions:
 \begin{itemize}[nosep]
   \item the \textbf{bulk} (homogeneous) free energy density $f(c)$,
         which is minimized by the pure phases and \emph{penalized} in
-        between --- this is what drives demixing;
+        between --- this is what drives demixing. Write its scale as
+        $W$, the height of the barrier between the two wells (units of
+        energy/volume);
   \item the \textbf{interfacial} term $\tfrac{\kappa}{2}|\grad c|^2$,
         which penalizes spatial variation of $c$ and therefore
-        \emph{opposes} demixing at short scales. The coefficient
-        $\kappa>0$ has units of energy$\times$length$^2$ and sets the
-        interface width $\ell \sim \sqrt{\kappa}$.
+        \emph{opposes} demixing at short scales.
 \end{itemize}
+
+\begin{keybox}
+\textbf{The interface width is $\ell\sim\sqrt{\kappa/W}$, not
+$\sqrt{\kappa}$.} Balancing the gradient penalty against the bulk
+barrier in \eqref{eq:F}, the equilibrium interface between the two
+phases is a $\tanh$ profile of width
+%
+\begin{equation}
+  \ell \;\sim\; \sqrt{\dfrac{\kappa}{W}} .
+  \label{eq:width}
+\end{equation}
+%
+Only the \emph{ratio} $\kappa/W$ is a length$^2$: $\kappa$ alone has
+units of energy$\times$length$^2$/volume and cannot by itself set a
+width. A deeper quench (larger $W$) sharpens the interface; a larger
+$\kappa$ broadens it. For the symmetric polynomial well below
+($W=1$ here) the exact profile gives $\ell=\sqrt{2\kappa/W}$, which at
+the tutorial's $\kappa=5\times10^{-4}$ is $\POLYell$ (about
+$\POLYellcells$ mesh cells --- comfortably resolved). We report the
+width in physical length \emph{and} in cells so you can judge
+resolution directly.
+\end{keybox}
 
 Because $c$ is conserved, the dynamics is the \emph{conserved}
 (Model-B) gradient flow of \eqref{eq:F}: mass moves down gradients of
@@ -44,19 +68,10 @@ the chemical potential $\mu = \delta F/\delta c$,
   \label{eq:ch}
 \end{equation}
 %
-Here $M>0$ is the mobility (how fast mass responds to a chemical-potential
-gradient; it sets the \emph{time} scale but not the equilibrium
-morphology). The fourth-order PDE is split into the two second-order
-equations \eqref{eq:ch} --- the \emph{mixed} $(c,\mu)$ form the solver
-uses.
-
-\begin{keybox}
-\textbf{$F$ is a Lyapunov functional.} Taking $dF/dt$ along
-\eqref{eq:ch} and integrating by parts with no-flux boundaries gives
-$\;dF/dt = -\!\intv M\,|\grad\mu|^2\,dV \le 0$. The free energy can
-only decrease. Watching it decrease --- and split between bulk and
-interface --- is how you \emph{see} the physics in the numbers.
-\end{keybox}
+Here $M>0$ is the mobility (it sets the \emph{time} scale but not the
+equilibrium morphology). The fourth-order PDE is split into the two
+second-order equations \eqref{eq:ch} --- the \emph{mixed} $(c,\mu)$ form
+the solver uses.
 
 \section{Two bulk free energies}
 
@@ -68,8 +83,9 @@ The simplest $f$ with two equal minima,
   f'=c^3-c,\qquad f''=3c^2-1,\qquad c\in[-1,1].
 \end{equation}
 %
-The two phases are $c=\pm1$; the region $f''<0$ (i.e. $|c|<1/\sqrt3$)
-is \emph{spinodally unstable} --- any small fluctuation there grows.
+The two phases are $c=\pm1$; the barrier height is $W=\tfrac14$ (and the
+curvature scale that enters \eqref{eq:width} is order one, $|f''(0)|=1$).
+The region $f''<0$ (i.e. $|c|<1/\sqrt3$) is \emph{spinodally unstable}.
 This model is dimensionless and symmetric; it isolates the phase-field
 mechanism from material detail.
 
@@ -85,31 +101,109 @@ For a real blend the mixing free energy is entropic $+$ enthalpic,
 where the logarithmic \emph{entropy of mixing} (scale $A\sim 1/N$, with
 $N$ the degree of polymerization) always favors mixing, and the
 \emph{enthalpic} term $B\,c(1-c)$ (with $B$ the Flory interaction
-parameter $\chi$) favors demixing when the components dislike each
-other. The curvature
+parameter $\chi$) favors demixing. The curvature
 %
 \begin{equation}
   f_{\text{fh}}''(c) = A\Big(\tfrac1c + \tfrac1{1-c}\Big) - 2B
 \end{equation}
 %
 is negative --- unstable --- only where the enthalpic $-2B$ beats the
-(always convex) entropic term. This is the \emph{spinodal}. The logs
-diverge at the pure phases, so Flory--Huggins keeps $c$ strictly inside
-$(0,1)$ (no unphysical overshoot), at the cost of a stiff $f''$ near
-the walls --- a numerical point we return to in the Computational
-track.
+entropic term. This is the \emph{spinodal}. The logs diverge at the
+pure phases, so Flory--Huggins keeps $c$ strictly inside $(0,1)$, at the
+cost of a stiff $f''$ near the walls.
+
+\begin{keybox}
+\textbf{Flory--Huggins needs a regularization \emph{and} a projection ---
+and we report both.} Two numerical safeguards keep the logarithm usable,
+and neither is free:
+\begin{itemize}[nosep]
+  \item \emph{Log regularization.} $\ln x$ is replaced by a $C^1$ linear
+        extension below $x=\epsilon$ ($\epsilon=\FHregeps$), capping
+        $f''$ at $1/\epsilon$ so a transient Newton overshoot near the
+        wall does not produce an infinite Jacobian.
+  \item \emph{Box projection.} Each Newton iterate is clipped back into
+        $(0,1)$. This keeps the state physical, but clipping a conserved
+        field \emph{moves mass}: when it fires it breaks exact
+        conservation. We therefore report, for the run, the converged
+        field bounds $\phi\in\FHcrange$ (strictly interior), the number
+        of projected degrees of freedom, and the largest correction, so
+        the cost of the safeguard is visible rather than hidden.
+\end{itemize}
+The distinction that matters: the projection fires on \emph{transient
+Newton iterates} ($\FHprojdofs$ dof-clips over the reference run), but
+each step's \emph{converged} state stays strictly interior
+($\phi\in\FHcrange$), so no mass is moved on any accepted step and the
+total mass is conserved to $\FHmass$. On a coarser mesh or a deeper
+quench, though, Newton no longer resolves the interior state within its
+iteration budget, the \emph{accepted} step is itself clipped, and mass
+then drifts (the quick-mode $32^2$ run shows a
+$\sim\!2\times10^{-4}$ drift for exactly this reason) --- a first,
+concrete example of an admissibility safeguard trading conservation for
+robustness (the substrate chapter, \ref{ch:p3}, returns to this with a
+conservative correction).
+\end{keybox}
 
 \begin{keybox}
 \textbf{Coefficients and their ranges.}
 $M>0$ (mobility, time scale). $\kappa>0$ (gradient penalty; interface
-width $\sqrt\kappa$ --- choose it so the interface spans $\sim$3--5 mesh
-cells). Polynomial: no free parameters. Flory--Huggins: $A>0$
-(entropy, $\sim1/N$; $A\to0$ for long polymers), $B=\chi$ (interaction;
-demixing requires $B$ large enough that $f''<0$ somewhere ---
-for $A=1$ the symmetric point $c=\tfrac12$ is unstable once $B>2A=2$).
-The tutorial uses $A=\FHA$, $B=\FHB$ (a clear quench); real blends map
-$A\sim1/N$, $B\sim\chi$ (see \file{materials/materials.yaml}).
+width $\sqrt{\kappa/W}$ --- choose it so the interface spans a few mesh
+cells). Polynomial: no free parameters, $W=\tfrac14$. Flory--Huggins:
+$A>0$ (entropy, $\sim1/N$), $B=\chi$ (interaction; for $A=1$ the
+symmetric point $c=\tfrac12$ is unstable once $B>2A=2$). The tutorial
+uses $A=\FHA$, $B=\FHB$ (a clear quench); real blends map $A\sim1/N$,
+$B\sim\chi$ (see \file{materials/materials.yaml}).
 \end{keybox}
+
+\section{Linear stability: the selected length scale}
+
+Before any domains form, the nearly uniform blend is a superposition of
+small Fourier modes. Linearizing \eqref{eq:ch} about the mean $\bar c$,
+a mode $\propto e^{i\mathbf{k}\cdot\mathbf{x}+\sigma t}$ grows at rate
+%
+\begin{equation}
+  \sigma(k) \;=\; -M\,k^2\big(f''(\bar c) + \kappa k^2\big).
+  \label{eq:disp}
+\end{equation}
+%
+When $f''(\bar c)<0$ a \emph{band} $0<k<k_c=\sqrt{-f''/\kappa}$ is
+unstable, and one wavenumber grows fastest:
+%
+\begin{equation}
+  k^\star = \sqrt{\dfrac{-f''(\bar c)}{2\kappa}},\qquad
+  \lambda^\star = \dfrac{2\pi}{k^\star}.
+  \label{eq:kstar}
+\end{equation}
+%
+This $\lambda^\star$ is the wavelength the spinodal decomposition
+\emph{selects} --- the initial domain spacing. For both free energies at
+their (unstable) mean, $f''=\POLYfpp$, so
+$k^\star=\POLYkstar$ and $\lambda^\star=\POLYlamstar$.
+
+\begin{keybox}
+\textbf{Prediction vs.\ measurement.} We verify \eqref{eq:disp}
+directly. The quench is violent: with these coefficients the fastest
+mode's growth rate is $\sigma^\star\!\sim\!M f''^2/(4\kappa)\!\sim\!500$,
+so at the production time step the linear window is under one step. A
+dedicated small-$\Delta t$ \emph{probe} (function \code{linear\_probe})
+marches a few tiny steps from the small-amplitude initial field and
+reads the growth of each Fourier shell,
+$\sigma_{\text{meas}}(k)=\tfrac12\ln[S(k,\tau)/S(k,0)]/\tau$
+(the factor $\tfrac12$ because $S\sim$ amplitude$^2$). Its peak lands on
+the predicted $k^\star$: the measured fastest wavelength is $\POLYlammeas$
+versus the predicted $\POLYlamstar$ (ratio $\POLYlamratio$), well within
+one FFT shell. Figure~\ref{fig:p1disp} overlays the two.
+\end{keybox}
+
+\begin{figure}[h]\centering
+  \includegraphics[width=\linewidth]{figures/p1_dispersion.png}
+  \caption{Linear-stability dispersion. The analytic growth rate
+    $\sigma(k)$ of \eqref{eq:disp} (line) against the measured growth
+    spectrum from the small-$\Delta t$ probe (points), for the
+    polynomial (left) and Flory--Huggins (right) free energies. The
+    measured peak sits on the predicted fastest mode $k^\star$ (dashed),
+    confirming that the spinodal selects $\lambda^\star=2\pi/k^\star$.}
+  \label{fig:p1disp}
+\end{figure}
 
 \section{Run it}
 
@@ -117,34 +211,51 @@ $A\sim1/N$, $B\sim\chi$ (see \file{materials/materials.yaml}).
 \textbf{Run it.}
 \begin{lstlisting}
 cd physics/01_ch_binary_energies
-python run.py            # both free energies, 128x128
+python run_harness.py --config configs/p1.yaml \
+    --mode reference --output outputs/p1 --overwrite
+python gen_figures.py --run-dir outputs/p1
 \end{lstlisting}
-It marches a spinodal decomposition from a nearly uniform blend
-($c=\bar c + $ small noise) for both free energies, printing the energy
-budget. Compare the printed table with \file{EXPECTED.md} and the
-figures below.
+The harness marches a spinodal decomposition for both free energies,
+runs the linear-stability probe, tracks the energy budget and the
+coarsening length scale, and checks the results against
+\file{baseline.yaml} (tolerance-based invariants, not bit-identity).
+\code{gen\_figures.py} renders every figure below from the saved
+\file{results.json}/\file{history.npz} --- the document's numbers
+\emph{are} the run's output. \file{quick} mode is a fast smoke; the
+5-seed research ensemble is \file{--mode research}.
 \end{runbox}
 
 \paragraph{What you should see.}
-From a nearly uniform, slightly noisy blend, small fluctuations in the
-unstable region grow (spinodal decomposition), sharpen into domains
-separated by thin interfaces, and then \emph{coarsen}. The total free
-energy drops monotonically (after a one-step start-up transient
-discussed below), mass is conserved to solver tolerance, and the field
-saturates at the two coexisting phases.
+From a nearly uniform, slightly noisy blend, fluctuations in the
+unstable band grow at the rate \eqref{eq:disp}, the pattern sharpens
+into domains of spacing $\sim\lambda^\star$ separated by interfaces of
+width $\ell\sim\sqrt{\kappa/W}$, and then \emph{coarsens}. The total
+free energy drops (after a one-step start-up transient), mass is
+conserved to solver tolerance, and the field saturates at the two
+coexisting phases.
 
 \begin{keybox}
-\textbf{On the random seed.} The initial perturbation is drawn from a
-\emph{fixed} random seed (set in \file{spinodal.py}), so every run is
-bit-reproducible and matches the figures here --- that is what lets you
-\emph{compare} against the document. Note the distinction: the
-\emph{statistics} (energy decay, mass conservation, the phase values
-$c_{\min},c_{\max}$) are seed-independent physics, but the \emph{exact
-morphology} --- which domain forms where --- is not. Change the seed and
-the pattern changes while the energy curve does not. (Later, in the
-Computational and Physics-noise concepts, the seed becomes a
-first-class object: convergence must be seed-robust, and thermal
-\emph{nucleation} is seeded by physical fluctuations.)
+\textbf{Three statements about ``the energy decreases'' --- keep them
+apart.}
+\begin{enumerate}[nosep]
+  \item \emph{Continuous Lyapunov.} In the PDE, $dF/dt =
+        -\!\intv M|\grad\mu|^2\,dV\le0$ exactly. A theorem about the
+        model.
+  \item \emph{Discrete energy-stability.} Whether the \emph{time scheme}
+        inherits $F^{n+1}\le F^{n}$ every step. This is a property of
+        the discretization, not automatic. We measure it: the largest
+        positive stepwise increment $\max_n(F^{n+1}-F^{n})$ after the
+        start-up step is $\POLYlargestinc$ (polynomial) and
+        $\FHlargestinc$ (Flory--Huggins) --- non-positive to round-off,
+        so this scheme \emph{is} energy-stable here.
+  \item \emph{One monotone run.} The particular trajectory you plotted
+        went downhill. Necessary, not sufficient: report the increment,
+        not just ``it looked monotone''.
+\end{enumerate}
+The step-$0\!\to\!1$ increment is separately reported ($\POLYstartup$
+for the polynomial): the \code{mu\_init="consistent"} projection sets a
+matching initial chemical potential so this start-up transient is small
+and bounded, not an instability.
 \end{keybox}
 
 % --- generated by gen_figures.py ---
@@ -153,26 +264,85 @@ first-class object: convergence must be seed-robust, and thermal
   \includegraphics[width=\linewidth]{figures/p1_morph_fh.png}
   \caption{Spinodal decomposition and coarsening for the polynomial
     (top, $c\in[-1,1]$) and Flory--Huggins (bottom, $c\in(0,1)$) free
-    energies, at the mesh and parameters of the tutorial. Same mixing
-    physics, different order-parameter range and interface structure.}
+    energies. Same mixing physics, different order-parameter range and
+    interface structure.}
   \label{fig:p1morph}
 \end{figure}
 
 \begin{figure}[h]\centering
   \includegraphics[width=\linewidth]{figures/p1_energy.png}
   \caption{The Ginzburg--Landau energy budget: total free energy (black)
-    and its bulk (blue) and interfacial (red) parts versus time. The
-    total is a Lyapunov functional --- monotone decreasing. Early on,
-    forming interfaces \emph{raises} the interfacial energy while the
+    and its bulk (blue) and interfacial (red) parts versus time. Early
+    on, forming interfaces \emph{raises} the interfacial energy while the
     bulk energy falls faster; during coarsening, domains merge and the
     interfacial energy falls as total interface area shrinks.}
   \label{fig:p1energy}
 \end{figure}
 
+\section{Coarsening: $L(t)\sim t^{n}$}
+
+Once domains exist, they grow: interfacial energy is paid down by
+merging domains, so the characteristic length $L(t)$ increases. We
+measure $L(t)$ \emph{three} ways (all from the shared
+\code{diffsim.diagnostics.morphology}) --- and the choice matters:
+\begin{itemize}[nosep]
+  \item \emph{peak} wavelength $2\pi/q_{\text{peak}}$ of the structure
+        factor $S(q)$: the intuitive domain spacing, but on a coarse
+        mesh it jumps between discrete $q$-shells (a quantization that
+        shows up as a near-zero, poorly-fit exponent);
+  \item \emph{first-moment} wavelength $2\pi/\langle q\rangle$:
+        smoother, but biased low by the sharp-interface high-$k$ tail
+        (it partly measures the interface width, not the domain size);
+  \item \emph{interfacial-area} length $L=A_{\text{domain}}/P_{\text{int}}$
+        (total area over total interface length): robust and monotone,
+        because the interface shrinks as $\sim1/L$ during coarsening.
+        This is the headline.
+\end{itemize}
+Fitting $L\sim t^{n}$ by least squares in $\log$--$\log$ on the
+\emph{pre-saturation} window (skip the onset, cap at $L<\text{box}/3$
+where finite-size saturation sets in --- the fit range is reported with
+the number) gives, from the interfacial-area length,
+$n=\POLYcoarsenN\pm\POLYcoarsenSD$ ($R^2=\POLYcoarsenR$) for the
+polynomial well and $\FHcoarsenN\pm\FHcoarsenSD$ for Flory--Huggins ---
+of order the diffusive Lifshitz--Slyozov value $n=\tfrac13$ for a
+conserved order parameter, though the precise value is sensitive to the
+length definition, the fit window, and finite-size saturation on the
+small reference box (the research mode, on a larger box and longer
+horizon, is where a clean asymptotic $1/3$ can be resolved). The peak
+($n\!\approx\!\POLYcoarsenNpk$, quantization-limited) and first-moment
+($n\!\approx\!\POLYcoarsenNfm$, tail-biased) definitions on the
+\emph{same} run give very different slopes: a concrete lesson that a
+coarsening exponent is only as good as the length definition, the fit
+window, and the reported uncertainty --- never a single slope asserted
+to be $1/3$.
+
+\begin{figure}[h]\centering
+  \includegraphics[width=\linewidth]{figures/p1_coarsening.png}
+  \caption{Coarsening length $L(t)$ on log--log for the two free
+    energies, from the peak (circles) and first-moment (squares)
+    definitions of $S(q)$, with the fitted power law (dashed) and its
+    uncertainty. The fit is taken on the coarsening window only.}
+  \label{fig:p1coarsen}
+\end{figure}
+
 \begin{keybox}
-\textbf{Measured self-check} (your \file{run.py} should reproduce
-these to a few significant figures; exact values depend on the RNG seed
-fixed in the tutorial).
+\textbf{On the random seed --- and why the morphology is \emph{not}
+reproducible.} The initial perturbation is drawn from a \emph{fixed}
+seed so the figures here are reproducible \emph{on this machine}. But
+the morphology is not a bit-reproducible quantity: which domain forms
+where is chaotically sensitive to the seed, the mesh, and floating-point
+order across GPUs. What \emph{is} robust is the physics --- the energy
+decay, the selected wavelength $\lambda^\star$, the coarsening exponent,
+the phase values $c_{\min},c_{\max}$. The research mode makes this
+explicit: it runs a \textbf{5-seed ensemble} and reports the mean
+$\pm$ standard deviation of the seed-independent quantities (final
+energy, final length scale, exponent). The single fixed seed is for
+the \emph{figures}; the science is the ensemble.
+\end{keybox}
+
+\begin{keybox}
+\textbf{Measured self-check} (reference mode; your run reproduces these
+within \file{baseline.yaml} tolerances, not bit-for-bit).
 \begin{center}\small
 \begin{tabular}{lcc}
 \toprule
@@ -180,9 +350,13 @@ fixed in the tutorial).
 \midrule
 total $F$: start $\to$ end       & \POLYFstart\ $\to$ \POLYFend & \FHFstart\ $\to$ \FHFend \\
 interfacial energy: peak $\to$ end & \POLYFintpeak\ $\to$ \POLYFintend & \FHFintpeak\ $\to$ \FHFintend \\
+interface width $\ell$ (cells)   & \POLYell\ (\POLYellcells) & \FHell\ (\FHellcells) \\
+$\lambda^\star$: predicted / measured & \POLYlamstar\ / \POLYlammeas & \FHlamstar\ / \FHlammeas \\
+coarsening $n$ (first moment)    & \POLYcoarsenN\ $\pm$ \POLYcoarsenSD & \FHcoarsenN\ $\pm$ \FHcoarsenSD \\
 phase values $[c_{\min},c_{\max}]$ & \POLYcrange & \FHcrange \\
+largest $+$ energy increment     & \POLYlargestinc & \FHlargestinc \\
 mass drift $|\Delta m|$           & \POLYmass & \FHmass \\
-$F$ monotone after step 1         & yes & yes \\
+projected dofs                    & \POLYprojdofs & \FHprojdofs \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -191,19 +365,20 @@ $F$ monotone after step 1         & yes & yes \\
 \section{Code walk-through}
 
 The tutorial's physics lives in \file{spinodal.py}, which drives the
-production brick \file{src/diffsim/physics/cahn\_hilliard.py}. The three
-sections you interact with:
+production brick \file{src/diffsim/physics/cahn\_hilliard.py}; the
+harness \file{run\_harness.py} turns it into a repeatable workflow, and
+the measured quantities all come from the shared, unit-tested
+\file{src/diffsim/diagnostics/} library (energy budget, structure
+factor, admissibility, ensemble statistics).
 
 \paragraph{1. Build a mesh and the stepper.}
 \begin{lstlisting}
-dm, mesh, cons = build_mesh_dm(level=7, p=1, device="cuda:0")  # 128x128
+dm, mesh, cons = build_mesh_dm(level=6, p=1, device="cuda:0")  # 64x64
 st = CahnHilliardStepper(dm, M, kappa, dt, order=1,
                          energy="poly")   # or energy="fh"
 \end{lstlisting}
 \code{energy} selects $f(c)$; \code{order} is the time scheme (1 =
-backward Euler); \code{M}, \code{kappa} are the coefficients above. The
-constructor is where the \emph{model} is chosen --- everything else is
-running it.
+backward Euler); \code{M}, \code{kappa} are the coefficients above.
 
 \paragraph{2. Seed the initial blend.}
 \begin{lstlisting}
@@ -212,47 +387,42 @@ st.set_initial(lambda x: c_avg + amp*rng.standard_normal(len(x)),
 \end{lstlisting}
 A nearly uniform field with a small random perturbation --- the seed of
 the spinodal instability. \code{mu\_init="consistent"} projects a
-matching initial chemical potential so the very first step does not see
-an artificial $\mu$-transient (the one-step start-up you see in
-Fig.~\ref{fig:p1energy}).
+matching initial chemical potential so the first step sees no artificial
+$\mu$-transient.
 
-\paragraph{3. March, and measure the energy each step.}
-\begin{lstlisting}
-for n in range(steps):
-    c, mu = st.step()
-    F_total, F_bulk, F_int = energy_budget(st, dm, mesh, c, ...)
-\end{lstlisting}
-\code{step()} advances one time step (assemble $\to$ Newton solve on the
-GPU). \code{energy\_budget} evaluates $c$ and $\grad c$ at the Gauss
-points --- using the same quadrature the solver uses --- and integrates
-the two energy densities of \eqref{eq:F} separately. That is the whole
-measurement: no post-processing magic, just the definition of $F$.
+\paragraph{3. March, measure, verify.} \code{run\_spinodal} advances the
+stepper, integrating the two energy densities of \eqref{eq:F} by the
+same quadrature the solver uses and sampling the length scale $L(t)$ as
+it goes; \code{linear\_probe} does the small-$\Delta t$ dispersion
+verification; and the harness writes \file{results.json}, checks it
+against \file{baseline.yaml}, and records provenance in
+\file{metadata.json}.
 
 \section{Explore on your own}
 
-\question{Vary $\kappa$ over, say, $\{2,5,10\}\times10^{-4}$. How does
-the equilibrium interface width scale, and how many mesh cells does the
-interface span in each case? At what point do you stop trusting the
-result, and why?}
+\question{Vary $\kappa$ over $\{2,5,10\}\times10^{-4}$. Confirm the
+interface width scales as $\sqrt{\kappa/W}$ (not $\sqrt{\kappa}$) and
+count the mesh cells it spans in each case. At what $\kappa$ does the
+interface fall below $\sim$3 cells, and why should you stop trusting the
+result there?}
 
-\question{For Flory--Huggins, sweep $B$ (the interaction $\chi$) from
-below to above the spinodal threshold $2A$. Where does demixing stop
-happening, and does the onset match $f''(\tfrac12)=0$?}
+\question{Verify the dispersion relation yourself: change $\bar c$ (for
+Flory--Huggins) or $\kappa$ and check that the probe's measured fastest
+mode tracks $k^\star=\sqrt{-f''/2\kappa}$. Where does $\bar c$ leave the
+spinodal band ($f''>0$) and growth stop?}
 
-\question{The polynomial model is symmetric ($\bar c=0$); Flory--Huggins
-with $\bar c\ne\tfrac12$ is not. Run an off-critical blend
-($\bar c=0.35$) and describe how the morphology differs from the
-symmetric case (droplets vs.\ bicontinuous). Which blend ratio gives
-which?}
+\question{Run the 5-seed research ensemble. How large is the
+seed-to-seed spread in the final energy and length scale compared with
+the difference between the two free energies? Is the coarsening exponent
+resolved within its uncertainty?}
 
-\question{The total energy dips monotonically but the interfacial
-energy is \emph{non}-monotone. Explain the two regimes (interface
-formation vs.\ coarsening) in terms of $F_{\text{bulk}}$ and
-$F_{\text{int}}$, and predict how each scales during coarsening.}
+\question{Extend the horizon (research mode, more steps). Does the
+fitted coarsening exponent climb toward the Lifshitz--Slyozov $1/3$? Plot
+$n$ versus fit-window start to see the asymptotic range emerge.}
 
-\question{Mobility $M$ was said to set the time scale but not the
-equilibrium. Test it: double $M$ and check whether the \emph{final}
-morphology and energy are unchanged while the \emph{approach} rescales
-in time.}
+\question{Drive Flory--Huggins into the wall: lower the mesh resolution
+or deepen the quench ($B$ up) until the box projection fires. Watch
+\code{proj\_dofs} and the mass drift rise together --- the safeguard
+trading conservation for robustness.}
 
 % ====================================================================

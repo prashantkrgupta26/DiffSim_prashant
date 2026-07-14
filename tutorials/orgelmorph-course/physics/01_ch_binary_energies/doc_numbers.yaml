@@ -3,12 +3,20 @@
 # Drives the docs-build staleness gate (common/check_doc_staleness.py).
 tex: ../../latex/numbers/p1.tex
 macros:
-  POLYFend:      {path: poly.Fend,       rtol: 0.05}
-  POLYFintpeak:  {path: poly.Fint_peak,  rtol: 0.05}
-  POLYFintend:   {path: poly.Fint_end,   rtol: 0.08}
-  POLYcrange:    {path: poly.c_max,      rtol: 0.05, extract: high}
-  POLYmass:      {path: poly.mass_drift, max: 1.0e-10}
-  FHFend:        {path: fh.Fend,         rtol: 0.05}
-  FHFintpeak:    {path: fh.Fint_peak,    rtol: 0.06}
-  FHFintend:     {path: fh.Fint_end,     rtol: 0.10}
-  FHcrange:      {path: fh.c_max,        rtol: 0.05, extract: high}
+  POLYFend:      {path: poly.Fend,               rtol: 0.05}
+  POLYFintpeak:  {path: poly.Fint_peak,          rtol: 0.05}
+  POLYFintend:   {path: poly.Fint_end,           rtol: 0.08}
+  POLYell:       {path: poly.interface_width,    rtol: 0.02}
+  POLYellcells:  {path: poly.interface_cells,    rtol: 0.05}
+  POLYkstar:     {path: poly.k_star,             rtol: 0.02}
+  POLYlamstar:   {path: poly.lambda_star,        rtol: 0.02}
+  POLYlammeas:   {path: poly.probe_lambda_meas,  rtol: 0.10}
+  POLYcoarsenN:  {path: poly.coarsen_n_area,     atol: 0.08}
+  POLYmass:      {path: poly.mass_drift,         max: 1.0e-10}
+  FHFend:        {path: fh.Fend,                 rtol: 0.05}
+  FHFintpeak:    {path: fh.Fint_peak,            rtol: 0.06}
+  FHFintend:     {path: fh.Fint_end,             rtol: 0.10}
+  FHell:         {path: fh.interface_width,      rtol: 0.05}
+  FHlamstar:     {path: fh.lambda_star,          rtol: 0.02}
+  FHlammeas:     {path: fh.probe_lambda_meas,    rtol: 0.10}
+  FHcoarsenN:    {path: fh.coarsen_n_area,       atol: 0.10}

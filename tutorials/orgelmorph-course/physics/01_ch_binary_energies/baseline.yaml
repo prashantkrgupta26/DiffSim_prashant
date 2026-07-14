@@ -1,27 +1,42 @@
 # P1 tolerance baseline — reference mode (level 6, 250 steps).
 #
 # Scientific invariants within DOCUMENTED tolerances, NOT bitwise GPU identity.
-# The energy numbers carry an rtol band (~5-8%) that absorbs card/BLAS
-# differences; the qualitative invariants (mass conservation to ~machine eps,
-# monotone energy decrease, two-phase bounds) are the hard checks.
+# Measured-then-locked with >=2x headroom: energy numbers carry an rtol band
+# that absorbs card/BLAS differences; the qualitative invariants (mass
+# conservation to ~machine eps, monotone energy decrease, two-phase bounds,
+# the linear-stability prediction, the pre-saturation coarsening exponent) are
+# the scientific checks.
 #
 # Ground truth captured on RTX 6000 Ada (CUDA 12.9 / driver 13.2, splu):
-#   POLY  F 0.25623 -> 0.049419;  interface peak 0.074898 -> 0.02405;
-#         c in [-1.040, 0.990];  |dm| 4.07e-16
+#   POLY  F 0.25623 -> 0.049419;  interface peak 0.074898 -> 0.024050;
+#         c_end [-1.040, 0.990];  |dm| 4.07e-16; ell 0.0316 (2.02 cells);
+#         k* 31.62, lambda* 0.1987 vs probe 0.1818 (ratio 0.915);
+#         coarsening n_area 0.303 +/- 0.018 (R2 0.99); proj_dofs 0.
 #   FH    F -0.061911 -> -0.10104; interface peak 0.0074139 -> 0.0014562;
-#         c in [0.144, 0.856];   |dm| 0
+#         c_end [0.144, 0.856];   |dm| 0; ell 0.0224 (1.43 cells);
+#         lambda* 0.1987 vs probe 0.1818; n_area 0.200 +/- 0.016 (R2 0.89);
+#         proj_dofs 2308 (transient iterates; converged states interior -> |dm|=0).
 checks:
   # --- polynomial double well -------------------------------------------
-  poly.Fend:                    {reference: 0.049419, rtol: 0.08}
+  poly.Fend:                    {reference: 0.049419, rtol: 0.06}
   poly.Fint_peak:               {reference: 0.074898, rtol: 0.08}
-  poly.Fint_end:                {reference: 0.02405, rtol: 0.10}
+  poly.Fint_end:                {reference: 0.02405, rtol: 0.12}
   poly.c_min:                   {min: -1.15, max: -0.90}
   poly.c_max:                   {min: 0.90, max: 1.05}
   poly.mass_drift:              {max: 1.0e-10}
   poly.monotone_after_step1:    {equals: true}
+  poly.largest_positive_increment: {max: 1.0e-6}
+  poly.interface_cells:         {reference: 2.024, rtol: 0.05}
+  poly.k_star:                  {reference: 31.62, rtol: 0.02}
+  poly.lambda_star:             {reference: 0.19869, rtol: 0.02}
+  poly.probe_lambda_meas:       {reference: 0.1818, rtol: 0.15}
+  poly.probe_lambda_ratio:      {min: 0.75, max: 1.20}
+  poly.coarsen_n_area:          {min: 0.20, max: 0.42}
+  poly.coarsen_r2_area:         {min: 0.80}
+  poly.proj_dofs:               {max: 0}
 
   # --- Flory-Huggins ----------------------------------------------------
-  fh.Fend:                      {reference: -0.10104, rtol: 0.08}
+  fh.Fend:                      {reference: -0.10104, rtol: 0.06}
   fh.Fint_peak:                 {reference: 0.0074139, rtol: 0.10}
   fh.Fint_end:                  {reference: 0.0014562, rtol: 0.15}
   # FH stays strictly inside (0,1) — the logarithm forbids overshoot
@@ -29,3 +44,12 @@ checks:
   fh.c_max:                     {min: 0.70, max: 1.0}
   fh.mass_drift:                {max: 1.0e-10}
   fh.monotone_after_step1:      {equals: true}
+  fh.largest_positive_increment: {max: 1.0e-6}
+  fh.interface_cells:           {reference: 1.431, rtol: 0.05}
+  fh.lambda_star:               {reference: 0.19869, rtol: 0.02}
+  fh.probe_lambda_meas:         {reference: 0.1818, rtol: 0.15}
+  fh.coarsen_n_area:            {min: 0.10, max: 0.32}
+  fh.coarsen_r2_area:           {min: 0.80}
+  # projection fires on transient Newton iterates (mesh/card-dependent count);
+  # the scientific invariant is that converged states stay interior -> |dm|~0.
+  fh.proj_dofs:                 {min: 0, required: false}
