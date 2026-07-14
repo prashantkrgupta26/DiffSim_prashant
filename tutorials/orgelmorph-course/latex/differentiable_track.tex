@@ -1,37 +1,216 @@
 % ====================================================================
-% DIFFERENTIABLE TRACK  (under construction; follows the P1 template)
+% DIFFERENTIABLE TRACK
 % ====================================================================
 \chapter{What differentiable simulation is}
 \label{ch:d1}
+
 \begin{keybox}
 \textbf{Key idea.} A classical solver answers \emph{``what happens?''}.
 A differentiable solver also answers \emph{``what should I change?''} ---
-it returns the gradient of any output with respect to any input
-(material parameters, process schedule, geometry), so the simulator
-becomes an instrument for design and inference, not just prediction.
+it returns the gradient of any scalar output $J$ with respect to any
+input parameter $p$ (material coefficients, a process schedule,
+geometry). That single object $dJ/dp$ turns the simulator from a
+\emph{predictor} into an \emph{instrument for design and inference}. And
+because a gradient you cannot trust is worse than none, DiffSim computes
+it \emph{three independent ways} and checks that they agree.
 \end{keybox}
-This concept introduces the three ways DiffSim computes a gradient ---
-a hand-derived adjoint, an autograd twin, and finite differences ---
-and the three-way check that keeps them honest. \emph{Under
-construction.}
 
+\section{Why a gradient}
+
+Every question we ask of a morphology simulator downstream --- fit this
+material parameter to a measured morphology, choose a quench schedule
+that hits a target crystallinity, learn a free-energy functional from
+snapshots --- is an \emph{optimization}. Optimization needs a gradient:
+$dJ/dp$ says how a scalar objective $J$ (a domain size, an interfacial
+area, a crystalline fraction) moves when you nudge a parameter $p$.
+
+The naive way to get $dJ/dp$ is finite differences: run the simulation
+at $p+\epsilon$ and $p-\epsilon$ and subtract. That costs \emph{two
+forward solves per parameter} and forces you to tune $\epsilon$ (too big:
+truncation error; too small: roundoff). With hundreds of parameters --- a
+temperature schedule sampled every step, a free energy with many
+coefficients --- it is hopeless. The \textbf{adjoint method} returns
+$dJ/dp$ for \emph{all} parameters at once, at the cost of a single extra
+(linear) solve backward through the trajectory, exact to machine
+precision. That $O(1)$-in-parameters cost is what makes design possible.
+
+\section{The three ways to a gradient}
+
+DiffSim's differentiable core (\file{src/diffsim/adjoint/}) computes the
+same gradient three ways, and the tutorial runs all three live:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Adjoint} --- a hand-derived reverse sweep. We do
+        \emph{not} tape the Newton iterations; we differentiate only the
+        converged discrete relation $R_n(x_n; x_{\text{hist}}, p)=0$ (the
+        implicit-function theorem). For $J=\sum_n j(x_n)$,
+        %
+        \begin{equation}
+          J_n^{\!\top}\lambda_n = \dd{j}{x_n}
+            - \!\sum_{k\ge1}\Big(\dd{R_{n+k}}{x_n}\Big)^{\!\top}\!\lambda_{n+k},
+          \qquad
+          \dd{J}{p} = -\sum_n \lambda_n^{\!\top}\,\dd{R_n}{p},
+          \label{eq:d1adj}
+        \end{equation}
+        %
+        where $J_n=\partial R_n/\partial x_n$ is \emph{exactly} the
+        Jacobian the forward Newton already assembled at convergence, and
+        $\partial R_n/\partial p$ is analytic. This is the production
+        capability.
+  \item \textbf{Autograd twin} --- a faithful PyTorch reimplementation of
+        the \emph{same} discrete solver, differentiated by
+        \code{torch.autograd} through the converged Newton loop. Different
+        code, a different differentiation engine, the same math: an
+        \emph{independent} reference.
+  \item \textbf{Finite differences} --- central differences
+        $\big(J(p+\epsilon)-J(p-\epsilon)\big)/2\epsilon$. No calculus at
+        all; the ground truth every gradient must match, down to the FD
+        error floor.
+\end{enumerate}
+
+\begin{keybox}
+\textbf{The adjoint differentiates the \emph{real} brick.} The discrete
+forward in \file{adjoint/phasefield.py} is a vectorised re-implementation
+of the production Cahn--Hilliard residual and Jacobian that is
+\emph{bit-parity} with \code{CahnHilliardStepper} (measured
+$\max|\Delta c|\sim10^{-16}$). So the gradient is taken through the same
+operator the research code marches --- not a look-alike toy.
+\end{keybox}
+
+\section{Run it}
+
+\begin{runbox}
+\textbf{Run it.}
+\begin{lstlisting}
+cd differentiable/01_three_way_gradient
+python run.py            # 9x9 nodes, 3 steps, three-way check
+\end{lstlisting}
+It marches a short Flory--Huggins Cahn--Hilliard rollout, forms the
+scalar objective $J=\tfrac12\lVert c_N-\tfrac12\rVert^2$, and computes
+$dJ/d\{M,\kappa,\chi,A\}$ all three ways. It prints the table and
+\textbf{self-checks} that the methods agree --- that agreement is the
+gate. Compare with \file{EXPECTED.md}.
+\end{runbox}
+
+\begin{keybox}
+\textbf{Measured self-check} (three-way gradient of
+$J=\tfrac12\lVert c_N-\tfrac12\rVert^2$ through a \DoneSteps-step march,
+$\DoneSide\times\DoneSide$ nodes).
+\begin{center}\small
+\begin{tabular}{lc}
+\toprule
+parameter & adjoint $dJ/dp$ \\
+\midrule
+$M$ (mobility)      & \DoneGradM     \\
+$\kappa$ (gradient) & \DoneGradKappa \\
+$\chi=B$ (Flory)    & \DoneGradChi   \\
+$A$ (entropic)      & \DoneGradA     \\
+\bottomrule
+\end{tabular}
+\end{center}
+Adjoint and autograd twin agree to $\sim$machine precision (worst
+$\le\DoneAgreeTwin$): the \emph{same} discrete math, two independent
+differentiation engines. Adjoint and finite differences agree to worst
+$\le\DoneAgreeFD$: the FD truncation/roundoff floor.
+\end{keybox}
+
+% --- generated by gen_figures.py ---
+\begin{figure}[h]\centering
+  \includegraphics[width=0.86\linewidth]{figures/d1_agreement.png}
+  \caption{The same gradient, three ways. For each parameter the adjoint,
+    autograd-twin, and finite-difference bars are \emph{visually
+    coincident} --- that overlap is the message: three independent methods
+    return one number. The signs are physical (raising $\chi$ drives the
+    field away from the uniform $c=\tfrac12$, so $J$ grows;
+    $dJ/d\chi>0$).}
+  \label{fig:d1agree}
+\end{figure}
+
+\begin{figure}[h]\centering
+  \includegraphics[width=0.66\linewidth]{figures/d1_fd_valley.png}
+  \caption{Why the adjoint, not finite differences. The error of the
+    central difference for $dJ/d\chi$ is a V-shaped function of the step
+    $\epsilon$: on the right, $O(\epsilon^2)$ truncation error falls as
+    $\epsilon$ shrinks; on the left, catastrophic cancellation (roundoff)
+    takes over and it rises. The valley floor (best FD $\approx
+    \DoneFDfloor$) is the most FD can achieve --- and it sits far above the
+    adjoint, which is exact and needs no step to tune.}
+  \label{fig:d1valley}
+\end{figure}
+
+\section{Code walk-through}
+
+The tutorial's core is \file{three\_way.py}; it drives
+\file{src/diffsim/adjoint/phasefield.py}.
+
+\paragraph{1. One reverse sweep, all gradients.}
+\begin{lstlisting}
+fwd = CHForward(dm, FHEnergy(A, B), M=M, kappa=kappa, dt=dt, order=order)
+fwd.set_initial(ic); fwd.run(n_steps)               # record the trajectory
+dJdx = [zeros] * n_steps
+dJdx[-1][0::2] = fwd.steps[-1]["c"] - target         # dj/dc on the final step
+g_adj = CHAdjoint(fwd).gradient(dJdx, ["M","kappa","B","A"])
+\end{lstlisting}
+\code{gradient} runs \eqref{eq:d1adj} backward through the recorded
+steps and returns \emph{every} $dJ/dp$ from that one sweep.
+
+\paragraph{2. The independent twin.}
+\begin{lstlisting}
+twin = CHTwin(dm, energy="fh", dt=dt, order=order, device="cpu")
+out  = twin.march(c0, None, M, kappa, dict(A=A, B=B), n_steps)  # leaf tensors
+loss = 0.5 * ((out[-1][0] - target)**2).sum();  loss.backward()
+\end{lstlisting}
+Autograd differentiates through the converged Newton iterations; because
+the loop is driven to a tight residual, that returns the same
+implicit-function-theorem gradient the hand adjoint derives.
+
+\paragraph{3. The ground truth.}
+Central differences on each parameter --- two forward solves apiece --- with
+no calculus, is what pins the other two to reality.
+
+\section{Explore on your own}
+
+\question{Switch to BDF2 (\code{--order 2 --steps 4}). The
+variable-coefficient history now couples \emph{two} previous steps into
+each residual; does the three-way agreement survive? (It must --- the
+adjoint's history cotangent carries both slots.)}
+
+\question{Add a second objective, e.g.\ the interfacial energy
+$\tfrac{\kappa}{2}\lVert\grad c_N\rVert^2$. Re-derive its seed
+$dj/dc_N$ and confirm the adjoint still matches finite differences.}
+
+\question{Time the adjoint vs.\ finite differences as you add parameters
+(say, a per-step schedule of length $N$). The adjoint cost is flat in
+$N$; the FD cost grows linearly. At what $N$ does the crossover make FD
+impractical?}
+
+\question{Shrink the FD step $\epsilon$ toward $10^{-12}$ and watch the
+error in Fig.~\ref{fig:d1valley} \emph{rise}. Explain why, and why the
+adjoint has no analogous floor.}
+
+% ====================================================================
 \chapter{Morphology sensitivity}
-\emph{Under construction --- gradient of a morphology observable
-(domain size, interfacial area) with respect to the interaction
-parameter $\chi$.}
+\label{ch:d2}
+\emph{Under construction --- gradient of a morphology observable with
+respect to the interaction parameter $\chi$, finite-difference
+verified.}
 \chapter{Recovering parameters from a morphology}
-\emph{Under construction --- fit $\chi$, $N$ to a target morphology
-(the Wodo-2012 ``learn the free-energy functional'' story, at tutorial
-scale).}
+\label{ch:d3}
+\emph{Under construction --- fit $\chi,\kappa$ to a target morphology by
+gradient descent.}
 \chapter{Process gradients}
-\emph{Under construction --- gradient with respect to evaporation rate
-and quench schedule.}
+\label{ch:d4}
+\emph{Under construction --- gradient with respect to the quench
+schedule $T(t)$, as a time series.}
 \chapter{Crystallinity sensitivity}
-\emph{Under construction --- differentiating through the $\psi,\theta$
-crystallization fields.}
+\label{ch:d5}
+\emph{Under construction --- differentiating a crystallinity metric
+through the coupled $\phi,\psi$ crystallization fields.}
 \chapter{Learning the free energy from snapshots}
-\emph{Under construction --- recover the free-energy functional from a
-time series of morphology snapshots.}
+\label{ch:d6}
+\emph{Under construction --- recover a parametrized $f(c)$ from a time
+series of morphology snapshots.}
 \chapter{Capstone: inverse-designing a process}
-\emph{Under construction --- optimize an evaporation schedule to hit a
-target domain size or crystallinity.}
+\label{ch:d7}
+\emph{Under construction --- optimize a $T(t)$ schedule to hit a target
+crystalline fraction.}
