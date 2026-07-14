@@ -256,7 +256,8 @@ class CACHTwin:
             J = J.index_add(0, B["lin"], Ae.reshape(-1))
         return R, J.reshape(self.ndof, self.ndof)
 
-    def march(self, phi0, psi0, P, n_steps, newton_max=40, newton_tol=1e-12):
+    def march(self, phi0, psi0, P, n_steps, newton_max=40, newton_tol=1e-12,
+              T_schedule=None, bT=0.0, Tref=0.0):
         NF = self.NF
         x = torch.zeros(self.ndof, device=self.dev)
         x[0::NF] = phi0
@@ -266,7 +267,7 @@ class CACHTwin:
         dt = self.dt
         t, dt_prev = 0.0, None
         out = []
-        for _ in range(n_steps):
+        for istep in range(n_steps):
             if self.order == 1 or dt_prev is None or t < dt / 2:
                 c0_, ch = 1.0, [1.0]
             else:
@@ -275,6 +276,10 @@ class CACHTwin:
                 ch = [1.0 + rr, -rr * rr / (1.0 + rr)]
             p = dict(P)
             p["sigma"] = c0_ / dt
+            if T_schedule is not None:
+                Tn = T_schedule[istep]
+                p["T"] = Tn
+                p["B"] = P["B"] + bT * (Tn - Tref)
 
             def hgp(hist):
                 hg = None

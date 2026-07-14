@@ -79,12 +79,28 @@ BDF2, 4 steps (`test_g2c_crystallization_bdf2`) — worst adj/twin `1.7e-15`,
 worst adj/FD `4.1e-09`.  Sample (BDF1): dh `+2.661164e-01`, Tm `+4.435273e-02`,
 dsig `-3.913890e-02`, eps2 `-2.743690e-01`, L `-5.534772e-02`.
 
+### G3 — processing param: quench schedule T(t) (`test_g3_temperature_schedule`)
+
+`CACHForward.set_schedule(T_list, bT, Tref)` drives the march from a per-step
+temperature control; T enters R_n through the crystallisation drive dh(T/Tm-1)
+AND the Flory chi B(T)=B0+bT(T-Tref).  `CACHAdjoint.temperature_gradient` returns
+the TIME SERIES dJ/dT_n = -lam_n^T(dR_n/dT|drive + bT dR_n/dB).  4-step ramp
+[0.5,0.6,0.7,0.55], target on phi & psi:
+
+BDF1 worst adj/twin `6.2e-16`, adj/FD `8.0e-10`; BDF2 worst adj/twin `1.0e-15`,
+adj/FD `6.8e-10`.  Sample (BDF2): dJ/dT = [+3.83e-1, +3.00e-1, +3.33e-1,
++2.82e-1].
+
 ## Capability status
 
 - (a) MATERIAL PARAMETERS — **DELIVERED & VERIFIED.** Binary CH (M, kappa,
   Flory chi B, A) and coupled CH x AC crystallisation (dh, Tm, dsigma, eps2, L),
   BDF1 and variable-coefficient BDF2, all three-way to machine precision.
-- (b) processing / (c) learn-free-energy / (d) design-route: pending.
+- (b) PROCESSING PARAMETERS — **quench schedule T(t) delivered & verified**
+  (time-series dJ/dT_n, three-way).  Evaporation-rate k_e through the film march
+  (top-flux + frame velocity) is a documented frontier (needs the wodo_film face
+  infrastructure; the same IFT sweep applies with a boundary dR/dk_e term).
+- (c) learn-free-energy / (d) design-route: see G4/G5 below.
 
 ## Scope notes
 - Gate meshes are uniform (constraints.T == identity), natural no-flux BCs.

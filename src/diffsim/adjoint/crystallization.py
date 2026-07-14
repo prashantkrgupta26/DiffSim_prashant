@@ -270,6 +270,26 @@ class CACHForward:
         self.newton_tol, self.newton_max = newton_tol, newton_max
         self.t, self.dt_prev = 0.0, None
         self.steps = []
+        # G3 quench schedule: per-step temperature control T_n entering
+        # through BOTH the crystallisation drive dh(T/Tm-1) AND the Flory
+        # chi B(T) = B0 + bT*(T - Tref).  bT=0 disables the chi channel.
+        self.T_schedule = None
+        self.bT, self.Tref = 0.0, 0.0
+        self._B0 = getattr(energy, "B", None)
+        self._A0 = getattr(energy, "A", None)
+        self._istep = 0
+
+    def set_schedule(self, T_list, bT=0.0, Tref=0.0):
+        """Drive the march from a temperature time series T_list (len =
+        n_steps); bT couples T into the Flory chi."""
+        self.T_schedule = [float(v) for v in T_list]
+        self.bT, self.Tref = float(bT), float(Tref)
+        return self
+
+    def _Tn(self):
+        if self.T_schedule is None:
+            return self.T
+        return self.T_schedule[self._istep]
 
     def set_initial(self, phi0, psi0):
         NF = self.op.NF
@@ -279,6 +299,7 @@ class CACHForward:
         self.hist_phi = [phi0.copy(), phi0.copy()]
         self.hist_psi = [psi0.copy(), psi0.copy()]
         self.t, self.dt_prev, self.steps = 0.0, None, []
+        self._istep = 0
 
     def _bdf(self):
         if self.order == 1 or self.dt_prev is None or self.t < self.dt / 2:
@@ -298,9 +319,13 @@ class CACHForward:
         return hg
 
     def _params(self, sigma):
+        Tn = self._Tn()
+        energy = self.energy
+        if self.bT != 0.0 and self._B0 is not None:
+            energy = FHEnergy(self._A0, self._B0 + self.bT * (Tn - self.Tref))
         return dict(M=self.M, kappa=self.kappa, eps2=self.eps2, L=self.L,
-                    dsig=self.dsig, dh=self.dh, Tm=self.Tm, T=self.T,
-                    energy=self.energy, sigma=sigma)
+                    dsig=self.dsig, dh=self.dh, Tm=self.Tm, T=Tn,
+                    energy=energy, sigma=sigma, bT=self.bT)
 
     def step(self, record=True):
         c0_, ch = self._bdf()
@@ -319,11 +344,12 @@ class CACHForward:
         self.x = x
         if record:
             self.steps.append(dict(x=x.copy(), sigma=sigma, ch=list(ch),
-                                   dt=self.dt, params=self._params(sigma)))
+                                   dt=self.dt, params=params, Tn=self._Tn()))
         self.hist_phi = [x[0::NF].copy(), self.hist_phi[0]]
         self.hist_psi = [x[2::NF].copy(), self.hist_psi[0]]
         self.t += self.dt
         self.dt_prev = self.dt
+        self._istep += 1
         return x.copy()
 
     def run(self, n):
@@ -365,3 +391,39 @@ class CACHAdjoint:
                 pending[kn][0::NF] += (cc / rec["dt"]) * (Mass @ lam_phi)
                 pending[kn][2::NF] += (cc / rec["dt"]) * (Mass @ lam_psi)
         return grads
+
+    def temperature_gradient(self, dJdx_list):
+        """G3 quench-schedule gradient: dJ/dT_n at each step's control point
+        (a TIME SERIES).  T enters R_n through the crystallisation drive
+        dh(T/Tm-1) AND (if bT != 0) the Flory chi B(T); dJ/dT_n =
+        -lam_n^T (dR_n/dT|drive + bT dR_n/dB).  Returns a length-N array.
+        The reverse sweep is identical to gradient() — history couples phi
+        and psi — but T_n is a per-step control so no cross-step chaining of
+        the T-derivative is needed (each T_n enters only step n)."""
+        op = self.op
+        NF = op.NF
+        steps = self.fwd.steps
+        N = len(steps)
+        Mass = op.mass_matrix()
+        gT = np.zeros(N)
+        pending = [np.zeros(op.ndof) for _ in range(N)]
+        zhist = [np.zeros_like(B["dJxW"]) for B in op.bins]
+        for n in range(N - 1, -1, -1):
+            rec = steps[n]
+            _, J = op.assemble(rec["x"], zhist, zhist, rec["params"],
+                               want_jac=True)
+            rhs = np.asarray(dJdx_list[n], np.float64) + pending[n]
+            lam = splu(J.T.tocsc()).solve(rhs)
+            dRdT = op.dR_dparam(rec["x"], rec["params"], "T")
+            bT = rec["params"].get("bT", 0.0)
+            if bT != 0.0:
+                dRdT = dRdT + bT * op.dR_dparam(rec["x"], rec["params"], "B")
+            gT[n] = -float(lam @ dRdT)
+            lam_phi, lam_psi = lam[0::NF], lam[2::NF]
+            for k, cc in enumerate(rec["ch"]):
+                kn = n - (k + 1)
+                if kn < 0:
+                    continue
+                pending[kn][0::NF] += (cc / rec["dt"]) * (Mass @ lam_phi)
+                pending[kn][2::NF] += (cc / rec["dt"]) * (Mass @ lam_psi)
+        return gT

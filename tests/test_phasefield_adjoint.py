@@ -189,6 +189,72 @@ def test_g2c_crystallization_bdf2(device):
         assert r_f < 1e-6, (p, a, f)
 
 
+def test_g3_temperature_schedule(device):
+    """G3 (processing params): the quench schedule T(t) gradient is a TIME
+    SERIES dJ/dT_n.  T enters through the crystallisation drive dh(T/Tm-1)
+    and the Flory chi B(T).  Verified three ways on a 4-step BDF2 ramp."""
+    import torch
+    from diffsim.adjoint.crystallization import CACHForward, CACHAdjoint
+    from diffsim.adjoint.torch_twin import CACHTwin
+    dm, mesh = _dm(3, device)
+    coords = mesh.node_coords
+    nn = dm.n_nodes
+    NF = 3
+    cc = np.cos(np.pi * coords[:, 0]) * np.cos(np.pi * coords[:, 1])
+    phi0, psi0 = 0.5 + 0.1 * cc, 0.3 + 0.1 * cc
+    tgt_phi, tgt_psi = np.full(nn, 0.5), np.full(nn, 0.45)
+    base = dict(M=1.0, kappa=0.02, eps2=0.02, L=1.0, dsig=1.0, dh=1.0,
+                Tm=2.0, A=1.0, B=2.5)
+    bT, Tref = 0.8, 0.5
+    Tsched = [0.5, 0.6, 0.7, 0.55]
+    NS, dt, order = 4, 0.01, 2
+
+    def run(Ts, record=False):
+        fwd = CACHForward(dm, FHEnergy(base["A"], base["B"]), M=base["M"],
+                          kappa=base["kappa"], eps2=base["eps2"], L=base["L"],
+                          dsig=base["dsig"], dh=base["dh"], Tm=base["Tm"],
+                          T=Ts[0], dt=dt, order=order)
+        fwd.set_initial(phi0, psi0)
+        fwd.set_schedule(Ts, bT=bT, Tref=Tref)
+        fwd.run(NS)
+        xN = fwd.steps[-1]["x"]
+        J = 0.5 * float(((xN[0::NF] - tgt_phi) ** 2).sum()
+                        + ((xN[2::NF] - tgt_psi) ** 2).sum())
+        return (fwd, J) if record else J
+
+    fwd, _ = run(Tsched, record=True)
+    adj = CACHAdjoint(fwd)
+    dJdx = [np.zeros(NF * nn) for _ in range(NS)]
+    xN = fwd.steps[-1]["x"]
+    dJdx[-1][0::NF] = xN[0::NF] - tgt_phi
+    dJdx[-1][2::NF] = xN[2::NF] - tgt_psi
+    gT_adj = adj.temperature_gradient(dJdx)
+
+    gT_fd = np.zeros(NS)
+    for i in range(NS):
+        hi = list(Tsched); hi[i] += 1e-6
+        lo = list(Tsched); lo[i] -= 1e-6
+        gT_fd[i] = (run(hi) - run(lo)) / 2e-6
+
+    twin = CACHTwin(dm, dt=dt, order=order, device="cpu")
+    P = {k: torch.tensor(float(v)) for k, v in base.items()}
+    Tleaves = [torch.tensor(float(v), requires_grad=True) for v in Tsched]
+    out = twin.march(torch.tensor(phi0), torch.tensor(psi0), P, NS,
+                     T_schedule=Tleaves, bT=bT, Tref=Tref)
+    xNt = out[-1]
+    loss = 0.5 * (((xNt[0::NF] - torch.tensor(tgt_phi)) ** 2).sum()
+                  + ((xNt[2::NF] - torch.tensor(tgt_psi)) ** 2).sum())
+    loss.backward()
+    gT_tw = np.array([float(l.grad) for l in Tleaves])
+    for i in range(NS):
+        r_t = abs(gT_adj[i] - gT_tw[i]) / max(abs(gT_tw[i]), 1e-14)
+        r_f = abs(gT_adj[i] - gT_fd[i]) / max(abs(gT_fd[i]), 1e-14)
+        print(f"G3 dJ/dT[{i}] adj={gT_adj[i]:+.6e} adj/twin={r_t:.2e} "
+              f"adj/fd={r_f:.2e}")
+        assert r_t < 1e-10, (i, gT_adj[i], gT_tw[i])
+        assert r_f < 1e-6, (i, gT_adj[i], gT_fd[i])
+
+
 def test_forward_parity_production(device):
     """The numpy discrete forward must reproduce the production
     CahnHilliardStepper to Newton tolerance — otherwise the adjoint is not
