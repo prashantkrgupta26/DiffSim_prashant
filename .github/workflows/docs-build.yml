@@ -1,0 +1,119 @@
+name: docs-build
+
+# Build the OrgElMorph course PDF and FAIL if a documented number has gone
+# stale versus freshly generated data (spec Phase 0 + cross-cutting principle:
+# every number is generated from saved data, never hand-copied).
+#
+# Two tiers:
+#   * doc-consistency — GitHub-hosted, no GPU: static consistency of the
+#                       chapter's cited macros vs its tolerance baseline (a
+#                       stale edit to either the doc or the baseline is caught
+#                       without running the simulation).
+#   * pdf-and-staleness — self-hosted (tectonic + GPU), token-gated: build the
+#                       PDF, regenerate P1's results.json, and run the
+#                       doc-vs-data staleness gate against latex/numbers/p1.tex.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: docs-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  doc-consistency:
+    name: doc-consistency (macros vs baseline, no GPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml
+      - name: P1 doc macros consistent with the tolerance baseline
+        run: |
+          PYTHONPATH=$GITHUB_WORKSPACE/src python - <<'PY'
+          # A cheap, GPU-free guard: the numbers cited in latex/numbers/p1.tex
+          # must be consistent with the reference values in the chapter's
+          # baseline.yaml (both are the "documented" numbers). This catches an
+          # edit to one but not the other before the expensive GPU job runs.
+          import os, sys, yaml
+          sys.path.insert(0, "tutorials/orgelmorph-course")
+          from common.check_doc_staleness import parse_macros, macro_value
+          ch = "tutorials/orgelmorph-course/physics/01_ch_binary_energies"
+          mapping = yaml.safe_load(open(os.path.join(ch, "doc_numbers.yaml")))
+          baseline = yaml.safe_load(open(os.path.join(ch, "baseline.yaml")))
+          macros = parse_macros(os.path.join(ch, "..", "..", "latex",
+                                             "numbers", "p1.tex"))
+          checks = baseline["checks"]
+          bad = []
+          for name, spec in mapping["macros"].items():
+              if "max" in spec:
+                  continue
+              doc = macro_value(macros[name], spec.get("extract"))
+              ref = checks.get(spec["path"], {}).get("reference")
+              if ref is None:      # range-only baseline entry (e.g. c_max)
+                  continue
+              tol = spec.get("rtol", 0.05) * abs(ref) + spec.get("atol", 0.0)
+              if abs(doc - ref) > tol:
+                  bad.append(f"{name}: doc {doc} vs baseline ref {ref}")
+          if bad:
+              print("STALE doc<->baseline:\n  " + "\n  ".join(bad))
+              sys.exit(1)
+          print("doc macros consistent with baseline references")
+          PY
+
+  pdf-and-staleness:
+    name: pdf-and-staleness (self-hosted — GATED)
+    # Needs a self-hosted runner with tectonic + an NVIDIA GPU AND repo
+    # variable ENABLE_GPU_CI = "true" (same gate as ci.yml gpu-smoke).
+    if: ${{ vars.ENABLE_GPU_CI == 'true' }}
+    runs-on: [self-hosted, gpu]
+    needs: doc-consistency
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install (with GPU + cuDSS)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,cudss]" pyyaml
+
+      - name: Build course PDF (tectonic)
+        working-directory: tutorials/orgelmorph-course/latex
+        run: |
+          tectonic main.tex
+          test -f main.pdf
+
+      - name: Regenerate P1 reference results
+        working-directory: tutorials/orgelmorph-course/physics/01_ch_binary_energies
+        run: |
+          PYTHONPATH=$GITHUB_WORKSPACE/src python run_harness.py \
+            --config configs/p1.yaml --mode reference \
+            --output outputs/p1 --overwrite
+
+      - name: Doc-vs-data staleness gate (P1 macros vs fresh results)
+        working-directory: tutorials/orgelmorph-course/physics/01_ch_binary_energies
+        run: |
+          PYTHONPATH=$GITHUB_WORKSPACE/src python \
+            ../../common/check_doc_staleness.py \
+            --mapping doc_numbers.yaml --results outputs/p1/results.json
+
+      - name: Archive PDF + results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: course-pdf-and-data
+          path: |
+            tutorials/orgelmorph-course/latex/main.pdf
+            tutorials/orgelmorph-course/physics/01_ch_binary_energies/outputs/p1/results.json
+            tutorials/orgelmorph-course/physics/01_ch_binary_energies/outputs/p1/metadata.json
+          if-no-files-found: warn

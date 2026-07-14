@@ -1,0 +1,111 @@
+name: tutorial-smoke
+
+# OrgElMorph course Phase-0 gate (spec docs/dev/2026-07-14-course-v2-evaluation).
+# Two tiers, mirroring the existing ci.yml pattern:
+#   * cpu-micro   — GitHub-hosted: the Warp-free course foundation tests
+#                   (diagnostics library + common/ config/checker/provenance).
+#                   No GPU, always runs.
+#   * gpu-tutorials — self-hosted NVIDIA runner: doctor + the ported tutorials
+#                   (00 smoke, P1 reference regression). Token-gated exactly
+#                   like ci.yml's gpu-smoke; also runs on a nightly schedule.
+# Metadata/results/logs are uploaded as artifacts.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # nightly 04:17 UTC — catches drift in the GPU tutorials
+    - cron: "17 4 * * *"
+
+concurrency:
+  group: tutorial-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-micro:
+    name: cpu-micro (Warp-free course foundation)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install CPU tooling (no Warp/Torch)
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy scipy pyyaml pytest
+          pip install -e . --no-deps
+
+      - name: Diagnostics library tests (numpy-only)
+        run: pytest tests/test_diagnostics.py -q
+
+      - name: Course common/ tests (config, checker, provenance)
+        run: pytest tests/test_course_common.py -q
+
+  gpu-tutorials:
+    name: gpu-tutorials (self-hosted — GATED)
+    # Same gate as ci.yml's gpu-smoke: needs a registered self-hosted NVIDIA
+    # runner AND repo variable ENABLE_GPU_CI = "true". Skipped (not failed)
+    # otherwise. On a scheduled run it still only fires when enabled.
+    if: ${{ vars.ENABLE_GPU_CI == 'true' }}
+    runs-on: [self-hosted, gpu]
+    needs: cpu-micro
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Environment report
+        run: nvidia-smi
+
+      - name: Install (editable, with GPU + cuDSS extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,cudss]" pyyaml
+
+      - name: Doctor (must end READY)
+        working-directory: tutorials/orgelmorph-course/00_setup_and_smoke_test
+        run: |
+          PYTHONPATH=$GITHUB_WORKSPACE/src python doctor.py
+
+      - name: 00 smoke test (harness end-to-end + baseline check)
+        working-directory: tutorials/orgelmorph-course/00_setup_and_smoke_test
+        run: |
+          PYTHONPATH=$GITHUB_WORKSPACE/src python run.py \
+            --config configs/smoke_cuda.yaml --output outputs/smoke --overwrite
+
+      - name: P1 quick smoke (fast harness tier)
+        working-directory: tutorials/orgelmorph-course/physics/01_ch_binary_energies
+        run: |
+          PYTHONPATH=$GITHUB_WORKSPACE/src python run_harness.py \
+            --config configs/p1.yaml --mode quick \
+            --output outputs/p1_quick --overwrite
+
+      - name: P1 reference regression (EXPECTED numbers, baseline-gated)
+        working-directory: tutorials/orgelmorph-course/physics/01_ch_binary_energies
+        run: |
+          PYTHONPATH=$GITHUB_WORKSPACE/src python run_harness.py \
+            --config configs/p1.yaml --mode reference \
+            --output outputs/p1 --overwrite
+
+      - name: Archive run artifacts (metadata/results/logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tutorial-runs
+          path: |
+            tutorials/orgelmorph-course/**/outputs/**/metadata.json
+            tutorials/orgelmorph-course/**/outputs/**/results.json
+            tutorials/orgelmorph-course/**/outputs/**/config.resolved.yaml
+            tutorials/orgelmorph-course/**/outputs/**/run.log
+          if-no-files-found: warn
