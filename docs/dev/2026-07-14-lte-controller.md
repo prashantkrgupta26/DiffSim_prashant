@@ -84,12 +84,14 @@ deterministic meaning.  `lte_march` therefore, when noise is on:
 3. falls back to the stepper's existing fixed-order BDF ladder (byte-
    identical to a plain non-LTE `.march()`), keeping the noise.
 
-RULING recorded for Baskar review: the spec says "fall back to BDF2".
-BDF2 is the deterministic recommendation, but the steppers forbid
-BDF2+noise at construction (the FDT weak order under BDF2 is out of scope,
-A4b).  A run that KEEPS its noise (no silent downgrade) therefore falls
-back to the noise-valid **BDF1** ladder, and the notice states this
-explicitly.  Deterministic runs get the full LTE controller.
+RULING (RATIFIED by Baskar 2026-07-14): the spec said "fall back to
+BDF2", but the steppers forbid BDF2+noise at construction (the FDT weak
+order under BDF2 is out of scope, A4b).  So a run that KEEPS its noise
+(no silent downgrade) falls back to the noise-valid **BDF1** ladder, not
+BDF2 — BDF1 fallback under noise is the CORRECT, confirmed behavior.
+BDF2 remains the deterministic recommendation (stated in the notice) and
+deterministic runs get the full LTE controller; only a noise-on LTE
+request degrades to BDF1.
 
 ## Measured gates
 
