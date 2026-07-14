@@ -241,7 +241,7 @@ class RunContext:
 
 def run_tutorial(run_fn, schema=None, args=None, description="OrgElMorph tutorial",
                  default_output=None, baseline=None, cli_overrides=None,
-                 extra_run_info=None):
+                 extra_run_info=None, default_solver=None):
     """Drive one tutorial run end-to-end.
 
     Parameters
@@ -262,6 +262,10 @@ def run_tutorial(run_fn, schema=None, args=None, description="OrgElMorph tutoria
         Extra config overrides derived from tutorial-specific CLI flags.
     extra_run_info : dict, optional
         Additional provenance fields to record.
+    default_solver : str, optional
+        Backend to use for ``--solver auto`` in place of the global auto
+        (cuDSS-else-splu) policy — the chapter's documented small-problem
+        choice. An explicit ``--solver`` on the CLI still overrides it.
 
     Returns
     -------
@@ -271,11 +275,14 @@ def run_tutorial(run_fn, schema=None, args=None, description="OrgElMorph tutoria
     if args is None:
         args = build_parser(description).parse_args()
 
+    # Device/solver are RUN-level arguments (available via ctx.device /
+    # ctx.solver and recorded in metadata), not config fields — do NOT inject
+    # them into the config overrides, or a schema that doesn't declare them
+    # would reject the run. A tutorial that genuinely wants device IN its
+    # config declares the field and sets it in the YAML.
     overrides = dict(cli_overrides or {})
     if args.seed is not None:
         overrides["seed"] = args.seed
-    if getattr(args, "device", None):
-        overrides.setdefault("device", args.device)
 
     if args.config:
         cfg = _config.resolve_config(args.config, schema=schema,
@@ -289,8 +296,19 @@ def run_tutorial(run_fn, schema=None, args=None, description="OrgElMorph tutoria
                                resume=args.resume)
     logger = setup_logging(paths["log"], args.log_level)
 
+    # A chapter may declare its own documented `auto` choice: some tutorials
+    # solve a small INDEFINITE saddle-point system (e.g. the binary CH (c, mu)
+    # block) where cuDSS's lack of partial pivoting diverges but scipy
+    # SuperLU's pivoting is exact. `default_solver` lets the chapter pin that
+    # documented fallback for `--solver auto` while still honouring an explicit
+    # --solver from an advanced user.
     dofs = cfg.get("dofs")
-    solver, rationale = resolve_solver(args.solver, dofs=dofs)
+    requested = args.solver
+    if requested == "auto" and default_solver:
+        solver, rationale = resolve_solver(default_solver, dofs=dofs)
+        rationale = f"auto -> {rationale} [chapter default_solver]"
+    else:
+        solver, rationale = resolve_solver(requested, dofs=dofs)
     logger.info("solver: %s", rationale)
 
     _config.save_resolved(cfg, paths["config"])

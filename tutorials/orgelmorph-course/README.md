@@ -84,13 +84,37 @@ and the gradient that optimizes it).
 
 ## Running your first tutorial
 
+**Start with Chapter 00** (`00_setup_and_smoke_test/`): run `doctor.py` to
+confirm your environment (it ends in `READY: full CUDA` / `READY: reduced (no
+cuDSS)` / `NOT READY: <fix>`), then the smoke test. Then:
+
 ```bash
 cd physics/01_ch_binary_energies
-python run.py                 # runs both free energies, prints the table
+python run.py                 # the student driver: both energies, prints the table
 ```
 
 Compare the printed numbers with `EXPECTED.md`, then open the course
 document to Physics Concept 1 and read the walkthrough.
+
+### The scientific-workflow harness (`common/`)
+
+Every run is a *repeatable workflow*, not a bespoke script. The shared
+foundation in `common/` gives each chapter a YAML config (the canonical run
+record), a provenance `metadata.json`, a `results.json` checked against a
+tolerance baseline, and a standard `outputs/<run>/` layout. P1 ships a
+harness-driven entry point (`run_harness.py`) as the reference example:
+
+```bash
+python run_harness.py --config configs/p1.yaml --mode reference \
+    --output outputs/p1 --overwrite      # reproduces EXPECTED.md + checks it
+```
+
+Modes trade cost for fidelity: `--mode quick` (<2 min smoke), `reference`
+(the EXPECTED numbers), `research` (finer/longer). The diagnostics library
+(`src/diffsim/diagnostics/`) provides the measured quantities — energy budget,
+mass conservation, structure factor, convergence order, ensemble statistics —
+that the chapters and the research code share. See
+`docs/dev/2026-07-14-course-phase0-foundation.md`.
 
 ---
 

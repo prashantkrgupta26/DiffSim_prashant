@@ -1,6 +1,8 @@
 # tutorial run outputs (regenerable)
 */*/out/
 **/out_*.npz
+# harness standard run directories (config.resolved.yaml/metadata.json/... )
+**/outputs/
 **/__pycache__/
 # LaTeX build intermediates (the built PDF IS committed)
 latex/*.aux

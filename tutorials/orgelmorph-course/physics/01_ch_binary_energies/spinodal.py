@@ -92,7 +92,7 @@ def total_mass(st, dm, mesh, cf):
 def run_spinodal(energy="poly", level=6, steps=300, dt=0.02,
                  M=1.0, kappa=5e-4, fh_A=1.0, fh_B=2.5,
                  c_avg=None, amp=0.05, seed=3, device="cuda:0",
-                 snap_steps=None):
+                 snap_steps=None, linsolver="splu"):
     """March a binary spinodal decomposition and record the energy
     budget each step.  Returns a dict with the time series + snapshots.
 
@@ -106,7 +106,7 @@ def run_spinodal(energy="poly", level=6, steps=300, dt=0.02,
         snap_steps = [0, steps // 10, steps // 3, steps]
     dm, mesh, cons = build_mesh_dm(level, p=1, device=device)
     st = CahnHilliardStepper(dm, M, kappa, dt, order=1, energy=energy,
-                             fh_A=fh_A, fh_B=fh_B)
+                             fh_A=fh_A, fh_B=fh_B, linsolver=linsolver)
     rng = np.random.default_rng(seed)
     st.set_initial(lambda x: c_avg + amp * rng.standard_normal(len(x)),
                    mu_init="consistent")

@@ -1,0 +1,31 @@
+# P1 tolerance baseline — reference mode (level 6, 250 steps).
+#
+# Scientific invariants within DOCUMENTED tolerances, NOT bitwise GPU identity.
+# The energy numbers carry an rtol band (~5-8%) that absorbs card/BLAS
+# differences; the qualitative invariants (mass conservation to ~machine eps,
+# monotone energy decrease, two-phase bounds) are the hard checks.
+#
+# Ground truth captured on RTX 6000 Ada (CUDA 12.9 / driver 13.2, splu):
+#   POLY  F 0.25623 -> 0.049419;  interface peak 0.074898 -> 0.02405;
+#         c in [-1.040, 0.990];  |dm| 4.07e-16
+#   FH    F -0.061911 -> -0.10104; interface peak 0.0074139 -> 0.0014562;
+#         c in [0.144, 0.856];   |dm| 0
+checks:
+  # --- polynomial double well -------------------------------------------
+  poly.Fend:                    {reference: 0.049419, rtol: 0.08}
+  poly.Fint_peak:               {reference: 0.074898, rtol: 0.08}
+  poly.Fint_end:                {reference: 0.02405, rtol: 0.10}
+  poly.c_min:                   {min: -1.15, max: -0.90}
+  poly.c_max:                   {min: 0.90, max: 1.05}
+  poly.mass_drift:              {max: 1.0e-10}
+  poly.monotone_after_step1:    {equals: true}
+
+  # --- Flory-Huggins ----------------------------------------------------
+  fh.Fend:                      {reference: -0.10104, rtol: 0.08}
+  fh.Fint_peak:                 {reference: 0.0074139, rtol: 0.10}
+  fh.Fint_end:                  {reference: 0.0014562, rtol: 0.15}
+  # FH stays strictly inside (0,1) — the logarithm forbids overshoot
+  fh.c_min:                     {min: 0.0, max: 0.30}
+  fh.c_max:                     {min: 0.70, max: 1.0}
+  fh.mass_drift:                {max: 1.0e-10}
+  fh.monotone_after_step1:      {equals: true}
