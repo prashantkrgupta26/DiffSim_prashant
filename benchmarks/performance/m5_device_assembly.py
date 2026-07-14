@@ -61,6 +61,18 @@ CASES = {
     "3d_slab64z32": dict(dim=3, level=6, nz=32, dt=1e-5, noise=0.0),
     "3d_slab64z48": dict(dim=3, level=6, nz=48, dt=1e-5, noise=0.0),
     "3d_slab128": dict(dim=3, level=7, nz=32, dt=1e-5, noise=0.0),
+    # B4: Baskar's 3-D film target — 128 x 128 x 64 elements
+    # (~1.06M nodes, 6.39M dofs at ndof = 6)
+    "3d_film128": dict(dim=3, level=7, nz=64, dt=1e-5, noise=0.0),
+    # B5 capacity rungs ((M, K) = (3, 2), ndof = 10; --mk 32)
+    "3d_slab64z32_mk32": dict(dim=3, level=6, nz=32, dt=1e-5,
+                              noise=0.0),
+    "3d_slab128z48_mk32": dict(dim=3, level=7, nz=48, dt=1e-5,
+                               noise=0.0),
+    "3d_slab128z64_mk32": dict(dim=3, level=7, nz=64, dt=1e-5,
+                               noise=0.0),
+    "3d_slab128z88_mk32": dict(dim=3, level=7, nz=88, dt=1e-5,
+                               noise=0.0),
 }
 
 
@@ -80,34 +92,65 @@ def build_case(c, device):
                                 device)
 
 
-def make_stepper(dm, assembly, dt=1e-4, noise=5e-3):
-    chi_aa = np.zeros((3, 3))
-    chi_aa[0, 1] = chi_aa[1, 0] = 1.0
-    chi_aa[0, 2] = chi_aa[2, 0] = 0.7248
-    chi_aa[1, 2] = chi_aa[2, 1] = 0.3
-    chi_ca = np.zeros((3, 3))
-    chi_ca[0, 1] = chi_ca[0, 2] = 1.6
-    Dslf = np.array([[1e-2, 1e-3, 0.5],
-                     [1e-4, 1e-4, 1e-2],
-                     [1e-2, 1e-3, 1.0]])
+def make_stepper(dm, assembly, dt=1e-4, noise=5e-3, linsolver="cudss",
+                 mk=(2, 1), block_sparse=False):
+    """S3b-class film production physics.  mk=(2, 1): the hero config
+    (M = 2 active + eliminated solvent, K = 1, ndof = 6).  mk=(3, 2):
+    the B5 capacity-study family (3 retained species, 2 crystallizable,
+    ndof = 10) — the (2, 1) energetics extended by a third polymer
+    (chi/N/Vignes rows in the same measured ranges)."""
+    M, K = mk
+    assert mk in ((2, 1), (3, 2)), mk
+    if mk == (2, 1):
+        chi_aa = np.zeros((3, 3))
+        chi_aa[0, 1] = chi_aa[1, 0] = 1.0
+        chi_aa[0, 2] = chi_aa[2, 0] = 0.7248
+        chi_aa[1, 2] = chi_aa[2, 1] = 0.3
+        chi_ca = np.zeros((3, 3))
+        chi_ca[0, 1] = chi_ca[0, 2] = 1.6
+        Dslf = np.array([[1e-2, 1e-3, 0.5],
+                         [1e-4, 1e-4, 1e-2],
+                         [1e-2, 1e-3, 1.0]])
+        kw = dict(N=[65.4, 87.0, 1.0], kappa=[2e-4] * 2,
+                  dsig=[8.0], dh=[-40.0], Tm=[402.0], eps2=[4e-3],
+                  L_psi=[65.4])
+    else:
+        chi_aa = np.zeros((4, 4))
+        for (i, j), v in {(0, 1): 1.0, (0, 2): 0.5, (1, 2): 0.8,
+                          (0, 3): 0.7248, (1, 3): 0.3,
+                          (2, 3): 0.4}.items():
+            chi_aa[i, j] = chi_aa[j, i] = v
+        chi_ca = np.zeros((4, 4))
+        chi_ca[0, 1] = chi_ca[0, 2] = chi_ca[0, 3] = 1.6
+        chi_ca[1, 0] = chi_ca[1, 2] = chi_ca[1, 3] = 1.2
+        Dslf = np.array([[1e-2, 1e-3, 5e-3, 0.5],
+                         [1e-4, 1e-4, 1e-3, 1e-2],
+                         [1e-3, 1e-3, 1e-3, 5e-2],
+                         [1e-2, 1e-3, 5e-3, 1.0]])
+        kw = dict(N=[65.4, 87.0, 40.0, 1.0], kappa=[2e-4] * 3,
+                  dsig=[8.0, 6.0], dh=[-40.0, -30.0],
+                  Tm=[402.0, 390.0], eps2=[4e-3, 4e-3],
+                  L_psi=[65.4, 40.0])
     st = MultiPhaseStepper(
-        dm, M=2, K=1, chi_aa=chi_aa, chi_ac=chi_ca.T.copy(),
-        chi_ca=chi_ca, N=[65.4, 87.0, 1.0], mob="fastmode_n",
-        D_self=Dslf, ls_drop=(1e-6, 0.97, 35.0), kappa=[2e-4] * 2,
+        dm, M=M, K=K, chi_aa=chi_aa, chi_ac=chi_ca.T.copy(),
+        chi_ca=chi_ca, mob="fastmode_n",
+        D_self=Dslf, ls_drop=(1e-6, 0.97, 35.0),
         T=333.0, dt=dt, bulk="r14", b_reg=1e-3,
-        dsig=[8.0], dh=[-40.0], Tm=[402.0], eps2=[4e-3],
-        L_psi=[65.4], noise_psi=noise,
+        noise_psi=noise,
         noise_damp=(1e-2, 0.85, 15.0), clip_psi=False,
-        newton_tol=1e-8, newton_max=50, linsolver="cudss",
+        newton_tol=1e-8, newton_max=50, linsolver=linsolver,
         line_search=True, noise_seed=11,
-        film=dict(k_e=0.1), assembly=assembly)
+        film=dict(k_e=0.1), assembly=assembly,
+        block_sparse=block_sparse, **kw)
     rng = np.random.default_rng(1011)
     nf = st.nfree
-    icf = 0.10 + 0.01 * rng.standard_normal(nf)
-    icp = 0.05 + 0.01 * rng.standard_normal(nf)
-    st.set_initial([lambda x: icf, lambda x: icp],
-                   [lambda x: np.zeros(len(x))],
-                   [lambda x: np.zeros(len(x))])
+    ics = [0.10 + 0.01 * rng.standard_normal(nf),
+           0.05 + 0.01 * rng.standard_normal(nf)]
+    if M == 3:
+        ics.append(0.05 + 0.005 * rng.standard_normal(nf))
+    z = lambda x: np.zeros(len(x))
+    st.set_initial([(lambda v: (lambda x: v))(v) for v in ics],
+                   [z] * K, [z] * K)
     return st
 
 
@@ -154,14 +197,21 @@ def main():
                     choices=["host", "device"])
     ap.add_argument("--steps", type=int, default=3)
     ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--solver", default="cudss",
+                    choices=["cudss", "splu", "blockch", "blockch_dev"])
+    ap.add_argument("--block-sparse", action="store_true",
+                    help="kron(G, blockmask) device pattern (B5)")
     args = ap.parse_args()
 
     case = CASES[args.case]
     dm = build_case(case, args.device)
     st = make_stepper(dm, args.assembly, dt=case.get("dt", 1e-4),
-                      noise=case.get("noise", 5e-3))
+                      noise=case.get("noise", 5e-3),
+                      linsolver=args.solver,
+                      mk=(3, 2) if args.case.endswith("_mk32")
+                      else (2, 1), block_sparse=args.block_sparse)
     ndofs = st.nfree * st.ndof
-    print(f"[{args.case}/{args.assembly}] elements "
+    print(f"[{args.case}/{args.assembly}/{args.solver}] elements "
           f"{len(dm.mesh.tree)} nodes {dm.n_nodes} dofs {ndofs}",
           flush=True)
 
@@ -179,7 +229,7 @@ def main():
     try:
         st.step()
     except Exception as e:
-        print(f"RESULT {args.case} {args.assembly} DNF-setup: "
+        print(f"RESULT {args.case} {args.assembly} {args.solver} DNF-setup: "
               f"{type(e).__name__}: {e}", flush=True)
         return
     t_setup = time.perf_counter() - t0
@@ -195,7 +245,7 @@ def main():
         try:
             st.step()
         except Exception as e:
-            print(f"RESULT {args.case} {args.assembly} DNF-march: "
+            print(f"RESULT {args.case} {args.assembly} {args.solver} DNF-march: "
                   f"{type(e).__name__}: {e}", flush=True)
             ok = False
             break
@@ -206,7 +256,7 @@ def main():
     other = t_tot - asm_acc[0] - slv_acc[0]
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
     nnz = st._asm.nnz if args.assembly == "device" else -1
-    print(f"RESULT {args.case} {args.assembly} dofs {ndofs} "
+    print(f"RESULT {args.case} {args.assembly} {args.solver} dofs {ndofs} "
           f"nnz {nnz} steps {n} "
           f"step {t_tot / n:.3f} s  asm {asm_acc[0] / n:.3f} s "
           f"({asm_acc[1]} calls, {asm_acc[0] / max(asm_acc[1], 1):.3f}"

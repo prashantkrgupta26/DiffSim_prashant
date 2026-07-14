@@ -67,8 +67,23 @@ def _blockch_pairs(A, b, meta, tol, device):
     the film's advection and top-flux rows live INSIDE the extracted
     blocks) are dropped in the PRECONDITIONER only — the outer FGMRES
     carries them. Escalation on outer stall switches the WHOLE apply to
-    per-pair exact-Schur. Returns (x, (outer(+1000 on fallback),
-    inner_total))."""
+    per-pair exact-Schur.
+
+    B-track (M, K) extension: meta may carry "ac" = [{"off": o}, ...],
+    one entry per Allen-Cahn (psi, theta) dof pair at node offsets
+    (o, o+1). Each AC block is preconditioned by its OWN extracted
+    diagonal blocks, lower-triangular within the pair (the theta row's
+    psi column — the KWC p'(psi) torque — is carried; the psi row has
+    no theta column by construction):
+        z_s = Ass^{-1} r_s;  z_t = Att^{-1} (r_t - Ats z_s)
+    Ass = sigma M + L_psi (f'' M + eps2 K) class (mass-dominated at
+    production dt; indefinite f'' and film advection possible -> GMRES
+    inner, not CG); Att = sigma M (frozen bookkeeping / marker
+    advection) or the KWC (p+pf)-weighted SPD row. The phi/mu <-> psi
+    couplings are dropped in the preconditioner; the outer FGMRES
+    carries them. AC blocks are exact-block solves already, so the
+    escalation only upgrades the CH pairs. Returns (x, (outer(+1000 on
+    fallback), inner_total))."""
     from scipy.sparse.linalg import (LinearOperator, cg as _cg,
                                      gmres as _gmres, lgmres as _lgmres)
     sig = meta["sigma"]
@@ -121,6 +136,10 @@ def _blockch_pairs(A, b, meta, tol, device):
         dgs[2] = np.abs(dgs[2])         # Jacobi sign-guard (indefinite)
 
         def _dev(op, y, dg, rtol, krylov, label):
+            if not np.any(y):
+                return np.zeros_like(y)   # zero rhs: exact, and the
+                # device BiCGStab 0/0-breaks down on it (frozen-theta
+                # rows carry an exactly-zero residual)
             x_, info = krylov(op, y, tol=rtol, atol=1e-13,
                               maxiter=4000, diag=dg, check_every=50)
             if not info.get("converged"):
@@ -133,8 +152,58 @@ def _blockch_pairs(A, b, meta, tol, device):
                 lambda y: _dev(ops[2], y, dgs[2], 1e-8, bicgstab_dev,
                                "W2"))
 
-    mk = (_device_solvers if meta.get("inners") == "device"
-          else _host_solvers)
+    def _host_block(W, label):
+        # Jacobi-GMRES on one extracted scalar block (possibly
+        # indefinite / advective — GMRES, not CG; abs-diag sign guard)
+        d = np.abs(W.diagonal().copy())
+        d[d == 0] = 1.0
+        Mj = LinearOperator(W.shape, lambda v: v / d)
+
+        def solve(y):
+            z, info = _gmres(W, y, M=Mj, rtol=1e-8, atol=0.0,
+                             maxiter=3000, restart=100, callback=_cb,
+                             callback_type="legacy")
+            if info != 0:
+                raise RuntimeError(
+                    f"blockch {label} GMRES not converged: {info}")
+            return z
+
+        return solve
+
+    def _dev_block(W, label):
+        from ..assembly.operators import CSROperator
+        from .krylov_dev import bicgstab_dev
+        op = CSROperator(W, device)
+        dg = np.abs(np.asarray(W.diagonal()).copy())
+        dg[dg == 0] = 1.0
+
+        def solve(y):
+            if not np.any(y):
+                return np.zeros_like(y)   # zero rhs (see _dev above)
+            x_, info = bicgstab_dev(op, y, tol=1e-8, atol=1e-13,
+                                    maxiter=4000, diag=dg,
+                                    check_every=50)
+            if not info.get("converged"):
+                raise RuntimeError(
+                    f"blockch {label} device solve: {info}")
+            inner_it[0] += info.get("iters", 0)
+            return x_
+
+        return solve
+
+    dev_inners = meta.get("inners") == "device"
+    mk = _device_solvers if dev_inners else _host_solvers
+    mkb = _dev_block if dev_inners else _host_block
+    acs = []
+    for a_ in meta.get("ac", ()):
+        si = base + a_["off"]
+        ti = si + 1
+        Ass = A[si][:, si].tocsr()
+        Att = A[ti][:, ti].tocsr()
+        Ats = A[ti][:, si].tocsr()      # KWC torque col (frozen: empty)
+        acs.append(dict(si=si, ti=ti, Ats=Ats,
+                        ssolve=mkb(Ass, "acS"),
+                        tsolve=mkb(Att, "acT")))
     pairs = []
     for p in meta["pairs"]:
         mmo, kap = p["m"], p["kappa"]
@@ -153,8 +222,15 @@ def _blockch_pairs(A, b, meta, tol, device):
                           Amm=Amm, Acc=Acc, K=K, msolve=msolve,
                           w1solve=w1solve, w2solve=w2solve))
 
+    def _apply_ac(r, z):
+        for B in acs:
+            zs = B["ssolve"](r[B["si"]])
+            zt = B["tsolve"](r[B["ti"]] - B["Ats"] @ zs)
+            z[B["si"]] = zs
+            z[B["ti"]] = zt
+
     def apply(r):
-        z = r.copy()            # identity on any dof no pair covers
+        z = r.copy()            # identity on any dof no block covers
         for P in pairs:
             rc, rm = r[P["ci"]], r[P["mi"]]
             a = P["w1solve"](rc - P["Acm"] @ P["msolve"](rm))
@@ -162,6 +238,7 @@ def _blockch_pairs(A, b, meta, tol, device):
             zm = P["msolve"](rm - P["Amc"] @ zc)
             z[P["ci"]] = zc
             z[P["mi"]] = zm
+        _apply_ac(r, z)
         return z
 
     it = [0]
@@ -202,6 +279,7 @@ def _blockch_pairs(A, b, meta, tol, device):
                 zm = P["msolve"](rm - P["Amc"] @ zc)
                 z[P["ci"]] = zc
                 z[P["mi"]] = zm
+            _apply_ac(r, z)
             return z
 
         it[0] = 0
@@ -215,45 +293,93 @@ def _blockch_pairs(A, b, meta, tol, device):
     return x, (it[0], inner_it[0])
 
 
+def _block_maps(indptr, indices, ndof, row_off, col_offs):
+    """Gather maps for the node-blocks (row_off, c) for c in col_offs:
+    positions in A.data of every entry whose dof row is ndof*k+row_off
+    and dof col is ndof*j+c.  Returns (rowptr, colnodes, {c: pos});
+    a block ABSENT from the pattern (block-masked kron(G, mask)
+    patterns) yields an empty pos and does not participate in the
+    shared-rowptr check.  All host, one row scan for all col_offs."""
+    n = (len(indptr) - 1) // ndof
+    nodes = np.arange(n, dtype=np.int64)
+    rows = nodes * ndof + row_off
+    starts = np.asarray(indptr)[rows].astype(np.int64)
+    cnt = (np.asarray(indptr)[rows + 1] - starts).astype(np.int64)
+    # positions of every entry in these rows (vectorized ranges)
+    base = np.repeat(starts - np.concatenate(
+        ([0], np.cumsum(cnt)[:-1])), cnt)
+    idx = base + np.arange(int(cnt.sum()), dtype=np.int64)
+    cols = np.asarray(indices)[idx].astype(np.int64)
+    row_of = np.repeat(nodes, cnt)
+    rowptr = colnodes = None
+    pos = {}
+    for col_off in col_offs:
+        sel = (cols % ndof) == col_off
+        pos[col_off] = idx[sel]
+        if len(pos[col_off]) == 0:
+            continue                    # structurally absent block
+        cn = (cols[sel] // ndof).astype(np.int32)
+        rp = np.zeros(n + 1, np.int64)
+        np.cumsum(np.bincount(row_of[sel], minlength=n), out=rp[1:])
+        if rowptr is None:
+            rowptr, colnodes = rp, cn
+        else:
+            assert len(cn) == len(colnodes) and (cn == colnodes).all(), \
+                "blocks do not share one node pattern"
+    return rowptr, colnodes, pos
+
+
 def _pair_pattern_maps(indptr, indices, ndof, off):
     """Host-once symbolic work for the DEVICE blockch setup (G5): for
     the (phi, mu) pair at dof offsets (ndof*k+off, ndof*k+off+1), gather
-    maps from positions in A.data to the four pair blocks. The element
-    assembly writes FULL ndof x ndof node blocks, so Acc/Acm/Amc/Amm all
+    maps from positions in A.data to the four pair blocks. All four
+    blocks are live in every pattern (superset AND block-masked) and
     share ONE node-neighbor pattern (asserted) — W1/W2 live on it too.
     Returns (rowptr, colnodes, pos{cc,cm,mc,mm}, diag_slots), all host."""
     import scipy.sparse as _sp
-    n = (len(indptr) - 1) // ndof
-    nodes = np.arange(n, dtype=np.int64)
-    pos = {}
-    rowptr = colnodes = None
-    for row_off, names in ((off, ("cc", "cm")), (off + 1, ("mc", "mm"))):
-        rows = nodes * ndof + row_off
-        starts = np.asarray(indptr)[rows].astype(np.int64)
-        cnt = (np.asarray(indptr)[rows + 1] - starts).astype(np.int64)
-        # positions of every entry in these rows (vectorized ranges)
-        base = np.repeat(starts - np.concatenate(
-            ([0], np.cumsum(cnt)[:-1])), cnt)
-        idx = base + np.arange(int(cnt.sum()), dtype=np.int64)
-        cols = np.asarray(indices)[idx].astype(np.int64)
-        row_of = np.repeat(nodes, cnt)
-        for name, col_off in zip(names, (off, off + 1)):
-            sel = (cols % ndof) == col_off
-            pos[name] = idx[sel]
-            cn = (cols[sel] // ndof).astype(np.int32)
-            rp = np.zeros(n + 1, np.int64)
-            np.cumsum(np.bincount(row_of[sel], minlength=n), out=rp[1:])
-            if rowptr is None:
-                rowptr, colnodes = rp, cn
-            else:
-                assert len(cn) == len(colnodes) and (
-                    cn == colnodes).all(), \
-                    "pair blocks do not share one node pattern"
+    rp1, cn1, posr1 = _block_maps(indptr, indices, ndof, off,
+                                  (off, off + 1))
+    rp2, cn2, posr2 = _block_maps(indptr, indices, ndof, off + 1,
+                                  (off, off + 1))
+    assert cn1 is not None and cn2 is not None and \
+        len(cn1) == len(cn2) and (cn1 == cn2).all() and \
+        all(len(p) == len(cn1)
+            for p in (*posr1.values(), *posr2.values())), \
+        "pair blocks do not share one node pattern"
+    rowptr, colnodes = rp1, cn1
+    pos = {"cc": posr1[off], "cm": posr1[off + 1],
+           "mc": posr2[off], "mm": posr2[off + 1]}
     probe = _sp.csr_matrix(
         (np.arange(len(colnodes), dtype=np.float64), colnodes, rowptr),
-        shape=(n, n))
+        shape=((len(indptr) - 1) // ndof,) * 2)
     diag = probe.diagonal().astype(np.int64)
     return rowptr, colnodes, pos, diag
+
+
+def _ac_pattern_maps(indptr, indices, ndof, off):
+    """AC-block analogue of _pair_pattern_maps for the (psi, theta)
+    group at (off, off+1): ss = (psi, psi), tt = (theta, theta) —
+    always live, shared node pattern asserted — and ts = (theta, psi),
+    the KWC torque column, which a block-masked frozen-theta pattern
+    legitimately DROPS (returned as None then).  Returns (rowptr,
+    colnodes, {ss, ts|None, tt}, diag_slots)."""
+    import scipy.sparse as _sp
+    rp1, cn1, posr1 = _block_maps(indptr, indices, ndof, off, (off,))
+    rp2, cn2, posr2 = _block_maps(indptr, indices, ndof, off + 1,
+                                  (off, off + 1))
+    assert cn1 is not None and cn2 is not None and \
+        len(cn1) == len(cn2) and (cn1 == cn2).all(), \
+        "AC ss/tt blocks do not share one node pattern"
+    ts = posr2[off] if len(posr2[off]) else None
+    if ts is not None:
+        assert len(ts) == len(cn1), \
+            "AC ts block pattern differs from ss/tt"
+    pos = {"ss": posr1[off], "ts": ts, "tt": posr2[off + 1]}
+    probe = _sp.csr_matrix(
+        (np.arange(len(cn1), dtype=np.float64), cn1, rp1),
+        shape=((len(indptr) - 1) // ndof,) * 2)
+    diag = probe.diagonal().astype(np.int64)
+    return rp1, cn1, pos, diag
 
 
 def _blockch_pair_fill_kernel():
@@ -293,7 +419,8 @@ def _blockch_pair_fill_kernel():
 
 
 def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
-                         device="cuda:0", cache=None, cache_key=None):
+                         device="cuda:0", cache=None, cache_key=None,
+                         idx_dev=None):
     """G5: _blockch_pairs with a DEVICE-RESIDENT setup. A's values live
     on the GPU (warp array vals_d, e.g. DeviceNSAssembler.vals_d);
     indptr/indices are the assembler's HOST pattern mirrors. Symbolic
@@ -307,6 +434,10 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
     inner-solve rhs/solution transfers are the recorded host cost of
     this rung. Same recipe/laws as _blockch_pairs; escalation gathers
     Acc lazily and runs the per-pair exact Schur via device matvecs.
+    B-track: meta["ac"] AC blocks ride the same machinery — value
+    GATHERS (no W combination) into per-block ss/ts/tt buffers on the
+    shared node pattern, device BiCGStab inners, lower-triangular
+    within the (psi, theta) pair (_blockch_pairs docstring).
     Returns host x; records ('blockch_iters', cache_key)."""
     import warp as wp
     from scipy.sparse.linalg import (LinearOperator, gmres as _gmres,
@@ -320,16 +451,16 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
     n = N // ndof
     nnz = len(indices)
     assert nnz < 2 ** 31, "int32 device slot maps (add int64 variant)"
-    fp = (N, nnz, len(meta["pairs"]))
+    fp = (N, nnz, len(meta["pairs"]), len(meta.get("ac", ())))
     setup = (cache or {}).get(("blockch_dev_setup", cache_key))
     if setup is None or setup["fp"] != fp:
-        setup = {"fp": fp, "pairs": []}
+        setup = {"fp": fp, "pairs": [], "ac": []}
+        dev = lambda a_, dt: wp.array(np.ascontiguousarray(a_),
+                                      dtype=dt, device=device)
         for p in meta["pairs"]:
             rowptr, colnodes, pos, diag = _pair_pattern_maps(
                 indptr, indices, ndof, p["off"])
             nnzp = len(colnodes)
-            dev = lambda a_, dt: wp.array(np.ascontiguousarray(a_),
-                                          dtype=dt, device=device)
             setup["pairs"].append(dict(
                 nnzp=nnzp,
                 rowptr_d=dev(rowptr.astype(np.int32), wp.int32),
@@ -343,7 +474,29 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
                 w1_d=wp.zeros(nnzp, dtype=wp.float64, device=device),
                 w2_d=wp.zeros(nnzp, dtype=wp.float64, device=device),
                 dg_d=wp.zeros(n, dtype=wp.float64, device=device)))
-        setup["A_idx_d"] = (
+        for a_blk in meta.get("ac", ()):
+            rowptr, colnodes, pos, diag = _ac_pattern_maps(
+                indptr, indices, ndof, a_blk["off"])
+            nnzp = len(colnodes)
+            setup["ac"].append(dict(
+                nnzp=nnzp,
+                rowptr_d=dev(rowptr.astype(np.int32), wp.int32),
+                colnodes_d=dev(colnodes, wp.int32),
+                # ss = psi-psi, ts = theta-psi (KWC torque; None when
+                # the pattern drops it), tt = theta-theta
+                pos_d={k: (None if pos[k] is None
+                           else dev(pos[k].astype(np.int32), wp.int32))
+                       for k in ("ss", "ts", "tt")},
+                diag_d=dev(diag.astype(np.int32), wp.int32),
+                ss_d=wp.zeros(nnzp, dtype=wp.float64, device=device),
+                ts_d=(wp.zeros(nnzp, dtype=wp.float64, device=device)
+                      if pos["ts"] is not None else None),
+                tt_d=wp.zeros(nnzp, dtype=wp.float64, device=device),
+                dg_d=wp.zeros(n, dtype=wp.float64, device=device)))
+        # idx_dev: caller-provided device (indptr, indices) int32 pair
+        # (e.g. DeviceNSAssembler._op_idx) — avoids a DUPLICATE device
+        # copy of the full-A indices (4-8 GB at the B4/B5 sizes)
+        setup["A_idx_d"] = idx_dev if idx_dev is not None else (
             wp.array(np.ascontiguousarray(
                 np.asarray(indptr).astype(np.int32)),
                 dtype=wp.int32, device=device),
@@ -356,6 +509,8 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
     _cb = lambda *_: inner_it.__setitem__(0, inner_it[0] + 1)
 
     def _dev_solve(op, y, dg, rtol, krylov, label):
+        if not np.any(y):
+            return np.zeros_like(y)       # zero rhs (see _blockch_pairs)
         x_, info = krylov(op, y, tol=rtol, atol=1e-13, maxiter=4000,
                           diag=dg, check_every=50)
         if not info.get("converged"):
@@ -399,6 +554,44 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
             w2solve=lambda y, o=opW2, d_=dgs[2]:
                 _dev_solve(o, y, d_, 1e-8, bicgstab_dev, "W2")))
 
+    acs = []
+    for a_blk, Bd in zip(meta.get("ac", ()), setup["ac"]):
+        for name, buf in (("ss", Bd["ss_d"]), ("ts", Bd["ts_d"]),
+                          ("tt", Bd["tt_d"])):
+            if buf is None:
+                continue                # masked-out KWC torque block
+            wp.launch(gat, dim=Bd["nnzp"],
+                      inputs=[vals_d, Bd["pos_d"][name], buf],
+                      device=device)
+        dgs = []
+        for arr in (Bd["ss_d"], Bd["tt_d"]):
+            wp.launch(gat, dim=n, inputs=[arr, Bd["diag_d"],
+                                          Bd["dg_d"]], device=device)
+            dg = np.abs(Bd["dg_d"].numpy())
+            dg[dg == 0] = 1.0
+            dgs.append(dg)
+        mkop = lambda a_, Bd=Bd: CSROperator.from_device_arrays(
+            Bd["rowptr_d"], Bd["colnodes_d"], a_, n, device)
+        si = np.arange(n, dtype=np.int64) * ndof + a_blk["off"]
+        acs.append(dict(
+            si=si, ti=si + 1,
+            opTS=(mkop(Bd["ts_d"]) if Bd["ts_d"] is not None
+                  else None),
+            ssolve=lambda y, o=mkop(Bd["ss_d"]), d_=dgs[0]:
+                _dev_solve(o, y, d_, 1e-8, bicgstab_dev, "acS"),
+            tsolve=lambda y, o=mkop(Bd["tt_d"]), d_=dgs[1]:
+                _dev_solve(o, y, d_, 1e-8, bicgstab_dev, "acT")))
+
+    def _apply_ac(r, z):
+        for B in acs:
+            zs = B["ssolve"](r[B["si"]])
+            rt = r[B["ti"]]
+            if B["opTS"] is not None:
+                rt = rt - B["opTS"].matvec_numpy(zs)
+            zt = B["tsolve"](rt)
+            z[B["si"]] = zs
+            z[B["ti"]] = zt
+
     def apply(r):
         z = r.copy()
         for P in pairs:
@@ -409,6 +602,7 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
             zm = P["msolve"](rm - P["opAmc"].matvec_numpy(zc))
             z[P["ci"]] = zc
             z[P["mi"]] = zm
+        _apply_ac(r, z)
         return z
 
     opA = CSROperator.from_device_arrays(*setup["A_idx_d"], vals_d, N,
@@ -459,6 +653,7 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
                 zm = P["msolve"](rm - P["opAmc"].matvec_numpy(zc))
                 z[P["ci"]] = zc
                 z[P["mi"]] = zm
+            _apply_ac(r, z)
             return z
 
         it[0] = 0
@@ -483,11 +678,15 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
     sym=True routes to CG/SPD paths. cache/cache_key: reuse device uploads
     or factorizations for constant matrices across steps."""
     A = A.tocsr()
-    if cache is not None and cache_key is not None:
+    if cache is not None and cache_key is not None \
+            and solver not in ("blockch",):
         # cheap staleness guard (evaluation solver-review item): cached
         # factorizations are for CONSTANT matrices — catch reuse of a key
         # after the matrix changed shape/pattern (values are the caller's
-        # contract; a full value check would defeat the cache's purpose)
+        # contract; a full value check would defeat the cache's purpose).
+        # blockch is EXEMPT: it caches meta/iteration records only and
+        # rebuilds its factors per call — the host T^T K T pattern
+        # legitimately flaps under multiphase noise (the S2 finding).
         fp = (A.shape, A.nnz, str(A.dtype))
         old = cache.get(("fingerprint", cache_key))
         if old is None:
@@ -666,6 +865,8 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
             dg2 = np.abs(dg2)               # Jacobi sign-guard (indefinite)
 
             def _dev(op, y, dg, rtol, krylov, label):
+                if not np.any(y):
+                    return np.zeros_like(y)   # zero rhs (see above)
                 x_, info = krylov(op, y, tol=rtol, atol=1e-13,
                                   maxiter=4000, diag=dg, check_every=50)
                 if not info.get("converged"):
