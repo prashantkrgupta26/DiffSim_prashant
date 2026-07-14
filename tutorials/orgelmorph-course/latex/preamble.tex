@@ -38,4 +38,7 @@
 \newcommand{\dd}[2]{\frac{\partial #1}{\partial #2}}
 \newcommand{\intv}{\int_\Omega}
 \newcommand{\code}[1]{\lstinline[basicstyle=\ttfamily\small]|#1|}
-\newcommand{\file}[1]{\texttt{\small #1}}
+% \file: typewriter paths that break at / and . so long paths never
+% overflow the margin (\nolinkurl from hyperref, tt style).
+\urlstyle{tt}
+\newcommand{\file}[1]{{\small\nolinkurl{#1}}}

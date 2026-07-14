@@ -21,7 +21,7 @@ from run import summarize
 FIGDIR = os.path.join(os.path.dirname(__file__),
                       "..", "..", "latex", "figures")
 NUMTEX = os.path.join(os.path.dirname(__file__),
-                      "..", "..", "latex", "numbers.tex")
+                      "..", "..", "latex", "numbers", "p1.tex")
 
 
 def write_numbers(recs):
@@ -55,6 +55,7 @@ def write_numbers(recs):
             mac(f"{pre}crange", crange(d)),
             mac(f"{pre}mass", mass(d)),
         ]
+    os.makedirs(os.path.dirname(NUMTEX), exist_ok=True)
     with open(NUMTEX, "w") as fh:
         fh.write("\n".join(lines) + "\n")
     print("wrote", NUMTEX)
