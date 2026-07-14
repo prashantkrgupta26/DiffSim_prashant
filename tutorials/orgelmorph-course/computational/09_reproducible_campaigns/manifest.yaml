@@ -1,0 +1,69 @@
+# OrgElMorph course - Computational C9: campaign MANIFEST (the run record).
+#
+# This YAML is the campaign's canonical, re-runnable description.  The runner
+# (campaign.py) loads it, freezes it to campaign.resolved.yaml (defaults made
+# explicit), enumerates the run grid, executes each real 2-D Cahn-Hilliard
+# spinodal march, and aggregates -- surfacing (never dropping) failures.
+#
+# WHY chi, NOT k_e:  the C9 spec suggests "2-3 k_e x 2 seeds".  We sweep the
+# Flory-Huggins ENTHALPIC parameter chi (== fh_B in the binary CH free energy
+# f = A[c ln c + (1-c)ln(1-c)] + B c(1-c)) instead, for two reasons: (1) chi is
+# the one production material parameter in materials.yaml that carries a real
+# measured UNCERTAINTY (P3HT:PCBM chi_pf = 0.86, order-of-magnitude 0.5), which
+# Chapter C10 then propagates -- the two chapters share one physical control;
+# (2) the CH spinodal march is ~10x faster than the drying-film k_e driver, so
+# the whole campaign runs locally in well under a minute on a shared GPU.  The
+# job-array sketch (job_array.sbatch) shows the same manifest at cluster scale.
+
+campaign: c9_chi_spinodal_demo
+description: >
+  Tiny reproducible campaign: sweep the Flory-Huggins enthalpic parameter chi
+  over a 3-point exploratory scan and a 1-point confirmatory replicate, each
+  across a 2-seed ensemble, on the fast 2-D binary Cahn-Hilliard spinodal.
+  Morphology observable: the interfacial-area domain length L_area.  Includes a
+  deliberately-misconfigured run to prove failures are surfaced, not dropped.
+
+# --- the FROZEN model (immutable across the whole campaign) -----------------
+base:
+  engine: ch_spinodal
+  energy: fh              # Flory-Huggins log free energy (chi enters as fh_B)
+  level: 5               # 2^5 = 32x32 lateral cells (fast, conserves at fh_A)
+  steps: 40
+  dt: 0.02
+  M: 1.0                 # Cahn-Hilliard mobility
+  kappa: 5.0e-4          # gradient-energy coefficient (interface width)
+  fh_A: 0.15             # entropic scale (~1/N); keeps the whole chi band spinodal
+  amp: 0.05              # initial perturbation amplitude
+  measure_every: 5
+  solver: splu           # exact pivoting on the small indefinite (c, mu) block
+  device: cuda:0
+  observable: L_area     # interfacial-area domain length (robust, monotone)
+  mass_drift_max: 5.0e-2 # hard admissibility gate -> over this = FAILED run
+
+# --- the sweeps (each tagged exploratory vs confirmatory) -------------------
+sweeps:
+  # EXPLORATORY: a coarse 3-point scan of chi to see the trend.  Its CIs are
+  # exploratory -- a hypothesis generator, NOT a confirmatory measurement.
+  - name: chi_scan
+    param: fh_B
+    values: [0.36, 0.86, 1.36]   # P3HT:PCBM chi_pf mean and +/- 1 sigma
+    seeds: [1, 2]
+    intent: exploratory
+
+  # CONFIRMATORY: the pre-registered operating point (nominal chi), a dedicated
+  # replicate ensemble reported as the confirmatory number.
+  - name: chi_confirm
+    param: fh_B
+    values: [0.86]
+    seeds: [11, 12]
+    intent: confirmatory
+
+# --- deliberate failure injection (the no-silent-drop demonstration) --------
+# A mistyped solver name is a classic real campaign failure: one cell of a
+# job array had a bad config and crashed.  The runner catches it, records it
+# FAILED, keeps going, and the aggregate SURFACES it by id and reason.
+deliberate_failures:
+  - label: bad_solver_typo
+    fh_B: 0.86
+    seed: 1
+    solver: nope          # <- misconfiguration: unknown solver -> ConfigError

@@ -1,4 +1,240 @@
 \chapter{Validation and uncertainty}
 \label{ch:c10}
+\begin{keybox}
+\textbf{Key idea.} ``Is the answer right?'' is not one question but six:
+code verification, solution verification, model validation, parameter
+uncertainty, stochastic variability, and model--experiment discrepancy.
+Conflating them is the most common way a computational study misleads ---
+a converged run can still be swamped because a material input is known
+only to order of magnitude. This chapter separates the six and closes
+with the deliverable that forces the separation: an \emph{uncertainty
+budget} that names the dominant source of error.
+\end{keybox}
 
-\emph{Under construction (course-v2 Phase 3).}
+\begin{keybox}
+\textbf{Learning objectives.} By the end you can name and separately
+measure all six error questions; propagate a material parameter
+uncertainty from \file{materials.yaml} to a morphology observable by a
+finite-difference sensitivity; combine parametric, stochastic and
+numerical standard deviations in quadrature into one budget; and read off
+the dominant source --- and therefore where the next effort should go (a
+better $\chi$, more seeds, or a finer mesh).\\[2pt]
+\textbf{Prerequisites.} Computational Chapter~\ref{ch:c1} (code and
+solution verification --- the MMS order study cited here),
+Chapter~\ref{ch:c9} (the seed ensemble and the $\chi$ sweep whose
+sensitivity is reused), the \file{materials.yaml} schema and loader (the
+parameter-uncertainty source), and the stochastic diagnostics.\\[2pt]
+\textbf{Expected cost.} Any CUDA GPU, 2-D, $<1$\,GB device memory. The
+budget campaign is $\approx13$ real runs (a \CtenNseeds-seed ensemble, a
+six-run sensitivity, a three-level mesh refinement, a linear-stability
+probe); $\approx2$--$3$\,min on an RTX~6000 Ada.
+\end{keybox}
+
+\section{Six questions, not one}
+
+A number from this simulator can be wrong in six independent ways, and a
+defensible study answers each separately:
+\begin{enumerate}[nosep]
+  \item \textbf{Code verification} --- am I solving the equations
+        \emph{right}? Order/MMS, conservation, energy monotonicity: a bug
+        check against \emph{mathematics}.
+  \item \textbf{Solution verification} --- is the \emph{discretization}
+        error of \emph{this} run small enough? Mesh refinement of the
+        observable.
+  \item \textbf{Model validation} --- is it the \emph{right model of
+        reality}? Comparison against an independent benchmark.
+  \item \textbf{Parameter uncertainty} --- how much does the observable
+        move because a material input has a \emph{spread}?
+  \item \textbf{Stochastic variability} --- how much does it move
+        \emph{seed to seed} at fixed parameters?
+  \item \textbf{Model--experiment discrepancy} --- the residual gap once
+        the rest are accounted.
+\end{enumerate}
+The trap is to answer one and imply the others: ``it converged, so it is
+right'' confuses~(2) with~(1) and~(3); ``mean $\pm$ seed-sd'' reports~(5)
+alone and hides~(4). We use one material case and one observable to keep
+all six commensurate.
+
+\section{One material case, one observable}
+
+The case is \CtenMaterial, read from \file{materials.yaml}: the Flory
+interaction $\chi_{\mathrm{pf}}=\CtenChiNom$ with a reported spread
+$\CtenChiSigma$ (order of magnitude --- the OSC literature has no single
+``true'' $\chi$ for this blend). We take that spread as the $1\sigma$
+parametric uncertainty on $\chi$. The parameter and its uncertainty are
+pulled through the validated loader, never hand-copied. $\chi$ enters the
+binary Cahn--Hilliard free energy as the enthalpic $B$
+(Chapter~\ref{ch:c9}'s engine); the observable is the interfacial-area
+domain length $L_{\mathrm{area}}$, with nominal value $\CtenLnominal$.
+
+\section{Verification: code, then solution}
+
+\paragraph{Code verification (1).} Two invariants a real bug would break:
+Model-B dynamics conserve mass (measured drift $\CtenMassDrift$) and the
+free energy is a Lyapunov functional (monotone decrease, largest positive
+increment $\CtenLargestInc$). The full spatial/temporal order verification
+is Chapter~\ref{ch:c1}'s manufactured-solution study --- cited, not
+repeated.
+
+\paragraph{Solution verification (2).} Refining the mesh from
+$\CtenSideCoarse^2$ to $\CtenSideFine^2$ moves $L_{\mathrm{area}}$ from
+$\CtenLcoarse$ through $\CtenLmid$ to $\CtenLfine$
+(Fig.~\ref{fig:c10verif}, left). The change over the last refinement,
+$\CtenDiscUnc$, is our \emph{numerical} uncertainty on the observable ---
+the discretization contribution to the budget.
+
+\section{Model validation (3)}
+
+Verification asks whether we solved the equations right; validation asks
+whether they are the right equations. Absent lab data we validate against
+an \emph{independent physical benchmark}: Cahn--Hilliard linear stability
+predicts the fastest-growing \emph{onset} wavelength
+$\lambda^\ast=2\pi/k^\ast$. A tiny-$\Delta t$ growth-spectrum probe
+measures the early-time fastest mode; its peak lands at
+$\lambda_{\mathrm{meas}}=\CtenLamMeas$ against the predicted
+$\lambda^\ast=\CtenLamStar$, a $\CtenValidPct\%$ discrepancy. Note the
+subtlety: the budgeted observable $L_{\mathrm{area}}$ is the
+\emph{coarsened} end state, many times $\lambda^\ast$ --- so the
+\emph{onset} probe, not the end field, is the correct benchmark
+(comparing the coarsened length to $\lambda^\ast$ gives a spurious
+two-hundred-percent ``discrepancy''). Experimental validation would need
+measured $S(q)$; that is the honest gap in facet~(6).
+
+\section{Uncertainty: parametric and stochastic}
+
+\paragraph{Parameter uncertainty (4).} A central finite-difference
+sensitivity (each side averaged over seeds to strip the noise) gives
+$\mathrm{d}L_{\mathrm{area}}/\mathrm{d}\chi\approx\CtenDLdchi$. Times the
+material's $1\sigma$ spread $\CtenChiSigma$ this is a parametric standard
+deviation $\sigma_{\mathrm{param}}=\CtenSigmaParam$.
+
+\paragraph{Stochastic variability (5).} A \CtenNseeds-seed ensemble at
+fixed $\chi$ gives a seed-to-seed standard deviation
+$\sigma_{\mathrm{stoch}}=\CtenSigmaStoch$ --- the same kind of ensemble
+spread Chapter~\ref{ch:c9} aggregated.
+
+\section{The uncertainty budget}
+
+Independent sources add in \emph{variance}, so we combine them in
+quadrature (Fig.~\ref{fig:c10budget}):
+%
+\begin{equation}
+  \sigma_{\mathrm{total}}
+  = \sqrt{\sigma_{\mathrm{param}}^2 + \sigma_{\mathrm{stoch}}^2
+          + \sigma_{\mathrm{num}}^2}
+  = \CtenSigmaTotal,
+\end{equation}
+%
+with $\sigma_{\mathrm{num}}=\CtenSigmaNum$ the discretization term. The
+result is unambiguous: the \textbf{\CtenDominant\ uncertainty dominates},
+$\CtenParamPct\%$ of the variance --- $\CtenDomRatio\times$ the next
+largest --- against $\CtenStochPct\%$ stochastic and $\CtenNumPct\%$
+numerical. The combined uncertainty is $\CtenRelTotal\%$ of the observable.
+Because $\chi$ is known only to order of magnitude, the morphology's
+uncertainty is set by the \emph{material input}, not the seed noise or the
+mesh. The actionable conclusion: to sharpen this prediction, measure
+$\chi$ better --- do \emph{not} buy more GPU seeds or refine the mesh.
+
+\begin{figure}[h]\centering
+  \includegraphics[width=0.86\linewidth]{figures/c10_budget.png}
+  \caption{The uncertainty budget for $L_{\mathrm{area}}$. The parametric
+    ($\chi$) contribution dominates at $\CtenParamPct\%$ of the variance;
+    the seed and mesh contributions are smaller. The combined bar is the
+    quadrature sum --- not the arithmetic sum of the three.}
+  \label{fig:c10budget}
+\end{figure}
+
+\begin{figure}[h]\centering
+  \includegraphics[width=\linewidth]{figures/c10_verification.png}
+  \caption{\emph{Left:} solution verification --- $L_{\mathrm{area}}$ under
+    mesh refinement, the last step defining the discretization uncertainty
+    $\CtenDiscUnc$. \emph{Right:} the spread by source around the nominal
+    observable; the parametric error bar is the widest, the combined
+    (quadrature) bar wider than any single one.}
+  \label{fig:c10verif}
+\end{figure}
+
+\section{Run it}
+
+\begin{runbox}
+\textbf{Run it.}
+\begin{lstlisting}
+cd computational/10_validation_and_uncertainty
+python uncertainty.py       # print the six facets + the budget
+python gen_figures.py       # figures + numbers/c10.tex + outputs/budget.json
+\end{lstlisting}
+It reads \CtenMaterial\ and its $\chi$ uncertainty from
+\file{materials.yaml}, runs the \CtenNseeds-seed ensemble, the sensitivity,
+the mesh refinement and the linear-stability probe, and writes
+\file{budget.json}. Gate with \file{baseline.yaml}; compare with
+\file{EXPECTED.md}.
+\end{runbox}
+
+\begin{keybox}
+\textbf{Measured self-check} (the \emph{dominant source} and the
+\emph{ordering} are load-bearing; last digits vary by card).
+\begin{center}\small
+\begin{tabular}{lcc}
+\toprule
+source & $\sigma$ in $L_{\mathrm{area}}$ & \% of variance \\
+\midrule
+parameter ($\chi$)   & \CtenSigmaParam & \CtenParamPct \\
+stochastic (seed)    & \CtenSigmaStoch & \CtenStochPct \\
+numerical (mesh)     & \CtenSigmaNum   & \CtenNumPct \\
+\midrule
+combined (quadrature) & \CtenSigmaTotal & --- \\
+\bottomrule
+\end{tabular}
+\end{center}
+Dominant source: \CtenDominant\ ($\CtenDomRatio\times$ the next). Code
+verification: mass drift $\CtenMassDrift$, energy monotone. Model
+validation: $\lambda^\ast\ \CtenLamStar$ vs measured $\CtenLamMeas$
+($\CtenValidPct\%$).
+\end{keybox}
+
+\section{Code walk-through}
+
+The six facets and the budget live in \file{uncertainty.py}.
+
+\paragraph{1. Read the material and its uncertainty.}
+\begin{lstlisting}
+mat  = load_system("P3HT_PCBM")            # materials.yaml, validated
+chi0 = mat.param("chi_polymer_fullerene").value        # 0.86
+sig  = mat.param("chi_polymer_fullerene").uncertainty  # order_of_mag 0.5
+\end{lstlisting}
+
+\paragraph{2. Propagate: sensitivity times spread.}
+\begin{lstlisting}
+dLdchi     = (L(chi0+d) - L(chi0-d)) / (2 d)   # noise-averaged over seeds
+sigma_param = abs(dLdchi) * sig                # facet 4
+sigma_stoch = sd(L over seeds at chi0)          # facet 5
+\end{lstlisting}
+
+\paragraph{3. Combine in quadrature, name the dominant source.}
+\begin{lstlisting}
+sigma_total = sqrt(param^2 + stoch^2 + num^2)
+dominant    = argmax(variance contributions)    # -> parameter (chi)
+\end{lstlisting}
+
+\section{Explore on your own}
+
+\question{Build the budget for a \emph{different} material in
+\file{materials.yaml} (e.g.\ PDPP5T:PCBM). Does the parametric source still
+dominate? For which materials would the seed noise win, and why?}
+
+\question{Reproduce the onset-vs-coarsened trap: compare the end-state
+$L_{\mathrm{area}}$ wavelength to $\lambda^\ast$ and watch the ``discrepancy''
+balloon past $200\%$. Explain why the early-time probe is the only fair
+model-validation benchmark here.}
+
+\question{Add a fourth budget term: the temporal (time-step) uncertainty,
+by refining $\Delta t$ the way facet~2 refines the mesh. Where does it rank?}
+
+\question{Interpret ``order of magnitude'' as a factor (log-normal) rather
+than an additive $\pm0.5$. Recompute $\sigma_{\mathrm{param}}$. Does the
+\emph{dominance} survive the reinterpretation?}
+
+\question{The combined $\sigma$ is $\CtenSigmaTotal$, not the arithmetic sum
+$\CtenSigmaParam+\CtenSigmaStoch+\CtenSigmaNum$. Explain why independent
+sources add in variance, and by how much the arithmetic sum would overstate
+the true uncertainty.}

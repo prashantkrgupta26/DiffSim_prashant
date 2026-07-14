@@ -1,0 +1,29 @@
+# OrgElMorph course - Computational C10: the validation/uncertainty case.
+#
+# The immutable record of the ONE material case and the frozen numerical model
+# the uncertainty budget is built on.  The chi value AND its uncertainty are
+# READ from materials.yaml (P3HT:PCBM) by uncertainty.py -- never hand-copied;
+# this file documents the operating point around them.
+
+material: P3HT_PCBM            # materials.yaml systems: the archetypal OSC blend
+chi_param: chi_polymer_fullerene   # value 0.86, uncertainty order_of_magnitude 0.5
+observable: L_area            # interfacial-area domain length (box fraction)
+
+# frozen numerical model (the C9 CH-spinodal engine, nominal operating point)
+model:
+  energy: fh                  # Flory-Huggins log free energy; chi enters as fh_B
+  fh_A: 0.15                  # entropic scale (spinodally unstable at nominal chi)
+  M: 1.0
+  kappa: 5.0e-4
+  amp: 0.05
+  dt: 0.02
+  steps: 40
+  solver: splu
+  nominal_level: 5            # 32x32; solution verification refines to 6
+
+# the budget campaign (all spreads MEASURED from these real runs)
+budget:
+  stochastic_seeds: [1, 2, 3, 4, 5]     # facet 5: seed ensemble at nominal chi
+  sensitivity_seeds: [1, 2, 3]          # facet 4: central-difference dL/dchi
+  sensitivity_delta: 0.2                # chi +/- delta for the finite difference
+  solution_levels: [4, 5, 6]            # facet 2: mesh-refinement of L_area

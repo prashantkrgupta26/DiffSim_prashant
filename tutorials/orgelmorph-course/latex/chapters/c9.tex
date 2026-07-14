@@ -1,4 +1,263 @@
 \chapter{Reproducible campaigns}
 \label{ch:c9}
+\begin{keybox}
+\textbf{Key idea.} A single verified run is a data point, not a result.
+A \emph{campaign} is the unit of morphology science: one frozen model
+swept over parameters and seeds, aggregated with confidence intervals,
+and reported \emph{without silently dropping the runs that failed}. The
+skill is bookkeeping --- immutable configs, deterministic run ids,
+checkpoint/restart, and an aggregation step that surfaces failures
+rather than averaging around them.
+\end{keybox}
 
-\emph{Under construction (course-v2 Phase 3).}
+\begin{keybox}
+\textbf{Learning objectives.} By the end you can: freeze a campaign to an
+immutable resolved manifest (the way the Phase-0 harness freezes one run
+to \file{config.resolved.yaml}); expand a parameter sweep $\times$ seed
+ensemble into a deterministic run grid; checkpoint and restart
+idempotently (skip completed, retry failed); aggregate a seed ensemble
+into mean, standard deviation and a bootstrap $95\%$ confidence interval
+with the shared \code{diffsim.diagnostics.stochastic}; enforce the
+\textbf{no-silent-drop} rule (a crashed run and a tolerance-violating run
+are both \emph{surfaced}); separate \textbf{exploratory} scans from
+\textbf{confirmatory} replicates; and scale the identical manifest to a
+SLURM job array.\\[2pt]
+\textbf{Prerequisites.} Physics Chapter~\ref{ch:p1} (the binary
+Cahn--Hilliard spinodal brick that is the campaign engine here),
+Computational Chapter~\ref{ch:c1} (a campaign is only meaningful over a
+\emph{converged} model), the Phase-0 harness, and the stochastic
+diagnostics.\\[2pt]
+\textbf{Expected cost.} Any CUDA GPU, 2-D, $<1$\,GB device memory. The
+\CnineNruns-run demo (\CnineNcompleted\ real runs $+$ \CnineNinjected\
+injected fault) finishes in under a minute on an RTX~6000 Ada; a restart
+with everything completed returns in seconds.
+\end{keybox}
+
+\section{The unit of work is the campaign}
+
+Chapters~\ref{ch:c1} and~\ref{ch:p1} taught you to \emph{trust one run}:
+converge it, control the algebraic error, verify the reference. But a
+research claim --- ``deeper quenches coarsen to larger domains'' --- is
+never one run. It is a \emph{sweep} over the physical parameter, replicated
+across a \emph{seed ensemble} because the initial noise is random, and it
+must survive the messy reality that some runs crash and some run but lie.
+The difference between a defensible campaign and a directory full of
+scripts is entirely bookkeeping:
+\begin{itemize}[nosep]
+  \item an \textbf{immutable resolved config} so ``what ran'' is never in
+        doubt --- the manifest is frozen to \file{campaign.resolved.yaml},
+        exactly as a single run is frozen to \file{config.resolved.yaml};
+  \item \textbf{deterministic run ids} so a restart is idempotent (skip the
+        completed, retry the failed) rather than a re-run or a collision;
+  \item an \textbf{aggregation} that reports the mean \emph{and} every
+        failure, and refuses to present a partial ensemble as whole.
+\end{itemize}
+
+\section{The model, and why we sweep \texorpdfstring{$\chi$}{chi}}
+
+The engine is the fast 2-D binary Cahn--Hilliard spinodal march of
+Physics~\ref{ch:p1}, with the Flory--Huggins log free energy
+%
+\begin{equation}
+  f(c) = A\big[c\ln c + (1-c)\ln(1-c)\big] + B\,c(1-c),
+\end{equation}
+%
+whose enthalpic parameter $B$ is the Flory interaction $\chi$. We sweep
+$\chi$ (the code's \code{fh\_B}) with the entropic scale
+$A=0.15$ held fixed so the whole band is spinodally unstable. Two reasons
+to sweep $\chi$ rather than the evaporation rate $k_e$: first, $\chi$ is
+the one \emph{production} parameter in the materials database that carries
+a real measured uncertainty (the P3HT:PCBM value $0.86$, order-of-magnitude
+$0.5$), which Chapter~\ref{ch:c10} then propagates --- the two chapters
+share one physical control; second, the spinodal march is an order of
+magnitude cheaper than the drying-film $k_e$ driver, so the campaign runs
+locally on a shared GPU. The cluster-scale $k_e$ variant is exactly the
+same manifest submitted as a job array (\S\ref{sec:c9slurm}). The
+morphology observable is the interfacial-area domain length
+$L_{\mathrm{area}}$ (box-fraction units).
+
+\section{Sweep, ensemble, and the two intents}
+
+The manifest declares a frozen \code{base} model and a list of
+\code{sweeps}; the runner takes the Cartesian product of each sweep's
+values with its seed list. We run two sweeps with \emph{different intent}:
+%
+\begin{itemize}[nosep]
+  \item an \textbf{exploratory} scan of $\chi\in\{\CnineChiLo,\CnineChiMid,
+        \CnineChiHi\}$ (the material's mean and $\pm1\sigma$), two seeds
+        each --- a hypothesis generator whose confidence intervals are
+        wide and \emph{not} a measurement;
+  \item a \textbf{confirmatory} replicate at the nominal $\chi=\CnineChiMid$
+        with a fresh, dedicated seed pair --- the pre-registered headline
+        number, so it is never cherry-picked from the scan.
+\end{itemize}
+%
+The measured response is monotone in $\chi$
+(Fig.~\ref{fig:c9sweep}): $L_{\mathrm{area}}$ rises from $\CnineLoMean$ at
+$\chi=\CnineChiLo$ through $\CnineMidMean$ to $\CnineHiMean$ at
+$\chi=\CnineChiHi$, a parametric sensitivity
+$\mathrm{d}L_{\mathrm{area}}/\mathrm{d}\chi\approx\CnineSensitivity$. Each
+point carries a bootstrap $95\%$ interval from
+\code{diffsim.diagnostics.stochastic}; the confirmatory replicate
+($\CnineConfMean$) sits a little below the exploratory point at the same
+$\chi$ ($\CnineMidMean$) --- that gap between two seed sets \emph{is} the
+stochastic variability Chapter~\ref{ch:c10} budgets.
+
+\begin{figure}[h]\centering
+  \includegraphics[width=0.82\linewidth]{figures/c9_sweep.png}
+  \caption{Campaign sweep. Domain length $L_{\mathrm{area}}$ vs the
+    Flory--Huggins parameter $\chi$: the exploratory scan (circles, $95\%$
+    CI) is monotone with slope $\CnineSensitivity$; faint dots are the
+    per-seed runs; the confirmatory replicate (square) is the
+    pre-registered headline at nominal $\chi$. The seed-set gap at
+    $\chi=\CnineChiMid$ is real stochastic spread, not error.}
+  \label{fig:c9sweep}
+\end{figure}
+
+\section{Checkpoint, restart, and failed-run recovery}
+
+Every cell writes \file{status.json} into its own
+\file{runs} sub-directory. Re-invoking the campaign is idempotent:
+a cell already \code{completed} is skipped, a cell that \code{failed} is
+retried. A crashed campaign therefore resumes where it stopped, and fixing
+a manifest typo re-runs only the broken cell --- no wasted GPU-hours, no
+manual bookkeeping.
+
+\section{The no-silent-drop rule}
+
+This is the whole point of the chapter. An aggregation that quietly drops
+the runs that failed reports a clean mean over the survivors and hides
+that a corner of parameter space is unreliable. We demonstrate two
+failure classes, both \emph{surfaced} (Fig.~\ref{fig:c9ledger}):
+%
+\begin{enumerate}[nosep]
+  \item \textbf{A crashed run.} The manifest injects a cell with a mistyped
+        solver; it raises (\CnineInjReason). The runner catches it, records
+        the cell \code{failed}, and the campaign continues ---
+        \CnineNinjected\ of \CnineNruns\ runs, surfaced by id and reason.
+  \item \textbf{A tolerance-violating run.} Under a tightened mass-drift
+        gate (\CnineTeethGate) the deepest quench ``completes'' numerically
+        but drifts \CnineTeethDrift\ --- finite, yet physically unreliable.
+        It is marked \code{failed} (validation), which flips
+        \code{campaign\_complete} to false and the exit code to a nonzero CI
+        gate. A silent nan-mean would have blessed it.
+\end{enumerate}
+%
+The aggregate reports the mean \emph{and} the failures, with how many seeds
+actually contributed at each point; the production gate uses a mass bound
+of \CnineMassGate, which all demo cells clear.
+
+\begin{figure}[h]\centering
+  \includegraphics[width=\linewidth]{figures/c9_ledger.png}
+  \caption{The campaign ledger: every run is accounted for. Completed cells
+    (green), the injected fault (orange, surfaced), and a real
+    tolerance-violating run under a tightened gate (red, which marks the
+    campaign incomplete). No failure is silently dropped.}
+  \label{fig:c9ledger}
+\end{figure}
+
+\section{At cluster scale: a SLURM job array}
+\label{sec:c9slurm}
+
+Locally the runner sweeps every cell in one process. At research scale each
+cell is a multi-hour GPU job, so the campaign becomes a SLURM job
+\emph{array}: one array task per cell, each resolving its
+$(\chi,\text{seed})$ from the array task index via \code{--only k}. The
+provided \file{job\_array.sbatch} mirrors the real kits in
+\file{cluster/wodo\_campaign} --- the same header shape, the same
+bootstrap, the same discipline of streaming per-task JSON to a log so even
+a preempted task is a complete measurement. Re-submitting is safe (the
+checkpoint skips completed cells); a dependent aggregate job re-reads every
+\file{status.json}, crashed tasks included, so a cluster failure is
+surfaced exactly as the local one is.
+
+\section{Run it}
+
+\begin{runbox}
+\textbf{Run it.}
+\begin{lstlisting}
+cd computational/09_reproducible_campaigns
+python campaign.py --manifest manifest.yaml \
+    --output outputs/demo --overwrite      # the tiny real sweep
+python campaign.py --manifest manifest.yaml \
+    --output outputs/demo                  # RESTART: skips completed
+python gen_figures.py                      # figures + numbers/c9.tex
+\end{lstlisting}
+It runs the \CnineNcompleted\ real cells plus the injected fault, writes
+\file{campaign.resolved.yaml}, \file{metadata.json} and
+\file{summary.json}, and gates on \file{baseline.yaml}. Compare with
+\file{EXPECTED.md}.
+\end{runbox}
+
+\begin{keybox}
+\textbf{Measured self-check} (reproduce to a couple of significant
+figures; the \emph{trend} and the \emph{bookkeeping invariants} are
+load-bearing).
+\begin{center}\small
+\begin{tabular}{llcc}
+\toprule
+sweep & intent & $\chi$ & mean $L_{\mathrm{area}}$ ($\pm$ sd) \\
+\midrule
+chi\_scan    & exploratory  & \CnineChiLo  & \CnineLoMean\ ($\pm\CnineLoSd$) \\
+             & exploratory  & \CnineChiMid & \CnineMidMean\ ($\pm\CnineMidSd$) \\
+             & exploratory  & \CnineChiHi  & \CnineHiMean\ ($\pm\CnineHiSd$) \\
+chi\_confirm & confirmatory & \CnineChiMid & \CnineConfMean\ ($\pm\CnineConfSd$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+Sensitivity $\mathrm{d}L_{\mathrm{area}}/\mathrm{d}\chi\approx
+\CnineSensitivity$; \CnineNcompleted\ completed, \CnineNinjected\ injected
+fault surfaced, campaign complete.
+\end{keybox}
+
+\section{Code walk-through}
+
+The runner is \file{campaign.py}; the campaign is \file{manifest.yaml}.
+
+\paragraph{1. Freeze the config, enumerate the grid.}
+\begin{lstlisting}
+resolved = resolve_manifest("manifest.yaml")   # defaults made explicit
+save    -> campaign.resolved.yaml              # the immutable record
+specs    = enumerate_runs(resolved)            # deterministic run ids
+\end{lstlisting}
+
+\paragraph{2. One cell, and its hard admissibility gate.}
+\begin{lstlisting}
+rec = run_spinodal(..., fh_B=chi, seed=seed)   # a real 2-D CH march
+obs = observable(rec)                          # L_area + mass_drift
+if not finite(obs) or obs.mass_drift > gate:   # -> FAILED (surfaced)
+    status = failed(validation)
+\end{lstlisting}
+A raised exception is caught the same way (failure class \code{exception})
+so one bad cell never aborts the campaign.
+
+\paragraph{3. Aggregate without dropping.}
+\begin{lstlisting}
+agg = ensemble_aggregate(vals)                 # mean, sd, sem
+ci  = bootstrap_ci(vals)                        # 95% percentile CI
+campaign_complete = (n_failed_real == 0)        # injected faults excepted
+\end{lstlisting}
+
+\section{Explore on your own}
+
+\question{Add a third seed to the exploratory scan. Does the bootstrap CI
+narrow? Predict the $\sqrt{n}$ scaling of the standard error and check it
+against the reported \code{sem}.}
+
+\question{Point the sweep at \code{kappa} instead of \code{fh\_B} (the
+gradient-energy coefficient sets the interface width). Predict the sign of
+the domain-length response to $\kappa$ and confirm it. Which control
+is the campaign more sensitive to?}
+
+\question{Inject a \emph{second} fault: a cell whose \code{level} is so
+large it exhausts device memory. Show it is surfaced (class
+\code{exception}), not dropped, and that the completed cells still
+aggregate.}
+
+\question{Tighten the mass gate until a \emph{real} exploratory cell fails.
+Confirm \code{campaign\_complete} flips to false and the process exits
+nonzero --- the CI gate that refuses to bless an incomplete campaign.}
+
+\question{Turn the exploratory scan into a confirmatory one: choose a single
+$\chi$, run five seeds, and report the mean with its bootstrap CI. Argue why
+this is now a measurement and the three-point scan was not.}

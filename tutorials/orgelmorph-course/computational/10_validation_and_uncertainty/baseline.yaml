@@ -1,0 +1,24 @@
+# C10 uncertainty-budget tolerance baseline — checked against
+# outputs/budget.json with common/check_results.py.  Scientific invariants
+# within documented tolerances, NOT bitwise GPU identity.
+#
+#   python ../../common/check_results.py \
+#       --results outputs/budget.json --baseline baseline.yaml
+#
+# Ground truth (RTX 6000 Ada, splu, P3HT:PCBM chi=0.86, fh_A=0.15):
+#   L_area nominal 0.408; mass_drift 2.6e-4; energy monotone.
+#   sigma_param 0.0557 (67% var) >> sigma_stoch 0.0337 (24%) > sigma_num 0.020.
+#   sigma_total 0.068; DOMINANT = parameter (chi).
+checks:
+  # --- code verification (correctness invariants a bug would break) -----
+  code_verification.mass_drift:        {max: 1.0e-3}
+  code_verification.energy_monotone:   {equals: true}
+  # --- the observable + the budget --------------------------------------
+  L_nominal:                           {reference: 0.408, rtol: 0.10}
+  parameter_uncertainty.sigma_param:   {reference: 0.0557, rtol: 0.25}
+  stochastic_variability.sigma_stoch:  {reference: 0.0337, rtol: 0.35}
+  solution_verification.discretization_uncertainty: {max: 0.05}
+  budget.sigma_total:                  {reference: 0.068, rtol: 0.25}
+  # the headline claim: parameter uncertainty dominates
+  budget.dominant_source:              {equals: "parameter (chi)"}
+  budget.contributions.0.source:       {equals: "parameter (chi)"}
