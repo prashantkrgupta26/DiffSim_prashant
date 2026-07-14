@@ -70,10 +70,18 @@ and the [curriculum](tutorials/README.md) takes a student from "solve Poisson on
 a disk" to "recover a shape from sensor data" in an afternoon. For organic
 electronics specifically, the
 **[OrgElMorph onboarding course](tutorials/orgelmorph-course/)** is a standalone,
-three-track (physics / computation / differentiation) course — a written
-document (shipped as a PDF) paired with runnable, self-checking tutorials — that
-takes a new student from binary phase separation to differentiable, GPU-native
-morphology simulation of real material systems.
+three-track course of **30 concepts** — **Physics** (P00 model hierarchy → P11
+model-extension capstone), **Computation** (C00 weak-form-to-CUDA → C10
+validation & uncertainty), and **Differentiation** (D1 → D7 inverse-design
+capstone) — pairing a **178-page written document** (shipped as a
+[PDF](tutorials/orgelmorph-course/latex/orgelmorph_course.pdf)) with runnable,
+self-checking tutorials that call the same production bricks. It carries a
+scientific-workflow harness (per-chapter YAML config → provenance → tolerance-checked
+baseline), a mandatory tutorial template and instructor companion for every
+chapter, and research-skills chapters on diagnostics, profiling, safe extension,
+reproducible campaigns, and uncertainty — taking a new student from binary phase
+separation to differentiable, GPU-native morphology simulation of real material
+systems.
 
 <p align="center">
   <img alt="Evaporation-induced phase separation and crystallization in a drying film" src="docs/assets/img/hero_film_drying.png" width="97%">
@@ -166,7 +174,7 @@ benchmarks/         literature-anchored validation drivers, grouped by physics
   poisson-sbm/  navier-stokes/  heat-mass/  phase-field/
   inverse-heroes/  performance/           (each with its own README)
 tutorials/          the curriculum: tracks A–F + P, one runnable chapter each
-tests/              the test suite (467 tests collected across 61 modules,
+tests/              the test suite (580 tests collected across 82 modules,
                     Jul 2026; the CPU-runnable subset runs in CI, the GPU
                     tiers on a self-hosted runner); baselines/ holds locked
                     values

@@ -56,19 +56,31 @@ point: you are learning the real interface.
 Cahn–Hilliard and Allen–Cahn phase-field theory, from a binary blend to
 the full evaporating, crystallizing, multi-component film. Free
 energies, coefficients and their physical ranges, boundary conditions,
-phase diagrams, nucleation. Questions are **physics** questions.
+phase diagrams, nucleation. It opens with **P00** (the model hierarchy,
+thermodynamics, and nondimensionalization) and closes with two
+**capstones** — reproducing a real material system end to end (P10) and
+extending the model with a new physical mechanism (P11). Questions are
+**physics** questions.
 
-### 💻 Computational — *how the equations become a fast, correct solver*
+### 💻 Computational — *how the equations become a fast, correct solver — and a reproducible instrument*
 Discretization and verification: basis order, time integration,
 convergence (MMS), boundary conditions, spatial and temporal
-adaptivity, the solver ecosystem, and 2-D vs 3-D. Questions are
-**numerical/implementation** questions.
+adaptivity, the solver ecosystem, and 2-D vs 3-D. It opens with **C00**
+(weak form → CUDA) and then turns to the **research skills** that make a
+solver trustworthy: reading nonlinear-solver diagnostics and diagnosing
+divergence (C6), CUDA profiling and memory (C7), extending DiffSim
+safely with a verified new term (C8), running reproducible campaigns
+with no silent drops (C9), and validation and an uncertainty budget
+(C10). Questions are **numerical / implementation** questions.
 
 ### 🔁 Differentiable — *how the simulator becomes an instrument for design*
 Gradients through the solver: sensitivity of morphology to parameters,
 recovering free-energy parameters from data, learning the free-energy
-functional from snapshots, and inverse-designing a process. Questions
-are **optimization/inverse-problem** questions.
+functional from snapshots, and inverse-designing a process. Every
+gradient runs on the genuine three-way-verified adjoint (custom adjoint
+== autograd twin == finite difference) through the same operator the
+research code marches. Questions are **optimization / inverse-problem**
+questions.
 
 Each track is a step-by-step progression; the tracks cross-reference one
 another (a physics concept links to the numerics that make it correct
@@ -82,8 +94,11 @@ and the gradient that optimizes it).
   couple of minutes on any modern card — an 8 GB laptop GPU is plenty;
   nothing here needs the 48 GB research cards).
 - DiffSim installed (see the repository root `README.md`).
-- To rebuild the course PDF: a LaTeX toolchain (`latexmk` + `pdflatex`).
-  A pre-built `orgelmorph_course.pdf` ships with the course.
+- To rebuild the course PDF: a LaTeX toolchain (built with `tectonic`,
+  which fetches its own packages and runs BibTeX automatically —
+  `tectonic latex/main.tex`; the output `main.pdf` is the deliverable,
+  committed as `latex/orgelmorph_course.pdf`). A pre-built copy ships
+  with the course, so you do not need LaTeX to take it.
 
 ## Running your first tutorial
 
@@ -162,13 +177,14 @@ crystallization energetics) and their provenance in the literature.
 
 | track | concepts |
 |-------|----------|
-| Physics | P1 binary CH energies · P2 adaptive stepping · P3 substrate & BCs · P4 ternary CH & the phase diagram · P5 evaporation · P6 Allen–Cahn crystallization · P7 coupled CH+AC · P8 noise & nucleation · P9 evaporation-induced crystallization |
-| Computational | C1 convergence (basis & time) · C2 boundary conditions · C3 adaptivity · C4 the solver ecosystem · C5 2-D vs 3-D |
+| Physics | **P00 model hierarchy & nondimensionalization** · P1 binary CH energies · P2 adaptive stepping · P3 substrate & BCs · P4 ternary CH & the phase diagram · P5 evaporation · P6 Allen–Cahn crystallization · P7 coupled CH+AC · P8 noise & nucleation · P9 evaporation-induced crystallization · **P10 material-system case study (capstone)** · **P11 model-extension capstone** |
+| Computational | **C00 weak form → CUDA** · C1 convergence (basis & time) · C2 boundary conditions · C3 dynamic adaptivity (AMR) · C4 the solver ecosystem · C5 2-D vs 3-D · **C6 nonlinear-solver diagnostics** · **C7 CUDA profiling & memory** · **C8 extending DiffSim safely** · **C9 reproducible campaigns** · **C10 validation & uncertainty** |
 | Differentiable | D1 what differentiable simulation is · D2 morphology sensitivity · D3 recovering parameters · D4 process gradients · D5 crystallinity sensitivity · D6 learning the free energy from snapshots · D7 inverse-design capstone |
 
-> Status. All three tracks are complete builds — **Physics (P1–P9)**,
-> **Computational (C1–C5)**, and **Differentiable (D1–D7)**. Every
-> concept has a runnable, self-checking tutorial (core module, `run.py`,
+> Status. All three tracks are complete builds — **Physics (P00, P1–P11)**,
+> **Computational (C00, C1–C10)**, and **Differentiable (D1–D7)**: 30
+> concepts plus the Chapter 00 environment gate. Every concept has a
+> runnable, self-checking tutorial (core module, `run.py`,
 > `gen_figures.py`, `EXPECTED.md`) and a chapter in the course document
 > with measured, locked numbers — see the built
 > `latex/orgelmorph_course.pdf` (178 pp). The Differentiable track is
@@ -178,14 +194,18 @@ crystallization energetics) and their provenance in the literature.
 > marches, not a toy — so a student learns to differentiate the real
 > simulator.
 >
-> *Scientific-workflow overhaul (Phase 2).* Every Physics (P1–P9) and
-> Computational (C1–C5) chapter now carries the full **mandatory tutorial
-> template** (objectives, prerequisites, expected cost, required
-> deliverable) and a complete **instructor companion** (`INSTRUCTOR.md`,
-> `grading_rubric.md`, `solutions/`). The course-level **assessment model**
-> (`ASSESSMENT.md`) and **definition of done** (`DEFINITION_OF_DONE.md`)
-> make the deliverable and the completion bar explicit. The **P00/C00
-> foundation chapters** and the `common/` scientific-workflow harness
-> (`docs/dev/2026-07-14-course-phase0-foundation.md`) complete the
-> derive → implement → verify → profile → interpret → perturb → reproduce
-> loop.
+> *Scientific-workflow overhaul.* Every chapter carries the full
+> **mandatory tutorial template** (objectives, prerequisites, expected
+> cost, required deliverable) and an **instructor companion**
+> (`INSTRUCTOR.md`, `grading_rubric.md`, `solutions/`); the course-level
+> **assessment model** (`ASSESSMENT.md`) and **definition of done**
+> (`DEFINITION_OF_DONE.md`) make the deliverable and the completion bar
+> explicit. The **P00/C00 foundation chapters** and the `common/`
+> scientific-workflow harness (`docs/dev/2026-07-14-course-phase0-foundation.md`)
+> close the derive → implement → verify → profile → interpret → perturb →
+> reproduce loop. The final phase added the **research-skills** run
+> (C6 diagnostics · C7 profiling · C8 safe extension · C9 reproducible
+> campaigns · C10 validation & uncertainty), **dynamic AMR** in C3
+> (`src/diffsim/adaptivity/`), and the two **capstones** (P10 reproducing
+> a real material system, P11 extending the model) — the full evaluation
+> and action list is `docs/dev/2026-07-14-course-v2-evaluation.md`.
