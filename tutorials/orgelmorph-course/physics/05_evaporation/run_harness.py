@@ -44,12 +44,21 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__),
                                                 os.pardir, os.pardir)))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                                os.pardir, os.pardir,
+                                                "materials")))
 from common import config as cfgmod                       # noqa: E402
 from common.run_base import build_parser, run_tutorial     # noqa: E402
 from diffsim.diagnostics import conservation as dcons      # noqa: E402
+from loader import load_system, save_resolved_materials     # noqa: E402
 
 from evaporation import (build_mesh_dm, run_film,            # noqa: E402
                          morphology_metrics)
+
+# The drying blend's chi and N are READ from the materials database
+# (materials.yaml drying_demo_ternary), never hand-copied.  These become the
+# P5 config DEFAULTS; a YAML/CLI config can still override them.
+DRY_BLEND = load_system("drying_demo_ternary")
 
 SCHEMA = cfgmod.ConfigSchema(name="p5", fields={
     "level": cfgmod.Field(int, default=6, min=3, max=9),
@@ -58,8 +67,8 @@ SCHEMA = cfgmod.ConfigSchema(name="p5", fields={
     "ke_regime": cfgmod.Field(list, default=[0.3, 0.6]),
     "ds_grid": cfgmod.Field(list, default=[0.1, 0.2, 0.4]),
     "matched_phis": cfgmod.Field(list, default=[0.30, 0.20, 0.10]),
-    "chi": cfgmod.Field(list, default=[1.5, 0.3, 0.3]),
-    "N": cfgmod.Field(list, default=[5.0, 5.0, 1.0]),
+    "chi": cfgmod.Field(list, default=list(DRY_BLEND.value("chi"))),
+    "N": cfgmod.Field(list, default=list(DRY_BLEND.value("N"))),
     "kappa": cfgmod.Field(list, default=[3.0e-4, 3.0e-4]),
     "phi0": cfgmod.Field(list, default=[0.22, 0.22]),
     "amp": cfgmod.Field(float, default=0.01, min=0.0),
@@ -190,7 +199,12 @@ def p5_run(cfg, ctx):
         mesh={"level": cfg["level"], "nx": 2 ** cfg["level"],
               "ny": 2 ** cfg["level"] + 1, "dim": 2, "p": 1},
         time_integrator="BDF1", newton_tol=1e-8, linear_tol=1e-10,
-        film={"h0": cfg["h0"], "mode": "landau-mapped moving frame"})
+        film={"h0": cfg["h0"], "mode": "landau-mapped moving frame"},
+        material={"system": DRY_BLEND.name, "chi": list(cfg["chi"]),
+                  "N": list(cfg["N"]), "source_file": "materials.yaml"})
+    # archive the resolved blend (values + provenance) next to the results
+    save_resolved_materials(
+        DRY_BLEND, os.path.join(ctx.paths["root"], "materials.resolved.json"))
     dm, mesh, cons = build_mesh_dm(cfg["level"], device=ctx.device)
     ctx.log(f"P5 mesh level {cfg['level']} -> {dm.n_nodes} nodes; "
             f"solver={ctx.solver}")

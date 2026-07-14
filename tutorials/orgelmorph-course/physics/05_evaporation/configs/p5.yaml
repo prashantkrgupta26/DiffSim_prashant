@@ -28,6 +28,9 @@ ke_regime: [0.3, 0.6]    # k_e values of the 2-D Biot regime map
 ds_grid: [0.1, 0.2, 0.4] # D_s values of the 2-D Biot regime map
 matched_phis: [0.30, 0.20, 0.10]   # dryness levels to compare morphology at
 
+# chi/N mirror materials.yaml `drying_demo_ternary` (loaded as the run_harness
+# defaults via materials/loader.py; set here explicitly as the canonical run
+# record). Change the material in materials.yaml, not by hand-editing code.
 chi: [1.5, 0.3, 0.3]     # (chi_pf, chi_ps, chi_fs) full-species Flory-Huggins
 N: [5.0, 5.0, 1.0]       # (polymer, fullerene, solvent) degrees of polymerization
 kappa: [3.0e-4, 3.0e-4]  # gradient-energy coeffs (interface width)
