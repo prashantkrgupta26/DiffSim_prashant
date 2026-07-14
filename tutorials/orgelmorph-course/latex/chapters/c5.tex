@@ -2,118 +2,180 @@
 \label{ch:c5}
 \begin{keybox}
 \textbf{Key idea.} Going from 2-D to 3-D is not a small constant factor.
-Every level of refinement multiplies the degrees of freedom by $4$ in
-2-D but $8$ in 3-D, the stencil thickens from $9$ to $27$ neighbors, the
-matrix nonzeros can overflow 32-bit indexing, and the direct-solver fill
-explodes --- which is precisely why 3-D forces the device assembly path
-and the \texttt{blockch} solver of Chapter~\ref{ch:c4}.
+Every refinement multiplies the degrees of freedom by $4$ in 2-D but $8$
+in 3-D; the matrix grows denser per row for reasons rooted in the finite-
+element \emph{connectivity} (not a finite-difference stencil); the full
+memory footprint --- far more than the CSR values --- overruns the card
+and the 32-bit index arithmetic; and, crucially, the \emph{physics} at
+equal resolution is different. 2-D is not a cheap 3-D.
 \end{keybox}
 
-This concept measures the 2-D-vs-3-D growth live on small meshes and
-connects it to the device-scale ladders from the dev notes. It is the
-capstone of the computational track: it explains \emph{why} everything
-in Chapter~\ref{ch:c4} (the device assembly path, the \texttt{blockch}
-solver, the matrix-free frontier) exists.
+This concept measures the 2-D-vs-3-D growth live on small meshes,
+accounts the memory completely, and shows that the morphology itself
+changes with dimension. It is the capstone of the computational track:
+it explains \emph{why} everything in Chapter~\ref{ch:c4} (the device
+assembly path, the \texttt{blockch} solver, the matrix-free frontier)
+exists.
 
-\section{Three things grow at once}
+\section{Where the sparsity really comes from}
 
 Refine a mesh by one level and the number of elements multiplies by
-$2^{\dim}$ --- $4$ in 2-D, $8$ in 3-D. That is the obvious growth. Two
-less-obvious ones compound it:
+$2^{\dim}$ --- $4$ in 2-D, $8$ in 3-D. That much is obvious. The density
+of the matrix is subtler, and it is easy to state wrong.
 
-\begin{itemize}[nosep]
-  \item \textbf{The stencil thickens.} A node couples to its
-        $3^{\dim}-1$ neighbors: $8$ in 2-D (a 9-point stencil), $26$ in
-        3-D (a 27-point stencil). For the mixed $(c,\mu)$ system that is
-        $\sim\CfiveNnzPerDofTwoD$ nonzeros per dof in 2-D and
-        $\sim\CfiveNnzPerDofThreeD$ in 3-D (measured below). The matrix
-        is not just bigger --- it is \emph{denser per row}.
-  \item \textbf{The direct-solver fill explodes.} A larger 3-D bandwidth
-        makes the LU factors fill in far worse than in 2-D --- the cuDSS
-        memory ceiling of Chapter~\ref{ch:c4}.
-\end{itemize}
+A row of the Jacobian is a degree of freedom. Its nonzeros are one per
+$(\text{coupled node})\times(\text{field})$, where two nodes couple iff
+they share a finite \emph{element}. For a degree-$p$ structured mesh the
+coupled nodes form a $(2p+1)^{\dim}$ block --- for $p=1$, $3^{\dim}$:
+\emph{nine} nodes in 2-D, \emph{twenty-seven} in 3-D (the node itself
+included). The mixed $(c,\mu)$ system carries $2$ fields, and within a
+coupled node pair the $2\times2$ field block is dense, so
+%
+\begin{equation}
+  \frac{\text{nnz}}{\text{dof}}
+  \;=\; \underbrace{(2p+1)^{\dim}}_{\text{connectivity}\,\times\,\text{order}\,\times\,\dim}
+        \;\times\; \underbrace{n_{\text{fields}}}_{\text{block}}
+  \;=\; 18\ (\text{2-D}),\quad 54\ (\text{3-D}).
+\end{equation}
+%
+So the density is set by five things: element \textbf{connectivity},
+basis \textbf{order} $p$, number of \textbf{fields}, the field
+\textbf{block} structure, and \textbf{dimension} (hanging-node
+\textbf{constraints} add a few more couplings). A ``$3^{\dim}-1$
+finite-difference stencil'' is the wrong mental model: it omits the node
+itself and the field block, and undercounts. The \emph{measured} averages
+(\CfiveNnzPerDofTwoD\ in 2-D, \CfiveNnzPerDofThreeD\ in 3-D) sit just below
+the interior maxima $18$ and $54$ because boundary nodes have fewer
+neighbours.
 
 \begin{keybox}
-\textbf{The compounding.} 2-D dofs grow $\times4$/level and carry
-$\sim\!18$ nnz/dof; 3-D dofs grow $\times8$/level and carry $\sim\!50$
-nnz/dof. Four levels of refinement is $256\times$ the dofs in 2-D but
-$4096\times$ in 3-D --- and each 3-D dof is $\sim3\times$ denser. This is
-why a code that is instant in 2-D needs a GPU, a device assembler, and a
-scalable solver in 3-D.
+\textbf{The compounding.} 2-D dofs grow $\times\CfiveDofGrowthTwoD$/level
+and carry $\CfiveNnzPerDofTwoD$ nnz/dof; 3-D dofs grow
+$\times\CfiveDofGrowthThreeD$/level and carry $\CfiveNnzPerDofThreeD$. Four
+levels is $256\times$ the dofs in 2-D but $4096\times$ in 3-D --- and each
+3-D dof is $\sim3\times$ denser. This is why a code that is instant in 2-D
+needs a GPU, a device assembler, and a scalable solver in 3-D.
 \end{keybox}
 
-\section{Run it}
-
-\begin{runbox}
-\textbf{Run it.}
-\begin{lstlisting}
-cd computational/05_two_vs_three
-python run.py            # live 2-D vs tiny-3-D + cited ladder (~30-40 s)
-\end{lstlisting}
-The 3-D level-5 step is a real $\CfiveThreeDdofs$-dof Cahn--Hilliard step
-on the box (a few seconds). Compare with \file{EXPECTED.md} and
-Fig.~\ref{fig:c5dof}--\ref{fig:c5nnz}.
-\end{runbox}
-
-Measured: dofs grow $\times\CfiveDofGrowthTwoD$/level in 2-D and
-$\times\CfiveDofGrowthThreeD$/level in 3-D (approaching the theoretical
-$4$ and $8$; Fig.~\ref{fig:c5dof}). At comparable size ---
-$\CfiveTwoDdofs$ dofs in 2-D versus $\CfiveThreeDdofs$ in 3-D --- the 3-D
-matrix has $\CfiveNnzRatio\times$ the nonzeros and the step takes
-$\CfiveStepRatio\times$ as long.
-
 \begin{figure}[h]\centering
-  \includegraphics[width=0.62\linewidth]{figures/c5_dofgrowth.png}
+  \includegraphics[width=0.6\linewidth]{figures/c5_dofgrowth.png}
   \caption{Degrees of freedom versus refinement level (log scale). Each
-    2-D level multiplies dofs by $\sim4$; each 3-D level by $\sim8$. The
-    gap widens without bound.}
+    2-D level multiplies dofs by $\sim4$; each 3-D level by $\sim8$.}
   \label{fig:c5dof}
 \end{figure}
 
-\section{The device-scale ladder}
+\section{Accounting the memory completely}
 
-The live meshes stop at tens of thousands of dofs; production 3-D films
-run at \emph{millions}. Figure~\ref{fig:c5nnz} places the cited
-device-scale points (dev notes) on the same axes as the live runs, with
-the 32-bit index ceiling drawn in.
+The CSR \emph{values} are only a fraction of what a real solve holds. The
+\file{estimate\_capacity.py} CLI accounts every buffer: CSR values, column
+indices \emph{and} row pointers, the device index mirror a resident
+assembler keeps, the Newton solution/residual and the BDF history vectors,
+the local-to-global connectivity map, quadrature/geometry tables, the
+solver workspace (direct \emph{fill-in} for splu/cuDSS, or the extracted
+preconditioner blocks for \texttt{blockch}), and the saved output snapshot.
 
-\begin{itemize}[nosep]
-  \item \code{3d\_slab64} ($417{,}792$ dofs, $65$M nnz) is the largest
-        cuDSS-stable case on a 48\,GB card --- $3\%$ of the int32 ceiling.
-  \item \code{3d\_film128} ($\CfiveFilmDofs$ dofs, $1.02$B nnz) runs on
-        \emph{one} 48\,GB card with \texttt{blockch}; cuDSS cannot.
-  \item at $(M{=}3,K{=}2)$ production physics, \code{128x128x48}
-        ($\CfiveMkOverflowDofs$ dofs) \emph{overflows} the 32-bit nnz
-        arithmetic --- which is exactly why the block-masked pattern
-        exists (it drops the structural zeros the superset stores).
-  \item \code{256x256x128} ($\CfiveNovaDofs$ dofs, $22.8$B nnz) has no
-        single-card stored CSR at all --- only matrix-free or multi-GPU.
-\end{itemize}
+\begin{runbox}
+\textbf{Estimate before you launch.}
+\begin{lstlisting}
+python estimate_capacity.py --dim 3 --n 128 --solver blockch
+python estimate_capacity.py --dim 3 --n 256              # exceeds 48 GB
+python estimate_capacity.py --dim 2 --level 8 --solver splu --idx-bytes 8
+\end{lstlisting}
+\end{runbox}
+
+At $128^3$ the total is $\sim\CfiveMemOneTwoEight\,$GB --- dominated by the
+\emph{solver workspace}, not the matrix values --- and it fits a 48\,GB
+card. At $256^3$ it is $\sim\CfiveMemTwoFiveSix\,$GB and does \emph{not}
+(Fig.~\ref{fig:c5mem}); only a matrix-free or multi-GPU path remains. The
+lesson is that ``will it fit?'' is answered by the \emph{complete}
+footprint, and the dominant term is often the solver's, not the matrix's.
 
 \begin{figure}[h]\centering
-  \includegraphics[width=0.72\linewidth]{figures/c5_nnz.png}
-  \caption{Matrix nonzeros versus problem size: live 2-D/3-D runs plus
-    the cited device-scale points. The dashed line is the 32-bit CSR
-    index ceiling ($2^{31}$); the $(M{=}3,K{=}2)$ 128-class films cross
-    it, forcing the block-masked pattern, and the Nova-class case
-    (22.8\,B nnz) has no stored-CSR form at all.}
+  \includegraphics[width=0.66\linewidth]{figures/c5_memory.png}
+  \caption{Complete device-memory footprint (all buffers) versus $n$, 2-D
+    and 3-D, with the 48\,GB card wall. The 3-D curve crosses it between
+    $128^3$ and $256^3$; the 2-D curve stays far below.}
+  \label{fig:c5mem}
+\end{figure}
+
+\paragraph{The int32 ceiling is an implementation choice.}
+The CSR index arithmetic here is 32-bit, so nnz $>2^{31}\approx2.1\times
+10^{9}$ overflows the slot arithmetic. That is a property of \emph{this
+build}, not a law: an int64 index build lifts the wall (at $2\times$ the
+index memory), and a distributed (multi-rank) or block-masked pattern
+sidesteps it by never storing one monolithic CSR. The cited
+$(M{=}3,K{=}2)$ films cross $2^{31}$, which is why the block-masked
+pattern exists (it drops the structural zeros the superset stores).
+
+\section{The device-scale ladder}
+
+\begin{figure}[h]\centering
+  \includegraphics[width=0.7\linewidth]{figures/c5_nnz.png}
+  \caption{Matrix nonzeros versus problem size: live 2-D/3-D runs plus the
+    cited device-scale points, with the 32-bit CSR ceiling ($2^{31}$). The
+    $(M{=}3,K{=}2)$ 128-class films cross it; the Nova-class case
+    ($22.8$\,B nnz) has no stored-CSR form at all.}
   \label{fig:c5nnz}
 \end{figure}
 
+The live meshes stop at tens of thousands of dofs; production films run at
+millions (cited, dev notes): \code{3d\_slab64} ($417{,}792$ dofs) is the
+largest cuDSS-stable case on 48\,GB; \code{3d\_film128} ($\CfiveFilmDofs$
+dofs) runs on one card with \texttt{blockch}; $(M{=}3,K{=}2)$
+\code{128x128x48} ($\CfiveMkOverflowDofs$ dofs) overflows int32; and
+\code{256x256x128} ($\CfiveNovaDofs$ dofs) needs matrix-free or multi-GPU.
+
+\section{Physics at equal resolution: 2-D is not cheap 3-D}
+
+The deepest reason to care about the cost of 3-D is that you cannot dodge
+it by working in 2-D: at the \emph{same} resolution the two answer
+\emph{different physical questions}. We quench the same spinodal blend in
+2-D and 3-D at identical $h=\CfivePhysH$ and measure the morphology
+(Fig.~\ref{fig:c5phys}):
+\begin{itemize}[nosep]
+  \item interfaces are \emph{curves} in 2-D but \emph{surfaces} in 3-D, so
+        the interfacial-area density differs ($\CfiveAreaTwoD$ vs
+        $\CfiveAreaThreeD$ in length$^{d-1}$ per unit volume);
+  \item the characteristic $S(q)$ wavelength differs
+        ($\CfiveLamTwoD$ vs $\CfiveLamThreeD$);
+  \item connectivity differs in kind: a 3-D blend can be \emph{bicontinuous}
+        (both phases percolate simultaneously), which is topologically
+        impossible for two phases in 2-D. Percolation, coarsening exponents,
+        and stratification under a substrate are all dimension-specific.
+\end{itemize}
+So a 2-D study is a legitimate, cheaper \emph{model problem} --- excellent
+for convergence, BCs, solver behaviour --- but its \emph{morphology} is not
+a thin slice of the 3-D answer. Report which question you are asking.
+
+\begin{figure}[h]\centering
+  \includegraphics[width=\linewidth]{figures/c5_physics.png}
+  \caption{Same spinodal quench at equal resolution. Left: 2-D field.
+    Middle: a 3-D mid-slice. Right: interfacial-area density by dimension.
+    The topology, not just the cost, is different.}
+  \label{fig:c5phys}
+\end{figure}
+
+\paragraph{Domain and aspect ratio.}
+Two more knobs the cost hides: a larger \emph{domain} at fixed $h$ scales
+dofs as (box size)$^{\dim}$ --- linearly in area (2-D) but as volume
+(3-D); and a thin-film \emph{aspect ratio} (wide $x,y$, thin $z$, e.g.
+$64\times64\times16$) keeps 3-D tractable by shrinking the cheap direction,
+which is exactly the \code{slab64} class on the ladder above. Choosing the
+domain and aspect ratio is choosing where on the cost curve you sit.
+
 \begin{keybox}
-\textbf{Measured self-check} (counts are exact; step times are
-card-dependent).
+\textbf{Measured self-check} (counts exact; step times card-dependent).
 \begin{center}\small
 \begin{tabular}{lcc}
 \toprule
  & 2-D & 3-D \\
 \midrule
 dofs per level          & $\times\CfiveDofGrowthTwoD$ & $\times\CfiveDofGrowthThreeD$ \\
-nnz per dof (stencil)   & $\CfiveNnzPerDofTwoD$ & $\CfiveNnzPerDofThreeD$ \\
+nnz per dof (FE model)  & $\CfiveNnzPerDofTwoD$ & $\CfiveNnzPerDofThreeD$ \\
+interfacial-area density & $\CfiveAreaTwoD$ & $\CfiveAreaThreeD$ \\
+$S(q)$ wavelength        & $\CfiveLamTwoD$ & $\CfiveLamThreeD$ \\
 \midrule
-\multicolumn{3}{l}{\footnotesize at comparable size ($\CfiveTwoDdofs$ vs $\CfiveThreeDdofs$ dofs):} \\
-nnz ratio (3-D / 2-D)   & \multicolumn{2}{c}{$\CfiveNnzRatio\times$} \\
-step-time ratio         & \multicolumn{2}{c}{$\CfiveStepRatio\times$} \\
+\multicolumn{3}{l}{\footnotesize memory (complete): $128^3\to\CfiveMemOneTwoEight$\,GB, $256^3\to\CfiveMemTwoFiveSix$\,GB ($>48$)} \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -121,50 +183,39 @@ step-time ratio         & \multicolumn{2}{c}{$\CfiveStepRatio\times$} \\
 
 \section{Code walk-through}
 
-\paragraph{Measuring a real system's size.}
+\paragraph{Measuring a real system's size (no monkeypatch).}
 \begin{lstlisting}
-dofs, nnz, step_s = _capture_nnz(dim, level)   # one real CH step
-row = scaling_row(dim, level)                  # + nnz/dof, mem estimate
+dofs, nnz, step_s = _capture_nnz(dim, level)   # capture_system=True API
+sparsity_breakdown(3)   # 27 coupled nodes x 2 fields = 54 nnz/dof
 \end{lstlisting}
-As in Chapter~\ref{ch:c4}, the benchmark assembles the \emph{real}
-Cahn--Hilliard Jacobian and reads its nnz --- the true storage the solver
-faces, not a formula.
 
-\paragraph{The int32 ceiling.}
+\paragraph{Complete memory + physics.}
 \begin{lstlisting}
-INT32_MAX = 2**31
-int32_headroom(nnz)          # nnz / 2^31: >1 means the CSR overflows
+memory_accounting(3, 128)      # every buffer, not just CSR values
+physics_comparison(level=..)   # 2-D vs 3-D morphology at equal h
 \end{lstlisting}
-The CSR index arithmetic is 32-bit; once nnz passes $2^{31}$ the slot
-arithmetic overflows, and the code must either mask the pattern down or
-go matrix-free.
 
 \section{Explore on your own}
 
-\question{Fit a power law to the live 3-D step times ($\text{step}\sim
-\text{dofs}^\alpha$). Is $\alpha$ closer to $1$ (ideal), $1.5$, or worse?
-Which stage --- host assembly or the solve --- drives it, and does that
-match the C4 story of where 3-D cost lives?}
+\question{Run \file{estimate\_capacity.py} with \code{--idx-bytes 8}
+(int64) at $256^3$. How much does the total grow, and does int64 alone
+make it fit a 48\,GB card, or is the solver workspace still the wall?}
 
-\question{Compute the crossover level at which a 3-D mesh overtakes a
-2-D mesh of the same refinement level in \emph{total nnz}. Then compute
-the level at which a uniform 3-D mesh would overflow int32 at
-$(M{=}1)$ binary physics --- and compare with the cited $(M{=}3,K{=}2)$
-overflow at 128×128×48.}
+\question{At equal resolution you measured different interfacial-area
+densities in 2-D and 3-D. Coarsen both further (more steps) and track the
+density over time --- do the 2-D and 3-D coarsening rates differ? Which
+dimension coarsens faster, and why?}
 
-\question{The block-masked pattern drops structural zeros to fit int32.
-Using the cited $(M{=}3,K{=}2)$ mask density ($54/100$ live blocks),
-predict the masked nnz for 128×128×48 and check it against the dev
-note's $1.16$B. At what mesh does even the \emph{masked} pattern
-overflow?}
+\question{Fit a power law to the live 3-D step times
+($\text{step}\sim\text{dofs}^\alpha$). Which stage --- host assembly or the
+solve --- drives $\alpha$, and does that match the C4 story?}
 
-\question{Estimate the host memory to store the 3-D level-6 CH matrix
-($\sim5.7\times10^5$ dofs) from the measured nnz/dof, and compare with
-the GPU memory a direct factorization would need (use the C4 fill
-behavior). Which runs out first, and on which card?}
+\question{An octree mesh (Chapter~\ref{ch:c3}) refined only at interfaces
+changes the 3-D growth law: a surface scales as area, not volume. Estimate
+the dofs of an interface-refined 3-D film versus the uniform
+$\CfiveThreeDdofs$, and argue why adaptivity matters far more in 3-D.}
 
-\question{An octree mesh (Chapter~\ref{ch:c3}) refined only at the
-interfaces changes the 3-D growth law: a surface scales as area, not
-volume. Estimate how many dofs an interface-refined 3-D film would have
-versus the uniform $\CfiveThreeDdofs$, and argue why adaptivity matters
-far more in 3-D than in 2-D.}
+\question{A bicontinuous 3-D morphology has both phases percolating. Sketch
+a diagnostic (from \code{diffsim.diagnostics.morphology}) that would
+distinguish a percolating from a droplet morphology, and explain why the
+same diagnostic is degenerate in 2-D.}

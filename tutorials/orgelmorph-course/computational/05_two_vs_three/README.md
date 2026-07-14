@@ -1,28 +1,32 @@
 # Computational C5 — Two dimensions versus three
 
-Going from 2-D to 3-D is not a constant factor — it changes the growth
-*law*. This tutorial measures the change live on small meshes and
-connects it to the device-scale ladders from the dev notes.
+Going from 2-D to 3-D changes the growth *law*, the storage, **and the
+physics**. This tutorial measures all three live on small meshes.
 
 - **dofs per level** scale as $2^{\dim}$: ×4 in 2-D, ×8 in 3-D.
-- **nnz per dof** reflects the stencil ($3^{\dim}-1$ neighbors): ≈ 18 in
-  2-D (9-point), ≈ 50 in 3-D (27-point). The matrix is bigger *and*
-  denser.
-- **int32 ceiling**: nnz $< 2^{31}$. At $(M{=}3,K{=}2)$ production
-  physics the 128×128×48 superset already overflows → the block-masked
-  pattern.
-- **direct-solver fill** is far worse in 3-D → the cuDSS memory wall of
-  C4, which is why 3-D forces the device assembly path + `blockch`.
+- **sparsity, correctly explained**: nnz/dof = coupled nodes × fields =
+  $(2p+1)^{\dim}\times n_{\text{fields}}$ = ≈ 18 (2-D) / ≈ 54 (3-D) — from
+  element **connectivity / order / fields / block / constraints / dim**,
+  NOT a "$3^d-1$ finite-difference stencil" (which undercounts).
+- **complete memory accounting** + an `estimate_capacity.py` CLI: every
+  buffer (row ptrs, index mirror, vectors, history, l2g, quadrature,
+  solver fill/preconditioner, output), not just CSR values. 128³ ≈ 8 GB;
+  256³ ≈ 63 GB (exceeds a 48 GB card).
+- **int32 CSR is an implementation choice**: nnz > 2³¹ overflows *this*
+  build; an int64 build or a distributed/block-masked pattern lifts it.
+- **physics at equal resolution**: 2-D is *not* a cheap 3-D — interfaces
+  are curves vs surfaces, blends can be bicontinuous in 3-D only, so
+  interfacial-area density, S(q), and percolation differ.
 
 **Read** the course document, Computational Chapter *"Two dimensions
 versus three"* (start with `scaling.py`).
 
 **Run:**
 ```bash
-python run.py                 # live 2-D vs tiny-3-D scaling + cited ladder
+python run.py                 # scaling + sparsity + memory + physics + ladder
+python estimate_capacity.py --dim 3 --n 256   # full memory of a big run
 ```
-The 3-D level-5 step takes ~20 s (a real 72k-dof CH step on the box); the
-whole run is ~30–40 s. Compare with [`EXPECTED.md`](EXPECTED.md).
+Compare with [`EXPECTED.md`](EXPECTED.md).
 
 **Regenerate the document's figures + numbers** (optional):
 ```bash
@@ -31,9 +35,10 @@ python gen_figures.py         # writes ../../latex/figures/c5_*.png + numbers/c5
 
 | file | role |
 |------|------|
-| `scaling.py` | the core: `measure_scaling`, `scaling_row`, `CITED_LADDER`, `int32_headroom` — read this first |
-| `run.py` | the driver you run; prints the scaling tables + cited ladder |
-| `gen_figures.py` | regenerates the dof-growth + nnz figures and `numbers/c5.tex` |
+| `scaling.py` | the core: `measure_scaling`, `sparsity_breakdown`, `physics_comparison`, `memory_accounting` — read this first |
+| `estimate_capacity.py` | CLI: complete memory footprint at any (dim, n, solver, index width) |
+| `run.py` | the driver you run; prints scaling + sparsity + memory + physics |
+| `gen_figures.py` | regenerates the figures and `numbers/c5.tex` |
 | `EXPECTED.md` | reference numbers your run should reproduce (counts exact) |
 
 The **2-D and tiny-3-D rows are live** (real captured CH Jacobians). The

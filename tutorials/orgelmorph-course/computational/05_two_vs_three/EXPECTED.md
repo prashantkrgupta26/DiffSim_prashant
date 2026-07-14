@@ -1,50 +1,63 @@
 # C5 — expected results (self-check)
 
-Running `python run.py` measures the 2-D-vs-3-D scaling live and echoes
-the cited device-scale ladder. The dof and nnz counts are
-**deterministic** and should match exactly; the step times vary by card.
+`python run.py` measures the 2-D-vs-3-D scaling, sparsity, complete memory,
+and physics live, then echoes the cited ladder. Counts are
+**deterministic** and match exactly; step times and the exact morphology
+metrics vary by card/seed. Five `[PASS]` lines and `ALL CHECKS: PASS` must
+print.
 
-## Live scaling (real Cahn–Hilliard systems)
+## 1. Live scaling (real Cahn–Hilliard systems)
 
-| dim | level | dofs | nnz | nnz/dof | mem (MB) |
-|---|---|---|---|---|---|
-| 2-D | 5 | 2,178 | 37,636 | 17.3 | 0.5 |
-| 2-D | 6 | 8,450 | 148,996 | 17.6 | 1.8 |
-| 2-D | 7 | 33,282 | 592,900 | 17.8 | 7.1 |
-| 3-D | 3 | 1,458 | 62,500 | 42.9 | 0.8 |
-| 3-D | 4 | 9,826 | 470,596 | 47.9 | 5.6 |
-| 3-D | 5 | 71,874 | 3,650,692 | 50.8 | 43.8 |
+- **dofs per level:** 2-D ≈ ×3.9, 3-D ≈ ×7.0 (theory ×4 vs ×8).
+- **nnz per dof:** 2-D ≈ 18, 3-D ≈ 50.
 
-- **dofs per level:** 2-D ×3.9, 3-D ×7.0 (theory ×4 vs ×8).
-- **nnz per dof:** 2-D ≈ 18, 3-D ≈ 47 (9-point vs 27-point stencil for
-  the mixed $(c,\mu)$ system).
-- At comparable dofs, 3-D carries ≈ 6× the nnz and ≈ 6–7× the step time.
+## 2. Sparsity, decomposed to its FE origins
 
-## Cited device-scale ladder (dev notes — NOT re-run)
+nnz/dof = coupled nodes × fields = (2p+1)^dim × n_fields:
+
+| dim | coupled nodes | × fields | = nnz/dof | a "3^d−1 stencil" would say |
+|---|---|---|---|---|
+| 2-D | 9 | 2 | **18** | 8 (wrong — undercounts) |
+| 3-D | 27 | 2 | **54** | 26 (wrong) |
+
+The density is set by element **connectivity**, basis **order**, **fields**,
+the **block** structure, **constraints**, and **dimension** — not a
+finite-difference stencil.
+
+## 3. Complete memory accounting (`estimate_capacity.py`)
+
+Every buffer, not just CSR values (the solver workspace usually dominates):
+
+| case | dofs | total | biggest term | fits 48 GB? |
+|---|---|---|---|---|
+| 2-D n=256 (splu) | 132,098 | ~0.2 GB | direct fill-in | yes |
+| 3-D n=128 (blockch) | 4,293,378 | **~8.0 GB** | solver workspace | yes |
+| 3-D n=256 (blockch) | 33,949,186 | **~63.4 GB** | solver workspace | **NO → matrix-free/multi-GPU** |
+
+The int32 CSR ceiling (nnz > 2³¹) is an **implementation choice**; int64 or
+a distributed/block-masked pattern lifts it.
+
+## 4. Physics at equal resolution (2-D is not cheap 3-D)
+
+Same spinodal quench, same h. The 2-D and 3-D morphologies differ in
+**interfacial-area density** and **S(q) wavelength**, and only 3-D can be
+bicontinuous (both phases percolating) — impossible for two phases in 2-D.
+The exact metrics are card/seed-dependent; the *difference* between 2-D and
+3-D is the load-bearing result.
+
+## 5. Cited device-scale ladder (dev notes — NOT re-run)
 
 | case | dofs | nnz | int32 |
 |---|---|---|---|
-| 3d_slab64 | 417,792 | 65,028,096 | 3% |
-| 3d_film128 (128³×64) | 6,389,760 | 1.02×10⁹ | 47% |
+| 3d_slab64 | 417,792 | 6.5×10⁷ | 3% |
+| 3d_film128 | 6,389,760 | 1.02×10⁹ | 47% |
 | mk32 128×128×48 (M=3,K=2) | 8,028,160 | 2.17×10⁹ | **OVERFLOW** |
 | mk32 256×256×128 (Nova) | 84,541,440 | 2.28×10¹⁰ | **OVERFLOW** |
 
-- The int32 CSR ceiling is nnz $< 2^{31} \approx 2.1\times10^9$. At
-  $(M{=}3,K{=}2)$ production physics, the 128×128×48 superset pattern
-  already overflows — which is why the block-masked pattern exists.
-- 256×256×128 has no single-card stored CSR at all → matrix-free or
-  multi-GPU.
-
 **What must be true regardless of hardware:**
 
-- **3-D grows faster in *both* dofs and nnz/dof** — the `CHECK ... PASS`
-  line asserts exactly this. The matrix is bigger *and* denser.
-- **dofs scale as $2^{\dim}$ per level** (×4 vs ×8) and **nnz/dof
-  reflects the stencil** ($3^{\dim}-1$ neighbors).
-- **The counts are exact** (uniform meshes, fixed): 2-D L7 has 33,282
-  dofs, 3-D L5 has 71,874 dofs, etc. If they differ, something changed
-  in the mesh or the constraint handling.
-
-This compounding growth — more dofs, denser matrix, worse direct-solver
-fill — is the whole reason 3-D forces the device assembly path and the
-`blockch` solver of C4.
+- **3-D grows faster in both dofs and nnz/dof** — bigger *and* denser.
+- **The sparsity matches the FE model** (54 nnz/dof in 3-D), not a 3^d−1
+  stencil.
+- **The complete memory estimate flags 256³ as over 48 GB.**
+- **The physics differs by dimension** at equal resolution.
