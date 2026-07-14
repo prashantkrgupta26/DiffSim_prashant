@@ -1,0 +1,21 @@
+# P6 Allen-Cahn crystallization -- scientific invariants (tolerance-based,
+# NOT bit-identical).  Numbers measured at level 5 (32x32), cuDSS; bounds
+# carry >= 2x headroom around the measured values so a different card passes.
+checks:
+  # 1. sign of the driving force and grow/melt behaviour
+  grow.drive:            {max: 0.0}            # T < Tm  -> drive < 0
+  grow.qpsi_ratio:       {min: 1.15}           # measured ~1.39; crystal grows
+  melt.drive:            {min: 0.0}            # T > Tm  -> drive > 0
+  melt.qpsi1:            {max: 0.02}           # measured ~0; crystal melts away
+  # 2. interface velocity rises with undercooling (constant mobility)
+  interface_velocity.monotone_increasing: {equals: true}
+  # 3. critical radius shrinks with undercooling: r*(mild) > r*(deep)
+  critical_radius.deep.r_star: {min: 0.02, max: 0.09}   # measured ~0.045
+  critical_radius.mild.r_star: {min: 0.06, max: 0.16}   # measured ~0.095
+  critical_radius.ratio_measured: {min: 1.2}            # r* grows as |drive| falls
+  # 4. Avrami / JMAK
+  avrami.X_end:          {min: 0.6}            # sigmoid saturates near 1
+  avrami.n:              {reference: 1.30, rtol: 0.35}  # baseline-corrected
+  avrami.r2:             {min: 0.9}            # clean double-log fit
+  avrami.n_seeds:        {equals: 4}
+  avrami.n_grains:       {min: 1, max: 4}      # grains <= seeds
