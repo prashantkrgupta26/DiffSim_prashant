@@ -109,12 +109,25 @@ jobs:
       - name: Environment report
         run: |
           nvidia-smi
-          python --version
+          python3 --version
 
-      - name: Install (editable, with GPU deps)
+      - name: Prepare CI venv (dedicated + cached; never the box's base env)
+        # The self-hosted runner's default `python` may be a shared/base
+        # interpreter (e.g. a conda base that belongs to another user). Never
+        # `pip install` into it. Build a hermetic venv under the runner's own
+        # dir, reuse it across runs, and prepend it to PATH for later steps.
+        # Kept OUT of the workspace so `actions/checkout` clean does not wipe it.
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          set -euo pipefail
+          VENV="$RUNNER_WORKSPACE/../ci-venv"          # _work/ci-venv (sibling of the checkout)
+          if [ ! -x "$VENV/bin/python" ]; then
+            python3 -m venv "$VENV"
+          fi
+          "$VENV/bin/python" -m pip install --upgrade pip
+          "$VENV/bin/pip" install -e ".[dev]"
+          "$VENV/bin/python" -c "import warp, torch; \
+            print('warp', warp.__version__, '| torch cuda', torch.cuda.is_available())"
+          echo "$VENV/bin" >> "$GITHUB_PATH"           # later steps use this python/pytest
 
       - name: Tier smoke (fast tiers, exclude the heavy tier5 solves)
         env:
