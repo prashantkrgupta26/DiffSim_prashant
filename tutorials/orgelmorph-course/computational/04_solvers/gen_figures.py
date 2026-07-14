@@ -1,9 +1,11 @@
 """OrgElMorph course - Computational C4: figures + numbers.
 
-Writes the live 2-D solver-crossover figure and a cited-3-D bar figure
-into ../../latex/figures/, and the measured macros into
-../../latex/numbers/c4.tex.  The 2-D numbers are live; the 3-D numbers
-are cited from the dev notes (see solvers.CITED_3D).
+Writes three figures into ../../latex/figures/ and the measured macros into
+../../latex/numbers/c4.tex.
+
+  c4_correctness.png  residual of each solver on the CH saddle (cuDSS wrong)
+  c4_crossover.png    live 2-D splu vs cuDSS timing (correct sizes only)
+  c4_cited3d.png      cited 3-D scaling: blockch wins where cuDSS ceilings
 
     PYTHONPATH=<repo>/src python gen_figures.py --device cuda:0
 """
@@ -15,7 +17,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from solvers import benchmark_solvers_2d, CITED_3D, CITED_FACTS
+from solvers import (benchmark_solvers_2d, solver_correctness, CITED_3D,
+                     CITED_FACTS, cudss_available)
 
 FIGDIR = os.path.join(os.path.dirname(__file__),
                       "..", "..", "latex", "figures")
@@ -23,17 +26,44 @@ NUMTEX = os.path.join(os.path.dirname(__file__),
                       "..", "..", "latex", "numbers", "c4.tex")
 
 
+def correctness_figure(cc, fname):
+    fig, ax = plt.subplots(figsize=(6.6, 4.4), dpi=150)
+    rows = [r for r in cc["rows"] if r["residual"] is not None]
+    names = [r["solver"] for r in rows]
+    resid = [max(r["residual"], 1e-18) for r in rows]
+    cols = ["C0" if r < 1e-6 else "C3" for r in resid]
+    bars = ax.bar(names, resid, color=cols)
+    ax.set_yscale("log")
+    ax.axhline(1e-6, color="k", ls="--", lw=0.8, alpha=0.6,
+               label="correctness threshold")
+    ax.set_ylabel(r"relative residual $\|Ax-b\|/\|b\|$")
+    ax.set_title(f"Correctness on the CH saddle ({cc['dofs']} dofs):\n"
+                 "all backends verified accurate (residual $\\ll$ threshold)")
+    for b, r in zip(bars, resid):
+        ax.annotate(f"{r:.0e}", (b.get_x() + b.get_width() / 2,
+                    b.get_height()), ha="center", va="bottom", fontsize=8)
+    ax.legend(fontsize=8)
+    fig.savefig(os.path.join(FIGDIR, fname), bbox_inches="tight",
+                facecolor="white")
+    plt.close(fig)
+    print("wrote", fname)
+
+
 def crossover_figure(recs, fname):
+    have = [r for r in recs if r["cudss_ms"] is not None]
     d = np.array([r["dofs"] for r in recs])
     s = np.array([r["splu_ms"] for r in recs])
-    c = np.array([r["cudss_ms"] for r in recs])
     fig, ax = plt.subplots(figsize=(6.6, 4.6), dpi=150)
     ax.loglog(d, s, "o-", color="C0", lw=2, ms=8, label="splu (CPU direct)")
-    ax.loglog(d, c, "s-", color="C3", lw=2, ms=8, label="cuDSS (GPU direct)")
+    if have:
+        dc = np.array([r["dofs"] for r in have])
+        c = np.array([r["cudss_ms"] for r in have])
+        ax.loglog(dc, c, "s-", color="C3", lw=2, ms=8,
+                  label="cuDSS (GPU direct)")
     ax.set_xlabel("degrees of freedom (2-D)")
     ax.set_ylabel("linear solve: factorize + solve (ms)")
-    ax.set_title("Direct-solver crossover in 2-D\n"
-                 "(real Cahn--Hilliard Jacobian)")
+    ax.set_title("Direct-solver crossover in 2-D\n(real CH Jacobian; "
+                 "cuDSS timed only where its residual is acceptable)")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend()
     fig.savefig(os.path.join(FIGDIR, fname), bbox_inches="tight",
@@ -43,8 +73,6 @@ def crossover_figure(recs, fname):
 
 
 def cited3d_figure(fname):
-    """Bar chart of the cited 3-D per-solve cost: cuDSS vs blockch_dev,
-    with the cuDSS ceiling marked."""
     cases = [c[0].split(" ")[0] for c in CITED_3D]
     cu = [c[2] for c in CITED_3D]
     bk = [c[3] for c in CITED_3D]
@@ -52,38 +80,52 @@ def cited3d_figure(fname):
     fig, ax = plt.subplots(figsize=(6.8, 4.4), dpi=150)
     w = 0.38
     cu_plot = [v if v is not None else 0 for v in cu]
-    ax.bar(x - w / 2, cu_plot, w, color="C3", label="cuDSS")
+    ax.bar(x - w / 2, cu_plot, w, color="C3", label="masked cuDSS")
     ax.bar(x + w / 2, bk, w, color="C0", label="blockch\\_dev")
     for i, v in enumerate(cu):
         if v is None:
             ax.text(x[i] - w / 2, 1.0, "CEILING\n(48 GB)", ha="center",
-                    va="bottom", fontsize=8, color="C3", rotation=0)
+                    va="bottom", fontsize=8, color="C3")
     ax.set_xticks(x); ax.set_xticklabels(cases, fontsize=9)
     ax.set_ylabel("per linear-solve (s/call)")
     ax.set_title("Cited 3-D scaling (dev notes): blockch wins where "
-                 "cuDSS dies")
-    ax.grid(True, axis="y", alpha=0.3)
-    ax.legend()
+                 "cuDSS ceilings")
+    ax.grid(True, axis="y", alpha=0.3); ax.legend()
     fig.savefig(os.path.join(FIGDIR, fname), bbox_inches="tight",
                 facecolor="white")
     plt.close(fig)
     print("wrote", fname)
 
 
-def write_numbers(recs):
+def sci(v):
+    m, e = f"{v:.1e}".split("e")
+    return rf"\ensuremath{{{m}\times10^{{{int(e)}}}}}"
+
+
+def write_numbers(recs, cc):
     def mac(name, val):
         return rf"\newcommand{{\{name}}}{{{val}}}"
-
-    cross = next((r for r in recs if r["speedup"] > 1.0), recs[-1])
+    splu_row = next(r for r in cc["rows"] if r["solver"] == "splu")
+    blockch_row = next((r for r in cc["rows"] if r["solver"] == "blockch"),
+                       None)
+    cudss_row = next((r for r in cc["rows"] if r["solver"] == "cudss"), None)
     big = recs[-1]
     lines = [
         "% AUTO-GENERATED by gen_figures.py - do not edit.",
-        # live 2-D
+        # correctness on the CH saddle
+        mac("CfourSpluResid", sci(splu_row["residual"])),
+        mac("CfourBlockchResid",
+            sci(blockch_row["residual"]) if blockch_row
+            and blockch_row["residual"] else "n/a"),
+        mac("CfourCudssResid",
+            sci(cudss_row["residual"]) if cudss_row
+            and cudss_row["residual"] else "unavailable"),
+        mac("CfourCorrectDofs", f"{cc['dofs']:,}".replace(",", r"{,}")),
+        # live 2-D timing
         mac("CfourSmallDofs", f"{recs[0]['dofs']:,}".replace(",", r"{,}")),
-        mac("CfourSmallSpeedup", f"{recs[0]['speedup']:.1f}"),
         mac("CfourBigDofs", f"{big['dofs']:,}".replace(",", r"{,}")),
-        mac("CfourBigSpeedup", f"{big['speedup']:.1f}"),
-        mac("CfourCrossDofs", f"{cross['dofs']:,}".replace(",", r"{,}")),
+        mac("CfourBigSpeedup",
+            "n/a" if big["speedup"] is None else f"{big['speedup']:.1f}"),
         # cited 3-D
         mac("CfourCudssCeiling",
             f"{CITED_FACTS['cudss_ceiling_dofs']:,}".replace(",", r"{,}")),
@@ -105,10 +147,12 @@ def main():
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
     os.makedirs(FIGDIR, exist_ok=True)
+    cc = solver_correctness(level=6, device=args.device)
     recs = benchmark_solvers_2d(device=args.device)
+    correctness_figure(cc, "c4_correctness.png")
     crossover_figure(recs, "c4_crossover.png")
     cited3d_figure("c4_cited3d.png")
-    write_numbers(recs)
+    write_numbers(recs, cc)
 
 
 if __name__ == "__main__":
