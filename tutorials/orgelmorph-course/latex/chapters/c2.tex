@@ -10,6 +10,29 @@ system and \emph{deliberately} breaks conservation; a weakly imposed
 (penalty) boundary trades exactness for a symmetric matrix.
 \end{keybox}
 
+\begin{keybox}
+\textbf{Learning objectives.} By the end you can: derive the two
+boundary terms of the mixed $(c,\mu)$ weak form (the mass flux
+$M\,\grad\mu\cdot\mathbf n$ and the interfacial term
+$\kappa\,\grad c\cdot\mathbf n$) and say which BCs make each vanish;
+compare natural, wall-energy (wetting/Robin), Dirichlet, and
+manufactured (MMS) conditions on whether they conserve mass; verify the
+flux balance $d/dt\intv c\,dV=-\oint_{\partial\Omega}\mathbf J\cdot
+\mathbf n\,dS$ directly from a run; and contrast weak (penalty) versus
+strong (row-replace / symmetric-elimination) imposition, including the
+penalty parameter's exactness-vs-conditioning trade-off.\\[2pt]
+\textbf{Prerequisites.} Integration by parts / the weak form, symmetric
+vs.\ non-symmetric linear systems; Chapter~\ref{ch:c1} (this track's
+convergence study) and Physics Chapter~\ref{ch:p3} (the physical wall
+energy); Chapter~00 (environment green).\\[2pt]
+\textbf{Expected cost.} Any CUDA GPU, 2-D, $<1$\,GB device memory (an
+8\,GB card is ample); solver \code{splu} on the $(c,\mu)$ saddle (the
+tiny weak-vs-strong demo is a dense NumPy solve, no GPU). \code{run.py}
+completes in $\approx$30--60\,s, comparable to Physics P1's quick mode
+($\approx75$\,s wall, measured, RTX~6000 Ada; mostly kernel compile);
+expect the same first-run Warp-compile overhead.
+\end{keybox}
+
 This concept shows, with measured numbers, the full boundary structure of
 the mixed system, the taxonomy of physical boundary conditions, how each
 constraint is implemented in the matrix, and the flux balance that ties

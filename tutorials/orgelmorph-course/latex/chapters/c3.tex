@@ -12,6 +12,34 @@ we report its \emph{real} cost, not a fictional saving, and show why
 growing $\Delta t$ forces BDF2 into its variable-coefficient form.
 \end{keybox}
 
+\begin{keybox}
+\textbf{Learning objectives.} By the end you can: distinguish octree
+refinement to a \emph{fixed geometric criterion} from solution-adaptive
+AMR, and list what dynamic AMR additionally needs (estimate, mark,
+refine/coarsen, 2:1 balance, rebuild, transfer state \emph{and} BDF
+history, continue); show why conservative (cell-averaging) transfer is
+exact while naive nodal injection is not; build a \emph{real} cost
+accounting for adaptive time-stepping (accepted/rejected steps, full+half
+solves, Newton iterations, wall time) against a matched-accuracy
+fixed-$\Delta t$ sweep, not a fictional horizon/min-dt ratio; and explain
+why a growing $\Delta t$ forces BDF2's variable-coefficient form, measuring
+both the preserved and the collapsed order on the same alternating
+sequence.\\[2pt]
+\textbf{Prerequisites.} Chapter~\ref{ch:c1} (the BDF1/BDF2 order this
+chapter must preserve under a varying step); Chapter~\ref{ch:c2} (the
+constraint operator $T$, $A=T^{\!\top}KT$, that hanging-node refinement
+reuses); Physics~P2 (\emph{Adaptive time stepping} --- the
+error-controlled step-doubling idea applied here). Chapter~00
+(environment green).\\[2pt]
+\textbf{Expected cost.} Any CUDA GPU, 2-D meshes (max octree level 6,
+4{,}225 nodes uniform at most), $<1$\,GB device memory; solver
+\code{splu} (the CH saddle is indefinite, as elsewhere in this track).
+Live runs are comparable to physics P1's quick mode ($\approx75$\,s wall,
+RTX~6000 Ada); within \file{run.py} the adaptive ladder to $t=0.6$ measures
+$\sim\!60$\,s wall and the matched fixed-$\Delta t$ sweep $\sim\!108$\,s
+(first run pays a one-time Warp compile cost).
+\end{keybox}
+
 This concept measures octree refinement and temporal adaptivity on the
 Cahn--Hilliard brick. It builds on the convergence study
 (Chapter~\ref{ch:c1}: the BDF2 order adaptivity must preserve).

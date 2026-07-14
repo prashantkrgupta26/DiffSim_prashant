@@ -10,6 +10,28 @@ verifies the reference before trusting it, and shows how the study can
 lie to you.
 \end{keybox}
 
+\begin{keybox}
+\textbf{Learning objectives.} By the end you can: separate spatial,
+temporal, and algebraic error and measure each alone; report the
+observed spatial order ($L^2\sim h^{p+1}$, $H^1\sim h^{p}$) for both
+$p=1$ and $p=2$, for both fields $c$ and $\mu$; report the observed
+temporal order (BDF1 $\to1$, BDF2 $\to2$) against a reference verified
+by halving its $\Delta t$ and a Richardson bound; and diagnose the four
+deliberate failures (wrong BC, wrong source, under-resolved feature,
+under-resolved reference) that each produce a plausible but wrong
+order.\\[2pt]
+\textbf{Prerequisites.} The weak (FE) form and Gauss quadrature, the
+method of manufactured solutions, BDF scheme order, Richardson
+extrapolation; Physics Chapter~\ref{ch:p1} (the same Cahn--Hilliard
+brick discretized here); Chapter~00 (environment green).\\[2pt]
+\textbf{Expected cost.} Any CUDA GPU, 2-D, $<1$\,GB device memory (an
+8\,GB card is ample); solver \code{splu} on the mixed $(c,\mu)$ saddle,
+exact to round-off. \code{run.py} runs all four studies in
+$\approx$1--2\,min on the GPU --- comparable to physics P1's quick mode,
+measured $\approx75$\,s wall on an RTX~6000 Ada (mostly Warp kernel
+compile + Python start-up).
+\end{keybox}
+
 This concept walks through the Cahn--Hilliard convergence gates that
 ship with the solver: $p=1$ vs $p=2$ spatial order, and BDF1 vs BDF2
 temporal order, each measured against a manufactured or self-convergent
