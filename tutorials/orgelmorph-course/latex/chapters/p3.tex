@@ -13,6 +13,29 @@ wall energy conserves mass to machine precision, and measures the
 enrichment boundary layer.
 \end{keybox}
 
+\begin{keybox}
+\textbf{Learning objectives.} By the end you can: derive both natural
+boundary integrals of mixed Cahn--Hilliard from the weak form and explain
+why only the wall energy $f_w(\phi)=g\phi+h\phi^2$ needs a face term;
+read off the preferred surface composition $\phi^\star=-g/(2h)$ and
+predict enrichment vs depletion before running anything; explain why the
+wall condition conserves mass exactly while a Dirichlet condition does
+not, and why the \emph{quadrature} mass $\int\phi\,dV$ is the correct
+check near a boundary; and predict $\delta\sim\sqrt\kappa$ and
+\emph{verify} it by fitting the measured decay length across several
+$\kappa$.\\[2pt]
+\textbf{Prerequisites.} Natural boundary conditions from integration by
+parts, the mixed $(\phi,\mu)$ weak form, quadrature vs nodal quantities;
+Chapter~\ref{ch:p1} (bulk Cahn--Hilliard and quadrature mass) and
+Chapter~00 (environment green).\\[2pt]
+\textbf{Expected cost.} Any CUDA GPU, 2-D (64$\times$64 at reference),
+$<1$\,GB device memory; solver \code{splu} (the CH saddle is indefinite,
+as in Chapter~\ref{ch:p1}). Quick mode comparable to Chapter~\ref{ch:p1}'s
+measured $\approx75$\,s wall (RTX~6000 Ada, similarly-sized mesh);
+reference a few minutes; research (finer mesh, denser $\kappa$ sweep)
+tens of minutes.
+\end{keybox}
+
 \section{The model: two boundary conditions}
 
 The bulk equations are binary Cahn--Hilliard (Chapter~\ref{ch:p1}) in the

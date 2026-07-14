@@ -14,6 +14,30 @@ the integrator's order, build a reference solution, and report the
 \end{keybox}
 
 \begin{keybox}
+\textbf{Learning objectives.} By the end you can: verify an
+integrator's observed order (BDF1~$\approx1$, BDF2~$\approx2$) on a
+smooth relaxation before trusting it on the quench; explain why
+accuracy is measured against a tight-$\Delta t$ reference and never
+read off the free energy; locate the quench's stiffness cliff and
+explain why a fixed step safe for it is wasteful for coarsening;
+account for step-doubling's real cost (one full plus two half solves
+per attempt); and report a matched-accuracy speed-up honestly in both
+steps \emph{and} solves, distinguishing it from the naive worst-case
+bound.\\[2pt]
+\textbf{Prerequisites.} Implicit (BDF) time integration and Newton
+solves, local-truncation-error step control, reading an observed
+convergence order off a log--log slope; Chapter~00 (environment green)
+\emph{and} Chapter~\ref{ch:p1} (same model and free energy, only the
+time integration changes).\\[2pt]
+\textbf{Expected cost.} Any CUDA GPU, 2-D meshes ($16^2$--$64^2$),
+$<1$\,GB device memory; solver \code{splu} (the CH saddle is
+indefinite, as in Chapter~\ref{ch:p1}). Quick mode comparable to
+Chapter~\ref{ch:p1}'s measured $\approx75$\,s wall; reference mode
+(the cited numbers) $\approx10$--$20$\,min; research mode tens of
+minutes.
+\end{keybox}
+
+\begin{keybox}
 \textbf{Accuracy is measured against a reference, not read off the
 energy.} A lower free energy does \emph{not} mean a more accurate
 solution --- an integrator can reach a lower energy simply by taking a

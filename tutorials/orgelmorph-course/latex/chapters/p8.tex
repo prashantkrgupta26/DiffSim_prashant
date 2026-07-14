@@ -12,6 +12,29 @@ fluctuation--dissipation normalization right --- and \emph{verifying} it
 numerically --- is the heart of this chapter.
 \end{keybox}
 
+\begin{keybox}
+\textbf{Learning objectives.} By the end you can: derive the discrete FDT
+per-Gauss-point noise normalization $\sqrt{2L/(\Delta t\,w^J)}$ and explain
+why the $1/\Delta t$ and $1/w^J$ factors are both required for
+mesh/$\Delta t$-independence; verify equipartition (variance
+$\Delta t$-independent, $\propto1/V_{\rm cell}$) in a clip-free stable
+well; report nucleation as an \textbf{ensemble} (probability, $X$
+distribution, nuclei density, induction time with a 95\% CI), not a
+single seed; and state precisely why this is a noise-amplitude sweep, not
+a temperature sweep.\\[2pt]
+\textbf{Prerequisites.} Chapter~\ref{ch:p6} (crystallization model, drive
+sign); fluctuation--dissipation theorems and equipartition; ensemble
+statistics as in Chapter~\ref{ch:p1}'s seed discussion (here the seed is
+\emph{physical}, not numerical).\\[2pt]
+\textbf{Expected cost.} Any CUDA GPU, 2-D, $<1$\,GB device memory.
+\textbf{Solver split:} the FDT-well verification runs on a
+\emph{coarse CPU/\code{splu}} mesh (fast, no cuDSS re-plan); the
+nucleation \emph{ensemble} runs at level 5 on the \emph{GPU}.
+\textbf{BDF1 only} (the brick asserts noise off under BDF2). Quick mode
+comparable to P1's measured $\approx75$\,s wall; the ensemble multiplies
+wall time by the realization count.
+\end{keybox}
+
 \section{The model and the discrete FDT normalization}
 
 We add the physical (fluctuation--dissipation) noise to the Allen--Cahn

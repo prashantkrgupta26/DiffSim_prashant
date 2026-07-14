@@ -12,6 +12,24 @@ energy and we \emph{measure} both: the interface width and the
 fastest-growing wavelength that the spinodal instability selects.
 \end{keybox}
 
+\begin{keybox}
+\textbf{Learning objectives.} By the end you can: derive the conserved
+Cahn--Hilliard flow from $F$ and split it into bulk and interfacial
+parts; explain why $\ell\sim\sqrt{\kappa/W}$ (not $\sqrt\kappa$) and count
+the cells it spans; predict $\lambda^\star=2\pi/k^\star$ and \emph{verify}
+it against $S(q)$; keep apart the three ``energy decreases'' statements
+and measure the last two; and report the cost of the Flory--Huggins
+projection.\\[2pt]
+\textbf{Prerequisites.} Calculus of variations ($\delta F/\delta c$),
+Fourier modes, thermodynamics of mixing; Chapter~00 (environment green).
+\emph{First physics chapter.}\\[2pt]
+\textbf{Expected cost.} Any CUDA GPU, 2-D, $<1$\,GB device memory (an
+8\,GB card is ample); solver \code{splu} (the CH saddle is indefinite).
+Quick mode $\approx75$\,s wall (measured, RTX~6000 Ada; mostly kernel
+compile); reference a few minutes; research (5-seed ensemble) tens of
+minutes.
+\end{keybox}
+
 \section{The model}
 
 Let $c(\mathbf{x},t)$ be the local volume fraction of one component (a

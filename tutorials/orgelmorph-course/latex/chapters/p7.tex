@@ -10,6 +10,26 @@ enriches its own phase and expels the others, sharpening a composition
 pattern that phase separation alone would not produce.
 \end{keybox}
 
+\begin{keybox}
+\textbf{Learning objectives.} By the end you can: explain why
+crystallinity needs a four-fold $\chi_{aa/ac/ca/cc}$ and convert between
+the p1 (absolute) and r14 (increment) conventions, verified against
+\code{test\_chi\_limits.py}; design commensurate controls (same mask,
+same metric, no divide-by-floor) to isolate a coupling; decompose
+crystallization-driven demixing into its crystal-bulk and
+$\chi$-expulsion channels; verify the coupled energy budget decreases
+monotonically; and run causality controls (frozen geometry; fixed
+coupling, varied kinetics).\\[2pt]
+\textbf{Prerequisites.} Chapter~\ref{ch:p6} (crystallinity model, driving
+force sign); the ternary/$\chi$ extension (Chapter~4); Chapter~\ref{ch:p1}
+(free-energy language, measure-with-uncertainty habit).\\[2pt]
+\textbf{Expected cost.} Any CUDA GPU, 2-D, $<1$\,GB device memory; solver
+\code{cuDSS} (documented \code{splu} fallback). Quick mode comparable to
+P1's measured $\approx75$\,s wall (RTX~6000 Ada, mostly kernel compile);
+reference (controls + budget + causality) a few minutes; research
+(\code{--level 6}) tens of minutes.
+\end{keybox}
+
 \section{The model: the four-fold $\chi$ (p1 vs r14)}
 
 With crystallinity, the interaction between two species depends on whether

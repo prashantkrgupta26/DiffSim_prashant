@@ -23,6 +23,28 @@ nucleation (Ch.~\ref{ch:p8}) is available as an advanced mode
 checked tutorial uses the deterministic implant.
 \end{keybox}
 
+\begin{keybox}
+\textbf{Learning objectives.} By the end you can: derive the solubility
+$\phi^\star=1-|\text{drive}|/\chi_{ca}$ from the homogeneous free energy
+and explain why it is an \emph{upper bound}; validate $\phi^\star$
+against an independent embryo-composition sweep and interpret why the
+measured crossover sits below it; explain why the default runs
+\emph{implant} rather than nucleate; run and interpret the wet-dissolves/
+dry-grows arc; and distinguish a sub- from a supercritical embryo at
+fixed composition (the Gibbs--Thomson floor), reading the honest
+\code{TERMINATION} status of a march.\\[2pt]
+\textbf{Prerequisites.} Chapter~\ref{ch:p5} (evaporation/drying);
+Chapter~\ref{ch:p7} (coupled CH+AC, the crystal-bulk self-enrichment
+channel); Chapter~\ref{ch:p6} (crystallization model, Gibbs--Thomson
+radius); the $\chi$/ternary-blend language of Chapter~4.\\[2pt]
+\textbf{Expected cost.} Any CUDA GPU, 2-D, $<1$\,GB device memory; solver
+\code{cuDSS} (documented \code{splu} fallback); \emph{tutorial
+simplification} --- constant Onsager mobility with cuDSS, not the
+production Vignes mobility. Quick mode comparable to P1's measured
+$\approx75$\,s wall; reference (solubility + sweep + control + arc) a
+few minutes; research (\code{--level 6}) tens of minutes.
+\end{keybox}
+
 \section{The solubility, derived from the free energy}
 
 We run $(M,K)=(2,1)$ in film mode: a crystallizable small molecule

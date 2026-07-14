@@ -12,6 +12,30 @@ two coexisting phases from the simulation by clustering the composition
 cloud --- theory and simulation compared on one triangle.
 \end{keybox}
 
+\begin{keybox}
+\textbf{Learning objectives.} By the end you can: derive the ternary
+exchange chemical potentials $\mu_i$ from the Flory--Huggins free energy
+\eqref{eq:p4f} with the solvent eliminated; derive the spinodal from the
+sign of $\det H$ and solve for the critical $\chi_{12}^\star$ at a
+composition; predict the binodal by the common-tangent (equal $\mu_i$,
+equal $\omega$) construction pinned by the lever rule; and explain why a
+two-component Gaussian-mixture clustering of the composition cloud
+replaces a median split, reporting the interface-excluded sensitivity as
+its uncertainty.\\[2pt]
+\textbf{Prerequisites.} Chapter~\ref{ch:p1} (this chapter promotes its
+Flory--Huggins bulk term and stepper to two composition fields,
+\code{bulk="p1"}); Chapter~00 (environment green). The $2\times2$ Hessian
+/ eigenvalue sign test, Gaussian-mixture (EM) clustering, common-tangent
+constructions.\\[2pt]
+\textbf{Expected cost.} Any CUDA GPU; the production \code{(M=2,K=0)}
+\code{MultiPhaseStepper} exposes the fast \code{cuDSS} solver, with a
+documented \code{splu} fallback for small runs without cuDSS. Quick mode
+is comparable to Chapter~\ref{ch:p1}'s measured $\approx75$\,s wall for a
+similarly-sized 2-D mesh; reference a few minutes (5--30\,min); research
+mode is a single finer/longer run ($129\times129$), not a multi-seed
+ensemble.
+\end{keybox}
+
 \section{The model, with the \texorpdfstring{$N_i$}{N} factors}
 
 Let $\phi_1,\phi_2$ be the volume fractions of the two solutes; the
