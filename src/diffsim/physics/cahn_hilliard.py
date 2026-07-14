@@ -195,6 +195,11 @@ class CahnHilliardStepper:
         self.nfree = self.Tc.shape[1]
         self.t = 0.0
         self.dt_prev = None     # dt of the last completed step (G3)
+        # FH admissibility-projection bookkeeping (spec P1: report the
+        # regularization+projection honestly). Cumulative count of Newton-iterate
+        # dofs the (0,1) box-projection moved, and the largest single correction.
+        self.proj_dofs = 0
+        self.proj_max = 0.0
 
     def set_initial(self, c0_fn, mu_init="zero"):
         """mu_init='consistent' seeds mu0 from the lumped weak potential
@@ -377,7 +382,13 @@ class CahnHilliardStepper:
                 # it the step-0 overshoot reaches the f'' regularization
                 # cap (measured f'' = 9984 at Newton iterate 2) and any
                 # iterative solver of the Jacobian is hostage to it.
+                pre = x[0::2].copy()
                 np.clip(x[0::2], 1e-3, 1.0 - 1e-3, out=x[0::2])
+                corr = np.abs(x[0::2] - pre)
+                moved = corr > 0.0
+                if moved.any():
+                    self.proj_dofs += int(moved.sum())
+                    self.proj_max = max(self.proj_max, float(corr.max()))
             if np.abs(dx).max() < self.newton_tol:
                 break
         self.x = x

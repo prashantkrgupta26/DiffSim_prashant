@@ -4,9 +4,14 @@
 \begin{keybox}
 \textbf{Key idea.} A film is cast from solution and \emph{dries}: solvent
 leaves the top surface, the film thins, and the solutes concentrate until
-they demix. Evaporation is the \emph{clock} of morphology formation ---
-how fast the solvent leaves sets how much time the blend has to phase-
-separate before it vitrifies.
+they demix. Evaporation is the \emph{clock} of morphology formation. But
+the honest question is subtle: does the drying \emph{rate} reshape the
+morphology, or does it merely decide \emph{when} you look? We compare
+morphologies at a \emph{matched dryness} (the same mean solvent fraction
+$\phi_s$, not the same time) and find that the \emph{degree} of demixing
+is set by dryness alone --- essentially rate-independent --- while the
+domain \emph{size} collapses onto a single Biot number
+$\mathrm{Bi}=k_e h_0/D_s$.
 \end{keybox}
 
 \section{The model}
@@ -14,27 +19,57 @@ separate before it vitrifies.
 We add a moving, evaporating top surface to the ternary system of
 Chapter~\ref{ch:p4} (the Landau-mapped moving frame of the
 Wodo--Ganapathysubramanian film formulation). The computational box
-$[0,1]^2$ represents a physical strip of shrinking height $h(t)$. The
-solvent flux at the top drives the frame:
+$[0,1]^2$ represents a physical strip of shrinking height $h(t)$; the
+vertical coordinate maps as physical $z = h(t)\,\xi_y$. The solvent flux
+at the top drives the frame,
 %
 \begin{equation}
   K = \sum_i k_{e,i}\,\overline{\phi_i^{\text{top}}} \;\ge 0,
   \qquad \dd{h}{t} = -K ,
+  \label{eq:p5film}
 \end{equation}
 %
 and each conserved solute gains a frame-advection term plus a surface-
 enrichment flux, arranged so the solute \emph{content} $h\!\int\phi_i$ is
-conserved exactly per step (only the solvent leaves). The bulk dynamics
-is the ternary Cahn--Hilliard of Chapter~\ref{ch:p4}.
+conserved exactly per BDF1 step (only the solvent leaves). The bulk
+dynamics is the ternary Cahn--Hilliard of Chapter~\ref{ch:p4}.
 
 \begin{keybox}
-\textbf{The evaporation rate (Biot number).} $k_e$ is the nondimensional
-evaporation rate of the solvent --- the Biot number $\mathrm{Bi}=k_e
-h_0/D_s$ in the wodo convention. Larger $k_e$ = more volatile solvent =
-faster drying. It is \emph{the} processing knob of solution-cast organic
-electronics. Different solvents map to different $k_e$; spin speed and
-temperature also move it (see the PDPP5T:PCBM Biot values in
-\file{materials/materials.yaml}).
+\textbf{The Biot number $\mathrm{Bi}=k_e h_0/D_s$.} $k_e$ is the
+nondimensional evaporation rate of the solvent; $D_s$ is the solute
+Onsager mobility (its diffusivity scale). Their ratio is the
+\emph{drying Biot number} --- equivalently the drying P\'eclet number in
+this unit-aspect geometry --- comparing how fast the surface recedes with
+how fast the solutes diffuse. $\mathrm{Bi}>1$ is \emph{drying-limited}
+(the film skins before it can homogenise); $\mathrm{Bi}<1$ is
+\emph{diffusion-limited}. Because $\mathrm{Bi}$ mixes $k_e$ and $D_s$,
+different solvents/temperatures ($k_e$) and different blends ($D_s$) that
+share a $\mathrm{Bi}$ dry to the \emph{same} morphology --- we test that
+collapse directly.
+\end{keybox}
+
+\section{Matched terminal state: rate versus dryness}
+
+A naive sweep compares each rate at the end of a fixed time horizon. That
+\emph{confounds} two different things: a slow film may only have reached
+$\phi_s=0.30$ while a fast one has dried to $\phi_s=0.10$, so any
+morphology difference could be entirely the different \emph{dryness}, not
+the rate. The fix is to drive \emph{every} rate past the same dryness and
+read each morphology metric at a \emph{matched} $\phi_s\in\{0.30,0.20,
+0.10\}$, interpolated along the run's own $\phi_s(t)$ trajectory
+(Fig.~\ref{fig:p5matched}). What is confounded in the naive comparison,
+and de-confounded here, is exactly this rate-versus-state distinction.
+
+\begin{keybox}
+\textbf{The morphology metric is a real length.} We take the first
+spectral moment of the \emph{lateral} (periodic-$x$) structure factor of
+the polymer field --- a mean cycles-per-box $\bar k$ --- and report the
+wavelength both as a fraction of the box width, $\lambda/L_x=1/\bar k$,
+\emph{and} in cells, $\lambda/\Delta x = n_x/\bar k$. A resolved length is
+always $>1$ cell; the earlier code reported a bare ``cells'' number below
+one, which conflated the box-width fraction with a cell count. We report
+$\ge 2$ metrics: the lateral wavelength, the interfacial length, and the
+phase contrast.
 \end{keybox}
 
 \section{Run it}
@@ -43,54 +78,153 @@ temperature also move it (see the PDPP5T:PCBM Biot values in
 \textbf{Run it.}
 \begin{lstlisting}
 cd physics/05_evaporation
-python run.py            # sweep the evaporation rate
+python run_harness.py --config configs/p5.yaml \
+    --mode reference --output outputs/p5 --overwrite
+python gen_figures.py --run-dir outputs/p5   # figures + numbers
 \end{lstlisting}
-It dries the same dilute ternary film at several $k_e$ and prints the
-drying time, final height, and morphology domain scale. Compare with
-\file{EXPECTED.md} and the figures.
+The harness dries the film over a $(k_e, D_s)$ sweep, records each
+morphology metric along the whole $\phi_s(t)$ trajectory, interpolates to
+the matched dryness levels, checks per-solute conservation, and writes a
+tolerance-checked \file{results.json}. \file{run.py} is a lighter
+student driver of the same core.
 \end{runbox}
 
-\paragraph{What you should see.} Every film dries (the mean solvent
-fraction $\phi_s$ falls, the height $h$ shrinks), but faster: at
-$k_e=\PfiveKeFast$ the film reaches the drying cutoff by $t\approx
-\PfiveTdryFast$ (final $\phi_s=\PfivePhisFast$, $h=\PfiveHfast$), while at
-$k_e=\PfiveKeSlow$ it lingers to $t\approx\PfiveTdrySlow$. And the
-morphology depends on the rate: faster drying freezes a \emph{finer}
-pattern (domain scale $\PfiveDomFast$ cells at $k_e=\PfiveKeFast$ vs
-$\PfiveDomSlow$ at $k_e=\PfiveKeSlow$) because the blend has less time to
-coarsen before it vitrifies.
+\paragraph{What you should see.} Every film dries and thins
+(Fig.~\ref{fig:p5drying}); the march reports \emph{why} it stopped, and we
+never call a horizon-truncated run ``dried''. At $k_e=\PfiveKeFast$
+($\mathrm{Bi}=\PfiveBiFast$) the film reaches the dryness cutoff
+(\texttt{\PfiveReasonFast}) by $t\approx\PfiveTdryFast$; at
+$k_e=\PfiveKeSlow$ ($\mathrm{Bi}=\PfiveBiSlow$) it takes until
+$t\approx\PfiveTdrySlow$ (\texttt{\PfiveReasonSlow}). Reading morphology at
+\emph{matched} dryness (Fig.~\ref{fig:p5matched}) tells the real story:
+
+\begin{itemize}[nosep]
+  \item \textbf{Dryness sets the \emph{degree} of demixing.} The phase
+        contrast rises monotonically as the film dries
+        ($\PfiveContrastThirty\to\PfiveContrastTwenty\to\PfiveContrastTen$
+        at $\phi_s=0.30,0.20,0.10$) --- and does so \emph{identically for
+        every rate}: at a matched $\phi_s=0.20$ the contrast agrees across
+        all runs to $\PfiveContrastSpread\%$. How far the blend has
+        separated is fixed by how \emph{dry} it is, not by how fast it got
+        there.
+  \item \textbf{The domain \emph{size} collapses onto $\mathrm{Bi}$.} At
+        matched dryness the lateral wavelength depends on the Biot number
+        ($\lambda$ at $\phi_s=0.20$: $\PfiveWLslowTwenty$ cells for slow
+        ($\mathrm{Bi}=\PfiveBiSlow$), $\PfiveWLfastTwenty$ for fast
+        ($\mathrm{Bi}=\PfiveBiFast$)), and runs that \emph{share} a
+        $\mathrm{Bi}$ from different $(k_e,D_s)$ agree to
+        $\PfiveCollapseSpread\%$ (Fig.~\ref{fig:p5regime}). With only
+        $\sim$2 lateral domains across the box the wavelength is
+        statistically noisy, so we report the collapse, not a sharp
+        size-versus-$\mathrm{Bi}$ law.
+  \item \textbf{The old ``faster $=$ finer'' was the confound.} It compared
+        a \emph{dried} fast film against a \emph{still-wet} slow one --- a
+        dryness difference misread as a rate effect. De-confounded, the
+        robust, rate-independent quantity is the demixing \emph{degree}
+        (contrast), and the size is governed by $\mathrm{Bi}$.
+\end{itemize}
 
 % --- generated by gen_figures.py ---
 \begin{figure}[h]\centering
   \includegraphics[width=\linewidth]{figures/p5_drying.png}
-  \caption{Drying curves (left, mean solvent fraction) and film height
-    (right) for several evaporation rates. Larger $k_e$ dries sooner and
-    thins faster.}
+  \caption{Drying curves $\phi_s(t)$ (left) and film height $h(t)$
+    (right). Dots mark the march exit; the label is the exit reason
+    (\texttt{phis\_stop} $=$ dried to the cutoff, not the time horizon).
+    Dotted lines are the matched dryness levels.}
   \label{fig:p5drying}
 \end{figure}
 
 \begin{figure}[h]\centering
+  \includegraphics[width=\linewidth]{figures/p5_matched.png}
+  \caption{Morphology metrics versus \emph{dryness} $\phi_s$ (the
+    un-confounded axis, drying to the right), all rates on one plot. The
+    phase contrast (right) rises with dryness \emph{identically} for every
+    rate --- the demixing degree is rate-independent; the wavelength and
+    interfacial length (left, centre) separate by Biot number. Vertical
+    lines: the matched $\phi_s$.}
+  \label{fig:p5matched}
+\end{figure}
+
+\begin{figure}[h]\centering
   \includegraphics[width=\linewidth]{figures/p5_morphology.png}
-  \caption{Dried morphology (the polymer field) vs evaporation rate.
-    Faster drying freezes a finer, more kinetically trapped morphology;
-    slower drying gives phase separation time to coarsen.}
+  \caption{Polymer field at the matched dryness levels, shown in \emph{both}
+    coordinate frames: the fixed computational box (unit height) and the
+    \emph{physical} frame with the vertical extent scaled by $h(t)$ --- the
+    actual thinning film, not just the mapped box.}
   \label{fig:p5morph}
 \end{figure}
 
+\section{Per-solute conservation and the height budget}
+
+Only the solvent evaporates, so each solute's content $h(t)\!\int\phi_i$
+must be constant. We integrate $\int\phi_i$ by quadrature on the fixed
+reference domain (the P1 lumped-mass weights) and multiply by $h(t)$; the
+relative drift over the whole run is $\PfiveBalPoly$ (polymer) and
+$\PfiveBalFull$ (fullerene) --- at solver tolerance, confirming the
+moving-frame scheme conserves solute. The height budget then closes
+identically: since the solutes are conserved, the solvent lost equals the
+height drop, $h_0-h(t)$, to $\PfiveBudgetClosure$. Over the slow run the
+film loses $\PfiveSolvRemoved\%$ of its solvent and thins by
+$\Delta h=\PfiveDhSlow$.
+
 \begin{keybox}
-\textbf{Measured self-check.}
+\textbf{Conservation is resolution-limited, and we say so.} This exact
+per-step conservation holds \emph{once the demixed interfaces and the
+surface enrichment layer are resolved}. On a too-coarse mesh (level 4,
+$16\times16$) the same run leaks $\sim10\%$ of a solute; at level 5--6 the
+drift falls to machine precision ($\sim10^{-15}$). The tutorial's
+\texttt{quick} tier therefore uses level 5, the coarsest mesh that still
+conserves --- a concrete lesson that a conservation law in the continuous
+model is only inherited by the discretisation you can afford to resolve.
+\end{keybox}
+
+\section{The Biot regime map}
+
+Sweeping \emph{both} $k_e$ and the solute mobility $D_s$ places each run in
+the $(k_e,D_s)$ plane (Fig.~\ref{fig:p5regime}), with
+$\mathrm{Bi}=k_e h_0/D_s$ iso-contours. Two observations:
+%
+\begin{itemize}[nosep]
+  \item \textbf{Morphology collapses onto $\mathrm{Bi}$.} Runs that share a
+        Biot number --- reached by different combinations of a faster
+        solvent (larger $k_e$) or a slower blend (smaller $D_s$) --- land on
+        the same matched-dryness wavelength, to $\PfiveCollapseSpread\%$.
+        The pair $(k_e,D_s)$ does not matter; only their ratio does.
+  \item \textbf{The crossover is $\mathrm{Bi}=1$.} Our sweep spans
+        $\mathrm{Bi}\in[\PfiveBiMin,\PfiveBiMax]$, straddling the
+        drying-limited/diffusion-limited boundary. This is the map a
+        process engineer reads: pick a solvent and a blend, compute
+        $\mathrm{Bi}$, and you know which regime you are casting in.
+\end{itemize}
+
+\begin{figure}[h]\centering
+  \includegraphics[width=0.8\linewidth]{figures/p5_regime.png}
+  \caption{Biot regime map over the $(k_e,D_s)$ sweep
+    (\PfiveNruns\ runs), coloured by the matched-dryness wavelength, with
+    $\mathrm{Bi}=k_e h_0/D_s$ contours and the $\mathrm{Bi}=1$
+    drying/diffusion crossover in red.}
+  \label{fig:p5regime}
+\end{figure}
+
+\begin{keybox}
+\textbf{Measured self-check (matched dryness, $\phi_s=0.20$).}
 \begin{center}\small
 \begin{tabular}{lcc}
 \toprule
- & slow ($k_e=\PfiveKeSlow$) & fast ($k_e=\PfiveKeFast$) \\
+ & slow ($\mathrm{Bi}=\PfiveBiSlow$) & fast ($\mathrm{Bi}=\PfiveBiFast$) \\
 \midrule
-drying time $t$        & \PfiveTdrySlow & \PfiveTdryFast \\
-final solvent $\phi_s$ & \PfivePhisSlow & \PfivePhisFast \\
-final height $h$       & \PfiveHslow & \PfiveHfast \\
-domain scale (cells)   & \PfiveDomSlow & \PfiveDomFast \\
+exit reason              & \texttt{\PfiveReasonSlow} & \texttt{\PfiveReasonFast} \\
+drying time $t$          & \PfiveTdrySlow & \PfiveTdryFast \\
+final height $h$         & \PfiveHslow & \PfiveHfast \\
+wavelength (cells)       & \PfiveWLslowTwenty & \PfiveWLfastTwenty \\
+interfacial length       & \PfiveIfaceSlowTwenty & \PfiveIfaceFastTwenty \\
+phase contrast           & \PfiveContrastTwenty & \multicolumn{1}{c}{(same, $\pm\PfiveContrastSpread\%$)} \\
 \bottomrule
 \end{tabular}
 \end{center}
+Per-solute drift $\le\PfiveBalFull$; Bi-collapse spread
+$\PfiveCollapseSpread\%$; contrast rate-independent to
+$\PfiveContrastSpread\%$.
 \end{keybox}
 
 \section{Code walk-through}
@@ -98,41 +232,47 @@ domain scale (cells)   & \PfiveDomSlow & \PfiveDomFast \\
 \paragraph{1. Film mode.} A single constructor argument turns on the
 moving frame:
 \begin{lstlisting}
-st = MultiPhaseStepper(dm, M=2, K=0, ..., film=dict(k_e=0.1, h0=1.0))
+st = MultiPhaseStepper(dm, M=2, K=0, ...,
+                       film=dict(k_e=0.3, h0=1.0))
 \end{lstlisting}
 \code{k\_e} is the solvent evaporation rate, \code{h0} the initial
 height. The stepper carries \code{h\_curr}, updated $-\Delta t\,K$ on each
 accepted step.
 
-\paragraph{2. The drying march.} \code{march(..., phis\_stop=0.05,
-h\_min=0.15)} adds film stop criteria (dryness / height floor) and the
-evaporation $\Delta t$-cap that bounds the height decrement per step.
+\paragraph{2. The drying march.} \code{march(..., phis\_stop=0.08,
+h\_min=0.12)} adds film stop criteria and returns the \emph{exit reason}
+(\texttt{phis\_stop}, \texttt{h\_min}, \texttt{dt\_underflow},
+\texttt{t\_end}); the harness records it per run.
 
-\paragraph{3. The domain scale.} \code{\_domain\_scale} reads the
-characteristic lateral wavelength from the first spectral moment of the
-polymer field --- a single number for ``how fine is the morphology''.
+\paragraph{3. The matched-state readout.} \code{run\_film} records the
+morphology metrics along the whole $\phi_s(t)$ trajectory;
+\code{morphology\_metrics} returns the lateral wavelength (fraction
+\emph{and} cells), the interfacial length, and the contrast. The harness
+interpolates each to the matched $\phi_s$ and computes
+$\mathrm{Bi}=k_e h_0/D_s$.
 
 \section{Explore on your own}
 
-\question{Push $k_e$ higher and lower by another factor. Does the domain
-scale keep shrinking with rate, or does it saturate? What sets the
-finest morphology you can freeze in?}
+\question{Widen the Biot range (push $D_s$ down and $k_e$ up). Does the
+matched-dryness wavelength ever break its collapse onto $\mathrm{Bi}$, or
+is $\mathrm{Bi}$ the only group that matters here?}
 
 \question{Change the solvent selectivity ($\chi_{1s}$ vs $\chi_{2s}$).
-Does a solvent that likes one solute more change which component
-enriches at the drying surface?}
+Does a solvent that prefers one solute change which component enriches at
+the drying surface --- and does that show up more in the \emph{vertical}
+(physical-frame) profile than in the lateral wavelength?}
 
 \question{The drying curve $\phi_s(t)$ is roughly linear early
-(constant-rate period) then bends. Explain the bend in terms of the
-surface composition feeding back into $K=\sum_i k_{e,i}
-\overline{\phi_i^{\text{top}}}$.}
+(constant-rate period) then bends. Explain the bend from the surface
+composition feeding back into $K=\sum_i k_{e,i}\overline{\phi_i^{\text{top}}}$.}
 
 \question{Combine this with Chapter~\ref{ch:p3}: add a substrate wall
 energy and dry the film. Does evaporation-driven enrichment at the top
-compete with substrate enrichment at the bottom? Which wins?}
+compete with substrate enrichment at the bottom? Which wins, and at what
+$\mathrm{Bi}$?}
 
-\question{Two solvents of different volatility can be modelled as
-different $k_e$. Predict how a fast vs a slow solvent changes the
-vertical stratification, then test it.}
+\question{Re-run at level 4 and watch the per-solute drift blow up. At
+what mesh does conservation recover? Relate the answer to the interface
+width $\ell\sim\sqrt{\kappa/W}$ of Chapter~\ref{ch:p1}.}
 
 % ====================================================================

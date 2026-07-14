@@ -1,0 +1,57 @@
+# P3 tolerance baseline — reference mode (level 6, t=0.4, chi=2.2).
+#
+# Scientific invariants within DOCUMENTED tolerances, NOT bitwise GPU
+# identity.  The wall re-arranges material without exchanging it, so the
+# hard checks are: the TRUE quadrature mass INT phi dV is conserved to
+# ~machine eps in every case, the projection never fires (projected_dofs
+# = 0) for the interior-phi* wells, the substrate composition tracks
+# phi* = -g/(2h), F_wall < 0 and falls as the wall wets, and the
+# boundary-layer thickness scales as delta ~ sqrt(kappa) (slope ~ 0.5).
+#
+# Ground truth captured on RTX 6000 Ada (CUDA 12.9 / driver 13.2, splu).
+checks:
+  # --- neutral (no wall) ------------------------------------------------
+  cases.neutral.substrate_phi:   {reference: 0.493, atol: 0.02}
+  cases.neutral.enrichment:      {min: -0.03, max: 0.03}
+  cases.neutral.mass_drift:      {max: 1.0e-12}
+  cases.neutral.projected_dofs:  {equals: 0}
+  cases.neutral.F_wall:          {min: -1.0e-9, max: 1.0e-9}
+
+  # --- attracting wall (phi* = 0.75) ------------------------------------
+  cases.attract.substrate_phi:   {reference: 0.750, atol: 0.02}
+  cases.attract.enrichment:      {min: 0.15, max: 0.32}
+  cases.attract.mass_drift:      {max: 1.0e-12}
+  cases.attract.projected_dofs:  {equals: 0}
+  cases.attract.F_wall:          {max: -0.30}
+  cases.attract.F_bulk:          {reference: -0.145, rtol: 0.15}
+
+  # --- repelling / depleting wall (phi* = 0.25) -------------------------
+  cases.repel.substrate_phi:     {reference: 0.250, atol: 0.02}
+  cases.repel.enrichment:        {min: -0.32, max: -0.15}
+  cases.repel.mass_drift:        {max: 1.0e-12}
+  cases.repel.projected_dofs:    {equals: 0}
+
+  # --- opposing walls (attract substrate / repel air) -------------------
+  cases.opposing.enrichment:     {min: 0.05, max: 0.35}
+  cases.opposing.mass_drift:     {max: 1.0e-12}
+  cases.opposing.projected_dofs: {equals: 0}
+
+  # --- confined lateral (no-flux sides, attracting substrate) -----------
+  cases.confined.substrate_phi:  {reference: 0.750, atol: 0.04}
+  cases.confined.enrichment:     {min: 0.12, max: 0.35}
+  cases.confined.mass_drift:     {max: 1.0e-12}
+
+  # --- demixing + wetting (chi = 2.7) -----------------------------------
+  cases.demix.substrate_phi:     {reference: 0.750, atol: 0.03}
+  cases.demix.enrichment:        {min: 0.12, max: 0.35}
+  cases.demix.mass_drift:        {max: 1.0e-12}
+  cases.demix.F_wall:            {max: -0.30}
+
+  # --- boundary layer: delta ~ sqrt(kappa) ------------------------------
+  bdlayer.slope_1e:              {reference: 0.5, atol: 0.12}
+  bdlayer.slope_fit:             {reference: 0.5, atol: 0.15}
+
+  # --- projection demonstration: a violating IC FIRES the projection,
+  #     but BDF1 still conserves the converged-state quadrature mass -----
+  clip.projected_dofs:           {min: 1}
+  clip.mass_drift:               {max: 1.0e-10}

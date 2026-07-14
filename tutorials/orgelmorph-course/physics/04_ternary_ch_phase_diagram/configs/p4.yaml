@@ -1,0 +1,39 @@
+# P4 - ternary Cahn-Hilliard + Gibbs phase diagram. Canonical run record.
+#
+# chi and N are NOT set here: they are read from materials/ternary_p4.yaml
+# by the validated loader (no hand-copied numbers). This config selects the
+# blend by NAME and sets the numerical / IC knobs.
+#
+# Cost modes (spec: quick <2 min, reference 5-30 min, research documented):
+#   quick      33x33 / short horizon smoke (the CI micro-test tier)
+#   reference  65x65, t_end 0.6 - the baseline.yaml numbers
+#   research   129x129, longer horizon (sharper phases)
+blend: synthetic_demix          # key in materials/ternary_p4.yaml
+asym_blend: synthetic_demix_asymN   # the N-shift comparison blend
+materials: ternary_p4.yaml
+level: 6                        # 2^level cells/side; 6 = 64x64 (65x65 nodes)
+t_end: 0.6
+dt: 5.0e-4
+dt_max: 0.02
+mobility: 0.2                   # symmetric Onsager mobility scale
+kappa: 6.0e-4                   # gradient-energy coefficient (both solutes)
+phi1_0: 0.35                    # initial blend composition (solute 1)
+phi2_0: 0.35                    # initial blend composition (solute 2)
+amp: 0.02                       # initial random perturbation amplitude
+keep: 0.5                       # bulk fraction kept for interface-excluded means
+run_asym_sim: true              # also march the asymmetric-N blend
+asym_level: 4                   # asym blend is stiffer -> small mesh
+asym_t_end: 0.1                 # ... and a short horizon (demonstration)
+seed: 6
+precision: fp64
+
+modes:
+  quick:
+    level: 5                    # 33x33
+    t_end: 0.3
+  reference:
+    level: 6                    # 65x65 - the baseline numbers
+    t_end: 0.6
+  research:
+    level: 7                    # 129x129
+    t_end: 1.0

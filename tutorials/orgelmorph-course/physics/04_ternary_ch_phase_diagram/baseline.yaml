@@ -1,0 +1,39 @@
+# P4 tolerance baseline -- reference mode (level 6 / 65x65, t_end 0.6).
+#
+# Scientific invariants within DOCUMENTED tolerances, NOT bitwise GPU identity.
+# Measured-then-locked with >= 2x headroom. Ground truth captured on
+# RTX 6000 Ada (CUDA 12.9 / driver 13.2, cuDSS), blend synthetic_demix,
+# chi=(3.5,1,0.6), N=(1,1,1), IC (0.35,0.35), seed 6:
+#   spinodal det@IC   -6.4753   chi12_crit 2.8397  (analytic, exact)
+#   phases (GMM)      A (0.162, 0.523)   B (0.529, 0.186)   sens 0.130
+#   simplex |sum-1|   1.11e-16   content drift 0 / 5.6e-17
+#   lever residual    6.1e-4     N-shift delta chi12_crit -0.860 (analytic)
+checks:
+  # --- spinodal at the initial blend (analytic; det<0 => unstable) ------
+  spinodal_ic.det:               {reference: -6.4753, rtol: 0.01}
+  spinodal_ic.unstable:          {equals: true}
+  spinodal_ic.chi12_crit:        {reference: 2.8397, rtol: 0.01}
+
+  # --- admissibility (Gibbs simplex is exact by solvent elimination) ----
+  admissibility.simplex_max_abs: {max: 1.0e-12}
+  admissibility.clipped_fraction: {max: 1.0e-6}
+
+  # --- quadrature conservation (Model-B, no-flux: content is pinned) ----
+  conservation.content1_drift:   {max: 1.0e-10}
+  conservation.content2_drift:   {max: 1.0e-10}
+
+  # --- lever rule: conserved mean == population-weighted phase average --
+  lever.residual:                {max: 1.5e-3}
+
+  # --- clustered coexisting-phase endpoints (GMM means) -----------------
+  clustering.phaseA_mean.0:      {reference: 0.162, rtol: 0.15}
+  clustering.phaseA_mean.1:      {reference: 0.523, rtol: 0.15}
+  clustering.phaseB_mean.0:      {reference: 0.529, rtol: 0.15}
+  clustering.phaseB_mean.1:      {reference: 0.186, rtol: 0.15}
+  clustering.endpoint_sensitivity: {max: 0.30}
+
+  # --- the cloud must open (order-of-magnitude spread growth) -----------
+  spread_end:                    {min: 0.12}
+
+  # --- N_i shift on the spinodal (analytic) -----------------------------
+  nshift.delta_chi12_crit:       {reference: -0.860, rtol: 0.01}

@@ -1,0 +1,75 @@
+# P2 -- adaptive time stepping. Canonical run record.
+#
+# The base config is the REFERENCE tier (the numbers the document cites). Mode
+# blocks override it:
+#   quick      coarse/short smoke (<2 min) -- the CI micro-test tier
+#   reference  the cited numbers (32x32, sharp interface, quench to t=0.6)
+#   research   finer mesh + longer horizon
+#
+# The quench uses a deliberately SHARP interface (small kappa on a modest mesh)
+# so the spinodal onset is genuinely stiff in time: a fixed step must be small
+# to resolve it, which is what makes error-controlled adaptivity worthwhile. We
+# only ever compare SAME-mesh runs, so spatial resolution cancels and the study
+# isolates the TIME integration (which is the chapter's subject).
+
+# --- quench problem ---
+level: 5             # 2^level cells/side; 5 = 32x32
+kappa: 2.0e-3        # gradient-energy coeff (sharp interface -> stiff quench)
+M: 1.0               # mobility
+amp: 0.05            # initial random perturbation amplitude
+c_avg: 0.0           # symmetric (critical) quench
+seed: 7
+t_end: 0.6           # horizon (quench + coarsening)
+
+ref_dt: 2.0e-4       # tight fixed-dt reference (the ground truth)
+fixed_dt: 2.0e-3     # headline "naive but safe" fixed step
+work_tol: 5.0e-4     # headline adaptive controller tolerance
+tols: [2.0e-3, 1.0e-3, 5.0e-4, 2.0e-4]          # tolerance sweep (knee)
+fixed_dts: [5.0e-4, 1.0e-3, 2.0e-3, 3.0e-3, 4.0e-3, 5.0e-3]  # convergence + cliff
+dt0: 2.0e-4          # initial adaptive step
+dt_max: 1.0e-2       # controller ceiling (physics-agnostic cap)
+dt_min: 1.0e-7       # controller floor
+nchecks: 40          # energy-history sample points for the headline adaptive run
+
+# --- smooth temporal-order verification (separate small mesh) ---
+order_level: 4       # 16x16
+order_kappa: 3.8e-2  # kappa*k^2 > 1 -> the k=2pi cosine mode RELAXES (smooth)
+order_amp: 2.0e-2    # small amplitude -> stays in the smooth (near-linear) regime
+order_T: 5.0e-2
+order_ref_dt: 2.5e-5
+order_dts: [1.0e-3, 5.0e-4, 2.5e-4, 1.25e-4]
+
+precision: fp64
+
+modes:
+  quick:
+    level: 4
+    kappa: 4.0e-3
+    t_end: 0.3
+    ref_dt: 5.0e-4
+    fixed_dt: 2.0e-3
+    work_tol: 1.0e-3
+    tols: [2.0e-3, 1.0e-3, 5.0e-4]
+    fixed_dts: [1.0e-3, 2.0e-3, 4.0e-3]
+    nchecks: 20
+    order_level: 3
+    order_ref_dt: 1.0e-4
+    order_dts: [1.0e-3, 2.5e-4]
+  reference:
+    level: 5
+    kappa: 2.0e-3
+    t_end: 0.6
+    ref_dt: 2.0e-4
+    fixed_dt: 2.0e-3
+    work_tol: 5.0e-4
+    tols: [2.0e-3, 1.0e-3, 5.0e-4, 2.0e-4]
+    fixed_dts: [5.0e-4, 1.0e-3, 2.0e-3, 3.0e-3, 4.0e-3, 5.0e-3]
+  research:
+    level: 6
+    kappa: 1.0e-3
+    t_end: 1.0
+    ref_dt: 1.0e-4
+    fixed_dt: 1.0e-3
+    work_tol: 5.0e-4
+    tols: [2.0e-3, 1.0e-3, 5.0e-4, 2.0e-4, 1.0e-4]
+    fixed_dts: [2.5e-4, 5.0e-4, 1.0e-3, 2.0e-3, 3.0e-3, 4.0e-3]

@@ -1,0 +1,57 @@
+# P3 — substrate / surface energy + Cahn-Hilliard boundary conditions.
+# Canonical run record.  Reproduces EXPECTED.md at mode=reference
+# (64x64, chi=2.2, quench to t=0.4).
+#
+# Cost modes (spec: quick <2 min, reference 5-30 min, research documented):
+#   quick      coarse 32x32 / short quench smoke — the CI micro-test tier
+#   reference  the EXPECTED.md tutorial numbers (64x64, t=0.4)
+#   research   finer 128x128, longer quench + denser kappa sweep
+level: 6              # 2^level cells/side; 6 = 64x64
+chi: 2.2             # Flory-Huggins interaction (weakly demixing: spinodal at 2)
+chi_demix: 2.7       # the demixing+wetting case (well above the spinodal)
+kappa: 1.0e-3        # gradient-energy coefficient (sets interface + layer width)
+onsager: 0.2         # Onsager mobility (low -> ~4 Newton iters/step)
+phi0: 0.5            # blend mean composition
+amp: 0.02            # initial random perturbation amplitude
+dt: 2.0e-4           # initial BDF1 step (the ladder grows it up to dt_max)
+dt_max: 2.0e-2       # step cap
+t_end: 0.4           # quench horizon
+seed: 5
+# Boundary-layer delta ~ sqrt(kappa) study.  Run on a STABLE (sub-
+# spinodal) bulk chi_bl so the ONLY structure in phi(y) is the wall
+# boundary layer (a demixing bulk fills the interior with domains and
+# corrupts the far-field).  Larger kappa keeps the layer resolved over
+# several cells.
+chi_bl: 1.0          # sub-spinodal bulk for the clean boundary-layer study
+kappa_sweep: [2.0e-3, 4.0e-3, 8.0e-3, 1.6e-2]
+# Projection / clipping demonstration.  An interior-phi* bounded well
+# NEVER drives phi out of (0,1), so the [1e-3, 1-1e-3] box projection
+# stays inactive (projected_dofs = 0) -- verified even at phi*=0.9975.
+# To make the projection FIRE we quench from an admissibility-VIOLATING
+# initial condition (large clip_amp so phi(t=0) overshoots (0,1)) on a
+# stable bulk with the attracting wall: the projection clips the early
+# iterates (projected_dofs > 0, max_correction > 0), yet BDF1 + no-flux
+# conserves INT phi dV at every CONVERGED state, so the quadrature mass
+# still holds to machine precision -- the honest result (a linear well,
+# whose equilibrium leaves (0,1), is the only genuine mass-injector, but
+# its FH log-barrier collapses the step to non-termination).
+clip_amp: 0.30       # initial-fluctuation amplitude that violates (0,1)
+clip_t_end: 0.1
+precision: fp64
+
+modes:
+  quick:
+    level: 5          # 32x32
+    t_end: 0.2
+    kappa_sweep: [4.0e-3, 8.0e-3, 1.6e-2]
+    clip_t_end: 0.06
+  reference:
+    level: 6          # 64x64 — the EXPECTED.md numbers
+    t_end: 0.4
+    kappa_sweep: [2.0e-3, 4.0e-3, 8.0e-3, 1.6e-2]
+    clip_t_end: 0.1
+  research:
+    level: 7          # 128x128
+    t_end: 0.6
+    kappa_sweep: [2.0e-3, 4.0e-3, 8.0e-3, 1.6e-2, 3.2e-2]
+    clip_t_end: 0.15

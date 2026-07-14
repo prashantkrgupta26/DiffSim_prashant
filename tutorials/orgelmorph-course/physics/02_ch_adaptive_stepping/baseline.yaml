@@ -1,0 +1,32 @@
+# P2 tolerance baseline -- reference mode (32x32, kappa=2e-3, quench to t=0.6).
+#
+# Scientific invariants within DOCUMENTED tolerances, NOT bitwise GPU identity.
+# Measured on RTX 6000 Ada (CUDA 12.9 / driver 13.2, splu) then locked with
+# >=2x headroom. The RELIABLE claims are gated tightly (integrator order, a
+# reproducible reference, robust-statistic accuracy, that dt spans orders); the
+# trajectory-sensitive cost counts (accepted/rejected/wall/pixelwise L2) get
+# wide, one-sided sanity bounds because a different card / step sequence moves
+# them.
+checks:
+  # --- 1. the integrator is correct (verified on the smooth problem) ---
+  order.bdf1.observed_order:   {min: 0.80, max: 1.25}
+  order.bdf2.observed_order:   {min: 1.70, max: 2.30}
+  fixed_order:                 {min: 1.60, max: 2.40}
+
+  # --- 2. the reference is reproducible + self-consistent ---
+  reference.F:                 {reference: 0.1007, rtol: 0.12}
+  reference.lam1:              {reference: 19.9, rtol: 0.12}
+  reference.selfcheck_relL2:   {max: 5.0e-3}
+
+  # --- 3. adaptive run reaches the reference physics (robust metrics) ---
+  adaptive.err_energy:         {max: 5.0e-3}
+  adaptive.err_lam1:           {max: 0.02}
+  adaptive.relL2:              {max: 0.05}
+
+  # --- 4. the adaptive step genuinely spans orders of magnitude ---
+  adaptive.dt_min:             {max: 1.0e-5}
+  adaptive.dt_max:             {min: 5.0e-3, max: 1.1e-2}
+  adaptive.accepted:           {min: 60, max: 400}
+
+  # --- 5. honest matched-accuracy saving (adaptive takes fewer steps) ---
+  matched.speedup_steps:       {min: 1.5}

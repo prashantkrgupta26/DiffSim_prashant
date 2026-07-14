@@ -14,16 +14,22 @@ kappa: 5.0e-4         # gradient-energy coefficient (sets interface width)
 fh_A: 1.0             # Flory-Huggins entropic scale (~1/N)
 fh_B: 2.5             # Flory-Huggins enthalpic scale (~chi)
 amp: 0.05             # initial random perturbation amplitude
-seed: 3
+seed: 3               # fixed seed for the FIGURES / reference numbers
+n_seeds: 1            # research mode runs a 5-seed ensemble (mean +/- sd)
+measure_every: 10     # cadence of the coarsening L(t) length-scale samples
 precision: fp64
 
 modes:
   quick:
     level: 5          # 32x32
     steps: 60
+    measure_every: 3
   reference:
     level: 6          # 64x64 — the EXPECTED.md numbers
     steps: 250
+    measure_every: 5  # fine early sampling for the pre-saturation coarsening fit
   research:
     level: 7          # 128x128
     steps: 600
+    measure_every: 10
+    n_seeds: 5        # research ENSEMBLE: 5 seeds, mean +/- sd

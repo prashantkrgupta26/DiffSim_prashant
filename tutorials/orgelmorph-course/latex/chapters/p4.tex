@@ -5,22 +5,37 @@
 \textbf{Key idea.} A real cast blend has (at least) three components ---
 two solutes and a solvent. With two independent conserved compositions
 the free energy is a \emph{surface over the Gibbs triangle}, and demixing
-follows \emph{tie-lines} on that triangle. Reading morphology on the
-phase diagram, not on a single axis, is the multi-component way of
-thinking.
+follows \emph{tie-lines} on that triangle. We do not eyeball the tie-line:
+we \emph{derive} the spinodal from the free-energy Hessian, \emph{predict}
+the binodal by a common-tangent construction, and then \emph{measure} the
+two coexisting phases from the simulation by clustering the composition
+cloud --- theory and simulation compared on one triangle.
 \end{keybox}
 
-\section{The model}
+\section{The model, with the \texorpdfstring{$N_i$}{N} factors}
 
 Let $\phi_1,\phi_2$ be the volume fractions of the two solutes; the
-solvent is eliminated by $\phi_s = 1-\phi_1-\phi_2$. Each solute carries
-a conserved $(\phi_i,\mu_i)$ Cahn--Hilliard pair; the Flory--Huggins
-exchange chemical potentials are
+solvent is eliminated by $\phi_s = 1-\phi_1-\phi_2$. The Flory--Huggins
+free-energy density (in $kT/v_0$ units) is
 %
 \begin{equation}
-  \mu_i^{\text{bulk}} = \ln\!\frac{\phi_i}{\phi_s}
-   + \chi_{12}\,\phi_j + \chi_{is}(\phi_s-\phi_i) - \chi_{js}\,\phi_j,
-   \qquad j\neq i,
+  f(\phi_1,\phi_2) = \sum_{i\in\{1,2,s\}} \frac{\phi_i}{N_i}\ln\phi_i
+    \;+\; \sum_{i<j}\chi_{ij}\,\phi_i\phi_j ,
+  \label{eq:p4f}
+\end{equation}
+%
+where $N_i$ is the degree of polymerization of species $i$ (entropic:
+a long chain has $N_i\gg1$ and a \emph{weak} mixing entropy $\propto1/N_i$)
+and $\chi_{ij}$ the pairwise interaction (enthalpic). The exchange
+chemical potentials, eliminating the solvent, are
+%
+\begin{equation}
+  \mu_i = \pd{f}{\phi_i}
+    = \frac{1}{N_i}\big(\ln\phi_i+1\big)
+      - \frac{1}{N_s}\big(\ln\phi_s+1\big)
+      + \chi_{12}\phi_j + \chi_{is}(\phi_s-\phi_i) - \chi_{js}\phi_j,
+  \quad j\neq i,
+  \label{eq:p4mu}
 \end{equation}
 %
 and the coupled conserved dynamics is
@@ -30,77 +45,185 @@ and the coupled conserved dynamics is
   \qquad \mu_i = \mu_i^{\text{bulk}} - \kappa_i\grad^2\phi_i ,
 \end{equation}
 %
-with $M$ a symmetric positive-definite Onsager mobility matrix (its
-off-diagonal couples the two solute fluxes). This is Chapter~\ref{ch:p1}
-promoted to two composition fields.
+with $M$ a symmetric positive-definite Onsager mobility (its off-diagonal
+couples the two solute fluxes) and $\kappa_i$ the gradient penalties. This
+is Chapter~\ref{ch:p1} promoted to two composition fields; in the code it
+is the $(M{=}2,K{=}0)$ case of the production
+\code{MultiPhaseStepper}, with the same \eqref{eq:p4f} bulk (\code{bulk="p1"}).
 
 \begin{keybox}
-\textbf{Coefficients.} Three interaction parameters:
-$\chi_{12}=\PfourChiab$ (solute--solute; large $\Rightarrow$ the two
-solutes demix), $\chi_{1s}=\PfourChias$ and $\chi_{2s}=\PfourChibs$
-(solute--solvent). The mobility matrix sets the time scale and the
-relative solute speeds; $\kappa_i$ set interface widths. Real blends map
-these to the $\chi$'s in \file{materials/materials.yaml} (e.g.\ the
-P3HT:PCBM and PDPP5T:PCBM systems).
+\textbf{Coefficients come from a materials file, not from code.} The run
+reads $(\chi_{12},\chi_{1s},\chi_{2s})$ and $(N_1,N_2,N_s)$ from
+\file{materials/ternary\_p4.yaml} through the validated loader
+\file{materials/loader.py} --- each parameter carries
+\texttt{value/units/definition/source/uncertainty}, so no number is
+hand-copied. The default \texttt{synthetic\_demix} blend is
+$\chi_{12}=\PfourChiab$, $\chi_{1s}=\PfourChias$, $\chi_{2s}=\PfourChibs$,
+$N=(\PfourNone,\PfourNtwo,\PfourNs)$ --- a deliberately strong quench so the
+symmetric blend sits well inside the spinodal.
 \end{keybox}
 
-\section{The Gibbs triangle}
+\section{The spinodal: where the Hessian loses definiteness}
 
-Each node has a composition $(\phi_1,\phi_2,\phi_s)$ summing to one --- a
-point in the 2-simplex, drawn as a point in an equilateral triangle
-(barycentric coordinates; solvent, $\phi_1$, $\phi_2$ at the three
-vertices). The bulk \emph{average} is conserved and never moves; the
-\emph{cloud} of local compositions starts as a tight blob at the initial
-blend and, as the system demixes, opens up along a tie-line toward the
-two coexisting phases. Watching that cloud open \emph{is} watching
-ternary phase separation.
+A blend demixes spontaneously (spinodal decomposition) where $f$ is
+locally concave in some direction --- i.e.\ where the $2\times2$ exchange
+Hessian $H_{ij}=\partial^2 f/\partial\phi_i\partial\phi_j$ stops being
+positive definite. Differentiating \eqref{eq:p4mu},
+%
+\begin{align}
+  H_{11} &= \frac{1}{N_1\phi_1} + \frac{1}{N_s\phi_s} - 2\chi_{1s}, &
+  H_{22} &= \frac{1}{N_2\phi_2} + \frac{1}{N_s\phi_s} - 2\chi_{2s}, \notag\\
+  H_{12} &= \frac{1}{N_s\phi_s} + \chi_{12} - \chi_{1s} - \chi_{2s}.
+  \label{eq:p4H}
+\end{align}
+%
+The blend is unstable where $\det H = H_{11}H_{22}-H_{12}^2 < 0$; the
+curve $\det H = 0$ is the \emph{spinodal}. At the initial blend
+$(\PfourPhione,\PfourPhitwo)$ the code evaluates \eqref{eq:p4H} and finds
+$\det H = \PfourDet$ (smaller eigenvalue $\lambda_{\min}=\PfourEigMin<0$):
+the quench is unstable, as it must be for the noise to grow rather than
+decay. Because $H_{12}$ is the only entry carrying $\chi_{12}$, we can
+solve $\det H=0$ for the \emph{critical} interaction at this composition,
+$\chi_{12}^\star=\sqrt{H_{11}H_{22}}-(1/N_s\phi_s-\chi_{1s}-\chi_{2s})
+=\PfourChiCrit$; any $\chi_{12}>\chi_{12}^\star$ demixes.
 
-\section{Run it}
+\begin{figure}[h]\centering
+  \includegraphics[width=0.62\linewidth]{figures/p4_spinodal.png}
+  \caption{Hessian eigenvalue sign map on the Gibbs triangle: the smaller
+    eigenvalue $\lambda_{\min}$ (red $<0$) marks the spinodal-unstable
+    region, bounded by the $\det H=0$ curve (black). The star is the
+    initial blend --- inside the unstable region.}
+  \label{fig:p4spinodal}
+\end{figure}
+
+\section{The binodal: a common-tangent prediction}
+
+The spinodal bounds the \emph{unstable} region; the two compositions the
+system actually separates \emph{into} lie on the \emph{binodal}, defined
+by equal chemical potentials and equal osmotic (grand) potential in the
+two phases, $\mu_i(\vec\phi^A)=\mu_i(\vec\phi^B)$ and
+$\omega(\vec\phi^A)=\omega(\vec\phi^B)$ with
+$\omega=f-\sum_i\mu_i\phi_i$ --- the common-tangent-plane construction.
+Pinning the tie-line to pass through the conserved mean (the lever rule)
+closes the system; the code solves it by a small bounded least-squares
+step, giving the predicted endpoints $\PfourBinodalA$ and $\PfourBinodalB$
+(in $(\phi_1,\phi_2)$). These are the theory the simulation is checked
+against.
+
+\section{Reading the two phases: cluster, don't median-split}
+
+The naive tie-line readout --- split the final field at the median
+$\phi_1$ and average each half --- is biased: it forces a $50/50$ split
+and lets interfacial (mixing-transient) nodes contaminate both means.
+Instead we treat the cloud of local compositions
+$\{(\phi_1,\phi_2)\}_{\text{nodes}}$ as a two-population sample and fit a
+\textbf{2-component Gaussian mixture} (EM; no \texttt{sklearn} needed).
+Each phase gets a \emph{mean}, a $2\times2$ \emph{covariance}, and a
+\emph{population fraction}. As a method check we refit on the
+\emph{interface-excluded} bulk nodes only (dropping the high-$|\grad\phi|$
+half, whose composition is not a bulk-phase value) and report the
+endpoint shift as a \emph{sensitivity}.
 
 \begin{runbox}
 \textbf{Run it.}
 \begin{lstlisting}
 cd physics/04_ternary_ch_phase_diagram
-python run.py            # ternary spinodal quench
+python run.py                              # quick look, prints the phases
+# the full checked workflow (results.json + baseline gate):
+PYTHONPATH=<repo>/src python run_harness.py \
+    --config configs/p4.yaml --mode reference --output outputs/p4
+python gen_figures.py --run outputs/p4     # figures + numbers from the run
 \end{lstlisting}
-It marches a ternary quench from a homogeneous blend
-$(\phi_1,\phi_2)=(\PfourPhione,\PfourPhitwo)$ and reports how the
-composition cloud spreads and where the two coexisting phases land.
-Compare with \file{EXPECTED.md} and the Gibbs-triangle figure.
 \end{runbox}
 
 \paragraph{What you should see.} The composition spread grows from
-$\PfourSpreadStart$ (a tight initial blob) to $\PfourSpreadEnd$ as the
-blend separates into two phases at $\PfourPhaseA$ and $\PfourPhaseB$ (in
-$(\phi_1,\phi_2)$). The mean composition stays pinned to solver
-tolerance ($|\Delta\phi|\le\PfourDrift$): conservation fixes the
-\emph{centroid} of the cloud while it opens along the tie-line.
+$\PfourSpreadStart$ (a tight blob) to $\PfourSpreadEnd$ as the blend
+separates. The GMM finds two coexisting phases at $\PfourPhaseA$ (population
+$\PfourPopA$) and $\PfourPhaseB$ (population $\PfourPopB$) --- one
+$\phi_1$-poor/$\phi_2$-rich, the other the mirror. The interface-excluded
+means shift by only $\PfourSens$, so the endpoints are robust to the
+clustering choice. The simulated endpoints sit \emph{inside} the predicted
+binodal (Fig.~\ref{fig:p4landscape}): a short quench has not yet reached
+full coexistence, which is exactly what the tie-line comparison reveals.
 
-% --- generated by gen_figures.py ---
+\begin{figure}[h]\centering
+  \includegraphics[width=0.78\linewidth]{figures/p4_landscape.png}
+  \caption{The signature figure: free-energy contours of \eqref{eq:p4f},
+    the spinodal ($\det H=0$, red) enclosing the unstable region, the
+    initial blend (star), the predicted binodal tie-line (common tangent,
+    dashed), and the \emph{simulated} coexisting phases (GMM means with
+    $1\sigma$ covariance ellipses). Theory and simulation on one triangle.}
+  \label{fig:p4landscape}
+\end{figure}
+
 \begin{figure}[h]\centering
   \includegraphics[width=\linewidth]{figures/p4_gibbs.png}
-  \caption{Composition trajectory on the Gibbs triangle: the local-
-    composition cloud (one point per mesh node) opens from the initial
-    blend along a tie-line toward the two coexisting phases. The mean
-    (centroid) is conserved.}
+  \caption{Composition-cloud evolution on the Gibbs triangle: the tight
+    initial blob opens along a tie-line as the blend demixes.}
   \label{fig:p4gibbs}
 \end{figure}
 
+\section{Admissibility, conservation, and the lever rule}
+
+A trustworthy multi-component run must stay on the simplex, conserve each
+solute, and respect the lever rule. The harness reports all three from the
+shared \file{diffsim.diagnostics} library:
+
+\begin{itemize}
+\item \textbf{Simplex residual.} $\max|\phi_1+\phi_2+\phi_s-1| =
+  \PfourSimplex$ --- machine zero, because the solvent is eliminated
+  exactly ($\phi_s\equiv1-\phi_1-\phi_2$). Field bounds stay in-range
+  ($\phi_1\in\PfourPhiOneRange$) with clipped fraction $\PfourClipFrac$
+  (the log barrier keeps the fractions admissible).
+\item \textbf{Quadrature conservation.} Integrating each solute by the
+  \emph{assembly quadrature} (Gauss points $\times$ Jacobian, not a nodal
+  mean), the per-solute content drifts are
+  $|\Delta C_1|=\PfourDriftOne$ and $|\Delta C_2|=\PfourDriftTwo$ ---
+  Model-B no-flux dynamics conserves each solute to round-off.
+\item \textbf{Lever rule.} The conserved mean must equal the
+  population-weighted average of the two phase compositions,
+  $\bar{\vec\phi}=w_A\vec\phi^A+w_B\vec\phi^B$. The residual is
+  $\PfourLever$ --- small, and a genuine cross-check that the clustering
+  and the conservation agree.
+\end{itemize}
+
+\section{The \texorpdfstring{$N_i$}{N} shift}
+
+Unequal degrees of polymerization move the spinodal. Because the entropic
+Hessian terms in \eqref{eq:p4H} scale as $1/N_i$, a longer solute-1 chain
+weakens the entropy that resists demixing and \emph{enlarges} the unstable
+region. Running the asymmetric blend
+$N=(\PfourAsymN,\PfourNtwo,\PfourNs)$ at the same composition, the critical
+interaction drops from $\PfourChiCrit$ to $\PfourAsymChiCrit$ (a shift of
+$\PfourDeltaChiCrit$) and $\det H$ deepens from $\PfourDet$ to
+$\PfourAsymDet$. The stronger instability drives a more complete
+separation --- the simulated phases move out to $\PfourAsymPhaseA$ and
+$\PfourAsymPhaseB$, near the triangle edges
+(Fig.~\ref{fig:p4nshift}).
+
 \begin{figure}[h]\centering
-  \includegraphics[width=0.85\linewidth]{figures/p4_fields.png}
-  \caption{The two solute fields of the final ternary morphology.}
-  \label{fig:p4fields}
+  \includegraphics[width=\linewidth]{figures/p4_nshift.png}
+  \caption{The $N_i$ shift: the asymmetric-$N$ spinodal (right) is much
+    larger than the symmetric one (left); the asymmetric blend demixes
+    almost completely (endpoints near the edges).}
+  \label{fig:p4nshift}
 \end{figure}
 
 \begin{keybox}
-\textbf{Measured self-check.}
+\textbf{Measured self-check (reference mode).}
 \begin{center}\small
 \begin{tabular}{lc}
 \toprule
-composition spread (std $\phi_1$): start $\to$ end & $\PfourSpreadStart \to \PfourSpreadEnd$ \\
-coexisting phase A $(\phi_1,\phi_2)$ & \PfourPhaseA \\
-coexisting phase B $(\phi_1,\phi_2)$ & \PfourPhaseB \\
-mean drift $|\Delta\phi|$ & \PfourDrift \\
+spinodal $\det H$ @ IC & $\PfourDet$ ($<0$: unstable) \\
+critical $\chi_{12}^\star$ @ IC & $\PfourChiCrit$ \\
+coexisting phase A $(\phi_1,\phi_2)$ / pop.\ & $\PfourPhaseA$ / $\PfourPopA$ \\
+coexisting phase B $(\phi_1,\phi_2)$ / pop.\ & $\PfourPhaseB$ / $\PfourPopB$ \\
+clustering sensitivity (GMM vs.\ bulk-only) & $\PfourSens$ \\
+predicted binodal A / B & $\PfourBinodalA$ / $\PfourBinodalB$ \\
+simplex residual $\max|\!\sum\phi-1|$ & $\PfourSimplex$ \\
+solute content drift $|\Delta C_1|,|\Delta C_2|$ & $\PfourDriftOne,\ \PfourDriftTwo$ \\
+lever-rule residual & $\PfourLever$ \\
+$N_i$ shift $\Delta\chi_{12}^\star$ ($N_1{:}\PfourNone{\to}\PfourAsymN$) & $\PfourDeltaChiCrit$ \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -108,38 +231,43 @@ mean drift $|\Delta\phi|$ & \PfourDrift \\
 
 \section{Code walk-through}
 
-\paragraph{1. The ternary stepper.} \code{TernaryCHStepper(dm, chi=(...),
-M=(...), kappa=(...))} builds the four-field $(\phi_1,\mu_1,\phi_2,\mu_2)$
-system; \code{set\_initial(f1, f2)} seeds the two compositions.
+\paragraph{1. Materials.} \code{load\_blend("synthetic\_demix")}
+(\file{materials/loader.py}) returns a validated $(\chi,N)$; the run never
+hard-codes them.
 
-\paragraph{2. Barycentric projection.} \code{bary\_to\_xy(phi1, phi2)}
-maps a composition to triangle coordinates; scattering every node gives
-the cloud of Fig.~\ref{fig:p4gibbs}.
+\paragraph{2. The stepper.} \code{MultiPhaseStepper(dm, M=2, K=0,
+chi\_aa=..., N=...)} builds the coupled $(\phi_1,\mu_1,\phi_2,\mu_2)$
+system; \code{set\_initial([f1, f2])} seeds the two compositions.
 
-\paragraph{3. Tie-line readout.} Splitting the final field at the median
-$\phi_1$ and averaging each half estimates the two coexisting phase
-compositions (the tie-line endpoints).
+\paragraph{3. Analysis (in \file{ternary.py}, not \file{src/}).}
+\code{spinodal\_hessian} / \code{spinodal\_maps} give
+\eqref{eq:p4H}; \code{gmm2} + \code{cluster\_phases} read off the phases
+with the interface-excluded sensitivity; \code{predict\_binodal} solves
+the common-tangent tie-line; the harness adds the quadrature conservation
+and lever-rule residual.
 
 \section{Explore on your own}
 
-\question{Increase $\chi_{12}$ (make the two solutes more immiscible).
-How do the tie-line endpoints move on the triangle, and does the cloud
-open further? Where is the spinodal boundary for this blend?}
+\question{Increase $\chi_{12}$ past $\chi_{12}^\star=\PfourChiCrit$ and
+below it. Confirm from \code{spinodal\_hessian} that $\det H$ changes sign,
+and that below $\chi_{12}^\star$ the noise decays (spread $\to0$) instead
+of growing.}
 
-\question{Change the solvent selectivity: make $\chi_{1s}\neq\chi_{2s}$.
-Which solute segregates preferentially, and how does the tie-line
-\emph{tilt} on the triangle?}
+\question{Make the solvent selective, $\chi_{1s}\neq\chi_{2s}$. Which
+solute segregates preferentially, and how does the predicted binodal
+\emph{tilt} on the triangle? Does the GMM sensitivity grow?}
 
-\question{Shift the initial blend off the symmetric point (e.g.\ solute-
-rich). Does the morphology change from bicontinuous to droplet, and does
-the cloud still open along the same tie-line?}
+\question{Push the asymmetry to $N_1=5$ or $10$. The spinodal enlarges
+further --- but the quench also gets stiffer (weaker log barrier). Watch
+the Newton iteration count and the reject ladder; this is why the tutorial
+demonstrates $N_1=\PfourAsymN$ on a small mesh.}
 
-\question{The off-diagonal mobility $M_{12}$ couples the two fluxes. Set
-it to zero and compare the coarsening: does the morphology or only the
-rate change?}
+\question{Turn off the off-diagonal mobility $M_{12}$. Does the tie-line
+(the endpoints) change, or only the coarsening rate?}
 
-\question{Map a real system from \file{materials.yaml} (say P3HT:PCBM)
-onto $(\chi_{12},\chi_{1s},\chi_{2s})$ and predict, from the triangle,
-which two phases should coexist. Then run it and check.}
+\question{Map a real system from \file{materials/ternary\_p4.yaml} (say
+\texttt{P3HT\_PCBM}) and predict, from its spinodal, whether the blend at a
+chosen composition should demix. Then run it and check against the GMM
+endpoints.}
 
 % ====================================================================
