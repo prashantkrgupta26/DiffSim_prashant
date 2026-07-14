@@ -18,7 +18,35 @@ sbatch cluster/wodo_campaign/a100_wodo.sbatch        # 14 cases, 2-D full res
 sbatch cluster/wodo_campaign/h200_wodo.sbatch        # ONE reduced-3D stretch
 sbatch cluster/wodo_campaign/a100_negi3d.sbatch      # Negi rpm ladder, FULL 3-D
 sbatch cluster/wodo_campaign/a100_wodo3d_hero.sbatch # fig6/7 regimes, FULL 3-D
+sbatch cluster/wodo_campaign/a100_s3d_pilot.sbatch   # M5 S3-3D hero, blockch_dev
+sbatch cluster/wodo_campaign/a100_s3d_hero_mk32.sbatch # OPTIONAL (M=3,K=2) rung
 ```
+
+## S3-3D M5 hero kit (blockch_dev)
+
+Separate track (M5 evaporation-quench, not Wodo), same directory. As of
+2026-07-14 the kit runs `linsolver=blockch_dev` (`assembly="device"`)
+instead of cuDSS — cuDSS CEILINGed at the 811k-dof case (>16 min
+factorization crawl, 48.2 GB) and blockch_dev marches it at 28.6 s/step
+(MEASURED, dev note `docs/dev/2026-07-13-blockch-mpf.md` Sec 3; 8.4x
+faster than cuDSS at slab64, 2.10 vs 17.7 s/call). Physics is
+single-sourced from `benchmarks/performance/m5_device_assembly.py`
+CASES + `make_stepper` (S3b production energetics); the drivers/sbatch
+only pick the case + solver knobs.
+
+- **a100_s3d_pilot.sbatch** — the 64x64x32 hero case (`3d_slab64z32`,
+  811,008 dofs, M2/K1). MEASURED 28.6 s/step / 2.16 s/call / ~22 GB on
+  RTX 6000 Ada; A100-80 estimate ~15 s/step (HBM2e ~2x, honest
+  extrapolation). Noisy production quench (noise_psi 5e-3), march
+  ladder, field snapshots every 10 steps.
+- **a100_s3d_hero_mk32.sbatch** (OPTIONAL) — the largest single-card
+  rung: 128x128x64 at (M=3, K=2), `3d_slab128z64_mk32`, 10.6M dofs,
+  block-masked pattern REQUIRED (superset overflows int32). MEASURED
+  160.8 s/step / 9.06 s/call / 23.9 GB GPU / 18.9 GB host (dev note
+  Sec 6). Runs noise=0: the noisy quench at 128^3-class h is the
+  recorded 3-D-FDT-recalibration frontier (dev note Sec 5); this rung
+  is a capacity + wall demonstration (deterministic quench marches
+  clean — 4 Newton its/step, zero fallbacks).
 
 ## What runs
 

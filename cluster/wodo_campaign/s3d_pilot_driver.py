@@ -1,14 +1,34 @@
-"""S3-3D pilot driver (Nova A100-80): ONE measure-first case of the
-recorded hero candidate — the 64 x 64 x 32 film slab (811,776 dofs)
-that exceeds the 48 GB workstation ceiling (dev note
-docs/dev/2026-07-13-m5-device-assembly.md Sec 5).
+"""S3-3D hero driver (Nova A100-80): the M5 evaporation-quench hero
+case, now on the blockch-(M,K) preconditioner instead of cuDSS.
 
-PURPOSE: measure, not campaign.  cuDSS 3-D at this size is expected
-SOLVER-BOUND (minutes/step class); this pilot records the real A100-80
-setup wall, s/step, and memory so the hero campaign can be sized after
-the blockch-(M,K) route lands.  Reuses the D3 bench constructors
-verbatim (single source of truth for the hero config; the bench CASES
-dicts define the geometry, the bench make_stepper the physics).
+WHAT CHANGED (2026-07-14): the pilot was built to MEASURE cuDSS 3-D at
+811k dofs, which was expected/measured SOLVER-BOUND (cuDSS CEILINGed at
+that size: >16 min factorization crawl, 48.2 GB — dev note
+docs/dev/2026-07-13-blockch-mpf.md Sec 3).  blockch_dev is now merged
+(src/diffsim/solvers/linsolve.py; MultiPhaseStepper linsolver=
+"blockch_dev") and MEASURED 8.4x faster than cuDSS at slab64
+(2.10 vs 17.7 s/call) and marches the 811k cuDSS-CEILING case at
+28.6 s/step.  So this driver defaults to linsolver="blockch_dev"
+(assembly="device"): the solver-bound pilot becomes a real 80 GB
+campaign that clears the cuDSS 3-D ceiling.
+
+MEASURED walls (RTX 6000 Ada 48 GB, dev-note tables — NOT invented):
+  * 3d_slab64z32  (811,008 dofs, M2/K1): 28.6 s/step, 2.16 s/call,
+    ~22 GB GPU (blockch_dev; cuDSS CEILINGed here).      [Sec 3]
+  * 3d_film128    (128x128x64, 6.39M dofs, M2/K1): 146.6 s/step,
+    9.46 s/call solve, 22.0 GB GPU / 14.6 GB host (superset).  [Sec 5]
+  * 3d_slab128z64_mk32 (128x128x64, M3/K2, 10.6M dofs): 160.8 s/step,
+    9.06 s/call, 23.9 GB GPU / 18.9 GB host (block-masked, REQUIRED —
+    the superset overflows int32 at this (M,K)).          [Sec 6]
+A100-80 (Nova) is HBM2e ~2x GDDR6 bandwidth on the spmv-bound solve =>
+~75-80 s/step estimate at the 6.4M-dof film128 rung, with 80 GB
+clearing 3.6x the measured 22 GB footprint (dev note Sec 5, honest
+extrapolation — NOT a measurement).
+
+Reuses the D3 bench constructors verbatim (single source of truth for
+the hero config; the bench CASES dicts define the geometry, the bench
+make_stepper the S3b production energetics).  mk32 cases run the
+(M=3, K=2) family with the REQUIRED block-masked pattern.
 """
 import argparse
 import json
@@ -30,6 +50,13 @@ def main():
                     choices=sorted(CASES))
     ap.add_argument("--assembly", default="device",
                     choices=["host", "device"])
+    ap.add_argument("--linsolver", default="blockch_dev",
+                    choices=["blockch_dev", "blockch", "cudss", "splu"],
+                    help="default blockch_dev — clears the cuDSS 3-D "
+                         "ceiling (dev note 2026-07-13-blockch-mpf.md)")
+    ap.add_argument("--block-sparse", action="store_true",
+                    help="kron(G, blockmask) device pattern; REQUIRED "
+                         "for the mk32 128-class rungs (int32-safe nnz)")
     ap.add_argument("--noise", type=float, default=5e-3,
                     help="FDT psi noise (the production quench)")
     ap.add_argument("--steps", type=int, default=60)
@@ -42,11 +69,16 @@ def main():
 
     t0 = time.time()
     c = CASES[args.case]
+    mk = (3, 2) if args.case.endswith("_mk32") else (2, 1)
     dm = build_case(c, args.device)
     st = make_stepper(dm, args.assembly, dt=c.get("dt", 1e-4),
-                      noise=args.noise)
+                      noise=args.noise, linsolver=args.linsolver,
+                      mk=mk, block_sparse=args.block_sparse)
     print(json.dumps(dict(event="setup", case=args.case,
                           assembly=args.assembly,
+                          linsolver=args.linsolver,
+                          block_sparse=bool(args.block_sparse),
+                          M=int(st.M), K=int(st.K),
                           nfree=int(st.nfree),
                           ndof_total=int(st.nfree * st.ndof),
                           wall=round(time.time() - t0, 1))),
@@ -56,10 +88,18 @@ def main():
     full = lambda v: np.asarray(Tc @ v)
 
     def snap(k):
-        np.savez(f"{args.outdir}/snap_{k:04d}.npz",
-                 t=st.t, h=st.h_curr,
-                 phi_f=full(st.phi(0)), phi_p=full(st.phi(1)),
-                 psi=full(st.psi(0)), theta=full(st.theta(0)))
+        fields = dict(t=st.t, h=st.h_curr)
+        for i in range(st.M):
+            fields[f"phi_{i}"] = full(st.phi(i))
+        for j in range(st.K):
+            fields[f"psi_{j}"] = full(st.psi(j))
+            fields[f"theta_{j}"] = full(st.theta(j))
+        # back-compat aliases for the 2-D analysis tooling (M2/K1 names)
+        fields["phi_f"] = fields["phi_0"]
+        fields["phi_p"] = fields["phi_1"]
+        fields["psi"] = fields["psi_0"]
+        fields["theta"] = fields["theta_0"]
+        np.savez(f"{args.outdir}/snap_{k:04d}.npz", **fields)
 
     snap(0)
     k = 0
