@@ -1,0 +1,16 @@
+# P0 - model hierarchy + the one worked nondimensionalization.
+# Dimensional inputs chosen so the Cahn number kappa~ = (lam/L)^2 = 5e-4
+# matches the P1 tutorial (lam = 11.18 nm interface, L = 500 nm domain), so the
+# interface-cell counts reproduce P1's measured 2.02 (poly) / 1.43 (FH) exactly.
+interface_length_nm: 11.18
+domain_size_nm: 500.0
+level: 6
+target_interface_cells: 3.0
+fh_A: 1.0
+fh_B: 2.5
+fh_c_bar: 0.5
+cryst_Tm_K: 558.0        # PCBM class, materials.yaml
+cryst_dh: 1.3072
+cryst_T_accel_K: 250.0   # accelerated-tutorial undercooling (deep quench)
+cryst_T_phys_K: 500.0    # a physical near-Tm anneal
+precision: fp64

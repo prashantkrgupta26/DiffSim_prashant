@@ -1,0 +1,16 @@
+# P0 tolerance baseline - the one worked nondimensionalization.
+#
+# Deterministic arithmetic, so tight tolerances. The load-bearing invariant is
+# that the nondimensional interface-cell counts REPRODUCE the P1 tutorial's
+# measured values (2.024 poly / 1.431 FH at level 6, kappa~=5e-4) -- a
+# cross-tutorial consistency check that the nondimensionalization is correct.
+checks:
+  cahn_number:             {reference: 5.0e-4, rtol: 0.01}
+  poly_interface_cells:    {reference: 2.024, rtol: 0.01}    # == P1 baseline
+  fh_interface_cells:      {reference: 1.431, rtol: 0.01}    # == P1 baseline
+  fh_curvature_fpp:        {reference: -1.0, atol: 0.02}
+  spinodal_unstable:       {equals: true}
+  min_level_for_target:    {equals: 7}
+  cryst_drive_accel:       {reference: -0.7215, rtol: 0.02}
+  cryst_drive_phys:        {reference: -0.1359, rtol: 0.02}
+  cryst_drive_ratio:       {reference: 5.31, rtol: 0.02}
