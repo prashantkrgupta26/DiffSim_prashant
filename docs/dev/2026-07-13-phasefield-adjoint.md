@@ -66,16 +66,35 @@ adj-vs-FD `< 1e-6` (measured ~1e-9..1e-11).
 ### Forward parity (`test_forward_parity_production`)
 poly-BDF1 `max|dc| = 1.1e-16`; FH-BDF2 `max|dc| = 3.3e-16`.  Locked `< 1e-12`.
 
+### G2b/G2c — coupled crystallisation CH x AC (M=K=1)
+
+`adjoint/crystallization.py`: node block (phi, mu, psi), representative
+Turnbull/r14 free energy `f = f_FH(phi) + phi[q(psi)dsig + p(psi)drive]`,
+`drive = dh(T/Tm-1)`.  Both phi and psi are BDF-stepped so the history
+cotangent couples two slots.  Params: M, kappa, eps2, L, dsig, dh, Tm, A, B.
+
+BDF1, 3 steps (`test_g2b_crystallization_bdf1`) — worst adj/twin `6.0e-16`,
+worst adj/FD `8.9e-10` (all 9 params).
+BDF2, 4 steps (`test_g2c_crystallization_bdf2`) — worst adj/twin `1.7e-15`,
+worst adj/FD `4.1e-09`.  Sample (BDF1): dh `+2.661164e-01`, Tm `+4.435273e-02`,
+dsig `-3.913890e-02`, eps2 `-2.743690e-01`, L `-5.534772e-02`.
+
 ## Capability status
 
-- (a) MATERIAL PARAMETERS — **G1 + BDF2 delivered & verified** for the CH
-  (binary) operator: mobility M, gradient energy kappa, Flory chi (B), entropic
-  A.  Multiphase (M,K) + crystallization params (dh, Tm, dsigma, eps2): pending.
+- (a) MATERIAL PARAMETERS — **DELIVERED & VERIFIED.** Binary CH (M, kappa,
+  Flory chi B, A) and coupled CH x AC crystallisation (dh, Tm, dsigma, eps2, L),
+  BDF1 and variable-coefficient BDF2, all three-way to machine precision.
 - (b) processing / (c) learn-free-energy / (d) design-route: pending.
 
+## Scope notes
+- Gate meshes are uniform (constraints.T == identity), natural no-flux BCs.
+- The crystallisation gate is the (M,K)=(1,1) retained-species core; orientation
+  theta (the 4th dof of the full 2M+2K block, KG-regularised |grad theta|) is a
+  documented frontier — the crystallisation *parameters* live in the phi/psi
+  coupling, which is fully covered.  Multi-species M>1 / matrix mobilities
+  reuse the same IFT sweep with a larger block.
+
 ## Frontiers / next
-- G2 multiphase: extend `CHDiscrete` to the `2M+2K` residual (multi-CH x
-  multi-AC) and the crystallization params; same IFT reverse sweep, larger
-  per-node block.
-- G3 processing params (evap rate k_e, quench schedule T(t) — a time series).
+- G3 processing params (evap rate k_e, quench schedule T(t) — a time series;
+  note `dR/dT = dh/Tm` per GP is already implemented as the "T" param deriv).
 - G4 learn f(c) from a trajectory; G5 design a process schedule.

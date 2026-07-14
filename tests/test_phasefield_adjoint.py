@@ -107,6 +107,88 @@ def test_g2a_ch_bdf2_material_params(device):
         assert r_f < 1e-6, (p, a, f)
 
 
+def _cryst_three_way(dm, coords, order, n_steps, dt=0.01):
+    """Coupled CH x AC (M=K=1) crystallisation: dJ/d{M,kappa,eps2,L,dsig,
+    dh,Tm,A,B} three ways.  J = 0.5(|phi_N-0.5|^2 + |psi_N-0.4|^2)."""
+    import torch
+    from diffsim.adjoint.crystallization import CACHForward, CACHAdjoint
+    from diffsim.adjoint.torch_twin import CACHTwin
+    nn = dm.n_nodes
+    NF = 3
+    cc = np.cos(np.pi * coords[:, 0]) * np.cos(np.pi * coords[:, 1])
+    phi0 = 0.5 + 0.1 * cc
+    psi0 = 0.3 + 0.1 * cc
+    tgt_phi = np.full(nn, 0.5)
+    tgt_psi = np.full(nn, 0.4)
+    base = dict(M=1.0, kappa=0.02, eps2=0.02, L=1.0, dsig=1.0, dh=1.0,
+                Tm=2.0, T=0.5, A=1.0, B=2.5)
+    names = ["M", "kappa", "eps2", "L", "dsig", "dh", "Tm", "A", "B"]
+
+    def run(P, record=False):
+        fwd = CACHForward(dm, FHEnergy(P["A"], P["B"]), M=P["M"],
+                          kappa=P["kappa"], eps2=P["eps2"], L=P["L"],
+                          dsig=P["dsig"], dh=P["dh"], Tm=P["Tm"], T=P["T"],
+                          dt=dt, order=order)
+        fwd.set_initial(phi0, psi0)
+        fwd.run(n_steps)
+        xN = fwd.steps[-1]["x"]
+        J = 0.5 * float(((xN[0::NF] - tgt_phi) ** 2).sum()
+                        + ((xN[2::NF] - tgt_psi) ** 2).sum())
+        return (fwd, J) if record else J
+
+    fwd, _ = run(base, record=True)
+    adj = CACHAdjoint(fwd)
+    dJdx = [np.zeros(NF * nn) for _ in range(n_steps)]
+    xN = fwd.steps[-1]["x"]
+    dJdx[-1][0::NF] = xN[0::NF] - tgt_phi
+    dJdx[-1][2::NF] = xN[2::NF] - tgt_psi
+    g_adj = adj.gradient(dJdx, names)
+
+    def fd(p):
+        eps = 1e-6 * max(1.0, abs(base[p]))
+        hi = dict(base); hi[p] += eps
+        lo = dict(base); lo[p] -= eps
+        return (run(hi) - run(lo)) / (2 * eps)
+    g_fd = {p: fd(p) for p in names}
+
+    twin = CACHTwin(dm, dt=dt, order=order, device="cpu")
+    leaves = {k: torch.tensor(float(v), requires_grad=True)
+              for k, v in base.items()}
+    out = twin.march(torch.tensor(phi0), torch.tensor(psi0), leaves, n_steps)
+    xNt = out[-1]
+    loss = 0.5 * (((xNt[0::NF] - torch.tensor(tgt_phi)) ** 2).sum()
+                  + ((xNt[2::NF] - torch.tensor(tgt_psi)) ** 2).sum())
+    loss.backward()
+    g_tw = {p: float(leaves[p].grad) for p in names}
+    return {p: (g_adj[p], g_tw[p], g_fd[p]) for p in names}
+
+
+def test_g2b_crystallization_bdf1(device):
+    """G2b: coupled CH x AC crystallisation params (dh, Tm, dsigma, eps2, L)
+    three-way verified, BDF1, 3 steps.  Capability (a) = complete."""
+    dm, mesh = _dm(3, device)
+    res = _cryst_three_way(dm, mesh.node_coords, order=1, n_steps=3)
+    for p, (a, t, f) in res.items():
+        r_t = abs(a - t) / max(abs(t), 1e-14)
+        r_f = abs(a - f) / max(abs(f), 1e-14)
+        print(f"G2b {p:6s} adj={a:+.6e} adj/twin={r_t:.2e} adj/fd={r_f:.2e}")
+        assert r_t < 1e-10, (p, a, t)
+        assert r_f < 1e-6, (p, a, f)
+
+
+def test_g2c_crystallization_bdf2(device):
+    """G2c: crystallisation params, variable-coefficient BDF2, 4 steps —
+    both conserved-in-time fields (phi AND psi) carry history cotangents."""
+    dm, mesh = _dm(3, device)
+    res = _cryst_three_way(dm, mesh.node_coords, order=2, n_steps=4)
+    for p, (a, t, f) in res.items():
+        r_t = abs(a - t) / max(abs(t), 1e-14)
+        r_f = abs(a - f) / max(abs(f), 1e-14)
+        print(f"G2c {p:6s} adj={a:+.6e} adj/twin={r_t:.2e} adj/fd={r_f:.2e}")
+        assert r_t < 1e-10, (p, a, t)
+        assert r_f < 1e-6, (p, a, f)
+
+
 def test_forward_parity_production(device):
     """The numpy discrete forward must reproduce the production
     CahnHilliardStepper to Newton tolerance — otherwise the adjoint is not
