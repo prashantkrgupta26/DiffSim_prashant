@@ -148,22 +148,26 @@ def _domain_scale(field):
 
 def compare(dm, mesh, t_end=0.8, dt_fixed=4e-3, tol=2e-3, order=2,
             kappa=8e-4, M=1.0, seed=7, device="cuda:0"):
-    """Run the NAIVE fixed-dt integrator and the adaptive integrator to
-    the same horizon.
+    """Run a fixed-dt integrator and the adaptive integrator to the same
+    horizon and return the cost/robust-statistic comparison the student
+    driver prints.
 
-    The point of the concept: a single fixed dt cannot serve both the
-    violent spinodal quench (which here needs dt ~ 1e-6 to control the
-    truncation error) and the slow coarsening tail (which tolerates
-    dt ~ 5e-2).  The adaptive controller spends steps where the solution
-    changes.  The result is that the naive fixed step is BOTH more
-    expensive AND less accurate (its energy lags, because it
-    under-resolves the quench), while the adaptive run reaches a more
-    relaxed state for less work.
+    NOTE ON ACCURACY.  Do NOT equate a lower energy with a more accurate
+    solution -- an integrator can reach a lower energy on a WORSE
+    trajectory.  Accuracy is measured against a tight reference; the full
+    reference-based study (temporal-order verification, relative L2 of
+    c(T), the stiffness cliff, real cost with rejected steps, and the
+    honest matched-accuracy speed-up) lives in run_harness.py, which is
+    the chapter's source of numbers.  This function is the lightweight
+    student-facing driver; it reports the step counts and the ROBUST
+    statistics (free energy, domain scale, phase values) that agree even
+    though the pixelwise coarsened pattern is step-sequence sensitive (as
+    it is RNG-seed sensitive, P1's seed note).
 
-    The EXACT coarsened microstructure depends on the step sequence just
-    as it depends on the RNG seed (P1's seed note), so we compare the
-    ROBUST statistics -- free energy, domain scale, phase values -- not
-    the pixelwise field."""
+    ``implied_fixed`` below is the NAIVE WORST CASE (a fixed step pinned
+    at the quench's smallest adaptive step for the whole horizon); it is
+    an upper bound for contrast, NOT the speed-up -- see run_harness.py
+    for the matched-accuracy number."""
     fx = run_fixed(dm, mesh, dt_fixed, t_end, order=order, kappa=kappa,
                    M=M, seed=seed, device=device)
     ad = run_adaptive(dm, mesh, t_end, tol=tol, order=order, kappa=kappa,

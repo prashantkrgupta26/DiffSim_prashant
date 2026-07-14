@@ -39,11 +39,14 @@ def main():
           f"{ad['nsteps']:5d} steps   F_end = {ad['F'][-1]:.5g}")
     print(f"  adaptive dt range: {r['dt_min']:.2e} "
           f"-> {ad['dt_hist'].max():.3f}")
-    print(f"  step-count saving vs naive fixed: {r['speedup']:.1f}x")
-    print(f"  a fixed dt safe for the whole quench (dt<={r['dt_min']:.1e})"
-          f" would need ~{r['implied_fixed']:,} steps")
-    print(f"  final energy: fixed {fx['F'][-1]:.4g} (lags) vs adaptive "
-          f"{ad['F'][-1]:.4g} (more relaxed); |dF| = {r['dF_end']:.3g}")
+    print(f"  step count: adaptive takes {r['speedup']:.1f}x fewer accepted "
+          f"steps than this fixed dt")
+    print(f"  NAIVE WORST CASE (not the speed-up): a fixed dt pinned at the "
+          f"quench's smallest step (dt<={r['dt_min']:.1e}) would need "
+          f"~{r['implied_fixed']:,} steps")
+    print(f"  final energy: fixed {fx['F'][-1]:.4g} vs adaptive "
+          f"{ad['F'][-1]:.4g} (|dF| = {r['dF_end']:.3g}); note: energy does "
+          f"NOT rank accuracy -- see run_harness.py for the reference study")
     print(f"  robust statistics agree: domain scale "
           f"{r['dscale_fixed']:.1f} vs {r['dscale_adapt']:.1f} cells; "
           f"phases c in [{r['crange_adapt'][0]:.2f}, "

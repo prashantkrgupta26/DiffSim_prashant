@@ -1,0 +1,16 @@
+# P2 doc-vs-data mapping: each course-document macro (latex/numbers/p2.tex) vs
+# the reference-mode results.json path it must match, within tolerance. Drives
+# the docs-build staleness gate (common/check_doc_staleness.py). Only the
+# reliable, reproducible numbers are gated here; trajectory-sensitive cost
+# counts (accepted/rejected/wall) are documented but not staleness-gated.
+tex: ../../latex/numbers/p2.tex
+macros:
+  PtwoOrderBDFone:  {path: order.bdf1.observed_order, rtol: 0.15}
+  PtwoOrderBDFtwo:  {path: order.bdf2.observed_order, rtol: 0.15}
+  PtwoFixedOrder:   {path: fixed_order,               rtol: 0.20}
+  PtwoRefF:         {path: reference.F,                rtol: 0.10}
+  PtwoReflam:       {path: reference.lam1,             rtol: 0.10}
+  PtwoAdlam:        {path: adaptive.lam1,              rtol: 0.10}
+  # Note: only plain-number macros are staleness-gated here. Scientific-
+  # notation macros (e.g. PtwoDtmax = 1.0e-2) don't round-trip through the
+  # macro number parser, and their invariants are covered by baseline.yaml.
