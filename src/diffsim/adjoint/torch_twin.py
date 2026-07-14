@@ -69,19 +69,26 @@ class CHTwin:
     def _assemble(self, c, mu, hist_gp, M, kap, params):
         R = torch.zeros(self.ndof, device=self.dev)
         J = torch.zeros(self.ndof * self.ndof, device=self.dev)
-        fp_fn = _fp_fh if self.energy == "fh" else _fp_poly
-        fpp_fn = None  # curvature via autograd of fp for FH; explicit poly
+        # energy is either a string tag ("fh"/"poly") or an object exposing
+        # .fp(c)/.fpp(c) (e.g. neural_energy.NeuralCHEnergy — beyond-FH head).
+        obj_energy = not isinstance(self.energy, str)
+        fp_fn = None if obj_energy else (_fp_fh if self.energy == "fh"
+                                         else _fp_poly)
         for bi, B in enumerate(self.bins):
             c_, gc = self._interp(c, B)
             mu_, gmu = self._interp(mu, B)
             dJxW, N, dN, dscale = B["dJxW"], B["N"], B["dN"], B["dscale"]
             hg = hist_gp[bi]
-            fp = fp_fn(c_, params)
-            if self.energy == "fh":
-                A, Bc = params["A"], params["B"]
-                fpp = A * (1.0 / c_ + 1.0 / (1.0 - c_)) - 2.0 * Bc
+            if obj_energy:
+                fp = self.energy.fp(c_)
+                fpp = self.energy.fpp(c_)
             else:
-                fpp = 3.0 * c_ * c_ - 1.0
+                fp = fp_fn(c_, params)
+                if self.energy == "fh":
+                    A, Bc = params["A"], params["B"]
+                    fpp = A * (1.0 / c_ + 1.0 / (1.0 - c_)) - 2.0 * Bc
+                else:
+                    fpp = 3.0 * c_ * c_ - 1.0
             gN_gmu = torch.einsum("qad,e,eqd->eqa", dN, dscale, gmu)
             gN_gc = torch.einsum("qad,e,eqd->eqa", dN, dscale, gc)
             Rc = torch.einsum("eq,qa->ea", dJxW * (params["sigma"] * c_ - hg),
