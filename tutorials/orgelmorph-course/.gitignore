@@ -1,0 +1,11 @@
+# tutorial run outputs (regenerable)
+*/*/out/
+**/__pycache__/
+# LaTeX build intermediates (the built PDF IS committed)
+latex/*.aux
+latex/*.log
+latex/*.toc
+latex/*.out
+latex/*.fls
+latex/*.fdb_latexmk
+latex/*.synctex.gz

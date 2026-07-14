@@ -1,0 +1,79 @@
+# OrgElMorph course - material parameter sets, with provenance.
+#
+# These are the real systems the tutorials use once material identity
+# matters (from the ternary concepts onward). Early binary concepts use
+# nondimensional models; the mapping to these parameters is explained in
+# the course document.
+#
+# Flory-Huggins convention used by the bricks (kT/v0 units):
+#   f = sum_i (phi_i/N_i) ln phi_i + sum_{i<j} chi_ij phi_i phi_j
+#   chi = interaction parameter (enthalpic); N = degree of polymerization
+#   (entropic); Biot number Bi = k_e h0 / D_s sets the evaporation rate.
+
+systems:
+
+  P3HT_PCBM:
+    description: >
+      Poly(3-hexylthiophene) : phenyl-C61-butyric-acid-methyl-ester --
+      the archetypal organic-solar-cell blend; the Wodo-Ganapathysubramanian
+      (2012) evaporation-morphology benchmark system.
+    species: [polymer, fullerene, solvent]
+    N: [~, 1, 1]                 # polymer N large (~1e2-1e3); tutorials
+                                 # use the symmetric-entropy model, see P1
+    chi:
+      polymer_fullerene: 0.86    # order-1; blend is weakly immiscible
+      polymer_solvent: 0.4
+      fullerene_solvent: 0.3
+    provenance: >
+      Wodo & Ganapathysubramanian, Comput. Mater. Sci. 55 (2012) 113;
+      chi values order-of-magnitude from the OSC literature.
+
+  PDPP5T_PCBM:
+    description: >
+      Diketopyrrolopyrrole-quinquethiophene : PCBM -- the Negi et al.
+      spin-coating study; used for the evaporation and mobility-closure
+      tutorials.
+    species: [polymer, fullerene, solvent]
+    N: [87, 5, 1]
+    chi:
+      polymer_fullerene: 1.0
+      polymer_solvent: 0.1
+      fullerene_solvent: 0.9
+    biot:                         # per-species, four spin speeds
+      s6000rpm: 0.0073
+      s3000rpm: 0.0051
+      s1500rpm: 0.0033
+      s500rpm:  0.0019
+    diffusivity_ratio:            # constant per-species D~ (Negi SI)
+      polymer: 0.001
+      fullerene: 0.005
+    noise_b_reg: 1.0e-4
+    provenance: >
+      Negi, Wodo et al. (spin-coating morphology); parameters from the
+      paper and its SI (see MyPapers/OSC/ in the repository).
+
+  isoindigo_PCBM:
+    description: >
+      Isoindigo-thienothiophene : PC61BM -- Gu et al. (2017) solution
+      shearing; the flow/rheology (M6) validation system.
+    species: [small_molecule, fullerene, solvent]
+    chi:
+      note: >
+        partially unknown for isoindigo-TT; the course treats chi and D
+        as parameters to be recovered (see Differentiable track).
+    solvent: chlorobenzene
+    provenance: >
+      Gu, Diao, Ganapathysubramanian, Toney, Bao, Org. Electron. 2017
+      (1-s2.0-S1566119916304608).
+
+# Crystallization energetics (dimensionless, kT/v0), for the Allen-Cahn
+# and coupled concepts. From the Siber-Ronsin-Harting crystallizing
+# multicomponent theory (2310.11844 / 2512.16370 / 2512.16390).
+crystallization:
+  PCBM_class:
+    dsigma: 2.6355     # amorphous-crystal surface parameter
+    dh: 1.3072         # latent heat
+    Tm: 558.0          # melting temperature (K)
+    eps2: 1.0e-3       # crystalline gradient coefficient
+    N: 5.03
+    provenance: 2310.11844 Table 1 (PCBM), dimensionless.

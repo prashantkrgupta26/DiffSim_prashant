@@ -57,7 +57,13 @@ runs without leaving the GPU.
 **Taught properly.** The code is written to be read — every numerical decision is
 documented where it lives, every claimed property has a test that measures it,
 and the [curriculum](tutorials/README.md) takes a student from "solve Poisson on
-a disk" to "recover a shape from sensor data" in an afternoon.
+a disk" to "recover a shape from sensor data" in an afternoon. For organic
+electronics specifically, the
+**[OrgElMorph onboarding course](tutorials/orgelmorph-course/)** is a standalone,
+three-track (physics / computation / differentiation) course — a written
+document (shipped as a PDF) paired with runnable, self-checking tutorials — that
+takes a new student from binary phase separation to differentiable, GPU-native
+morphology simulation of real material systems.
 
 <p align="center">
   <img alt="Evaporation-induced phase separation and crystallization in a drying film" src="docs/assets/img/hero_film_drying.png" width="97%">

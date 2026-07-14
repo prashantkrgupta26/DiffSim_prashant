@@ -1,0 +1,37 @@
+% ====================================================================
+% DIFFERENTIABLE TRACK  (under construction; follows the P1 template)
+% ====================================================================
+\chapter{What differentiable simulation is}
+\label{ch:d1}
+\begin{keybox}
+\textbf{Key idea.} A classical solver answers \emph{``what happens?''}.
+A differentiable solver also answers \emph{``what should I change?''} ---
+it returns the gradient of any output with respect to any input
+(material parameters, process schedule, geometry), so the simulator
+becomes an instrument for design and inference, not just prediction.
+\end{keybox}
+This concept introduces the three ways DiffSim computes a gradient ---
+a hand-derived adjoint, an autograd twin, and finite differences ---
+and the three-way check that keeps them honest. \emph{Under
+construction.}
+
+\chapter{Morphology sensitivity}
+\emph{Under construction --- gradient of a morphology observable
+(domain size, interfacial area) with respect to the interaction
+parameter $\chi$.}
+\chapter{Recovering parameters from a morphology}
+\emph{Under construction --- fit $\chi$, $N$ to a target morphology
+(the Wodo-2012 ``learn the free-energy functional'' story, at tutorial
+scale).}
+\chapter{Process gradients}
+\emph{Under construction --- gradient with respect to evaporation rate
+and quench schedule.}
+\chapter{Crystallinity sensitivity}
+\emph{Under construction --- differentiating through the $\psi,\theta$
+crystallization fields.}
+\chapter{Learning the free energy from snapshots}
+\emph{Under construction --- recover the free-energy functional from a
+time series of morphology snapshots.}
+\chapter{Capstone: inverse-designing a process}
+\emph{Under construction --- optimize an evaporation schedule to hit a
+target domain size or crystallinity.}

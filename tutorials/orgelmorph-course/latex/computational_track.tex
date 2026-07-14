@@ -1,0 +1,37 @@
+% ====================================================================
+% COMPUTATIONAL TRACK  (concept 1 is the reference build; the rest
+% follow the same template and are under construction)
+% ====================================================================
+\chapter{Convergence: basis order and time integration}
+\label{ch:c1}
+\begin{keybox}
+\textbf{Key idea.} A discretization is only trustworthy if it
+\emph{converges} at the rate the theory predicts. The method of
+manufactured solutions (MMS) measures that rate directly: plug a known
+solution into the equations, add the residual as a source, and check
+that the error falls like $h^{p+1}$ in space and $\Delta t^{\,q}$ in
+time.
+\end{keybox}
+
+This concept walks through the Cahn--Hilliard convergence gates that
+ship with the solver: $p=1$ vs $p=2$ spatial order, and BDF1 vs BDF2
+temporal order, each measured against a manufactured solution. It
+connects to Physics Chapter~\ref{ch:p1} (the same brick) and to the
+adaptive-stepping concept (why variable-coefficient BDF2 matters once
+$\Delta t$ changes).
+
+\emph{Under construction --- follows the Physics~\ref{ch:p1} template
+(equations, run-it, measured self-check, code walk-through, questions).}
+
+\chapter{Boundary conditions, numerically}
+\emph{Under construction.}
+\chapter{Spatial and temporal adaptivity}
+\emph{Under construction --- octree refinement and the LTE/PI step
+controller.}
+\chapter{The solver ecosystem}
+\emph{Under construction --- direct (cuDSS) vs the \texttt{blockch}
+block preconditioner vs matrix-free, and when each wins (with the
+measured tables).}
+\chapter{Two dimensions versus three}
+\emph{Under construction --- cost, memory, and the assembly/solve story
+at scale.}

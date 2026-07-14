@@ -1,0 +1,41 @@
+% OrgElMorph course - shared preamble
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=teal,urlcolor=purple]{hyperref}
+\usepackage{mdframed}
+\usepackage{enumitem}
+
+\definecolor{codebg}{RGB}{245,247,250}
+\definecolor{codekw}{RGB}{0,90,160}
+\definecolor{codecom}{RGB}{110,120,130}
+\definecolor{codestr}{RGB}{160,60,40}
+
+\lstdefinestyle{py}{
+  language=Python, backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small, keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecom}\itshape, stringstyle=\color{codestr},
+  showstringspaces=false, breaklines=true, frame=single,
+  framerule=0pt, rulecolor=\color{codebg}, numbers=none, xleftmargin=6pt}
+\lstset{style=py}
+
+% concept boxes ----------------------------------------------------------
+\newmdenv[linecolor=teal!60,linewidth=1pt,backgroundcolor=teal!4,
+  skipabove=8pt,skipbelow=8pt,innertopmargin=6pt,innerbottommargin=6pt]{keybox}
+\newmdenv[linecolor=purple!55,linewidth=1pt,backgroundcolor=purple!4,
+  skipabove=8pt,skipbelow=8pt,innertopmargin=6pt,innerbottommargin=6pt]{runbox}
+
+% "explore on your own" questions
+\newcounter{qcounter}[section]
+\newcommand{\question}[1]{\refstepcounter{qcounter}%
+  \par\smallskip\noindent\textbf{\textcolor{purple!70!black}{Q\thesection.\theqcounter}}\; #1\par}
+
+% shorthand
+\newcommand{\grad}{\nabla}
+\newcommand{\dd}[2]{\frac{\partial #1}{\partial #2}}
+\newcommand{\intv}{\int_\Omega}
+\newcommand{\code}[1]{\lstinline[basicstyle=\ttfamily\small]|#1|}
+\newcommand{\file}[1]{\texttt{\small #1}}
