@@ -36,7 +36,7 @@ class DeviceNSAssembler:
     per step on device."""
 
     def __init__(self, dm, sigma_like=1.0, coloring=False, ndof=None,
-                 node_pattern=None, blockmask=None):
+                 node_pattern=None, blockmask=None, matvec_only=False):
         # ndof: dofs per node (default dim+1 = the NS layout; 4 for the
         # ternary CH film system, 2 for binary CH — M4 device-bound)
         # blockmask (B5): bool [ndof, ndof] compile-time dof-pair block
@@ -81,6 +81,21 @@ class DeviceNSAssembler:
                 "node-graph pattern requires identity constraints and "
                 "no coloring")
             self.Nfull = dm.n_nodes * ndof
+            if matvec_only:
+                # MATRIX-FREE ONLY (M3): build ONLY what apply_batch_matvec
+                # needs (bins + per-bin device conn); SKIP the CSR pattern
+                # entirely — no indices (nnz int32, ~91 GB host at 256^3),
+                # no vals_d (~148 GB), and NO int32-nnz ceiling.  This is
+                # the true footprint of the matrix-free outer solve.
+                self.node_mode = True
+                self._blockmask = blockmask
+                self._bins, self._conn_d = [], []
+                for pv, b in dm.bins.items():
+                    ne, nbf = dm.mesh.conn_of[pv].shape
+                    self._bins.append((pv, b, ne, nbf, None))
+                    self._conn_d.append(b["conn"])
+                self.nnz = None
+                return
             self._init_node_pattern(dm, ndof)
             return
         # CONSTRAINT-AWARE (D1 item 3, cuFEM design): element entries are

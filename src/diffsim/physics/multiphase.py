@@ -1535,7 +1535,8 @@ class MultiPhaseStepper:
                  T_mode="scalar", T_field=None, D_T=None,
                  wall_g=None, wall_h=None, wall_face=(1, 0),
                  delta_a=None, m_a=None, a_reg=1e-8, tstep="bdf1",
-                 film=None, assembly="host", block_sparse=False):
+                 film=None, assembly="host", block_sparse=False,
+                 matfree=False):
         from ..physics.poisson import gauss_points
         self.dm = dm
         self.M, self.K = int(M), int(K)
@@ -1697,6 +1698,15 @@ class MultiPhaseStepper:
         self.block_sparse = bool(block_sparse)
         assert not (block_sparse and assembly == "host"), \
             "block_sparse is a device-assembly pattern option"
+        # M5 matrix-free OUTER: the outer FGMRES sees J only through the
+        # device element-block apply (apply_Jv); the blockch W-factor
+        # inners stay stored.  For the 256^3 (M, K)=(3, 2) system whose
+        # CSR fits on no single card (dev note 2026-07-14).  Requires
+        # assembly="device" + linsolver blockch/blockch_dev.
+        self.matfree = bool(matfree)
+        assert not (matfree and assembly != "device"), \
+            "matfree requires assembly='device'"
+        self._mf_ctx = self._mf_face = self._mf_strong = None
         self._asm = None            # DeviceNSAssembler (lazy, per mesh)
         self._cudss_dev = None      # device-CSR DirectSolver plan
         self._n_dev_plans = 0       # nnz-stability regression counter
@@ -2547,6 +2557,46 @@ class MultiPhaseStepper:
         # element-batch buffers (Ae transient capped ~2 GB, G5 rung c)
         self._dev_bufs = {}
 
+    def _init_matfree_assembly(self):
+        """M3: matrix-free-ONLY setup — the GP-field + element-batch
+        buffers apply_Jv needs, over a DeviceNSAssembler in matvec_only
+        mode (bins + device conn; NO CSR pattern, NO vals_d, NO int32-nnz
+        ceiling).  This is the TRUE footprint of the matrix-free outer at
+        sizes whose stored CSR fits on no card.  No wall/flux slot or
+        strong-row CSR setup (apply_Jv carries face terms via the host
+        _build_face_jac correction and strong rows via the index list);
+        asserts wall/Dirichlet absent (film top-flux is fine)."""
+        from ..assembly.device_assembly import DeviceNSAssembler
+        n = self.Tc.shape[0]
+        assert self.Tc.shape[0] == self.Tc.shape[1] and \
+            (self.Tc - sp.identity(n, format="csr")).nnz == 0, \
+            "matrix-free requires identity constraints"
+        assert not self.wall_on and self.dirichlet is None, (
+            "matrix-free-only setup: wall/Dirichlet need the CSR slot "
+            "path (use assembly='device' + matfree there)")
+        nd = self.ndof
+        d = self.dm.device
+        self._asm = DeviceNSAssembler(self.dm, ndof=nd,
+                                      node_pattern=True, matvec_only=True)
+        self._vals_dev, self._grads_dev = {}, {}
+        self._zsrc_d, self._zqpsi_d, self._zqphi_d = {}, {}, {}
+        for pv, b in self.dm.bins.items():
+            ngp = len(self.mesh.conn_of[pv]) * b["nqp"]
+            self._vals_dev[pv] = wp.zeros((ngp, nd), dtype=wp.float64,
+                                          device=d)
+            self._grads_dev[pv] = wp.zeros((ngp, nd, self.dm.dim),
+                                           dtype=wp.float64, device=d)
+            if self.src_fns is None:
+                self._zsrc_d[pv] = wp.zeros((ngp, nd), dtype=wp.float64,
+                                            device=d)
+            if not (self.noise_psi > 0.0 and self.K):
+                self._zqpsi_d[pv] = wp.zeros((ngp, self.Kp),
+                                             dtype=wp.float64, device=d)
+            if not self.noise_phi > 0.0:
+                self._zqphi_d[pv] = wp.zeros(
+                    (ngp, self.M, self.dm.dim), dtype=wp.float64, device=d)
+        self._dev_bufs = {}
+
     def _dev_inputs(self, ctx):
         """Per-attempt device GP inputs (hist/src/noise/T), uploaded
         ONCE per ctx and cached on ctx['_dev'] (iterate-independent;
@@ -2839,12 +2889,15 @@ class MultiPhaseStepper:
             # contract as the host branch.
             from ..solvers.linsolve import blockch_pairs_device
             asm.device_operator()      # ensures the _op_idx upload
+            # matfree: the outer FGMRES matvec is the CSR-free element
+            # apply; the W-factor inners still gather from vals_d.
+            jv = self.apply_Jv if self.matfree else None
             try:
                 return blockch_pairs_device(
                     asm.indptr, asm.indices, asm.vals_d,
                     asm.F_d.numpy(), self._blockch_meta(), tol=1e-10,
                     device=self.dm.device, cache=self._solver_cache,
-                    cache_key="mpf_dev", idx_dev=asm._op_idx)
+                    cache_key="mpf_dev", idx_dev=asm._op_idx, jv=jv)
             except RuntimeError:
                 return np.full(asm.Nfull, np.nan)
         if self.linsolver == "cudss":
@@ -2902,6 +2955,12 @@ class MultiPhaseStepper:
 
         x = self.x.copy()
         r = assemble(x)
+        if self.matfree:
+            # freeze the x-independent face Jacobian + strong rows once
+            # per attempt; apply_Jv rides the CURRENT _vals_dev (updated
+            # by each assemble() at the accepted iterate) so the outer
+            # matvec always linearizes at the point being solved.
+            self._matfree_setup(x, ctx)
         for it in range(self.newton_max):
             dx = self._solve_dev()
             if not np.isfinite(dx).all():
