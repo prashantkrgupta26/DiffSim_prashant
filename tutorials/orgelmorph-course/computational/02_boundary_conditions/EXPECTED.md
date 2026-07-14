@@ -1,35 +1,60 @@
 # C2 — expected results (self-check)
 
-Running `python run.py` (fixed seed) should reproduce the following. The
-field values depend on the RNG seed fixed in `bc.py`; the *qualitative*
-contrast (no-flux conserves, Dirichlet does not and pins the wall) must
-hold exactly.
+`python run.py` (fixed seed) should reproduce the following. Field values
+depend on the RNG seed fixed in `bc.py`; the *qualitative* contrasts
+(no-flux conserves, Dirichlet does not and pins the wall; row-replace
+breaks symmetry; penalty converges) must hold exactly. Nine `[PASS]`
+lines and `ALL CHECKS: PASS` must print.
 
-| quantity | natural (no-flux) | Dirichlet (wall $c=0.9$) |
+## 1. Natural vs Dirichlet (33×33, 60 steps)
+
+| quantity | natural (no-flux) | Dirichlet (wall c=0.9) |
 |---|---|---|
-| mass drift $\lvert\Delta m\rvert$ | 1.3×10⁻¹⁶ (machine) | 0.95 (material drawn in) |
+| mass drift \|Δm\| | 1.3×10⁻¹⁶ (machine) | 0.95 (material drawn in) |
 | edge composition | −0.13 (free) | +0.90 (pinned exactly) |
-| field range $[c_{\min}, c_{\max}]$ | [−1.01, +1.02] | [+0.68, +1.00] |
-| field difference max$\lvert c_{\text{nf}}-c_{\text{dir}}\rvert$ | — | 2.00 |
+| field difference max\|c_nf−c_dir\| | — | 2.00 (full range) |
+
+## 2. Flux balance  d/dt ∫c = −∮J·n
+
+| mode | net flux dm/dt |
+|---|---|
+| no-flux | \|flux\|max = 5.5×10⁻¹⁵ (zero → mass conserved) |
+| Dirichlet | +4.15 early → +0.54 late (reservoir shuts off) |
+
+The mixed system has **two** BCs (∇μ·n=0 for mass flux, κ∇c·n for
+wetting); natural imposes both by omitting both surface integrals.
+
+## 3. BC test matrix (one blend, several boundaries)
+
+| configuration | #pinned | mass drift | edge |
+|---|---|---|---|
+| natural (no-flux) | 128 | 1.3e-16 | −0.128 |
+| prescribed c=+0.9 | 128 | 0.954 | +0.900 |
+| prescribed c=−0.9 | 128 | 0.943 | −0.900 |
+| prescribed c=0.0 | 128 | 0.094 | +0.000 |
+| mixed: c=+0.9 L/R, no-flux T/B | 66 | 0.290 | +0.628 |
+
+`c=0.0` nearly conserves only because the IC mean is ≈0 — a coincidence of
+the initial condition, not the boundary.
+
+## 4. Weak vs strong Dirichlet (tiny −u″=0 system)
+
+- Row replacement: matrix **asymmetric**, solution exact (0.0). Strong but
+  breaks SPD.
+- Symmetric elimination: matrix **symmetric**, solution exact. Strong,
+  keeps SPD.
+- Penalty (weakly imposed): boundary error ∝ 1/β — 6.7e-1, 1.7e-1, …,
+  2.0e-6 as β = 1e0 … 1e6. Trades exactness for a symmetric matrix and no
+  destroyed row (useful on hanging-node / immersed boundaries).
 
 **What must be true regardless of hardware:**
 
-- **No-flux conserves mass to solver tolerance** (drift ≈ machine
-  epsilon). The natural boundary adds no boundary integral to the weak
-  form; nothing crosses the wall. This is the same conservation you saw
-  in Physics P1.
-- **Dirichlet does *not* conserve mass** — and that is correct, not a
-  bug. Pinning the boundary makes it a reservoir; here it pulls the
-  $c=+0.9$ phase in, so total mass *rises* by ≈ 0.95. A boundary
-  condition that fixes a value must let flux adjust.
-- **The Dirichlet edge sits exactly at the wall value** (+0.90 to
-  rounding): the row-replacement imposes it strongly, node by node.
-- **The two fields differ substantially** (max difference ≈ 2, the full
-  order-parameter range): the wall reorganizes the morphology near it,
-  drawing one phase to the boundary. The boundary condition is not a
-  cosmetic detail — it changes the answer.
-- **The `ALL CHECKS: PASS` line prints** (no-flux drift < 1e-10;
-  Dirichlet drift > 1e-2; edge pinned to wall; fields differ > 0.5).
-
-If no-flux drifts, or Dirichlet's edge is not pinned, the boundary
-machinery is being applied wrong — re-read the walkthrough.
+- **No-flux conserves mass to machine precision** and its net boundary
+  flux is zero — the natural BC omits both surface integrals.
+- **Dirichlet does *not* conserve** (a reservoir), and its influx **decays
+  to zero** as the interior reaches the wall value — the flux balance in
+  action.
+- **The imposition method changes the matrix**: row-replace is asymmetric,
+  symmetric-elimination is SPD, penalty is weak but SPD.
+- **Manufactured vs physical**: pinning *both* c and μ (as C1 did) is an
+  MMS device; a physical composition contact pins only c.

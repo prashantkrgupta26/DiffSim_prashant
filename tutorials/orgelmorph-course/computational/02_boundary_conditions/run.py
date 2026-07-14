@@ -1,13 +1,21 @@
 """OrgElMorph course - Computational C2 driver (the file you run).
 
-    python run.py                # both boundary treatments, compared
+    python run.py                # the full boundary-condition study
 
-Runs the same binary spinodal blend under natural (no-flux) and
-Dirichlet boundaries, then prints a self-check table contrasting mass
-conservation and the boundary layer.  Compare with EXPECTED.md."""
+Runs, in order:
+  1. The same binary spinodal blend under natural (no-flux) and Dirichlet
+     boundaries, contrasting mass conservation and the boundary layer.
+  2. The FLUX BALANCE d/dt Int c = -Int J.n: measured dm/dt is zero for
+     no-flux and a decaying reservoir influx for Dirichlet.
+  3. A BC TEST MATRIX over the boundary taxonomy.
+  4. WEAK vs STRONG Dirichlet on a tiny system: row replacement (strong,
+     asymmetric), symmetric elimination, and a penalty (weakly imposed,
+     O(1/beta)).
+Then prints PASS/FAIL checks.  Compare with EXPECTED.md."""
 import argparse
 
-from bc import compare
+from bc import (compare, flux_balance, bc_test_matrix,
+                strong_vs_weak_dirichlet)
 
 
 def main():
@@ -19,33 +27,59 @@ def main():
 
     r = compare(device=args.device, wall=args.wall)
     nf, di = r["noflux"], r["dirichlet"]
+    print(f"=== 1. Natural vs Dirichlet ({nf['side']}x{nf['side']}, "
+          f"{nf['steps']} steps) ===")
+    print(f"  no-flux   : mass drift {nf['mass_drift']:.2e} (conserved), "
+          f"edge {nf['edge_mean']:+.3f} (free)")
+    print(f"  Dirichlet : mass drift {di['mass_drift']:.3f} (reservoir), "
+          f"edge {di['edge_mean']:+.3f} (pinned to {args.wall:+.2f})")
+    print(f"  field difference max|c_nf - c_dir| = {r['field_diff']:.3f}")
 
-    print(f"=== Boundary conditions on a binary spinodal blend "
-          f"({nf['side']}x{nf['side']}, {nf['steps']} steps) ===\n")
-    print("NATURAL (no-flux) boundary:")
-    print(f"  mass drift |dm|   = {nf['mass_drift']:.2e}   "
-          f"(conserved -- sealed box)")
-    print(f"  edge composition  = {nf['edge_mean']:+.3f}   "
-          f"(free; two phases meet the wall)")
-    print(f"  field range       = [{nf['c_min']:+.3f}, {nf['c_max']:+.3f}]")
-    print("\nDIRICHLET boundary (c pinned to "
-          f"{args.wall:+.2f} on every edge):")
-    print(f"  mass drift |dm|   = {di['mass_drift']:.3f}    "
-          f"(NOT conserved -- reservoir wall)")
-    print(f"  edge composition  = {di['edge_mean']:+.3f}   "
-          f"(pinned to the wall value)")
-    print(f"  field range       = [{di['c_min']:+.3f}, {di['c_max']:+.3f}]")
-    print(f"\nfield difference max|c_noflux - c_dirichlet| = "
-          f"{r['field_diff']:.3f}   (the boundary's measured effect)\n")
+    print("\n=== 2. Flux balance  d/dt Int c = -Int J.n ===")
+    fb = {m: flux_balance(m, wall=args.wall, device=args.device)
+          for m in ("noflux", "dirichlet")}
+    print(f"  no-flux   : |net flux|_max = {fb['noflux']['flux_abs_max']:.2e}"
+          f"  (zero: mass exactly conserved)")
+    print(f"  Dirichlet : influx {fb['dirichlet']['flux_early']:+.2f} (early) "
+          f"-> {fb['dirichlet']['flux_late']:+.2f} (late; reservoir shuts off)")
 
-    # gate-style checks
-    ok = (nf["mass_drift"] < 1e-10 and di["mass_drift"] > 1e-2
-          and abs(di["edge_mean"] - args.wall) < 1e-2
-          and r["field_diff"] > 0.5)
-    print("checks: no-flux conserves (< 1e-10), Dirichlet does not "
-          "(> 1e-2),")
-    print("        Dirichlet edge pinned to wall, fields differ (> 0.5)")
-    print(f"  ALL CHECKS: {'PASS' if ok else 'FAIL'}")
+    print("\n=== 3. BC test matrix ===")
+    mat = bc_test_matrix(device=args.device)
+    print(f"  {'configuration':40s} {'#pinned':>7} {'mass drift':>11} "
+          f"{'edge':>7}")
+    for m in mat:
+        print(f"  {m['name']:40s} {m['npin']:7d} {m['mass_drift']:11.3e} "
+              f"{m['edge_mean']:+7.3f}")
+
+    print("\n=== 4. Weak vs strong Dirichlet (tiny -u''=0 system) ===")
+    w = strong_vs_weak_dirichlet()
+    print(f"  row-replacement matrix symmetric? {w['rr_symmetric']}  "
+          f"(strong, but breaks SPD)")
+    print(f"  symmetric-elimination symmetric?  {w['sym_symmetric']}  "
+          f"(strong, keeps SPD)")
+    print(f"  strong solution error vs exact: {w['strong_err']:.1e}")
+    print("  weak (penalty) boundary error vs beta:")
+    for p in w["penalty"]:
+        print(f"     beta {p['beta']:.0e}: u0={p['u0']:.4f}  "
+              f"bc_err {p['bc_err']:.1e}")
+
+    print("\n--- self-check summary ---")
+    checks = {
+        "no-flux conserves (< 1e-10)": nf["mass_drift"] < 1e-10,
+        "Dirichlet reservoir (> 1e-2)": di["mass_drift"] > 1e-2,
+        "Dirichlet edge pinned": abs(di["edge_mean"] - args.wall) < 1e-2,
+        "fields differ (> 0.5)": r["field_diff"] > 0.5,
+        "no-flux net flux ~ 0": fb["noflux"]["flux_abs_max"] < 1e-8,
+        "Dirichlet flux decays": (abs(fb["dirichlet"]["flux_late"])
+                                  < abs(fb["dirichlet"]["flux_early"])),
+        "row-replace breaks symmetry": not w["rr_symmetric"],
+        "sym-elim keeps symmetry": w["sym_symmetric"],
+        "penalty converges O(1/beta)": (w["penalty"][-1]["bc_err"]
+                                        < 0.1 * w["penalty"][0]["bc_err"]),
+    }
+    for name, ok in checks.items():
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
+    print(f"\n  ALL CHECKS: {'PASS' if all(checks.values()) else 'FAIL'}")
     print("\nCompare with EXPECTED.md; render figures with gen_figures.py.")
 
 

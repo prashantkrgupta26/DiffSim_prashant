@@ -1,45 +1,75 @@
 # C1 — expected results (self-check)
 
-Running `python run.py` (fixed problem, seeds where relevant) should
-reproduce the following to a couple of significant figures. Small
-differences from a different card or BLAS are normal; the **observed
-orders** are the load-bearing quantities and must land in the stated
-bands.
+Running `python run.py` should reproduce the following to a couple of
+significant figures. Small differences from a different card or BLAS are
+normal; the **observed orders** are the load-bearing quantities and must
+land in the stated bands. Eight `[PASS]` lines and `ALL GATES: PASS`
+must print.
 
-## Spatial convergence (manufactured solution)
+## 1. Spatial convergence (steady manufactured solution)
 
-| degree | levels | $L^2$ errors (coarse → fine) | observed order | expected |
+Two error sources are **separated**: the manufactured field is *steady*,
+so the measured error is pure spatial error, independent of `dt`. We
+report `L2` and `H1` for **both** fields `c` and `mu`.
+
+| degree | levels | L2(c) coarse → fine | order L2(c) / H1(c) / L2(μ) | expected |
 |---|---|---|---|---|
-| $p=1$ | 4, 5, 6 | 2.9e-3, 7.1e-4, 1.8e-4 | 2.00, 2.01 | $h^{2}$ |
-| $p=2$ | 3, 4 | 2.0e-4, 2.5e-5 | 3.00 | $h^{3}$ |
+| p=1 | 3,4,5,6 | 1.8e-2 → 2.8e-4 | 2.01 / 1.02 / 2.00 | 2 / 1 / 2 |
+| p=2 | 2,3,4,5 | 1.7e-3 → 3.2e-6 | 3.03 / 2.00 / 2.99 | 3 / 2 / 3 |
 
-The error falls like $h^{p+1}$: doubling the resolution cuts the $p=1$
-error by $\approx 4$ and the $p=2$ error by $\approx 8$.
+`L2 ~ h^(p+1)`, `H1 seminorm ~ h^p`, for each field. The discrete mass
+error converges at the same L2 rate.
 
-## Temporal convergence (fixed mesh, shrinking $\Delta t$)
+## 2. Algebraic-error control (p=1, level 5)
 
-| scheme | $\Delta t$ = 8e-3, 4e-3, 2e-3 | observed order | expected |
+Tightening the Newton tolerance from `1e-4` to `1e-12` must **not** move
+the discretization error (the linear solve is direct `splu`, exact to
+round-off):
+
+| Newton tol | L2(c) | Newton its |
+|---|---|---|
+| 1e-4 | 1.114226e-3 | 1 |
+| 1e-8 | 1.114226e-3 | 2 |
+| 1e-12 | 1.114226e-3 | 2 |
+
+The error moves by ≈ **3e-13 of itself** — the plot measures
+discretization, not solver, error. A study that fails this check must be
+fixed before any order is quoted.
+
+## 3. Temporal convergence (fixed over-resolved mesh, verified reference)
+
+| scheme | dt = 1.6e-2, 8e-3, 4e-3, 2e-3 | observed order | expected |
 |---|---|---|---|
-| BDF1 (backward Euler) | 1.1e-3, 5.7e-4, 2.9e-4 | 0.97, 0.99 | $\Delta t^{1}$ |
-| BDF2 | 4.5e-5, 9.8e-6, 2.3e-6 | 2.18, 2.07 | $\Delta t^{2}$ |
+| BDF1 | 1.4e-3 … 1.8e-4 | 0.97 | dt^1 |
+| BDF2 | 1.3e-4 … 1.3e-6 | 2.23 | dt^2 |
 
-At the same $\Delta t$, BDF2 is roughly **25× more accurate** than BDF1
-here, and the gap widens as $\Delta t$ shrinks (one extra order).
+**Reference verified:** the BDF2 order is stable when the reference `dt`
+is halved (2.06 → 2.04, Δ 0.02), and a Richardson estimate bounds the
+reference's own error at ≈ 3e-9 — well below the coarsest sampled error.
+
+## 4. Deliberate failures (diagnose these)
+
+| failure | measured order | why |
+|---|---|---|
+| wrong BC (natural, not pinned) | 0.00 | error flat & huge; boundary dominates |
+| wrong source (κ term dropped) | 0.00 | converges to the *wrong* steady state |
+| under-resolved feature (k=6) | 1.18 | pre-asymptotic; mesh can't resolve it |
+| under-resolved reference | −0.01 | error saturates at the reference's error |
 
 **What must be true regardless of hardware:**
 
-- **The measured order matches the theory.** $p=1$ gives order $\approx
-  2$, $p=2$ gives $\approx 3$ (order $= p+1$). BDF1 gives $\approx 1$,
-  BDF2 gives $\approx 2$. A measured order well below the expected value
-  means a bug (missing term in the weak form, a boundary applied wrong,
-  or a source that does not match the manufactured field).
-- **MMS error is discretization error only.** Because the source terms
-  are built from the exact field, everything except the discretization
-  itself cancels; the error you see is the method's, nothing else.
-- **The `ALL GATES: PASS` line prints.** It asserts p1 order > 1.8, p2
-  order > 2.6, BDF1 in [0.8, 1.3], BDF2 > 1.7 — the same thresholds the
-  shipping gates in `tests/test_cahn_hilliard.py` use.
+- **The measured order matches the theory** — L2 order `p+1`, H1 order
+  `p`, for both fields; BDF1 ≈ 1, BDF2 ≈ 2. A low order means a bug
+  (missing weak-form term, wrong BC, mismatched source), *not* a mesh
+  that is too coarse.
+- **Error sources are separated.** Steady MMS removes the time error from
+  the spatial study; self-convergence on a fixed mesh removes the spatial
+  error from the temporal study.
+- **Algebraic error is controlled**, not assumed — the invariance check
+  proves the plot is not solver-limited.
+- **The reference is verified** before it is trusted.
 
 If an order comes out low, do **not** just take a finer mesh — a
 first-order bug does not become second order by refining. Re-derive the
-source term and re-check the boundary treatment.
+source, re-check the boundary treatment, and confirm the algebraic and
+reference checks pass first.

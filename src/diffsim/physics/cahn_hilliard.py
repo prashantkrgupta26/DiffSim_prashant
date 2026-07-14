@@ -174,13 +174,16 @@ class CahnHilliardStepper:
     def __init__(self, dm, M, kappa, dt, order=2, fc_fn=None, fm_fn=None,
                  dirichlet=None, gc_fn=None, gm_fn=None,
                  newton_tol=1e-10, newton_max=15,
-                 energy="poly", fh_A=1.0, fh_B=3.0, linsolver="splu"):
+                 energy="poly", fh_A=1.0, fh_B=3.0, linsolver="splu",
+                 capture_system=False):
         from ..physics.poisson import gauss_points
         self.dm, self.M, self.kappa, self.dt = dm, M, kappa, dt
         self.order = order
         assert energy in ("poly", "fh"), energy
         self.energy, self.fh_A, self.fh_B = energy, float(fh_A), float(fh_B)
         self.linsolver = linsolver
+        self.capture_system = capture_system
+        self.last_system = None       # (A_csr, r) of the last Newton solve
         self._solver_cache = {}
         z = lambda x, t: np.zeros(len(x))
         self.fc_fn, self.fm_fn = fc_fn or z, fm_fn or z
@@ -349,6 +352,11 @@ class CahnHilliardStepper:
                         rr = i * 2 + c_
                         A.rows[rr] = [int(rr)]; A.data[rr] = [1.0]
                         r[rr] = gval - x[rr]
+            # Supported capture API (replaces tutorial monkeypatching of
+            # solve_linear): stash the exact assembled saddle system a solver
+            # would factor, for benchmarking / correctness studies.
+            if self.capture_system:
+                self.last_system = (A.tocsr().copy(), np.asarray(r).copy())
             if self.linsolver == "splu":
                 dx = splu(A.tocsr().tocsc()).solve(r)
             else:
@@ -391,6 +399,16 @@ class CahnHilliardStepper:
                     self.proj_max = max(self.proj_max, float(corr.max()))
             if np.abs(dx).max() < self.newton_tol:
                 break
+        # Additive instrumentation (no behaviour change): expose the last
+        # step's Newton convergence so tutorials/research can separate
+        # ALGEBRAIC error (solver) from DISCRETIZATION error, and account
+        # for real solver work (Newton iterations, adaptive-step cost).
+        self.last_newton = {
+            "iters": int(it + 1),
+            "dx_inf": float(np.abs(dx).max()),
+            "converged": bool(np.abs(dx).max() < self.newton_tol),
+            "newton_tol": float(self.newton_tol),
+        }
         self.x = x
         self.hist = [x[0::2].copy(), self.hist[0]]
         self.t = t_new

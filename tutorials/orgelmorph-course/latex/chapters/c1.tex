@@ -2,96 +2,195 @@
 \label{ch:c1}
 \begin{keybox}
 \textbf{Key idea.} A discretization is only trustworthy if it
-\emph{converges} at the rate the theory predicts. The method of
-manufactured solutions (MMS) measures that rate directly: plug a known
-solution into the equations, add the residual as a source, and check
-that the error falls like $h^{p+1}$ in space and $\Delta t^{\,q}$ in
-time.
+\emph{converges} at the rate the theory predicts --- but only if you
+measure the \emph{right} error. This chapter separates the two
+discretization errors so each is measured alone, controls the
+\emph{algebraic} (solver) error so it cannot contaminate the plot,
+verifies the reference before trusting it, and shows how the study can
+lie to you.
 \end{keybox}
 
 This concept walks through the Cahn--Hilliard convergence gates that
 ship with the solver: $p=1$ vs $p=2$ spatial order, and BDF1 vs BDF2
-temporal order, each measured against a manufactured solution. It
-connects to Physics Chapter~\ref{ch:p1} (the same brick) and to the
-adaptive-stepping concept (Chapter~\ref{ch:c3}: why
+temporal order, each measured against a manufactured or self-convergent
+reference. It connects to Physics Chapter~\ref{ch:p1} (the same brick)
+and to the adaptive-stepping concept (Chapter~\ref{ch:c3}: why
 variable-coefficient BDF2 matters once $\Delta t$ changes).
 
-\section{The two kinds of error}
+\section{Three errors, not one}
 
 Every result from this simulator is wrong. The question is only
 \emph{how} wrong, and whether the error shrinks --- at the rate the
-theory promises --- as you refine. A finite-element discretization has
-two independent discretization errors:
+theory promises --- as you refine. A time-dependent finite-element
+computation carries \emph{three} errors, and a convergence study is only
+meaningful when you measure one at a time:
 \begin{itemize}[nosep]
   \item a \textbf{spatial} error from representing $c(\mathbf x)$ in a
         finite basis on a mesh of size $h$; for degree-$p$ elements the
-        $L^2$ error scales as $h^{p+1}$;
+        $L^2$ error scales as $h^{p+1}$ and the $H^1$ seminorm (the
+        gradient error) as $h^{p}$;
   \item a \textbf{temporal} error from advancing in finite steps
         $\Delta t$; for a scheme of order $q$ it scales as
-        $\Delta t^{\,q}$.
+        $\Delta t^{\,q}$;
+  \item an \textbf{algebraic} error from solving the nonlinear system
+        only approximately (Newton stopped at some tolerance, the linear
+        solve at another).
 \end{itemize}
-The exponents $p+1$ and $q$ are \emph{predictions}. Measuring them is
-the single most important correctness check in scientific computing: a
-code can run, conserve mass, and look physical while quietly converging
-one order too slow because a term is missing from the weak form. This
-concept measures both.
+The exponents $p+1$, $p$ and $q$ are \emph{predictions}. Measuring them
+is the single most important correctness check in scientific computing:
+a code can run, conserve mass, and look physical while quietly
+converging one order too slow because a term is missing from the weak
+form. The catch is that a spatial study run with a too-large $\Delta t$
+measures the \emph{time} error, and a study where Newton stopped too
+early measures the \emph{solver} error --- either way you get a
+wrong-but-plausible number. So we isolate each.
 
-\section{Spatial order: the method of manufactured solutions}
+\section{Spatial order: a steady manufactured solution}
 
 The trouble with checking a solver against a ``true'' answer is that
-PDEs rarely have closed-form solutions. The \emph{method of
-manufactured solutions} (MMS) turns the problem around: \emph{pick} a
-smooth field, then compute what source term would make it an exact
-solution, and feed that source to the solver. Now you know the exact
-answer everywhere, so the error is measurable.
+PDEs rarely have closed-form solutions. The \emph{method of manufactured
+solutions} (MMS) turns the problem around: \emph{pick} a smooth field,
+compute what source term would make it an exact solution, and feed that
+source to the solver. Now you know the exact answer everywhere, so the
+error is measurable.
 
-We manufacture the composition and the chemical potential
-\emph{independently} (the cleanest choice --- it avoids taking a
-Laplacian of the cubic $f'(c)$ by hand):
+The key correction over a naive MMS is to pick a \textbf{steady} (time
+\emph{independent}) manufactured field. Then $c^\ast_t = 0$, the time
+term contributes nothing at the discrete steady state, and the measured
+error is pure spatial error --- \emph{independent of $\Delta t$}. We
+manufacture composition and chemical potential independently (the
+cleanest choice --- it avoids taking a Laplacian of the cubic $f'(c)$ by
+hand):
 %
 \begin{equation}
-  c^\ast = \cos(\pi x)\cos(\pi y)\,e^{-t},\qquad
-  \mu^\ast = \sin(\pi x)\sin(\pi y)\,e^{-t}.
+  c^\ast = \cos(\pi x)\cos(\pi y),\qquad
+  \mu^\ast = \sin(\pi x)\sin(\pi y).
 \end{equation}
 %
-Substituting $(c^\ast,\mu^\ast)$ into the mixed Cahn--Hilliard system
-\eqref{eq:ch} leaves a residual; we \emph{add it back} as two source
-terms $f_c, f_m$ so the pair is an exact solution:
+Substituting into the mixed Cahn--Hilliard system \eqref{eq:ch} leaves a
+residual; we \emph{add it back} as two steady source terms so the pair
+is an exact solution:
 %
 \begin{align}
-  f_c &= c^\ast_t - M\,\grad^2\mu^\ast
-       = -c^\ast + 2\pi^2 M\,\mu^\ast, \\
-  f_m &= \mu^\ast - f'(c^\ast) + \kappa\,\grad^2 c^\ast
-       = \mu^\ast - \big((c^\ast)^3 - c^\ast\big) - 2\pi^2\kappa\,c^\ast .
+  f_c &= -M\,\grad^2\mu^\ast = 2\pi^2 M\,\mu^\ast, \\
+  f_m &= \mu^\ast - \big((c^\ast)^3 - c^\ast\big) - 2\pi^2\kappa\,c^\ast .
 \end{align}
 %
-Because the sources are built from the exact field, everything
-\emph{except} the discretization cancels: the measured $L^2$ error is
-pure discretization error. We impose $c^\ast,\mu^\ast$ as strong
-(Dirichlet) data on the boundary (the manufactured field is not
-no-flux), then halve $h$ and watch the error fall.
+We impose $c^\ast,\mu^\ast$ as strong (Dirichlet) data on the boundary
+(the manufactured field is not no-flux), then take a few very large
+$\Delta t$ steps from the exact field: the time term $\sigma\sim1/\Delta
+t$ vanishes and each Newton solve lands on the discrete \emph{steady} FE
+system --- staying in the correct branch of the non-monotone cubic
+$f'(c)$ (small-$\Delta t$ marching can drift to a spurious steady branch,
+a real Cahn--Hilliard pitfall).
+
+We report $L^2$ \emph{and} $H^1$ errors for \emph{both} fields $c$ and
+$\mu$, plus the discrete mass error, over \ConeSpaPoneNlevels\ mesh
+levels at $p=1$ and \ConeSpaPtwoNlevels\ at $p=2$ (two points is not a
+study). The observed orders match theory to two figures: $L^2$ order
+$p{+}1$, $H^1$ order $p$, for each field.
 
 \begin{keybox}
 \textbf{Reading a convergence order.} If the error is
 $E(h)\approx C\,h^{\,k}$, then between two meshes with $h$ and $h/2$,
 $\;\log_2\!\big(E(h)/E(h/2)\big) = k$. That ratio --- the
 \emph{observed order} --- is what you compare against the theoretical
-$p+1$. It is far more diagnostic than any single error value: the
+value. It is far more diagnostic than any single error value: the
 \emph{slope} is the physics of the method; the \emph{intercept} $C$ is
-just problem-dependent.
+just problem-dependent. We fit the slope by least squares across all
+levels.
 \end{keybox}
 
-\section{Temporal order: self-convergence}
+\begin{figure}[h]\centering
+  \includegraphics[width=\linewidth]{figures/c1_spatial.png}
+  \caption{Spatial convergence under mesh refinement, steady MMS.
+    \emph{Left:} $L^2$ error of both $c$ and $\mu$ falls along the ideal
+    slope $p{+}1$ (order $\ConeSpaPoneOrder$ for $p=1$,
+    $\ConeSpaPtwoOrder$ for $p=2$). \emph{Right:} the $H^1$ seminorm of
+    $c$ falls one order slower, along $h^{p}$ (order
+    $\ConeSpaPoneHoneOrder$ and $\ConeSpaPtwoHoneOrder$). Both fields,
+    both norms, at the predicted rate.}
+  \label{fig:c1spatial}
+\end{figure}
 
-For the time error we do not need a manufactured source. We freeze the
-mesh, march the same smooth initial blend with a shrinking $\Delta t$,
-and compare each run against a very fine-$\Delta t$ reference march on
-the identical mesh --- so only the time error remains. Backward Euler
+\section{Algebraic error: control it, or the plot is worthless}
+
+A convergence plot contaminated by solver error measures the solver, not
+the discretization. The check is direct: hold the mesh fixed and
+\emph{tighten} the Newton tolerance from $\ConeAlgTolLo$ to
+$\ConeAlgTolHi$. If the measured $L^2$ error moves, the plot was
+solver-limited. Here the linear solve is a direct sparse LU (\code{splu})
+--- exact to round-off, so Newton is the only algebraic knob --- and the
+discretization error moves by just $\ConeAlgSpread$ of itself
+(Fig.~\ref{fig:c1diag}, left). The discretization error is what we claim
+to measure. \emph{A study in which tightening the tolerance changes the
+answer must fail this check before any order is quoted.}
+
+\section{Temporal order: a \emph{verified} self-convergence reference}
+
+For the time error we do not need a manufactured source. We freeze an
+\emph{over-resolved} mesh, march the same smooth initial blend with a
+shrinking $\Delta t$ over \ConeNdt\ levels, and compare each run against a
+very fine-$\Delta t$ reference march on the identical mesh --- so the
+spatial error cancels and only the time error remains. Backward Euler
 (\textbf{BDF1}) is first order; the two-step \textbf{BDF2} is second
 order. At constant $\Delta t$, BDF2 runs its textbook coefficients
 $\tfrac{3}{2}c^{n+1} = 2c^n - \tfrac12 c^{n-1} + \Delta t\,(\cdots)$;
 Chapter~\ref{ch:c3} returns to what happens when $\Delta t$ is allowed
 to \emph{vary} (and why the coefficients must then change).
+
+Self-convergence has one pitfall: if the reference is not fine enough it
+is not ``truth,'' and the measured order is meaningless. So we
+\emph{verify} it: halving the reference $\Delta t$ leaves the BDF2 order
+unchanged ($\ConeRefOrderLo\to\ConeRefOrderHi$, a shift of
+$\ConeRefStable$), and a Richardson estimate bounds the reference's own
+error at $\ConeRefRich$ --- orders below the coarsest sampled error. Only
+then do we trust it.
+
+\begin{figure}[h]\centering
+  \includegraphics[width=0.82\linewidth]{figures/c1_temporal.png}
+  \caption{Temporal convergence at fixed mesh. Relative $L^2$ error
+    against the verified fine-$\Delta t$ reference: BDF1 tracks slope~1
+    (order $\ConeBdfoneOrder$), BDF2 slope~2 (order $\ConeBdftwoOrder$).
+    At the same $\Delta t$, BDF2 is over an order of magnitude more
+    accurate.}
+  \label{fig:c1temporal}
+\end{figure}
+
+\section{Ways to get a wrong answer}
+
+An honest workflow includes the failure modes. Each of the following
+produces a plausible-looking but \emph{wrong} order; learning to read the
+signature is the skill.
+
+\begin{figure}[h]\centering
+  \includegraphics[width=\linewidth]{figures/c1_diagnostics.png}
+  \caption{\emph{Left:} algebraic control --- the $L^2$ error is flat as
+    the Newton tolerance sweeps $\ConeAlgTolLo\to\ConeAlgTolHi$
+    (discretization error invariant). \emph{Right:} four deliberate
+    failures, each a wrong or erratic order the student must diagnose.}
+  \label{fig:c1diag}
+\end{figure}
+
+\begin{center}\small
+\begin{tabular}{lcl}
+\toprule
+failure & measured order & signature to diagnose \\
+\midrule
+wrong BC (natural, not pinned) & $\ConeFailBcOrder$ & error flat and huge --- boundary dominates \\
+wrong source ($\kappa$ term dropped) & $\ConeFailSrcOrder$ & converges to the \emph{wrong} steady state \\
+under-resolved feature ($k{=}6$) & $\ConeFailFeatOrder$ & pre-asymptotic --- mesh cannot resolve it \\
+under-resolved reference & $\ConeFailRefOrder$ & error saturates at the reference's own error \\
+loose Newton (algebraic) & --- & caught by the invariance check above \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The last is subtle: on this smooth, well-conditioned problem
+Newton converges in one or two iterations, so even a loose tolerance does
+\emph{not} contaminate the order --- which is exactly why you must
+\emph{verify} algebraic control rather than assume it. The lesson is not
+``Newton is always fine'' but ``check, do not assume.''
 
 \section{Run it}
 
@@ -99,51 +198,34 @@ to \emph{vary} (and why the coefficients must then change).
 \textbf{Run it.}
 \begin{lstlisting}
 cd computational/01_convergence
-python run.py            # spatial + temporal studies
+python run.py            # spatial + algebraic + temporal + failures
 \end{lstlisting}
-It runs the MMS study at $p=1$ and $p=2$, the temporal study for BDF1
-and BDF2, and prints the observed orders with a \code{PASS/FAIL} gate
-check. Compare with \file{EXPECTED.md} and the figures below.
+It runs the steady-MMS spatial study ($L^2$/$H^1$ for $c$ and $\mu$), the
+algebraic-control sweep, the verified temporal study for BDF1 and BDF2,
+and the four deliberate failures, printing eight \code{PASS/FAIL} gate
+checks. Compare with \file{EXPECTED.md} and the figures above.
 \end{runbox}
-
-\begin{figure}[h]\centering
-  \includegraphics[width=0.86\linewidth]{figures/c1_spatial.png}
-  \caption{Spatial convergence under mesh refinement. The $L^2$ error
-    against the manufactured solution falls along the ideal slope
-    $p{+}1$: order $\ConeSpaPoneOrder$ for $p=1$ and
-    $\ConeSpaPtwoOrder$ for $p=2$ (dashed = ideal $h^{p+1}$).}
-  \label{fig:c1spatial}
-\end{figure}
-
-\begin{figure}[h]\centering
-  \includegraphics[width=0.86\linewidth]{figures/c1_temporal.png}
-  \caption{Temporal convergence at fixed mesh. Error against a
-    fine-$\Delta t$ reference march versus $\Delta t$: BDF1 tracks the
-    slope-1 line (order $\ConeBdfoneOrder$), BDF2 the slope-2 line
-    (order $\ConeBdftwoOrder$). At the same $\Delta t$, BDF2 is over an
-    order of magnitude more accurate.}
-  \label{fig:c1temporal}
-\end{figure}
 
 \begin{keybox}
 \textbf{Measured self-check} (your \file{run.py} should reproduce these
 to a couple of significant figures; the observed \emph{orders} are the
-load-bearing quantities).
+load-bearing quantities). Spatial rows list $L^2(c)$ error coarse
+$\to$ fine and the three fitted orders $L^2(c)$ / $H^1(c)$ / $L^2(\mu)$.
 \begin{center}\small
-\begin{tabular}{lccc}
+\begin{tabular}{llcc}
 \toprule
-study & discretization & error (coarse $\to$ fine) & observed order \\
+study & discretization & error (coarse $\to$ fine) & orders (expect) \\
 \midrule
-spatial (MMS) & $p=1$ & \ConeSpaPoneErrCoarse\ $\to$ \ConeSpaPoneErrFine & \ConeSpaPoneOrder \\
-              & $p=2$ & \ConeSpaPtwoErrCoarse\ $\to$ \ConeSpaPtwoErrFine & \ConeSpaPtwoOrder \\
+spatial & $p=1$ & \ConeSpaPoneErrCoarse\ $\to$ \ConeSpaPoneErrFine & $\ConeSpaPoneOrder$/$\ConeSpaPoneHoneOrder$/$\ConeSpaPoneMuOrder$ ($2/1/2$) \\
+        & $p=2$ & \ConeSpaPtwoErrCoarse\ $\to$ \ConeSpaPtwoErrFine & $\ConeSpaPtwoOrder$/$\ConeSpaPtwoHoneOrder$/$\ConeSpaPtwoMuOrder$ ($3/2/3$) \\
 \midrule
-temporal      & BDF1  & \ConeBdfoneErrCoarse\ $\to$ \ConeBdfoneErrFine & \ConeBdfoneOrder \\
-              & BDF2  & \ConeBdftwoErrCoarse\ $\to$ \ConeBdftwoErrFine & \ConeBdftwoOrder \\
+temporal & BDF1 & \ConeBdfoneErrCoarse\ $\to$ \ConeBdfoneErrFine & $\ConeBdfoneOrder$ ($1$) \\
+         & BDF2 & \ConeBdftwoErrCoarse\ $\to$ \ConeBdftwoErrFine & $\ConeBdftwoOrder$ ($2$) \\
 \bottomrule
 \end{tabular}
 \end{center}
-Expected: spatial order $p+1$ ($2$ and $3$); temporal order $1$ (BDF1)
-and $2$ (BDF2).
+Algebraic control: the error moves $\ConeAlgSpread$ of itself under a
+Newton-tolerance sweep $\ConeAlgTolLo\to\ConeAlgTolHi$.
 \end{keybox}
 
 \section{Code walk-through}
@@ -152,64 +234,55 @@ The study lives in \file{convergence.py}, which drives the production
 brick \file{src/diffsim/physics/cahn\_hilliard.py} --- the same brick as
 Physics Chapter~\ref{ch:p1}.
 
-\paragraph{1. The manufactured solution and its sources.}
+\paragraph{1. Steady manufactured solution and its sources.}
 \begin{lstlisting}
-def c_star(x, t):  return cos(pi x) cos(pi y) e^{-t}
-def f_c(x, t):     return -c_star + M*2*pi^2 * mu_star   # residual, added back
+def c_star(x):  return cos(pi x) cos(pi y)          # time-independent
+def f_c(x, t):  return 2*pi^2 * M * mu_star(x)      # residual, added back
 \end{lstlisting}
 \code{c\_star}, \code{mu\_star} are the exact fields; \code{f\_c},
-\code{f\_m} are the source terms that make them exact. These are passed
-to the stepper as \code{fc\_fn}, \code{fm\_fn}; the boundary data goes
-in as \code{gc\_fn}, \code{gm\_fn} on the Dirichlet nodes.
+\code{f\_m} the sources that make them exact. Because they are steady, the
+measured error is pure spatial error.
 
-\paragraph{2. The spatial sweep.}
+\paragraph{2. Errors on the solver's quadrature.}
 \begin{lstlisting}
-for lv in levels:                       # 4, 5, 6  (p=1)
-    dm, mesh, cons = build_dm(lv, p)    # 2^lv cells per side
-    st = CahnHilliardStepper(dm, M, kap, dt, order=2,
-                             fc_fn=f_c, fm_fn=f_m, dirichlet=..., ...)
-    for _ in range(6): c, _ = st.step()
-    errs.append(l2_error(dm, cons.T @ c, lambda x: c_star(x, st.t)))
-order = log2(errs[0] / errs[1])         # the observed order
+cv, cg = st._gp_scalar(c_free)    # value + gradient at Gauss points
+l2c += sum(w * (cv - c_star(xq))**2)              # L2
+h1c += sum(w * ||cg - grad_c_star(xq)||**2)       # H1 seminorm
 \end{lstlisting}
-\code{l2\_error} integrates $\|c_h - c^\ast\|$ with the same quadrature
-the solver uses. The ratio of successive errors, base-2, is the order.
+Integrated with the \emph{same} quadrature the solver uses --- no nodal
+proxy. Both fields, both norms, plus $\int c$ for the mass error.
 
-\paragraph{3. Temporal self-convergence.}
+\paragraph{3. Algebraic control and verified reference.}
 \begin{lstlisting}
-ref = march(order=2, dt=2e-4)           # fine reference on this mesh
-errs = [max|march(order, dt) - ref|  for dt in (8e-3, 4e-3, 2e-3)]
+algebraic_control(p=1, level=5, tols=(1e-4, 1e-8, 1e-12))  # error invariant
+verify_reference(ref_dts=(2e-4, 1e-4))  # order stable + Richardson bound
 \end{lstlisting}
-The reference is a high-accuracy BDF2 march; each coarse march's error
-is measured against it, isolating the time error. \code{order=1}
-selects BDF1, \code{order=2} selects BDF2 --- one flag in the same
-constructor.
 
 \section{Explore on your own}
 
-\question{Add a $p=1$ level~7 ($128\times128$) point to the spatial
-sweep. Does the observed order stay at $2$, or does it drift? At some
-resolution the error stops being dominated by the spatial term ---
-predict which term (the fixed $\Delta t$, or floating-point round-off)
-takes over, and confirm it by also refining $\Delta t$.}
+\question{Extend the $p{=}1$ spatial sweep to level~7 ($128\times128$).
+Does the observed order stay at $2$? Because the study is steady the
+answer is $\Delta t$-independent --- but round-off eventually floors the
+error. Predict at which level the $L^2$ error stops halving-squared and
+confirm it.}
 
-\question{Change the manufactured field's frequency to
-$\cos(2\pi x)\cos(2\pi y)$. The error \emph{intercept} should jump (the
+\question{Change the manufactured wavenumber to $k=2$
+($\cos(2\pi x)\cos(2\pi y)$). The error \emph{intercept} should jump (the
 field is harder to resolve) while the \emph{order} stays $p+1$. Verify
 both, and explain why the slope is invariant but the constant is not.}
 
-\question{Break the solver on purpose: drop the $\kappa\,\grad^2 c$ term
-from \code{f\_m} (so the source no longer matches the manufactured
-field). What order do you now measure, and why is a wrong-but-nonzero
-order more dangerous than an obvious crash?}
+\question{Reproduce the \emph{wrong-source} failure: drop the
+$\kappa\,\grad^2 c$ term from \code{f\_m}. You measured order
+$\ConeFailSrcOrder$ --- the scheme converges, but to the wrong steady
+state. Why is a wrong-but-nonzero order more dangerous than an obvious
+crash?}
 
-\question{Measure BDF2's temporal order at a \emph{coarser} reference
-($\Delta t_{\text{ref}}=10^{-3}$ instead of $2\times10^{-4}$). At what
-point does the reference stop being ``exact enough'' and the measured
-order degrade? This is the self-convergence method's one pitfall ---
-quantify it.}
+\question{The under-resolved-feature failure used $k=6$ on levels
+$2,3,4$ and measured order $\ConeFailFeatOrder$. Push the same field to
+levels $5,6,7$ --- at what resolution does the order recover to $2$? This
+is the boundary of the asymptotic range.}
 
-\question{The p2 spatial study uses coarser levels (3, 4) than p1 (4, 5,
-6). Why can it afford to? Count the degrees of freedom at $p{=}2$
-level~4 versus $p{=}1$ level~6 and compare the two errors per DOF ---
-which discretization is more accurate for the same cost here?}
+\question{The $p2$ spatial study uses coarser levels ($2$--$5$) than $p1$
+($3$--$6$). Count the degrees of freedom at $p{=}2$ level~4 versus
+$p{=}1$ level~6 and compare the two $L^2$ errors per DOF --- which
+discretization is more accurate for the same cost here?}

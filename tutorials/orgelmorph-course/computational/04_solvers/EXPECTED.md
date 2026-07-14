@@ -1,49 +1,65 @@
 # C4 — expected results (self-check)
 
-Running `python run.py` benchmarks the linear solve live and echoes the
-cited 3-D story. **Timings vary run-to-run and by card** (clock
-governor, contention); the *shape* — splu wins tiny, cuDSS wins as the
-2-D problem grows — is the load-bearing result, not any single
-millisecond value.
+`python run.py` marches the real spinodal with each solver, times the 2-D
+solve, and echoes the cited 3-D story. **The divergence is reproducible;
+timings vary by card.** Seven `[PASS]` lines and `ALL CHECKS: PASS` must
+print.
 
-## Live 2-D linear-solve benchmark (real CH Jacobian)
+## 1. March divergence — the real correctness test (level 5, dt 0.02, 20 steps)
 
-| level | dofs | nnz | splu (CPU) | cuDSS (GPU) | speedup |
-|---|---|---|---|---|---|
-| 5 | 2,178 | 37,636 | ~10 ms | ~95 ms | **0.1×** (splu wins) |
-| 6 | 8,450 | 148,996 | ~100 ms | ~115 ms | ~0.9× (even) |
-| 7 | 33,282 | 592,900 | ~470 ms | ~160 ms | **2–3×** (cuDSS wins) |
-
-The crossover sits around $10^4$ dofs: below it, cuDSS's kernel-launch
-and transfer overhead dominate; above it, GPU direct factorization pulls
-away and keeps scaling better.
-
-## Cited 3-D scaling (dev notes — NOT re-run)
-
-| case | dofs | cuDSS s/call | blockch_dev s/call |
+| energy | solver | final c range | verdict |
 |---|---|---|---|
-| 3d_l5 (32³) | 202,752 | 6.95 | 1.44 |
-| 3d_slab64 | 417,792 | 17.7 | **2.10 (8.4×)** |
-| 3d_slab64z32 | 811,008 | **CEILING** (48 GB) | 2.16 |
+| poly | splu | [−1.03, 1.01] | ok |
+| poly | **cuDSS** | **[−552, 542]** | **DIVERGED** (~500× blow-up) |
+| fh | splu | [0.06, 0.94] | ok |
+| fh | cuDSS | [0.001, 0.999] | ok |
 
-- cuDSS's factorization fill hits the 48 GB card at ~811k dofs.
-- blockch_dev beats cuDSS **8.4×** on the slab64 solve and *marches*
-  where cuDSS ceilings.
-- block-masked cuDSS cuts the 3-D fill (17.7 → 3.70 s/call) — strong
-  under ~5×10⁵ dofs.
-- **AMGX verdict: NO** — the inners are mass-dominated at production
-  $\Delta t$, so algebraic multigrid adds nothing.
-- matrix-free / blockch: 128×128×64 = 6,389,760 dofs runs on **one**
-  48 GB card; cuDSS cannot.
+**cuDSS diverges on the polynomial CH saddle** and is fine on
+Flory–Huggins. Why: the poly well's curvature f″=3c²−1 goes **negative**
+in the spinodal band |c|<1/√3, so the (c,μ) block is **indefinite** there;
+cuDSS does **no partial pivoting**, so its solution is wrong and the error
+compounds until the field escapes. FH's entropic curvature
+f″=A(1/c+1/(1−c)) ≥ 4A stays positive, so cuDSS survives — but you cannot
+rely on that. **splu (pivoted) is safe on both.**
+
+## 2. The trap: a one-iterate residual lies
+
+| solver | one-iterate residual |
+|---|---|
+| splu | ~1e-12 |
+| cuDSS | **~5e-13 (tiny!)** |
+| blockch | ~4e-10 |
+
+cuDSS's residual at a single captured Newton iterate is tiny — yet its
+march diverges. **A small residual ≠ a small error** on an indefinite,
+unpivoted system. Measure the marched *solution*, not a one-shot residual.
+
+## 3. Live 2-D timing (context only — cuDSS is disqualified for CH)
+
+cuDSS is *faster* than splu above ~10⁴ dofs (2–6× at 33k dofs), but that
+speed is unusable on the CH saddle because cuDSS returns a wrong answer.
+Fastest ≠ correct.
+
+## 4. Cited 3-D scaling (dev notes — NOT re-run)
+
+- cuDSS ceilings at ~811k dofs on 48 GB (>16 min factorization); blockch_dev
+  is 8.4× cheaper at slab64 and marches where cuDSS ceilings.
+- masked cuDSS cuts the fill (17.7 → 3.70 s/call) below the ceiling.
+- AMGX: NO (mass-dominated inners). matrix-free reaches 6.39M dofs on one card.
+
+## 5. Decision support (`recommend_solver`)
+
+small → **splu**; large 2-D → **splu / blockch (not cuDSS)**; small 3-D →
+masked cuDSS / blockch_dev; large 3-D → **blockch_dev**; extreme →
+matrix-free. Every rationale begins with the correctness constraint and
+**never picks cuDSS on the raw CH block**.
 
 **What must be true regardless of hardware:**
 
-- **splu wins at the smallest size and cuDSS wins at the largest** — the
-  `CHECK ... PASS` line asserts exactly this crossover.
-- **No solver is universally best.** The concept is the decision rule
-  (`choose_solver`), not a winner: 2-D → direct; small 3-D → cuDSS;
-  large 3-D → blockch; beyond the matrix itself → matrix-free.
-
-If cuDSS is *always* faster (even at level 5) or *never* faster, the
-timing is being swamped by something else (a hot cache, a contended
-GPU) — re-run on a quiet card.
+- **cuDSS DIVERGES on the polynomial CH march** (field escapes [−1,1] by
+  orders of magnitude); **splu is safe on poly and FH**.
+- **cuDSS survives the FH march** (better-conditioned), but that is
+  energy-specific, not a green light.
+- **The `--solver auto` default of splu for CH is correct.**
+- **The capture uses a supported API** (`capture_system=True`), not a
+  `solve_linear` monkeypatch — and the captured residual is shown to *lie*.

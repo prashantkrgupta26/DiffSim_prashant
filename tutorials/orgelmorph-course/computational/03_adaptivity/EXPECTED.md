@@ -1,56 +1,68 @@
 # C3 — expected results (self-check)
 
-Running `python run.py` (fixed seed) should reproduce the following.
-Exact step counts depend on the RNG-seeded quench and the card; the
-*qualitative* results (octree saves dofs, dt grows through coarsening,
-variable-coefficient BDF2 keeps order 2) must hold.
+`python run.py` (fixed seed) should reproduce the following. Exact step
+counts depend on the RNG-seeded quench and the card; the *qualitative*
+results (octree saves dofs, conservative transfer is exact, adaptivity's
+real cost, variable-coefficient BDF2 keeps order 2) must hold. Eight
+`[PASS]` lines and `ALL CHECKS: PASS` must print.
 
-## 1. Spatial adaptivity (octree refinement)
+## 1. Octree refinement + hanging-node constraints
 
-| quantity | adaptive (refined at interface) | uniform L6 |
+| quantity | adaptive (static circle) | uniform L6 |
 |---|---|---|
 | nodes | 1,173 | 4,225 |
 | elements | 1,024 | 4,096 |
-| — | **3.6× fewer nodes** | (same finest $h$) |
+| — | **3.6× fewer nodes** | (same finest h) |
 
-The CH brick steps on the hanging-node adaptive mesh (`step_ok = True`):
-`build_constraints` ties the hanging nodes, and the same stepper runs
-unchanged.
+The CH brick steps on the hanging-node mesh (`step_ok = True`). **This is
+octree refinement to a *static* geometric criterion — NOT solution-adaptive
+AMR** (a Phase-3 deliverable).
 
-## 2. Temporal adaptivity (LTE step ladder over a quench)
+## 2. Conservative-transfer error (a piece of true AMR)
 
-| quantity | value |
+Restricting a fine field of sub-cell droplets to a 2× coarser grid:
+
+| transfer | mass error |
 |---|---|
-| adaptive steps to $t=0.8$ | 142 |
-| $\Delta t$ range | 1.0e-5 (onset floor) → 6.6e-2 (coarsening), ≈ 6600× |
-| equivalent fixed-$\Delta t$ steps | ≈ 80,000 |
-| **step savings** | **≈ 563×** |
+| injection (naive) | ≈ 20% (droplets missed) |
+| cell averaging (conservative) | 0 (exact) |
 
-$\Delta t$ collapses to the floor during the violent spinodal onset,
-then grows more than four orders of magnitude as the domains coarsen —
-the property that makes long phase-field horizons affordable.
+Dynamic AMR must use a conservative restriction or mass leaks every time a
+region coarsens.
 
-## 3. Why variable-coefficient BDF2
+## 3. Temporal adaptivity — REAL cost accounting
 
-| BDF2 form on varying $\Delta t$ | observed order |
+The dt ladder over a quench to t=0.8 spans **1.0e-5 → 6.6e-2** (≈ 6600×).
+Real cost to t=0.6 (not the fictional horizon/min-dt ratio):
+
+| run | steps | Newton its | wall | final error |
+|---|---|---|---|---|
+| adaptive (tol 5e-4) | 138 acc, 31 rej (169 full + 338 half solves) | 2,373 | ~60 s | 2.4e-2 |
+| matched fixed dt=5e-4 | 1,200 | 4,380 | ~108 s | 5.2e-3 |
+
+**Adaptivity saves ≈ 1.85× Newton work and 1.79× wall here** — real but
+*modest*, and it grows with the horizon (the step-doubling overhead of 3
+solves per accepted step is amortized only once the coarsening tail
+dominates). The old "≈ 563×" was a fiction (horizon ÷ smallest step).
+
+## 4. Variable- vs constant-coefficient BDF2 (both MEASURED here)
+
+| BDF2 form on varying dt | observed order |
 |---|---|
-| variable-coefficient (current brick) | **2.01** (order preserved) |
-| constant-coefficient (cited G3 baseline) | 0.90 / 0.95 (collapses toward 1) |
+| variable-coefficient (brick) | **2.01** (preserved) |
+| constant-coefficient (forced r=1, tutorial-local) | **0.93** (collapses toward 1) |
+
+The constant-coefficient degradation is measured locally by a
+`_const_march` that forces the coefficient ratio r=1 on a varying history —
+no dependence on an inaccessible dev note.
 
 **What must be true regardless of hardware:**
 
-- **Octree saves dofs** — the adaptive mesh has several times fewer nodes
-  than the uniform mesh at the same finest resolution, and the solver
-  runs on it. (Node count is deterministic; it will match exactly.)
-- **$\Delta t$ grows through coarsening** — the shipping gate asserts
-  > 4× growth; you should see far more (the onset floor is orders below
-  the coarsening step). The march stays physical ($c\in[-1,1]$).
-- **Variable-coefficient BDF2 keeps order ≈ 2** under a varying step.
-  This is the load-bearing correctness result: the constant-coefficient
-  form *measured* 0.90/0.95 on the same alternating-$\Delta t$ sequence
-  (audit doc, G3). If your measured order drops toward 1, the scheme is
-  using the wrong (constant-step) coefficients.
-- **The `ALL CHECKS: PASS` line prints.**
-
-If the octree does not save dofs, or the adaptive step does not grow, or
-the variable-dt order is near 1, re-read the walkthrough.
+- **Octree saves dofs** (node count deterministic, matches exactly) and the
+  solver runs on the hanging-node mesh.
+- **Conservative transfer is exact**; naive injection loses sub-cell mass.
+- **Adaptivity's cost is REAL and modest** — a ~1.8× saving at t=0.6, not a
+  500× fantasy. Accounting = accepted/rejected steps, full+half solves,
+  Newton iterations, wall.
+- **Variable-coefficient BDF2 keeps order ≈ 2** under a varying step, while
+  the constant-coefficient form collapses toward 1 — both measured here.
