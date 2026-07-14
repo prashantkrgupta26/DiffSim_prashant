@@ -156,6 +156,8 @@ class FilmParams:
     # -- numerics --------------------------------------------------------
     dt0: float = 1e-4
     tstep: str = "bdf1"                   # retrofit G5: bdf1 | bdf2
+    adapt: str = "ladder"                 # LTE ctrl: ladder(OFF) | lte
+    lte_tol: float = 1e-4                 # LTE controller tolerance
     noise: float = 1e-3                   # CHC conserved-flux amplitude
     noise_seed: int = 0
     ic_noise: float = 0.01
@@ -193,6 +195,7 @@ class FilmParams:
         # basis-generic since G1 and BDF2-capable since G2)
         assert int(self.p) in (1, 2), f"p must be 1 or 2 (got {self.p})"
         assert self.tstep in ("bdf1", "bdf2"), self.tstep
+        assert self.adapt in ("ladder", "lte"), self.adapt
         if self.tstep == "bdf2" and float(self.noise) != 0.0:
             raise ValueError(
                 "tstep=bdf2 is deterministic-only (set noise: 0) — the "

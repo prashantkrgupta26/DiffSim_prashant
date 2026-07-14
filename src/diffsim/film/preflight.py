@@ -236,6 +236,31 @@ def run_preflight(params, resolved, query_hardware=True):
                 "blockch_dev")
     rep.add("memory-forecast", status, txt)
 
+    # -- lte-noise-incompatible (the LTE controller's noise contract) ---
+    # Strong/pathwise LTE is ILL-POSED under FDT forcing: the step-
+    # doubling / predictor-corrector difference of two noisy realizations
+    # is dominated by the independent noise draws, not the truncation
+    # error, so a tolerance has no deterministic meaning.  When the user
+    # switches the LTE controller ON (adapt="lte") with noise still on we
+    # REPORT it here and the controller falls back to the fixed-order BDF
+    # ladder (physics.lte.lte_march; noise-valid BDF1, BDF2 being the
+    # deterministic recommendation).  adapt defaults to "ladder" (OFF),
+    # so existing runs never see this check (bit-parity).
+    adapt = getattr(p, "adapt", "ladder")
+    if adapt == "lte":
+        if float(getattr(p, "noise", 0.0)) != 0.0:
+            rep.add("lte-noise-incompatible", WARN,
+                    f"adapt=lte requested with FDT noise={p.noise:g}: "
+                    "strong-order LTE is ill-posed under stochastic "
+                    "forcing -- the LTE controller will REFUSE and fall "
+                    "back to the fixed-order BDF ladder (noise-valid "
+                    "BDF1; BDF2 is the deterministic recommendation). "
+                    "Set noise=0 for the full LTE PI(D) controller.")
+        else:
+            rep.add("lte-noise-incompatible", PASS,
+                    "adapt=lte with noise=0: deterministic run gets the "
+                    "full LTE PI(D) controller.")
+
     # -- int32-slot-ceiling ---------------------------------------------
     if p.device_assembly:
         pct = 100.0 * r.nnz / INT32_CEIL
