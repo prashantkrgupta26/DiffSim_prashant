@@ -1,0 +1,21 @@
+# P10 doc-vs-data mapping: each course-document macro (latex/numbers/p10.tex)
+# vs the reference-mode results.json path it must match, within tolerance.
+# Drives the docs-build staleness gate (common/check_doc_staleness.py).
+# gen_figures.py writes the macros FROM this same results.json, so a match is
+# guaranteed until someone hand-edits the .tex without re-generating.
+#
+# Only the flat `checks.*` scalars are surfaced (the per-run keys contain dots
+# the dotted-path resolver would mis-split).
+tex: ../../latex/numbers/p10.tex
+macros:
+  PtenBiSlow:            {path: checks.Bi_min,                   rtol: 0.02}
+  PtenBiFast:            {path: checks.Bi_max,                   rtol: 0.02}
+  PtenContrastSlowHi:    {path: checks.contrast_slow_hi,         rtol: 0.05}
+  PtenContrastSlowMid:   {path: checks.contrast_slow_mid,        rtol: 0.05}
+  PtenContrastSlowLo:    {path: checks.contrast_slow_lo,         rtol: 0.05}
+  PtenContrastFastMid:   {path: checks.contrast_fast_mid,        rtol: 0.05}
+  PtenWLslowMid:         {path: checks.wl_cells_slow_mid,        rtol: 0.12}
+  PtenWLfastMid:         {path: checks.wl_cells_fast_mid,        rtol: 0.12}
+  PtenContrastRateSpread: {path: checks.contrast_rate_spread_mid, rtol: 0.30}
+  PtenBiCollapseSpread:  {path: checks.bi_collapse_wl_spread_mid, rtol: 0.30}
+  PtenSensSpan:          {path: checks.sens_contrast_rel_span,   rtol: 0.20}

@@ -1,0 +1,19 @@
+# P11 doc-vs-data mapping: each course-document macro (latex/numbers/p11.tex)
+# vs the reference-mode results.json path it must match, within tolerance.
+# Drives the docs-build staleness gate (common/check_doc_staleness.py).
+# gen_figures.py writes the macros FROM this same results.json, so a match is
+# guaranteed until someone hand-edits the .tex without re-generating.
+#
+# Only the plain-numeric macros are mapped (the scientific-notation / percent /
+# GPU-profile macros are formatted, so they are validated by the baseline gate
+# and the profile step rather than this numeric staleness check).
+tex: ../../latex/numbers/p11.tex
+macros:
+  PelevenMMSorder:      {path: checks.mms_order_mean,             rtol: 0.02}
+  PelevenMMSorderMin:   {path: checks.mms_order_min,              rtol: 0.02}
+  PelevenTempOrder:     {path: checks.temporal_order,             rtol: 0.05}
+  PelevenSigAna:        {path: checks.dispersion_sigma_analytic,  rtol: 0.01}
+  PelevenSigMeas:       {path: checks.dispersion_sigma_measured,  rtol: 0.01}
+  PelevenLfree:         {path: checks.L_final_free,               rtol: 0.05}
+  PelevenLarrest:       {path: checks.L_final_arrest,             rtol: 0.05}
+  PelevenArrestRatio:   {path: checks.arrest_ratio,               rtol: 0.05}

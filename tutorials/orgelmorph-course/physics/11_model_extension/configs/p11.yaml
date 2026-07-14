@@ -1,0 +1,45 @@
+# P11 — vitrification / composition-dependent mobility arrest (1-D CH).
+# Canonical run record.
+#
+# A self-contained tutorial-local Cahn-Hilliard brick with a smooth
+# vitrification arrest factor a(phi) = sigmoid((phi_g - phi)/w) multiplying the
+# mobility.  The harness runs five VERIFICATIONS (analytic-derivative check, a
+# hand-derived Jacobian FD-check, the constant-mobility CH dispersion limiting
+# case, MMS spatial convergence, and temporal order) plus the SCIENTIFIC
+# coarsening/arrest result.  `N`, `dt`, `nsteps` size the coarsening run; the
+# verification sub-tests use their own fixed, cost-independent resolutions.
+#
+# Coarsening seeds the mean composition AT the glass point (mean = phi_g), so
+# the polymer-rich MATRIX vitrifies (a -> 0) while the minority pockets stay
+# mobile: with the arithmetic face-averaged mobility the transporting matrix is
+# frozen and coarsening halts (L plateaus), whereas the free run (phi_g -> inf,
+# constant mobility) keeps coarsening.
+#
+# Cost modes (spec: quick <2 min, reference 5-30 min, research documented):
+#   quick      N=64, 200 steps   — smoke tier (<2 min)
+#   reference  N=128, 300 steps  — the EXPECTED, checked numbers
+#   research   N=256, 400 steps  — finer coarsening + finer MMS meshes
+
+N: 128            # coarsening grid nodes (periodic)
+L: 1.0            # periodic box length
+kappa: 3.0e-4     # gradient-energy coefficient (interface width ~ sqrt(kappa))
+M0: 1.0           # mobility prefactor
+phi_g: 0.7        # glass / vitrification composition (arrest threshold)
+w: 0.03           # arrest transition width (sharp -> the vitrified matrix
+                  # mobility collapses cleanly, so coarsening FREEZES/plateaus;
+                  # w=0.05 also halts but plateaus less sharply, see README)
+dt: 1.0e-3        # coarsening time step (backward Euler)
+nsteps: 300       # coarsening steps
+seed: 11
+precision: fp64
+
+modes:
+  quick:
+    N: 64
+    nsteps: 200
+  reference:
+    N: 128
+    nsteps: 300
+  research:
+    N: 256
+    nsteps: 400

@@ -1,0 +1,52 @@
+# P11 tolerance baseline — reference mode (N=128, 300 coarsening steps).
+#
+# Scientific / numerical invariants within DOCUMENTED tolerances, NOT bitwise
+# GPU identity.  Ground truth measured on RTX 6000 Ada (CUDA 13, torch 2.12,
+# float64) by run_harness.py --mode reference.  Measured values (for the record):
+#   fprime_cd_err        1.34e-11    fpp_cd_err            5.36e-11
+#   jac_fd_max_err       3.60e-08    jac_autograd_max_err  2.27e-13   (|J|~1e3)
+#   dispersion_rel_err   1.16e-03    (sigma_analytic 39.01)
+#   mms_order_min        1.994       mms_order_mean        1.996
+#   temporal_order       1.023       temporal_order_min    1.004
+#   L_final_free         0.3845      L_final_arrest        0.1129
+#   arrest_ratio         3.405       arrest_plateau_growth 0.008 (-> plateaus)
+#   coarsen_mass_drift   1.78e-15    coarsen_max_newton_iters 5
+#
+# The HARD, resolution-robust gates are: the hand-derived Jacobian matching FD
+# (the contributor workflow gate), the constant-mobility CH dispersion, the
+# ~2nd-order MMS space + ~1st-order BE time convergence, exact mass
+# conservation, and arrest clearly halting coarsening (ratio + plateau).  The
+# absolute L_final scales are single-seed and noisier -> wider rtol bands.
+# Every gated scalar is a DOT-FREE key under results["checks"].
+checks:
+  # --- (a) analytic derivatives match central differences ---------------
+  checks.fprime_cd_err:            {max: 1.0e-6}
+  checks.fpp_cd_err:               {max: 1.0e-6}
+
+  # --- (b) hand-derived analytic Jacobian is correct (THE workflow gate) -
+  checks.jac_fd_max_err:           {max: 1.0e-6}
+  checks.jac_autograd_max_err:     {max: 1.0e-9}
+
+  # --- (c) limiting-case constant-mobility CH dispersion ----------------
+  checks.dispersion_rel_err:       {max: 0.01}
+  checks.dispersion_sigma_analytic: {reference: 39.011, rtol: 0.02}
+
+  # --- (d) MMS: ~2nd-order spatial convergence --------------------------
+  checks.mms_order_min:            {min: 1.9}
+  checks.mms_order_mean:           {min: 1.9}
+
+  # --- (e) backward Euler: ~1st-order temporal convergence --------------
+  checks.temporal_order:           {min: 0.9, max: 1.2}
+  checks.temporal_order_min:       {min: 0.9}
+
+  # --- exact conservation (conservative flux-divergence form) -----------
+  checks.coarsen_mass_drift_max:   {max: 1.0e-10}
+  checks.coarsen_max_newton_iters: {max: 15}
+
+  # --- (f) SCIENTIFIC RESULT: vitrification arrest halts coarsening ------
+  checks.arrest_plateaus:          {equals: true}
+  checks.arrest_ratio:             {min: 1.3}       # L_free / L_arrest
+  checks.arrest_plateau_growth:    {max: 0.10}      # arrested L(t) plateaus
+  checks.L_final_free:             {reference: 0.3845, rtol: 0.15}
+  checks.L_final_arrest:           {reference: 0.1129, rtol: 0.20}
+  checks.n_checks:                 {equals: 6}

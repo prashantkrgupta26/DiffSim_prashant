@@ -1,0 +1,81 @@
+# P10 - material-system reproduction capstone. Canonical run record.
+#
+# System: PDPP5T_PCBM (materials.yaml). chi / N are loaded THROUGH the validated
+# loader (materials/loader.py) as the harness defaults and mirrored here as the
+# canonical record; change the material in materials.yaml, never by hand-editing
+# these numbers. Every PDPP5T_PCBM parameter is `accelerated_tutorial`/`fitted`
+# (representative, not a measured table value) -- the run archives the full
+# provenance to materials.resolved.json.
+#
+# The reproduced trend is the Negi spin-coating rate -> morphology axis: the
+# recorded spin-speed Biot ladder (4 rungs) is mapped onto a runnable drying
+# rate k_e (ratios preserved; one documented scale factor set so the fastest
+# rung reaches k_e_max). Morphology is read at MATCHED dryness phi_s.
+#
+# Cost modes (spec: quick <2 min / reference 5-30 min / research documented):
+#   quick      level 4 (16x16), the 4-rung ladder only, short horizon. A smoke
+#              tier (NOT gated); level 4 under-resolves the demixed surface
+#              layer so conservation is looser here.
+#   reference  level 5 (32x32), 4-rung ladder + 1 finer mesh + 2 dt + 2 chi
+#              (9 films) -- the EXPECTED numbers, conservation gated.
+#   research   level 6 (64x64) ladder + level 7 mesh-convergence rung.
+
+system: PDPP5T_PCBM
+level: 5
+ds_base: 0.2             # solute Onsager mobility D_s (sets Bi = k_e h0 / D_s)
+# The recorded spin-speed Biot ladder is mapped, in RANK order, linearly onto a
+# moderate resolvable drying-rate window [k_e_slow, k_e_fast] (P5's drying
+# regime). Only the ORDERING is reproduced -- the recorded absolute Biot values
+# carry an order-of-magnitude uncertainty, so neither their magnitude nor exact
+# ratio is meaningful. See material_case.ke_ladder_from_biot.
+k_e_slow: 0.30           # slowest rung's drying rate (lowest rpm)
+k_e_fast: 0.60           # fastest rung's drying rate (highest rpm)
+max_rungs: 0             # 0 = every recorded spin speed; quick subsamples to 2
+matched_phis: [0.30, 0.20, 0.12]   # dryness levels to compare morphology at
+
+chi: [1.0, 0.1, 0.9]     # (chi_pf, chi_ps, chi_fs); mirrors PDPP5T_PCBM
+N: [87.0, 5.0, 1.0]      # (polymer, fullerene, solvent) degrees of polymerization
+kappa: [3.0e-4, 3.0e-4]  # gradient-energy coeffs (interface width)
+phi0: [0.20, 0.20]       # initial (polymer, fullerene); solvent = 0.60
+amp: 0.01
+h0: 1.0
+
+dt: 1.0e-3
+dt_max: 0.01
+t_end: 8.0
+phis_stop: 0.10          # dryness cutoff (below smallest matched phi_s=0.12)
+h_min: 0.12
+nchecks: 32
+seed: 7
+
+conv_rung: 2             # ladder index (0..3) used for convergence + sensitivity
+conv_levels: [6]         # extra meshes for the mesh-convergence study
+conv_dts: [0.02, 0.005]  # extra dt_max for the time-convergence study
+chi_pf_sens: [0.5, 2.0]  # chi_pf order-of-magnitude band (base 1.0 included)
+
+precision: fp64
+
+modes:
+  quick:
+    level: 4
+    max_rungs: 2
+    matched_phis: [0.28, 0.18]
+    phis_stop: 0.15
+    t_end: 8.0
+    dt_max: 0.02
+    nchecks: 20
+    conv_rung: 1
+    conv_levels: []
+    conv_dts: []
+    chi_pf_sens: []
+  reference:
+    level: 5
+    matched_phis: [0.30, 0.20, 0.12]
+    conv_levels: [6]
+    conv_dts: [0.02, 0.005]
+    chi_pf_sens: [0.5, 2.0]
+  research:
+    level: 6
+    conv_levels: [7]
+    conv_dts: [0.02, 0.01, 0.005]
+    chi_pf_sens: [0.3, 0.5, 2.0, 3.0]
