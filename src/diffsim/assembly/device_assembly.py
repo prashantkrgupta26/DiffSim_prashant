@@ -19,6 +19,8 @@ import numpy as np
 import scipy.sparse as sp
 import warp as wp
 
+from ..errors import BackendError, ConfigError
+
 from .operators import _kernel_cache
 
 
@@ -70,16 +72,18 @@ class DeviceNSAssembler:
                                         * ndof) ** 2
             for pv in dm.bins)
         if blockmask is not None:
-            assert node_pattern is not False, (
-                "blockmask requires the node-graph pattern")
+            if node_pattern is False:
+                raise ConfigError(
+                    "blockmask requires the node-graph pattern")
             node_pattern = True
         if node_pattern is None:
             node_pattern = (identity_T and not coloring
                             and tot_entries > NODE_PATTERN_AUTO_ENTRIES)
         if node_pattern:
-            assert identity_T and not coloring, (
-                "node-graph pattern requires identity constraints and "
-                "no coloring")
+            if not (identity_T and not coloring):
+                raise BackendError(
+                    "node-graph pattern requires identity constraints and "
+                    "no coloring")
             self.Nfull = dm.n_nodes * ndof
             self._init_node_pattern(dm, ndof)
             return
@@ -308,9 +312,10 @@ class DeviceNSAssembler:
                 colpos[ca * ndof + np.where(mask[ca])[0]] = \
                     np.arange(rowcnt[ca])
             self.nnz = gnnz * int(rowcnt.sum())
-        assert self.nnz < 2 ** 31, (
-            f"node-pattern dof nnz {self.nnz} >= 2^31: the int32 device "
-            f"slot arithmetic overflows — needs an int64 kernel variant")
+        if self.nnz >= 2 ** 31:
+            raise BackendError(
+                f"node-pattern dof nnz {self.nnz} >= 2^31: the int32 device "
+                f"slot arithmetic overflows — needs an int64 kernel variant")
         # dof-level indptr in closed form (int64: values reach nnz)
         if mask is None:
             self.indptr = np.concatenate(
@@ -353,8 +358,8 @@ class DeviceNSAssembler:
                                                cols_all):
             key = rr.astype(np.int64) * n + cc
             slot = np.searchsorted(Gkey, key)
-            assert slot.max() < gnnz and (Gkey[slot] == key).all(), \
-                "node-pair slot lookup failed"
+            if not (slot.max() < gnnz and (Gkey[slot] == key).all()):
+                raise BackendError("node-pair slot lookup failed")
             self._gslot_d.append(wp.array(slot.astype(np.int32),
                                           dtype=wp.int32, device=d))
             del key, slot
@@ -568,8 +573,9 @@ class DeviceNSAssembler:
                               wp.int32(e0), wp.int32(nbf),
                               wp.int32(ndof), self.F_d], device=d)
             return
-        assert self._identity_T, (
-            "scatter_batch: constraint-aware path is whole-bin only")
+        if not self._identity_T:
+            raise BackendError(
+                "scatter_batch: constraint-aware path is whole-bin only")
         slots_v = self._slots_d[k_bin][e0 * npair:(e0 + nb) * npair]
         wp.launch(_scatter_kernel(), dim=nb * npair,
                   inputs=[Ae_d.reshape((-1,)), slots_v, self.vals_d],
@@ -649,8 +655,10 @@ class DeviceNSAssembler:
         for i in range(len(rows)):
             s_, e_ = self.indptr[rows[i]], self.indptr[rows[i] + 1]
             k = s_ + np.searchsorted(self.indices[s_:e_], cols[i])
-            assert k < e_ and self.indices[k] == cols[i], \
-                (rows[i], cols[i])
+            if not (k < e_ and self.indices[k] == cols[i]):
+                raise BackendError(
+                    f"CSR slot lookup failed for entry "
+                    f"(row={rows[i]}, col={cols[i]})")
             slots[i] = k
         return slots
 
