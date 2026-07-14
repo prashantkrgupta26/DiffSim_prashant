@@ -2,127 +2,125 @@
 \label{ch:c4}
 \begin{keybox}
 \textbf{Key idea.} Every implicit step ends in a linear solve of the
-\emph{indefinite} $(c,\mu)$ Cahn--Hilliard saddle, and there is no single
-best solver. Choose by measuring \emph{both} correctness (the residual)
-and speed: a fast solver that returns a wrong answer is not fast. In 2-D,
-correctness is not the deciding factor --- every backend is accurate ---
-so speed decides; in 3-D the deciding factor is \emph{memory}, not
-accuracy, and that is where the block preconditioner and matrix-free
-methods take over.
+\emph{indefinite} $(c,\mu)$ Cahn--Hilliard saddle, and the choice of
+solver is a \emph{correctness} decision before it is a speed one. A
+general-purpose GPU direct solver (cuDSS) \textbf{diverges} on the
+polynomial CH saddle --- it does no pivoting, and the polynomial well is
+indefinite in the spinodal band --- so the field blows up. The pivoted CPU
+direct solver \code{splu} is safe at small scale; the CH-specific
+\texttt{blockch} preconditioner, which splits the saddle into
+symmetric-positive-definite sub-solves, is the choice at scale. \emph{Not}
+cuDSS on the raw CH block.
 \end{keybox}
 
-This concept teaches how to choose, using a small live 2-D comparison ---
-with the residual reported beside the speed --- plus the measured 3-D
-scaling tables from the device-assembly and \texttt{blockch} development
-notes.
+This concept teaches how to choose, using a real marched divergence test
+--- the honest way to check a solver on the CH saddle --- plus the live
+2-D timing and the cited 3-D scaling tables.
 
-\section{Correctness first, then speed}
+\section{The real test: march it and look at the solution}
 
 Each Newton iterate solves $A\,\delta = r$, where $A$ is the mixed
 $(c,\mu)$ Cahn--Hilliard Jacobian --- a \emph{saddle}-structured,
-\emph{indefinite} sparse matrix. Indefiniteness is a real hazard: a
-general-purpose GPU direct solver factorizes without the pivoting an
-indefinite system may need, so \emph{in principle} it could return a
-large-residual (wrong) answer. The scientific response is not to assume,
-but to \textbf{verify}: solve the same captured system with each backend
-and report the relative residual $\|A\delta-r\|/\|r\|$.
+\emph{indefinite} sparse matrix. The tempting shortcut is to solve one
+captured system and check its residual. That shortcut \textbf{lies}: on
+the polynomial saddle, cuDSS's residual at a single Newton iterate is
+$\CfourCudssResid$ (as small as \code{splu}'s $\CfourSpluResid$), yet
+\emph{marching} the real 20-step spinodal with cuDSS blows the field up.
+A small residual does not imply a small error when the matrix is
+ill-conditioned. So we measure the \emph{marched solution}
+(Table~\ref{tab:c4diverge}, Fig.~\ref{fig:c4diverge}).
 
-\begin{keybox}
-\textbf{Measured (2-D, $\CfourCorrectDofs$ dofs).} Every backend is
-accurate: \code{splu} (pivoted CPU direct) $\CfourSpluResid$, \textbf{cuDSS}
-(GPU direct) $\CfourCudssResid$, and \texttt{blockch} (the CH-specific
-block preconditioner) $\CfourBlockchResid$. The verification \emph{passes}
-for each --- including cuDSS, which handles the indefinite 2-D saddle fine.
-So in 2-D correctness does not pick the solver; \emph{speed} does. (This
-overturns a tempting but unverified claim that cuDSS ``diverges on the CH
-saddle''; on the systems measured here it does not. Always check the
-residual rather than repeat folklore.)
-\end{keybox}
+\begin{table}[h]\centering\small
+\begin{tabular}{llcc}
+\toprule
+energy & solver & final $c$ range (\CfourSteps\ steps) & verdict \\
+\midrule
+polynomial & \code{splu}  & \CfourPolySpluRange & ok \\
+polynomial & cuDSS        & $[\CfourPolyCudssMin,\ \CfourPolyCudssMax]$ & \textbf{DIVERGED} \\
+Flory--Huggins & \code{splu} & $[0.06,\ 0.94]$ & ok \\
+Flory--Huggins & cuDSS     & \CfourFhCudssRange & ok \\
+\bottomrule
+\end{tabular}
+\caption{Marched-solution correctness (level 5, $\Delta t=0.02$,
+  $\mu$-init consistent). cuDSS blows the polynomial field up by a factor
+  $\sim500$; \code{splu} is safe on both energies.}
+\label{tab:c4diverge}
+\end{table}
 
 \begin{figure}[h]\centering
-  \includegraphics[width=0.6\linewidth]{figures/c4_correctness.png}
-  \caption{Relative residual of each backend on the same captured CH
-    saddle. All sit far below the correctness threshold ($10^{-6}$):
-    \code{splu}, cuDSS, and \texttt{blockch} each solve the indefinite
-    2-D saddle accurately. Correctness is proved, not assumed.}
-  \label{fig:c4correct}
+  \includegraphics[width=0.66\linewidth]{figures/c4_divergence.png}
+  \caption{Final field range after \CfourSteps\ steps for each
+    (energy, solver). cuDSS on the polynomial saddle escapes the physical
+    band $[-1,1]$ by orders of magnitude (symlog axis); the pivoted
+    \code{splu} and cuDSS-on-Flory--Huggins stay inside.}
+  \label{fig:c4diverge}
 \end{figure}
 
-\section{The 2-D crossover, measured live}
+\section{Why: an indefinite saddle with no pivoting}
 
-With correctness settled, speed decides in 2-D. We assemble the
-\emph{real} Cahn--Hilliard Jacobian at three mesh sizes and time the
-linear solve (factorize $+$ solve), cold and warm, CUDA-synchronised, as a
-median. The full step is host-assembly-bound in this brick, which would
-swamp the solver signal, so we isolate the solve.
+The polynomial well $f(c)=\tfrac14(c^2-1)^2$ has bulk curvature
+$f''(c)=3c^2-1$, which is \emph{negative} across the spinodal band
+$|c|<1/\sqrt3$ --- exactly the region the dynamics drives the field into.
+There the $(c,\mu)$ block is genuinely \emph{indefinite}. cuDSS
+factorizes without the partial pivoting an indefinite system needs, so its
+solution is wrong, and the error compounds over the Newton and time
+iterations until the field escapes. Flory--Huggins survives because its
+entropic curvature $f''=A\!\left(\tfrac1c+\tfrac1{1-c}\right)\ge 4A$ stays
+\emph{positive} and better-conditioned --- but you cannot count on that in
+general, and the production default must be safe for the polynomial well.
 
-\begin{runbox}
-\textbf{Run it.}
-\begin{lstlisting}
-cd computational/04_solvers
-python run.py            # correctness + 2-D benchmark + decision support
-\end{lstlisting}
-It prints the versioned benchmark provenance (commit, GPU, library
-versions), the correctness table, the crossover, the cited 3-D story, and
-the \code{recommend\_solver} rationale.
-\end{runbox}
+\begin{keybox}
+\textbf{The recipe this forces.}
+\begin{itemize}[nosep]
+  \item \textbf{small:} \code{splu} --- pivoted CPU direct, safe on the
+        indefinite saddle.
+  \item \textbf{at scale:} \texttt{blockch} / \code{blockch\_dev} --- an
+        FGMRES around a block preconditioner that splits the saddle into
+        \emph{SPD} sub-solves (mass, $W_1$, $W_2$), so no monolithic
+        indefinite factorization is ever formed.
+  \item \textbf{not} cuDSS on the raw CH block. (cuDSS is fine on the
+        well-conditioned SPD sub-blocks a preconditioner factors, and on
+        block-masked 3-D film patterns.)
+\end{itemize}
+The \code{--solver auto} default of \code{splu} for CH is correct.
+\end{keybox}
 
-At $\CfourSmallDofs$ dofs \code{splu} still wins --- the GPU's launch and
-transfer overhead dominates a tiny solve. By $\CfourBigDofs$ dofs cuDSS is
-$\sim\CfourBigSpeedup\times$ faster and pulling away (the crossover sits
-near $10^4$ dofs; Fig.~\ref{fig:c4cross}), and its residual stays
-$\sim10^{-14}$ throughout. The block preconditioner is far slower than
-cuDSS across this whole 2-D range (latency-bound) --- you would not use it
-here.
+\section{The 2-D timing (context only)}
+
+With correctness settled, we still measure speed --- but note that for CH
+the fastest 2-D solver is \emph{disqualified}. Timing the linear solve
+(factorize $+$ solve, cold and warm, CUDA-synchronised median) shows cuDSS
+overtaking \code{splu} as the 2-D problem grows past $\sim10^4$ dofs (at
+$\CfourBigDofs$ dofs it is $\sim\CfourBigSpeedup\times$ faster;
+Fig.~\ref{fig:c4cross}). But that speed is unusable on the CH saddle
+because cuDSS returns a wrong answer there. The lesson: \emph{fastest} is
+not \emph{correct}.
 
 \begin{figure}[h]\centering
   \includegraphics[width=0.62\linewidth]{figures/c4_crossover.png}
-  \caption{Direct-solver crossover in 2-D on the real Cahn--Hilliard
-    Jacobian: CPU \code{splu} wins at small sizes (GPU overhead dominates),
-    GPU cuDSS wins as the problem grows. Timings vary run-to-run; the
-    crossover shape does not.}
+  \caption{2-D linear-solve timing on the real CH Jacobian. cuDSS is
+    faster above $\sim10^4$ dofs --- but it \emph{diverges} on the CH
+    saddle (dashed, disqualified), so \code{splu} is the 2-D choice.}
   \label{fig:c4cross}
 \end{figure}
 
-\section{The 3-D wall is memory, not accuracy}
+\section{The 3-D story, cited}
 
-The 3-D numbers take minutes per step to produce, so we cite the
-development notes' measured tables. The picture is decisive
-(Fig.~\ref{fig:c4cited}) --- and it is about \emph{memory}:
-\begin{itemize}[nosep]
-  \item cuDSS's factorization fill hits the 48\,GB card at
-        $\sim\CfourCudssCeiling$ dofs --- a $>16$\,min factorization that
-        never returns. This is a \emph{memory} ceiling; where it fits,
-        cuDSS is accurate.
-  \item \code{blockch\_dev} beats cuDSS $\CfourBlockchSpeedup\times$ on the
-        slab64 solve \emph{and} keeps marching at $\CfourCudssCeiling$
-        dofs, where cuDSS ceilings, because it never forms the full LU.
-  \item a \emph{block-masked} cuDSS pattern cuts the 3-D fill
-        ($17.7\to\CfourMaskedScall$ s/call) --- a strong option below the
-        ceiling.
-  \item \textbf{AMGX verdict: no.} At production $\Delta t$ the inner
-        solves are mass-dominated (well-conditioned), so algebraic
-        multigrid has no $O(h^{-1})$ growth to flatten.
-  \item matrix-free (and \code{blockch}) push the ceiling to
-        $\CfourMatrixfreeDofs$ dofs on a single 48\,GB card.
-\end{itemize}
-
-\begin{keybox}
-\textbf{A note on preconditioner design.} That the two-factor
-\texttt{blockch} preconditioner \emph{exists} is itself a hard-won result:
-several \emph{naive} block preconditioners \emph{diverge} on the stiff
-Flory--Huggins log potential (documented design-laws in
-\file{src/diffsim/solvers/linsolve.py}). That is a statement about
-approximate preconditioners --- not about a pivoted direct solve, which is
-accurate on the same systems.
-\end{keybox}
+The 3-D numbers take minutes per step, so we cite the dev-note tables. At
+scale the \emph{memory} of a direct factorization compounds the accuracy
+problem: cuDSS's fill hits the 48\,GB card at $\sim\CfourCudssCeiling$
+dofs (a $>16$\,min factorization that never returns). \code{blockch\_dev}
+beats masked cuDSS $\CfourBlockchSpeedup\times$ on the slab64 solve and
+keeps marching where cuDSS ceilings; a block-masked cuDSS pattern cuts the
+fill ($17.7\to\CfourMaskedScall$ s/call) below the ceiling; AMGX adds
+nothing at production $\Delta t$ (mass-dominated inners); and matrix-free
+reaches $\CfourMatrixfreeDofs$ dofs on one card (Fig.~\ref{fig:c4cited}).
 
 \begin{figure}[h]\centering
   \includegraphics[width=0.72\linewidth]{figures/c4_cited3d.png}
   \caption{Cited 3-D per-solve cost (dev notes): masked cuDSS versus
     \code{blockch\_dev}. blockch is $\CfourBlockchSpeedup\times$ cheaper at
-    slab64 and keeps marching at the size where cuDSS's factorization
-    ceilings on 48\,GB memory.}
+    slab64 and marches where cuDSS's factorization ceilings on 48\,GB.}
   \label{fig:c4cited}
 \end{figure}
 
@@ -131,70 +129,68 @@ accurate on the same systems.
 Rather than a one-line \code{choose\_solver(dim, dofs)}, the tutorial's
 \code{recommend\_solver} weighs dofs, nnz, block structure, precision,
 memory, factorization reuse, tolerance, $\Delta t$, and hardware, and
-returns a \emph{rationale}, not just a name:
+returns a \emph{rationale} that begins with the correctness constraint:
 \begin{center}\small
 \begin{tabular}{lll}
 \toprule
 regime & dofs (order) & recommendation \\
 \midrule
-2-D, small        & $<2\times10^4$   & \code{splu} (pivoted, no GPU overhead) \\
-2-D, large        & $<5\times10^5$   & cuDSS (fast, verified accurate) \\
+2-D, small        & $<2\times10^4$   & \code{splu} (pivoted; safe on saddle) \\
+2-D, large        & $<5\times10^5$   & \code{splu} / \texttt{blockch} (\emph{not} cuDSS) \\
 3-D, small        & $<5\times10^5$   & masked cuDSS / \code{blockch\_dev} \\
-3-D, large        & up to $\sim1.5\times10^6$ & \code{blockch\_dev} (memory) \\
+3-D, large        & up to $\sim1.5\times10^6$ & \code{blockch\_dev} \\
 3-D, extreme      & $>$ int32 / memory & matrix-free (or multi-GPU) \\
 \bottomrule
 \end{tabular}
 \end{center}
-Every recommendation carries the caveat to \emph{verify the residual} of a
-non-pivoting direct solve, and names \emph{why} (size, fill, memory) so the
-choice transfers when the hardware or problem changes.
+Every recommendation names \emph{why} --- and never picks cuDSS on the raw
+indefinite CH block.
 
 \section{Code walk-through}
 
-\paragraph{Capturing the real operator (supported API).}
+\paragraph{The real correctness test (marched, not one-shot).}
 \begin{lstlisting}
-st = CahnHilliardStepper(..., capture_system=True)   # no monkeypatch
-st.step()
-A, b = st.last_system        # the exact saddle a solver would factor
+march_divergence()      # marches 20 steps per (energy, solver); c.min/max
 \end{lstlisting}
-The benchmark captures the operator through a supported stepper flag ---
-not by monkeypatching \code{solve\_linear}. It warms up a few steps so the
-residual $b$ is non-trivial (a consistent-$\mu$ step-0 iterate has
-$b\approx0$, which makes a relative-residual test degenerate).
+It marches the production stepper and reads the final field range --- the
+only honest test on an indefinite saddle.
 
-\paragraph{Correctness beside speed.}
+\paragraph{The trap, and the supported capture API.}
 \begin{lstlisting}
-solver_correctness()          # residual + iters of splu / cuDSS / blockch
-benchmark_solvers_2d()        # cold+warm, CUDA-synced, median timing
-recommend_solver(dofs, dim)   # a rationale, not just a name
+solver_correctness()    # one-iterate residual: cuDSS looks fine (~1e-13)!
+st = CahnHilliardStepper(..., capture_system=True)   # no monkeypatch
+A, b = st.last_system
 \end{lstlisting}
-If cuDSS is unavailable, the benchmark degrades gracefully (it skips the
-GPU rows and \code{recommend\_solver} falls back to \code{splu}/blockch).
+The one-iterate residual is captured through a supported stepper flag (not
+a \code{solve\_linear} monkeypatch) --- and it \emph{lies}, which is the
+point.
 
 \section{Explore on your own}
 
-\question{Extend the live 2-D sweep to level~8 ($\sim1.3\times10^5$ dofs).
-Does cuDSS's lead over \code{splu} keep growing, and does the solve time
-scale closer to $O(n)$ or $O(n^{1.5})$? What does the exponent say about
-2-D direct fill-in?}
+\question{Reproduce the divergence: march the polynomial spinodal with
+cuDSS for $5, 10, 15, 20$ steps and plot $\max|c|$ versus step. Is the
+blow-up gradual or sudden, and what does that say about how the
+unpivoted-factorization error compounds?}
 
-\question{You verified cuDSS is accurate on the 2-D saddle. Construct a
-system where a non-pivoting direct solve \emph{should} struggle (hint:
-push the FH potential to the regularization cap, or shrink $\Delta t$ so
-$\sigma$ is huge) and re-measure the residual. Does the verification still
-pass? This is the experiment that separates folklore from measurement.}
+\question{cuDSS survives Flory--Huggins because $f''\ge4A>0$. Lower the FH
+regularization floor (push $c$ toward $0$ or $1$ so $f''$ spikes) and
+re-march. Does cuDSS still survive, and at what conditioning does it
+break?}
 
-\question{The dev note reports \code{blockch\_dev} at $8.4\times$ cuDSS on
-the slab64 \emph{solve} but only $2.6\times$ on the \emph{step}. What does
-the rest of the step cost, and why does the solver speedup not carry
-through one-to-one?}
+\question{The one-iterate residual for cuDSS was $\CfourCudssResid$ ---
+tiny --- yet the march diverged. Construct the argument (condition number
+$\times$ residual bounds the error) that explains how a small residual can
+accompany a large error, and estimate the effective condition number
+needed.}
 
-\question{Using the measured cuDSS ceiling ($\sim\CfourCudssCeiling$ dofs
-on 48\,GB), estimate the ceiling on an 80\,GB A100. For a
-$96\times96\times48$ film, which solver, and would masked cuDSS change your
-answer?}
+\question{\texttt{blockch} splits the saddle into SPD sub-solves. Read the
+design-laws in \file{src/diffsim/solvers/linsolve.py}: which naive block
+preconditioners \emph{also} diverge on FH, and why does the two-factor
+signed-$F$ form survive? Contrast that (a preconditioner failure) with the
+cuDSS direct-solve failure here.}
 
-\question{Add \code{fp32} to \code{recommend\_solver}'s reasoning: halving
-the precision halves memory and bandwidth, but the CH condition number may
-demand fp64 for the tolerance. Design the experiment (fp32 solve, fp64
-residual check) that decides whether fp32 is safe for a given problem.}
+\question{Using the cited cuDSS memory ceiling ($\sim\CfourCudssCeiling$
+dofs on 48\,GB), estimate it on an 80\,GB A100 --- and note that even
+where cuDSS \emph{fits} in 3-D, it is still the raw indefinite block, so
+the masked pattern (SPD-friendlier) or \code{blockch\_dev} is what you
+actually run.}

@@ -3,9 +3,9 @@
 Writes three figures into ../../latex/figures/ and the measured macros into
 ../../latex/numbers/c4.tex.
 
-  c4_correctness.png  residual of each solver on the CH saddle (cuDSS wrong)
-  c4_crossover.png    live 2-D splu vs cuDSS timing (correct sizes only)
-  c4_cited3d.png      cited 3-D scaling: blockch wins where cuDSS ceilings
+  c4_divergence.png  marched field range: cuDSS blows up on the poly saddle
+  c4_crossover.png   live 2-D splu vs cuDSS timing (cuDSS disqualified for CH)
+  c4_cited3d.png     cited 3-D scaling: blockch wins where cuDSS ceilings
 
     PYTHONPATH=<repo>/src python gen_figures.py --device cuda:0
 """
@@ -17,8 +17,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from solvers import (benchmark_solvers_2d, solver_correctness, CITED_3D,
-                     CITED_FACTS, cudss_available)
+from solvers import (benchmark_solvers_2d, march_divergence, solver_correctness,
+                     CITED_3D, CITED_FACTS)
 
 FIGDIR = os.path.join(os.path.dirname(__file__),
                       "..", "..", "latex", "figures")
@@ -26,23 +26,28 @@ NUMTEX = os.path.join(os.path.dirname(__file__),
                       "..", "..", "latex", "numbers", "c4.tex")
 
 
-def correctness_figure(cc, fname):
-    fig, ax = plt.subplots(figsize=(6.6, 4.4), dpi=150)
-    rows = [r for r in cc["rows"] if r["residual"] is not None]
-    names = [r["solver"] for r in rows]
-    resid = [max(r["residual"], 1e-18) for r in rows]
-    cols = ["C0" if r < 1e-6 else "C3" for r in resid]
-    bars = ax.bar(names, resid, color=cols)
-    ax.set_yscale("log")
-    ax.axhline(1e-6, color="k", ls="--", lw=0.8, alpha=0.6,
-               label="correctness threshold")
-    ax.set_ylabel(r"relative residual $\|Ax-b\|/\|b\|$")
-    ax.set_title(f"Correctness on the CH saddle ({cc['dofs']} dofs):\n"
-                 "all backends verified accurate (residual $\\ll$ threshold)")
-    for b, r in zip(bars, resid):
-        ax.annotate(f"{r:.0e}", (b.get_x() + b.get_width() / 2,
-                    b.get_height()), ha="center", va="bottom", fontsize=8)
-    ax.legend(fontsize=8)
+def divergence_figure(md, fname):
+    """Final field range c.min..c.max for each (energy, solver): cuDSS on the
+    polynomial saddle blows far outside the physical band; the rest stay in."""
+    fig, ax = plt.subplots(figsize=(7.0, 4.4), dpi=150)
+    rows = [r for r in md["rows"] if r["cmin"] is not None]
+    labels = [f"{r['energy']}\n{r['solver']}" for r in rows]
+    x = np.arange(len(rows))
+    for i, r in enumerate(rows):
+        col = "C3" if r["diverged"] else "C0"
+        ax.plot([x[i], x[i]], [r["cmin"], r["cmax"]], color=col, lw=8,
+                solid_capstyle="round")
+        tag = "DIVERGED" if r["diverged"] else "ok"
+        ax.annotate(tag, (x[i], max(r["cmax"], 1.2)), ha="center",
+                    va="bottom", fontsize=8, color=col)
+    ax.axhspan(-1, 1, color="gray", alpha=0.15, label="physical band $[-1,1]$")
+    ax.set_yscale("symlog", linthresh=1.0)
+    ax.set_xticks(x); ax.set_xticklabels(labels)
+    ax.set_ylabel("final field range after 20 steps (symlog)")
+    ax.set_title("cuDSS DIVERGES on the polynomial CH saddle\n"
+                 "(indefinite $f''<0$, no pivoting); splu is safe on both")
+    ax.grid(True, axis="y", which="both", alpha=0.3)
+    ax.legend(loc="upper left", fontsize=8)
     fig.savefig(os.path.join(FIGDIR, fname), bbox_inches="tight",
                 facecolor="white")
     plt.close(fig)
@@ -54,16 +59,16 @@ def crossover_figure(recs, fname):
     d = np.array([r["dofs"] for r in recs])
     s = np.array([r["splu_ms"] for r in recs])
     fig, ax = plt.subplots(figsize=(6.6, 4.6), dpi=150)
-    ax.loglog(d, s, "o-", color="C0", lw=2, ms=8, label="splu (CPU direct)")
+    ax.loglog(d, s, "o-", color="C0", lw=2, ms=8, label="splu (safe on CH)")
     if have:
         dc = np.array([r["dofs"] for r in have])
         c = np.array([r["cudss_ms"] for r in have])
-        ax.loglog(dc, c, "s-", color="C3", lw=2, ms=8,
-                  label="cuDSS (GPU direct)")
+        ax.loglog(dc, c, "s--", color="C3", lw=2, ms=8,
+                  label="cuDSS (faster, but WRONG on CH)")
     ax.set_xlabel("degrees of freedom (2-D)")
     ax.set_ylabel("linear solve: factorize + solve (ms)")
-    ax.set_title("Direct-solver crossover in 2-D\n(real CH Jacobian; "
-                 "cuDSS timed only where its residual is acceptable)")
+    ax.set_title("2-D timing: cuDSS is faster but DISQUALIFIED for CH\n"
+                 "(it diverges on the indefinite saddle) -- splu is the choice")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend()
     fig.savefig(os.path.join(FIGDIR, fname), bbox_inches="tight",
@@ -102,27 +107,36 @@ def sci(v):
     return rf"\ensuremath{{{m}\times10^{{{int(e)}}}}}"
 
 
-def write_numbers(recs, cc):
+def write_numbers(md, recs, cc):
     def mac(name, val):
         return rf"\newcommand{{\{name}}}{{{val}}}"
-    splu_row = next(r for r in cc["rows"] if r["solver"] == "splu")
-    blockch_row = next((r for r in cc["rows"] if r["solver"] == "blockch"),
-                       None)
+
+    def rng(energy, solver):
+        return next(x for x in md["rows"]
+                    if x["energy"] == energy and x["solver"] == solver)
+
+    pc = rng("poly", "cudss")
+    ps = rng("poly", "splu")
+    fc = rng("fh", "cudss")
     cudss_row = next((r for r in cc["rows"] if r["solver"] == "cudss"), None)
+    splu_row = next(r for r in cc["rows"] if r["solver"] == "splu")
     big = recs[-1]
     lines = [
         "% AUTO-GENERATED by gen_figures.py - do not edit.",
-        # correctness on the CH saddle
-        mac("CfourSpluResid", sci(splu_row["residual"])),
-        mac("CfourBlockchResid",
-            sci(blockch_row["residual"]) if blockch_row
-            and blockch_row["residual"] else "n/a"),
+        # the divergence finding
+        mac("CfourPolyCudssMax", f"{pc['cmax']:.0f}"),
+        mac("CfourPolyCudssMin", f"{pc['cmin']:.0f}"),
+        mac("CfourPolySpluRange",
+            f"$[{ps['cmin']:.2f}, {ps['cmax']:.2f}]$"),
+        mac("CfourFhCudssRange",
+            f"$[{fc['cmin']:.3f}, {fc['cmax']:.3f}]$"),
+        mac("CfourSteps", f"{md['steps']}"),
+        # the trap: one-iterate residuals (deceptively small)
         mac("CfourCudssResid",
             sci(cudss_row["residual"]) if cudss_row
             and cudss_row["residual"] else "unavailable"),
-        mac("CfourCorrectDofs", f"{cc['dofs']:,}".replace(",", r"{,}")),
-        # live 2-D timing
-        mac("CfourSmallDofs", f"{recs[0]['dofs']:,}".replace(",", r"{,}")),
+        mac("CfourSpluResid", sci(splu_row["residual"])),
+        # live 2-D timing (context)
         mac("CfourBigDofs", f"{big['dofs']:,}".replace(",", r"{,}")),
         mac("CfourBigSpeedup",
             "n/a" if big["speedup"] is None else f"{big['speedup']:.1f}"),
@@ -147,12 +161,13 @@ def main():
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
     os.makedirs(FIGDIR, exist_ok=True)
+    md = march_divergence(device=args.device)
     cc = solver_correctness(level=6, device=args.device)
     recs = benchmark_solvers_2d(device=args.device)
-    correctness_figure(cc, "c4_correctness.png")
+    divergence_figure(md, "c4_divergence.png")
     crossover_figure(recs, "c4_crossover.png")
     cited3d_figure("c4_cited3d.png")
-    write_numbers(recs, cc)
+    write_numbers(md, recs, cc)
 
 
 if __name__ == "__main__":

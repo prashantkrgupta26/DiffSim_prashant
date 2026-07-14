@@ -7,29 +7,42 @@ choice where it is cheap (a small 2-D CH Jacobian) with BOTH speed AND
 CORRECTNESS, and pairs it with the MEASURED 3-D scaling tables from the
 device-assembly and blockch dev notes.
 
-CORRECTNESS FIRST, THEN SPEED.  A fast solver that returns a wrong answer is
-not fast -- so this chapter reports the RELATIVE RESIDUAL ||Ax-b||/||b|| of
-every solver, not just its timing.  A non-pivoting GPU direct solver on an
-INDEFINITE saddle is a real theoretical RISK, so you must VERIFY it rather
-than trust it.  Measured here (2-D, poly and Flory-Huggins, sigma up to 500):
-scipy `splu`, cuDSS, and the CH-specific `blockch` preconditioner ALL reach
-tiny residuals (~1e-11 to 1e-13) -- the verification PASSES for each.  So in
-2-D correctness does not decide the choice; SPEED and, at scale, MEMORY do.
+THE HEADLINE FINDING (measured): cuDSS DIVERGES on the polynomial CH saddle.
+Marching the real 20-step spinodal (level 5, dt 0.02, mu_init=consistent)
+with the production stepper:
 
-THE REAL 3-D WALL IS MEMORY, NOT ACCURACY.  A direct factorization's fill-in
-explodes in 3-D; cuDSS ceilings on a 48 GB card around ~8e5 dofs (a >16 min
-factorization that never returns -- cited dev notes), NOT because it is
-inaccurate but because the factors do not fit.  That is where `blockch` /
-`blockch_dev` (an FGMRES around a block preconditioner that never forms the
-full LU) and, beyond it, matrix-free take over.  A block-masked cuDSS pattern
-extends the direct reach in 3-D.  (Historical note: the two-factor blockch
-PRECONDITIONER was itself hard to design -- several naive block
-preconditioners DIVERGE on the stiff FH log potential; see the design-laws in
-`src/diffsim/solvers/linsolve.py`.  That is a statement about approximate
-preconditioners, not about a pivoted direct solve.)
+    poly  splu : c in [-1.03, 1.01]   ok
+    poly  cudss: c in [-552,  542 ]   DIVERGED (field blows up ~500x)
+    fh    splu : c in [ 0.06, 0.94]   ok
+    fh    cudss: c in [0.001, 0.999]  ok
+
+WHY.  The mixed (c, mu) CH Jacobian is a SADDLE, and for the polynomial well
+f(c)=1/4(c^2-1)^2 the bulk curvature f''(c)=3c^2-1 goes NEGATIVE across the
+spinodal band |c|<1/sqrt(3) -- so the block is genuinely INDEFINITE there.
+cuDSS factorizes WITHOUT partial pivoting, which an indefinite system needs,
+so its solution is wrong (a small per-solve residual does NOT imply a small
+ERROR when the matrix is ill-conditioned), and the error COMPOUNDS over the
+Newton/time iterations until the field blows up.  Flory-Huggins survives
+because its entropic curvature f''=A(1/c + 1/(1-c)) >= 4A stays POSITIVE and
+better-conditioned -- but you cannot rely on that in general.
+
+THE TRAP this chapter teaches: a residual captured at ONE Newton iterate is
+DECEPTIVELY small for cuDSS on the poly saddle (~1e-13) even though the 20-
+step march diverges.  You must measure the marched SOLUTION (c.min/max), not
+a one-shot residual.
+
+THE CORRECT RECIPE, therefore:
+  * SMALL: scipy `splu` (CPU direct, PIVOTED) -- safe on the indefinite saddle.
+  * AT SCALE: `blockch` / `blockch_dev` -- an FGMRES around a block
+    preconditioner that splits the saddle into SPD sub-solves (mass / W1 / W2
+    blocks), so no monolithic indefinite factorization is ever formed.
+  * NOT cuDSS on the raw CH block.  (cuDSS is fine on the well-conditioned SPD
+    sub-blocks a preconditioner factors, and on block-masked 3-D film
+    patterns -- but not on the raw indefinite CH saddle.)
+The `--solver auto` default of splu for CH is correct.
 
 The teaching goal is a decision, not a number: given a problem, WHICH solver,
-WHY, and PROVED correct by its residual.
+WHY, and PROVED correct by the marched solution.
 """
 import platform
 import statistics
@@ -137,6 +150,47 @@ def capture_ch_system(level, device="cuda:0", warmup=4, energy="poly"):
     return A, b, dm.n_nodes * 2, int(A.nnz)
 
 
+def march_divergence(level=5, steps=20, dt=0.02, device="cuda:0",
+                     energies=("poly", "fh"), solvers=("splu", "cudss")):
+    """THE headline correctness test: march the real spinodal with the
+    production stepper under each (energy, solver) and report the final field
+    range c.min/max.  A blown-up range means the solver DIVERGED -- the true
+    test of a solver on the indefinite CH saddle (a one-iterate residual can
+    be deceptively small; see solver_correctness).  Measured: cuDSS diverges
+    on the polynomial well (indefinite f''<0 in the spinodal band, no
+    pivoting) but survives Flory-Huggins; splu is safe on both."""
+    rows = []
+    for energy in energies:
+        m0 = 0.5 if energy == "fh" else 0.0
+        for solver in solvers:
+            if solver == "cudss" and not cudss_available():
+                rows.append(dict(energy=energy, solver=solver, cmin=None,
+                                 cmax=None, diverged=None,
+                                 note="cuDSS unavailable"))
+                continue
+            dm, mesh, cons = build_dm(level, device)
+            st = CahnHilliardStepper(dm, 1.0, 5e-4, dt, order=1,
+                                     linsolver=solver, energy=energy,
+                                     fh_A=1.0, fh_B=3.0)
+            rng = np.random.default_rng(3)
+            st.set_initial(lambda x: m0 + 0.05 * rng.standard_normal(len(x)),
+                           mu_init="consistent")
+            c = st.hist[0]
+            try:
+                for _ in range(steps):
+                    c, _ = st.step()
+                cmin, cmax = float(c.min()), float(c.max())
+            except Exception as e:
+                cmin = cmax = float("nan")
+            # physical range: poly ~[-1,1], FH ~(0,1); >2x outside => diverged
+            hi_ref = 1.2 if energy == "poly" else 1.05
+            lo_ref = -1.2 if energy == "poly" else -0.05
+            diverged = not (lo_ref < cmin and cmax < hi_ref)
+            rows.append(dict(energy=energy, solver=solver, cmin=cmin,
+                             cmax=cmax, diverged=diverged))
+    return dict(level=level, steps=steps, dt=dt, rows=rows)
+
+
 def _residual(A, b, x):
     """Relative residual ||A x - b|| / ||b|| -- the correctness that a
     fast-but-wrong solver fails."""
@@ -162,13 +216,12 @@ def _solve_with(A, b, solver, device):
 
 def solver_correctness(level=6, device="cuda:0",
                        solvers=("splu", "cudss", "blockch")):
-    """Solve the SAME captured CH saddle with several backends and report the
-    relative residual, iteration count, and difference from the trusted splu
-    solution.  This is the VERIFICATION step: on the 2-D CH saddle every
-    backend (pivoted CPU direct splu, GPU direct cuDSS, and the CH-specific
-    blockch preconditioner) reaches a tiny residual -- correctness is proved,
-    not assumed.  (The point is the habit of checking; a non-pivoting direct
-    solve on an indefinite saddle is a risk you must verify.)"""
+    """Solve ONE captured (poly) CH saddle with several backends and report
+    the relative residual.  THE TRAP: cuDSS's one-iterate residual here is
+    deceptively SMALL (~1e-13) even though the 20-step march with cuDSS
+    DIVERGES (see march_divergence) -- a small residual does not imply a
+    small error on an indefinite, unpivoted system.  This function exists to
+    show the deception; the marched solution is the real test."""
     A, b, dofs, nnz = capture_ch_system(level, device)
     x_ref = spla.splu(A.tocsc()).solve(b)          # trusted
     rows = []
@@ -284,23 +337,25 @@ def recommend_solver(dofs, dim=2, nnz=None, indefinite=True, precision="fp64",
         cudss = cudss_available()
     est_nnz = nnz if nnz is not None else int(dofs * (7 if dim == 2 else 15))
     reasons = []
-    # 0. always VERIFY: a non-pivoting direct solve on an indefinite saddle is
-    # a risk -- check the residual (measured fine in 2-D for splu AND cuDSS)
+    # 0. the indefinite (c,mu) saddle EXCLUDES a non-pivoting GPU direct solve
+    # on the raw block: cuDSS DIVERGES on the polynomial CH saddle (measured
+    # 20-step march blows the field up ~500x; f''<0 in the spinodal band, no
+    # partial pivoting).  splu (pivoted) is safe; blockch splits into SPD
+    # sub-solves.
     if indefinite:
-        reasons.append("indefinite (c,mu) saddle: verify the residual of any "
-                       "non-pivoting direct solve (measured accurate in 2-D "
-                       "for both splu and cuDSS; do not merely assume it)")
-    # 1. small: CPU direct wins (no launch/transfer overhead, pivoted, exact)
+        reasons.append("indefinite (c,mu) saddle: cuDSS DIVERGES on the raw "
+                       "poly CH block (measured; no pivoting) -- exclude it; "
+                       "use pivoted splu (small) or blockch (SPD sub-solves)")
+    # 1. small: CPU direct, PIVOTED -> safe on the saddle
     if dofs < 2e4:
         pick = "splu"
-        reasons.append(f"{dofs:.0f} dofs is small: CPU splu's factorization is "
-                       "cheaper than GPU launch+transfer, and it is pivoted "
-                       "and exact")
+        reasons.append(f"{dofs:.0f} dofs is small: pivoted CPU splu is safe on "
+                       "the indefinite saddle and cheaper than GPU launch")
     elif dim == 2 and dofs < 5e5:
-        pick = "cuDSS (GPU direct; splu if no GPU)"
-        reasons.append("2-D at this size: fill-in is modest, so a GPU direct "
-                       "solve (cuDSS) is fast and -- verified -- accurate; "
-                       "splu is the CPU fallback")
+        pick = "splu (small/mid) or blockch (large 2-D)"
+        reasons.append("2-D at this size: still the indefinite CH saddle, so a "
+                       "PIVOTED direct solve (splu) or the CH-aware blockch "
+                       "preconditioner -- NOT cuDSS on the raw block")
     else:
         # 3-D or large 2-D: MEMORY decides, and the cuDSS factorization
         # ceiling is a MEASURED empirical fact (~8e5 dofs on 48 GB, dev
