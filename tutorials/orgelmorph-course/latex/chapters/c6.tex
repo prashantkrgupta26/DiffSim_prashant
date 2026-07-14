@@ -1,4 +1,293 @@
 \chapter{Nonlinear solver diagnostics}
 \label{ch:c6}
+\begin{keybox}
+\textbf{Key idea.} Every implicit phase-field step is a \emph{nonlinear}
+solve. Whether a run is trustworthy, merely slow, or silent garbage is
+decided inside the Newton loop --- and that loop leaves a readable trail:
+residual and update norms, safeguard activity, a condition number. This
+chapter teaches you to read that trail, to recognize the handful of ways a
+nonlinear solve fails, and to act on each. The failures here are not
+hypothetical: we \emph{run} them and they genuinely fail.
+\end{keybox}
 
-\emph{Under construction (course-v2 Phase 3).}
+\begin{keybox}
+\textbf{Learning objectives.} By the end you can: read a Newton solve's
+residual $\Vert r\Vert$ and update $\Vert\delta x\Vert_\infty$ per iteration
+and recognize quadratic convergence; choose between an absolute, relative, and
+residual stopping test and say when each misleads; explain what the trust
+clamp and the box projection do and see them act; and diagnose the four
+canonical failures --- Newton stagnation, a min-$\Delta t$ wall, an
+ill-conditioned Jacobian, and a diverging start --- from their signatures,
+using the decision tree, and leaving a failure checkpoint behind.\\[2pt]
+\textbf{Prerequisites.} Newton's method and its quadratic convergence; the
+mixed Cahn--Hilliard weak form and its analytic Jacobian
+(Chapter~\ref{ch:c0}); adaptive time stepping and local truncation error
+(Chapter~\ref{ch:c3}); Physics Chapter~\ref{ch:p1} (the brick solved here).
+\\[2pt]
+\textbf{Expected cost.} Any CUDA GPU, 2-D, $<0.5$\,GB device memory; solver
+\texttt{splu} (exact to round-off, so Newton is the only nonlinear knob).
+\texttt{run.py} runs every diagnostic in $\approx$20--30\,s on an RTX~6000 Ada
+(mostly Warp kernel compile + Python start-up); the studies are single- and
+few-step.
+\end{keybox}
+
+This chapter instruments the \emph{production} Cahn--Hilliard Newton solve
+(\file{src/diffsim/physics/cahn\_hilliard.py}, the brick of
+Chapters~\ref{ch:p1} and~\ref{ch:c1}) into a repeatable diagnostic workflow.
+We do not modify the stepper. The per-iteration trajectory it does not log we
+reconstruct through its public API --- re-solving the same step capped at
+$1,2,3,\dots$ Newton iterations and reading its \texttt{last\_newton} record
+and captured system --- which is exact because a Newton solve from a fixed
+state is deterministic.
+
+\section{Anatomy of a healthy Newton solve}
+
+Each Cahn--Hilliard step solves the coupled nonlinear system
+$R(x)=0$ for $x=(c,\mu)$ by Newton's method: assemble the residual $R$ and the
+tangent $J=\partial R/\partial x$, solve $J\,\delta x=-r$ (with $r=R$), update
+$x\leftarrow x+\delta x$, repeat. The single most informative thing you can
+watch is the pair of norms per iteration: the residual $\Vert r\Vert$ (how far
+the equations are from satisfied) and the update $\Vert\delta x\Vert_\infty$
+(how much the solution still moves). With a \emph{correct analytic Jacobian}
+Newton is \textbf{quadratically} convergent: near the root the residual is
+roughly squared each step. On a gentle poly quench we measure
+%
+\begin{center}\small
+\begin{tabular}{cccc}
+\toprule
+iteration & $\Vert r\Vert$ & $\Vert\delta x\Vert_\infty$ & behaviour \\
+\midrule
+1 & \CsixHealthyResZero & $3.1\times10^{-3}$ & first step \\
+2 & $2.0\times10^{-8}$ & $1.2\times10^{-6}$ & residual squared \\
+3 & \CsixHealthyResEnd & $1.6\times10^{-15}$ & at round-off \\
+\bottomrule
+\end{tabular}
+\end{center}
+%
+Three iterations, the residual falling from \CsixHealthyResZero\ to
+\CsixHealthyResEnd\ (Fig.~\ref{fig:c6newton}, green). That squaring is the
+fingerprint of a correct tangent; if you see \emph{linear} convergence instead,
+suspect the Jacobian (Chapter~\ref{ch:c0} shows how a missing Jacobian term
+degrades exactly this curve). This is also the honest way to separate
+\emph{algebraic} error (an unconverged Newton solve) from \emph{discretization}
+error (Chapter~\ref{ch:c1}): only once $\Vert r\Vert$ is at tolerance is the
+step's error purely the discretization's.
+
+\section{When have you converged? Three stopping tests}
+
+``Converged'' is a choice, not a fact. Three tests are in common use, all at
+the same tolerance $\tau$:
+\begin{itemize}[nosep]
+  \item \textbf{residual} $\Vert r\Vert<\tau$: the equations are nearly
+        satisfied --- the most physical test, but its scale is the residual's,
+        not the solution's;
+  \item \textbf{absolute update} $\Vert\delta x\Vert_\infty<\tau$: the iterate
+        has stopped moving --- what the stepper actually uses;
+  \item \textbf{relative update} $\Vert\delta x\Vert_\infty/\Vert x\Vert<\tau$:
+        the iterate has stopped moving \emph{relative to its own size}.
+\end{itemize}
+On this well-scaled problem, where $c$ and $\mu$ are $O(1)$, all three fire at
+the same iteration~\CsixHealthyIters. They part company the moment the field
+is rescaled: multiply the solution by $10^{-3}$ (a change of units, not of
+physics) and the \emph{absolute} update test now trips $10^3\times$ sooner ---
+it is blind to scale. The lesson: an absolute update tolerance is a statement
+about your units; prefer a residual or a relative test, or verify that your
+fields are $O(1)$ before trusting an absolute one.
+
+\begin{figure}[h]\centering
+  \includegraphics[width=\linewidth]{figures/c6_newton.png}
+  \caption{Anatomy of a Newton solve. \emph{Left:} residual norm per
+    iteration --- a healthy poly step (green) squares its residual each step to
+    round-off in \CsixHealthyIters\ iterations; a stagnating step (red) only
+    crawls down linearly. \emph{Right:} update norm --- the healthy step's
+    update collapses, while the stagnating step's update is pinned at the trust
+    clamp $|\delta c|=2$ (\texttt{x} marks) every iteration, the signature of a
+    diverging direction.}
+  \label{fig:c6newton}
+\end{figure}
+
+\section{Safeguards: what keeps a hard step alive}
+
+A raw Newton step off a bad iterate can be enormous or unphysical. The
+production stepper carries two safeguards, and a diagnostic run should confirm
+they are working rather than assume it.
+
+\paragraph{Trust clamp.} A composition increment beyond $2$ units is always a
+diverging transient (poly's physical range is $[-1,1]$, Flory--Huggins' is
+$(0,1)$). When $\max|\delta c|>2$ the stepper rescales the \emph{whole} update
+to preserve its direction while capping its length. Unclamped, a quench-onset
+step at large $\Delta t$ drives $|c|\sim37$, where $f''=3c^2-1\approx4100$
+poisons any linear solve.
+
+\paragraph{Box projection (Flory--Huggins).} The FH bulk energy
+$f(c)=A[c\ln c+(1-c)\ln(1-c)]+Bc(1-c)$ has $f''(c)\sim A/c$ near the wall
+$c\to0$; the kernel regularizes the logarithm with a cap $1/\varepsilon=10^4$.
+To keep early Newton iterates off that cap, each iterate is clipped into
+$[10^{-3},1-10^{-3}]$, and the stepper records how many dofs it moved and by
+how much. On a deep FH quench ($B=8$) the projection moves \CsixSafeProjDofs\
+dofs (largest correction \CsixSafeProjMax) and the step still converges ---
+exactly the intended behaviour: the safeguard absorbs the overshoot instead of
+letting it detonate the solve.
+
+\section{Four ways a nonlinear solve fails}
+
+An honest workflow rehearses its failures. Each case below is \emph{run} and
+genuinely fails; the skill is reading the signature and taking the right
+action (Fig.~\ref{fig:c6decision}).
+
+\paragraph{1. Newton stagnation (the step size is too large).} Take a deep poly
+quench --- a high-amplitude random field --- at $\Delta t=\CsixStagDt$. The raw
+Newton direction diverges, so the trust clamp fires on \emph{every} iteration
+(clamp fraction \CsixStagClampFrac); the residual crawls down only linearly and
+after the stepper's full budget of \CsixStagIters\ iterations is still
+\CsixStagResFinal, many orders from tolerance (Fig.~\ref{fig:c6newton}, red).
+The trap is that it \emph{looks} like slow progress. The fix is not more
+iterations --- it is a smaller step: the identical quench at
+$\Delta t=\CsixStagFixedDt$ converges in \CsixStagFixedIters\ iterations. A
+persistently clamped update with sub-quadratic residual decay means ``reduce
+$\Delta t$,'' full stop.
+
+\paragraph{2. The min-$\Delta t$ wall.} An adaptive integrator shrinks
+$\Delta t$ until its local-truncation-error (LTE) estimate meets a tolerance
+(Chapter~\ref{ch:c3}). Ask for an LTE tolerance it cannot reach and set the
+floor $\Delta t_{\min}$ too high, and the controller is trapped: every step is
+a forced accept at the floor. We drive \CsixMindtSteps\ steps, all at
+$\Delta t_{\min}$, and measure the LTE \emph{at the floor} directly ---
+$\CsixMindtLte$, far above the requested tolerance \CsixMindtTol. The
+signature (constant $\Delta t=\Delta t_{\min}$ with LTE $>$ tol) says the
+controller has run out of room: loosen the LTE tolerance, or accept ---
+knowingly --- the floor's accuracy. Silently ``succeeding'' at the floor is the
+failure to avoid.
+
+\paragraph{3. An ill-conditioned Jacobian.} As a Flory--Huggins state
+approaches the wall, $f''(c)\sim A/c$ climbs toward the $1/\varepsilon$ cap and
+the tangent's condition number climbs with it. Freezing a uniform state at each
+mean composition and forming its Jacobian, the exact 2-norm condition number
+rises from \CsixCondBulk\ at $c=0.5$ to \CsixCondWall\ at $c=0.003$ ---
+$\CsixCondRatio\times$ worse (Fig.~\ref{fig:c6conditioning}). An ill-conditioned
+tangent starves an iterative linear solver and erodes accuracy in a direct one;
+the cure is upstream --- keep iterates off the wall (the projection above), or
+precondition. This is why the projection is not cosmetic.
+
+\paragraph{4. A diverging start (wrong Jacobian or bad initial guess).} If
+convergence is linear from the very first step, or the residual grows, suspect
+the tangent itself or an inadmissible initial condition. Verify the Jacobian
+against a finite difference (Chapter~\ref{ch:c0}'s red$\to$green gate) and seed
+a physical initial state. This case is diagnosed, not with a number, but by
+ruling the others out.
+
+\begin{figure}[h]\centering
+  \includegraphics[width=0.92\linewidth]{figures/c6_decision.png}
+  \caption{The nonlinear-failure decision tree: from the symptom you can see
+    (residual/update/$\Delta t$/condition), to the diagnosis, to the action ---
+    and always a failure checkpoint. A stalled residual with a clamped update
+    means reduce $\Delta t$; $\Delta t$ stuck at the floor means the LTE
+    tolerance is unreachable; a huge condition number means the state is at the
+    wall; divergence from step~1 means the Jacobian or the initial guess.}
+  \label{fig:c6decision}
+\end{figure}
+
+\begin{figure}[h]\centering
+  \includegraphics[width=0.72\linewidth]{figures/c6_conditioning.png}
+  \caption{Ill-conditioning near the wall. As the Flory--Huggins state
+    approaches $c=0$, $|f''(c)|$ (orange) grows toward the regularization cap
+    and the Jacobian condition number (blue) climbs $\CsixCondRatio\times$ from
+    bulk to wall. Keeping Newton iterates off the wall keeps the tangent
+    solvable.}
+  \label{fig:c6conditioning}
+\end{figure}
+
+\section{Never drop a failed step: checkpoints}
+
+A production campaign must never silently discard a step that failed to
+converge --- that is how a bad result masquerades as a good one. When the
+stagnation case fails, the run writes a \textbf{failure checkpoint} to
+\file{checkpoints/stagnation\_step.npz}: the initial and last Newton states,
+the full residual/update history, the convergence flag, and the exact config
+to reproduce it. A post-mortem then starts from data, not from a re-run that
+may not reproduce.
+
+\begin{runbox}
+\textbf{Run it.}
+\begin{lstlisting}
+cd computational/06_nonlinear_diagnostics
+python run.py --config configs/c6.yaml --device cuda:0 \
+    --solver splu --output outputs/c6 --overwrite --mode reference
+python gen_figures.py --run-dir outputs/c6
+\end{lstlisting}
+It runs the healthy anatomy, the stopping-criterion comparison, the safeguard
+report, and the four failures, prints nine \texttt{PASS/FAIL} gates (several of
+which \emph{assert a failure} --- the stagnation solve must not converge, the
+controller must stay pinned), writes a failure checkpoint, and checks
+\file{baseline.yaml}. Compare with \file{EXPECTED.md}.
+\end{runbox}
+
+\begin{keybox}
+\textbf{Measured self-check} (reproduce to a couple of significant figures; the
+\emph{behaviours} are the load-bearing quantities).
+\begin{center}\small
+\begin{tabular}{lcl}
+\toprule
+case & measured & signature \\
+\midrule
+healthy poly & \CsixHealthyIters\ iters, res $\to$ \CsixHealthyResEnd & quadratic \\
+stagnation & \emph{not converged}, clamp \CsixStagClampFrac & reduce $\Delta t$ \\
+\;\;$\hookrightarrow$ fixed & \CsixStagFixedIters\ iters at $\Delta t=\CsixStagFixedDt$ & smaller step converges \\
+FH safeguards & \CsixSafeProjDofs\ dofs projected, converged & overshoot absorbed \\
+min-$\Delta t$ & \CsixMindtSteps\ steps at floor, LTE $\CsixMindtLte$ & tol unreachable \\
+ill-conditioned & cond $\CsixCondBulk\!\to\!\CsixCondWall$ & wall blow-up \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{keybox}
+
+\section{Code walk-through}
+
+The diagnostics live in \file{diagnostics\_ch.py}; they drive the production
+stepper unchanged.
+
+\paragraph{1. Reconstruct the per-iteration trajectory.}
+\begin{lstlisting}
+for k in range(1, kmax+1):                  # cap Newton at k iterations
+    st = CahnHilliardStepper(..., newton_max=k, capture_system=True)
+    st.set_initial(ic, mu_init="consistent"); st.step()
+    A, r = st.last_system                    # the k-th assembled system
+    res.append(norm(r)); dx.append(st.last_newton["dx_inf"])
+\end{lstlisting}
+Deterministic, so the $k$-th entry is exactly the $k$-th internal iterate --- no
+stepper edits needed.
+
+\paragraph{2. Detect the safeguards.} A clamped iteration is
+$|\,\Vert\delta x\Vert_\infty-2\,|<10^{-9}$; the projection exposes
+\texttt{st.proj\_dofs} and \texttt{st.proj\_max} directly.
+
+\paragraph{3. Measure the min-$\Delta t$ LTE.} One $\Delta t_{\min}$ step versus
+two $\Delta t_{\min}/2$ steps from the same state gives the step-doubling LTE
+(Chapter~\ref{ch:c3}); at the floor it exceeds the requested tolerance.
+
+\section{Explore on your own}
+
+\question{Reproduce the stagnation case, then bisect $\Delta t$ between
+\CsixStagDt\ and \CsixStagFixedDt\ to find the largest step that still
+converges within the \CsixStagIters-iteration budget. How does that critical
+$\Delta t$ scale if you halve the mesh size $h$?}
+
+\question{The absolute update test tripped $10^3\times$ early when the field
+was rescaled by $10^{-3}$. Implement a relative-residual test
+$\Vert r\Vert/\Vert r_0\Vert<\tau$ and show it is invariant to that rescaling.
+Which test would you make the default, and why?}
+
+\question{Push the Flory--Huggins conditioning sweep to $c=10^{-4}$ (closer to
+the wall). Does cond$(J)$ keep climbing, or does the $1/\varepsilon$ cap flatten
+it? Relate the plateau to the regularization constant $\varepsilon=10^{-4}$.}
+
+\question{Turn the stagnation failure into a \emph{line search}: after the
+clamp, backtrack the step ($\delta x\leftarrow\alpha\,\delta x$, halving
+$\alpha$ until the residual decreases). Does the deep quench now converge at
+$\Delta t=\CsixStagDt$? What does that cost in iterations versus simply
+reducing $\Delta t$?}
+
+\question{Open the failure checkpoint \file{checkpoints/stagnation\_step.npz}
+and plot \texttt{c\_last}. Where on the domain is the unconverged residual
+largest --- and does that location coincide with the sharpest composition
+gradient?}

@@ -1,0 +1,21 @@
+# C6 — nonlinear-solver diagnostics (canonical run record).
+# The mixed Cahn-Hilliard Newton solve, instrumented into a diagnostic
+# workflow. All studies are single- or few-step, so quick and reference share
+# one small mesh; research widens the trajectory + conditioning sweep.
+level: 4
+kmax: 6
+healthy_dt: 1.0e-3
+stag_dt: 5.0e-2
+stag_fixed_dt: 2.0e-3
+newton_max: 15
+fh_B: 6.0
+safe_fh_B: 8.0
+precision: fp64
+
+modes:
+  quick:
+    kmax: 6
+  reference:
+    kmax: 6
+  research:
+    kmax: 8

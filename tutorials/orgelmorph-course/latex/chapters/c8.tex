@@ -1,4 +1,243 @@
 \chapter{Extending DiffSim safely}
 \label{ch:c8}
+\begin{keybox}
+\textbf{Key idea.} The bridge from \emph{using} a solver to \emph{contributing}
+to one is a discipline, not a leap. Adding a new physics term is easy; adding
+it \emph{safely} --- so the next person can trust it --- means carrying it
+through a fixed sequence of gates: equations and units, a config knob, the
+residual, the \emph{analytic} Jacobian, a finite-difference check, a
+limiting-case check, a convergence study, the conservation and energy
+invariants, a profile, and documentation. This chapter walks that entire
+sequence on one small real term, and every gate is \emph{run} and passes.
+\end{keybox}
 
-\emph{Under construction (course-v2 Phase 3).}
+\begin{keybox}
+\textbf{Learning objectives.} By the end you can: add a new free-energy term to
+a Cahn--Hilliard model with correct units; write its residual and its
+\emph{analytic} tangent contribution; verify that tangent against a finite
+difference; prove the extension reduces to the base model in the limiting case;
+confirm the discretization still converges at the theoretical order; check that
+mass and energy invariants still hold; profile the new term's cost; and write
+the docs a reviewer needs. In short: turn a good idea into a contribution
+someone else can build on.\\[2pt]
+\textbf{Prerequisites.} The weak form $\to$ CUDA pipeline and the
+red$\to$green Jacobian gate (Chapter~\ref{ch:c0}); convergence and MMS
+(Chapter~\ref{ch:c1}); nonlinear diagnostics (Chapter~\ref{ch:c6}); profiling
+(Chapter~\ref{ch:c7}); the Cahn--Hilliard energy (Physics
+Chapter~\ref{ch:p1}).\\[2pt]
+\textbf{Expected cost.} No GPU required --- the worked reference is a
+transparent readable-NumPy solver on the diffsim mesh infrastructure (exactly
+as Chapter~\ref{ch:c0}), so every stage is visible and cheap. \texttt{run.py}
+and the \texttt{pytest} battery each finish in a few seconds on a laptop.
+\end{keybox}
+
+This chapter extends Chapter~\ref{ch:c0}'s hands-on (add a Jacobian term to a
+scalar problem) to a \emph{full} contribution on a conserved, mixed system. The
+worked reference lives in \file{sextic\_ch.py} (the solver) and
+\file{test\_sextic\_ch.py} (its gate); \file{run.py} walks the whole workflow
+and prints a \texttt{PASS/FAIL} for each stage (Fig.~\ref{fig:c8workflow}).
+
+\section{Step 1 --- the term, its equations, and its units}
+
+The base Cahn--Hilliard bulk energy is the quartic double well
+$f_0(c)=\tfrac14(c^2-1)^2$. We add a sixth-order Landau term --- a higher-order
+stabilizer that steepens the well and bounds deep quenches:
+%
+\begin{equation}
+  f(c) = \tfrac14(c^2-1)^2 + \frac{\beta}{6}\,c^6 ,\qquad
+  f'(c) = c^3 - c + \beta\,c^5 ,\qquad
+  f''(c) = 3c^2 - 1 + 5\beta\,c^4 .
+\end{equation}
+%
+The new coefficient $\beta$ is dimensionless (energy-scaled), and
+$\beta=0$ recovers the base model \emph{exactly} --- the limiting case we will
+test. Only two derived quantities matter downstream: $f'(c)$, which enters the
+chemical-potential residual, and $f''(c)$, which enters the Jacobian. Getting
+the analytic $f''$ contribution $5\beta c^4$ right is the crux of the
+contribution.
+
+\section{Step 2 --- a config knob}
+
+A new physical parameter is a new config field, validated and defaulted through
+the course schema (Chapter~00's harness), never a hard-coded constant:
+\begin{lstlisting}
+"beta": Field(float, default=0.5, min=0.0),   # sixth-order Landau coefficient
+\end{lstlisting}
+The resolved value is written to \file{config.resolved.yaml}, so every run
+records exactly which $\beta$ produced it.
+
+\section{Steps 3--4 --- residual and \emph{analytic} Jacobian}
+
+The mixed backward-Euler weak form is $R_c=0,\;R_\mu=0$ with
+%
+\begin{align}
+  R_c   &= \intv w\,\frac{c-c^{\,n}}{\Delta t}\dV
+         + M\!\intv \grad w\cdot\grad\mu\dV, \\
+  R_\mu &= \intv q\,\mu\dV - \intv q\,f'(c)\dV
+         - \kappa\!\intv \grad q\cdot\grad c\dV .
+\end{align}
+%
+The new term rides in through $f'(c)$: the only nonlinear assembly,
+$\int N_a f'(c)$, gains $\beta c^5$. Newton then needs the tangent
+$J=\partial R/\partial x$, whose four blocks per node are
+%
+\begin{equation}
+  J_{cc}=\frac{M_e}{\Delta t},\quad
+  J_{c\mu}=M\,K_e,\quad
+  J_{\mu c}=-M_e^{f''}-\kappa K_e,\quad
+  J_{\mu\mu}=M_e ,
+\end{equation}
+%
+with $M_e$ the mass and $K_e$ the stiffness element matrices and
+$M_e^{f''}=\intv N_a\,f''(c)\,N_b\dV$ the $f''$-weighted mass matrix. The new
+term enters exactly one block, $J_{\mu c}$, through
+$f''(c)=3c^2-1+5\beta c^4$. This is the single most error-prone line in any
+contribution --- so we never trust it by eye.
+
+\section{Steps 5--6 --- verify the derivative, and the limiting case}
+
+\paragraph{Finite-difference check.} The analytic tangent must match a finite
+difference of the residual, $J\,v\approx[R(x+\varepsilon v)-R(x)]/\varepsilon$.
+On a random admissible state the relative error is \CeightJacFd\ (and
+\CeightJacFdBase\ at $\beta=0$) --- limited only by finite-difference
+truncation, the signature of a \emph{correct} tangent (a wrong $f''$ would sit
+at $O(1)$, exactly Chapter~\ref{ch:c0}'s red$\to$green contrast). The new term's
+own derivatives check too: $f_6'=\beta c^5$ and $f_6''=5\beta c^4$ agree with a
+finite difference to \CeightTermFp\ and \CeightTermFpp.
+
+\paragraph{Limiting case.} A safe extension must \emph{not} change the base
+model where it shouldn't. At $\beta=0$ the new-term value, first, and second
+derivatives vanish identically and $f',f''$ reduce to $c^3-c$ and $3c^2-1$ --- so
+the extended solver reproduces the base double well bit-for-bit. This guards
+against the classic regression: a ``harmless'' addition that quietly perturbs
+existing results.
+
+\section{Step 7 --- convergence still holds}
+
+Adding a term must not break the discretization's order of accuracy. Using a
+steady manufactured solution with the term active (Chapter~\ref{ch:c1}'s method:
+manufacture $c^\ast,\mu^\ast$, add the residual they leave as sources, pin them
+on the boundary), the $L^2$ error of $c$ falls from \CeightMmsCoarse\ to
+\CeightMmsFine\ over three mesh levels at observed order \CeightMmsOrder\ ---
+the theoretical $p{+}1=2$ for linear elements (Fig.~\ref{fig:c8verify}, left).
+The manufactured source carries the new $\beta c^5$ term, so this is a genuine
+test of the extended residual, not the base one.
+
+\section{Step 8 --- conservation and energy still hold}
+
+The two physical invariants of Cahn--Hilliard must survive the change. A
+no-flux march conserves the quadrature mass $\int c\dV$ to \CeightMassDrift\
+(relative) --- Model-B transport moves material, never creates it. And the
+Ginzburg--Landau energy $F=\int[f(c)+\tfrac{\kappa}{2}|\grad c|^2]\dV$ decreases
+monotonically, \CeightEnergyStart\ $\to$ \CeightEnergyEnd, with largest positive
+step increment \CeightEnergyInc\ --- the discrete Lyapunov property intact
+(Fig.~\ref{fig:c8verify}, middle). A term that broke either invariant would be
+physically wrong no matter how well it converged.
+
+\begin{figure}[h]\centering
+  \includegraphics[width=\linewidth]{figures/c8_verify.png}
+  \caption{The new term, verified. \emph{Left:} steady-MMS convergence at
+    order \CeightMmsOrder\ (the predicted $h^2$) with the term active.
+    \emph{Middle:} a no-flux march --- the energy $F$ decreases monotonically
+    while the mass drift stays at round-off (\CeightMassDrift). \emph{Right:}
+    the new term steepens the free-energy well, the physical effect it was added
+    for.}
+  \label{fig:c8verify}
+\end{figure}
+
+\section{Step 9 --- profile the cost}
+
+A contribution should know its own cost (Chapter~\ref{ch:c7}). Timed with
+CUDA-synchronized stage timers, the new term adds only a fifth power evaluation
+to the residual and a fourth power to the Jacobian --- its assembly overhead is
+negligible, within timing noise of the base assembly. The term buys a real
+physical effect (a steeper well, bounded deep quenches;
+Fig.~\ref{fig:c8verify}, right) for essentially no cost.
+
+\section{Step 10 --- documentation and changelog}
+
+The last gate is the one that makes the work \emph{reusable}: docstrings stating
+the equations and units, the schema field, an \file{EXPECTED.md} of the passing
+gates, and a \file{CHANGELOG.md} entry naming the term, its parameter, and the
+tests that cover it. An undocumented correct term is a landmine for the next
+contributor.
+
+\begin{figure}[h]\centering
+  \includegraphics[width=0.82\linewidth]{figures/c8_workflow.png}
+  \caption{The contributor workflow, end to end: from equations and units to
+    docs, each stage a gate the worked sextic term passes. Steps 5--9 (green)
+    are the verification core --- the finite-difference tangent check, the
+    limiting case, the convergence study, the conservation/energy invariants,
+    and the profile.}
+  \label{fig:c8workflow}
+\end{figure}
+
+\begin{runbox}
+\textbf{Run it.}
+\begin{lstlisting}
+cd computational/08_extending_diffsim
+python run.py --config configs/c8.yaml --device cpu \
+    --solver splu --output outputs/c8 --overwrite --mode reference
+python -m pytest -q test_sextic_ch.py      # the contributor's gate
+python gen_figures.py --run-dir outputs/c8
+\end{lstlisting}
+\texttt{run.py} walks all ten steps and prints eight \texttt{PASS/FAIL} gates;
+\texttt{pytest} runs the \CeightTests-check battery
+(\file{test\_sextic\_ch.py}); results are checked against \file{baseline.yaml}.
+Compare with \file{EXPECTED.md}.
+\end{runbox}
+
+\begin{keybox}
+\textbf{Measured self-check} (deterministic on CPU; the FD-consistency and
+order are the load-bearing quantities).
+\begin{center}\small
+\begin{tabular}{lcl}
+\toprule
+gate & measured & meaning \\
+\midrule
+new-term $f',f''$ vs FD & \CeightTermFp\ / \CeightTermFpp & term derivatives correct \\
+analytic Jacobian vs FD & \CeightJacFd & tangent correct \\
+limiting case $\beta{\to}0$ & exact & no regression \\
+MMS order & \CeightMmsOrder & convergence intact ($p{+}1$) \\
+mass drift (rel) & \CeightMassDrift & conserved \\
+energy start $\to$ end & \CeightEnergyStart$\to$\CeightEnergyEnd & Lyapunov \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{keybox}
+
+\section{Code walk-through}
+
+\paragraph{The new term, isolated.} \file{sextic\_ch.py} keeps the term as three
+one-liners so the derivative test targets it directly:
+\begin{lstlisting}
+def sextic_term(c, beta):
+    return dict(f=(beta/6)*c**6, fp=beta*c**5, fpp=5*beta*c**4)
+\end{lstlisting}
+
+\paragraph{Where it enters.} The residual gains $\beta c^5$ in one place
+(\texttt{fprime}), the Jacobian gains $5\beta c^4$ in one block
+(\texttt{fdoubleprime} inside $J_{\mu c}$). Every other line is the base model
+--- the smallest possible diff is the safest.
+
+\section{Explore on your own}
+
+\question{Add a \emph{different} term --- a cubic tilt $\tfrac{\gamma}{3}c^3$
+(which breaks the well's symmetry). Write $f',f''$, add them, and run the full
+gate. Which invariant is most sensitive to getting the tilt's Jacobian wrong?}
+
+\question{Deliberately break the tangent: drop the $5\beta c^4$ from
+\texttt{fdoubleprime}. Which gates fail, and which still pass? Explain why the
+MMS study can still look plausible while the FD check screams.}
+
+\question{Make $\beta$ a \emph{field} $\beta(\mathbf x)$ (spatially varying).
+What changes in the residual, the Jacobian, and the units? Re-run the FD check.}
+
+\question{Push $\beta$ to $2$ and re-quench from a large-amplitude state. Does
+the steeper well keep $|c|$ more tightly bounded than the base model? Relate the
+bound to the balance $c^3\sim\beta c^5$.}
+
+\question{Port the term to the production Warp kernel
+(\file{cahn\_hilliard.py}: \texttt{make\_ch\_newton}). What must you add for the
+device path that the transparent NumPy reference did not need, and how would you
+re-run this exact gate against the device implementation?}

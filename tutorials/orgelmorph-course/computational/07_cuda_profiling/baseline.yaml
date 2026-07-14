@@ -1,0 +1,20 @@
+# C7 baseline — profiling INVARIANTS, not absolute timings.
+# Wall times and bandwidths vary by card/BLAS/PCIe; these gates check the
+# qualitative facts a profile must reveal, with wide bounds.
+checks:
+  # a complete step was timed and Newton behaved
+  step_ms:              {min: 1.0}
+  newton_iters:         {min: 1, max: 20}
+  # device memory bandwidth dwarfs the host<->device PCIe link
+  bw_ratio:             {min: 10.0}
+  # the streaming triad is memory-bound
+  device_ai:            {max: 0.5}
+  # a sparse-LU factorisation costs far more than a triangular solve
+  factor_over_solve:    {min: 5.0}
+  # per-step device->host copy volume is measured (dense element Jacobians)
+  d2h_per_step_mb:      {min: 1.0}
+  # the device-memory footprint is measured
+  footprint_mb:         {min: 1.0}
+  # kernel-launch overhead is in a sane microsecond range
+  launch_us:            {min: 0.1, max: 1000.0}
+  all_gates_pass:       {equals: true}
