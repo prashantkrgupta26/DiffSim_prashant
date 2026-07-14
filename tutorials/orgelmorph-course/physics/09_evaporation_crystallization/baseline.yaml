@@ -1,0 +1,15 @@
+# P9 evaporation-conditioned embryo growth -- scientific invariants
+# (tolerance-based, NOT bit-identical).  Level 5 (32x32), cuDSS.
+checks:
+  # DERIVED solubility validated by the embryo composition sweep: the
+  # crossover is bracketed and lies below the homogeneous phi* (a
+  # supercritical embryo self-enriches, so phi* is an upper bound).
+  solubility.crossover_bracketed:     {equals: true}
+  solubility.crossover_below_derived: {equals: true}
+  # sub/supercritical embryo control (Gibbs-Thomson floor)
+  embryo_control.super_grew: {equals: true}    # large embryo grows above phi*
+  embryo_control.sub_grew:   {equals: false}   # small embryo redissolves
+  # the evaporation-conditioned arc: wet dissolves, dry grows
+  arc.wet_area: {max: 0.15}     # wet-implant embryo dissolves
+  arc.dry_area: {min: 0.30}     # dry-implant embryo grows to a film
+  arc.dry_psi_max: {min: 0.8}   # terminal crystallinity near 1

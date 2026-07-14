@@ -1,47 +1,57 @@
 # P9 — expected results (self-check)
 
-Running `python run.py` (defaults: 64×64, M=2/K=1 film mode, r14 with the
-crystal-contact solubility, fixed seed) implants the same crystal seeds
-in the film either early (wet) or mid-drying, and reports the drying
-state at implant and the terminal crystalline area for each.
+Running `python run.py` (defaults: **level 5 = 32×32**, M=2/K=1 film mode,
+r14 with the crystal-contact solubility, χ_ca = 1.6) derives the r14
+solubility, validates it by an embryo composition sweep, runs the
+sub/supercritical embryo control, and runs the evaporation-conditioned
+arc; then checks `outputs/results.json` against `baseline.yaml`.
 
-Measured (32×32, level 5, k_e = 0.1, fixed seed):
+Representative measured values (level 5, cuDSS):
 
-| quantity | wet implant | dry implant |
-|---|---|---|
-| φ_s at implant | 0.836 | 0.633 |
-| crystalline area: start → end | 0.312 → 0.000 | 0.312 → 1.000 |
-| ψ_max (terminal) | 0.00 | 0.99 |
+| quantity | value |
+|---|---|
+| derived **homogeneous** solubility φ\* = 1 − \|drive\|/χ_ca (drive −0.527, χ_ca 1.6) | 0.671 |
+| embryo composition-sweep crossover (supercritical embryo) | bracketed, **below** φ\* |
+| supercritical embryo (r₀ = 0.20, φ_f = 0.85) | grows |
+| subcritical embryo (r₀ = 0.05, φ_f = 0.85) | dissolves (Gibbs–Thomson) |
+| WET implant: φ_s at implant / terminal area / ψ_max | ~0.84 / ~0 / ~0 |
+| DRY implant: φ_s at implant / terminal area / ψ_max | ~0.63 / ~1.0 / ~0.99 |
 
-The wet seed **dissolves completely** (area → 0, ψ_max → 0); the same
-seed implanted mid-drying **grows to a fully crystalline film**
-(area → 1, ψ_max → 0.99). The fate is set entirely by the solvent
-fraction at implant.
+**What must be true regardless of hardware** (the `baseline.yaml`
+invariants):
 
-**What must be true regardless of hardware:**
+- **The solubility φ\* is DERIVED from the free energy, then VALIDATED.**
+  Comparing the r14 homogeneous free energy at ψ = 1 vs ψ = 0 at fixed
+  composition gives φ\* = 1 − \|drive\|/χ_ca: below it the crystal-contact
+  penalty beats the undercooling drive and an embryo redissolves; above it
+  it grows. The embryo composition sweep (implant into uniform blends of
+  varying φ_f, **no drying**) locates the grow/dissolve crossover.
+  **Honest finding:** φ\* is the *homogeneous* solubility; a supercritical
+  embryo self-enriches φ_f in its neighbourhood (the P7 crystal-bulk
+  channel), so its *effective* growth threshold sits **below** φ\* — the
+  derivation is an **upper bound**, and the measured crossover confirms a
+  composition threshold exists while lying below φ\*.
+- **These runs IMPLANT an embryo — they do not spontaneously nucleate.**
+  This is *evaporation-conditioned embryo growth*, not nucleation.
+  (Genuine FDT nucleation is the advanced `make_stepper(noise_psi=...)`
+  mode, cross-referencing P8.)
+- **Seeding has a Gibbs–Thomson floor.** At the same super-solubility
+  composition a large embryo (r₀ = 0.20) grows but a small one
+  (r₀ = 0.05) redissolves — the critical radius, not just the composition.
+- **Wet dissolves, dry grows.** The same embryo implanted in the wet film
+  (local φ_f below φ\*) dissolves; implanted mid-drying (drying has raised
+  φ_f above φ\*) it grows to a crystalline film. The fate is set by the
+  drying-**conditioned local composition** relative to φ\* — *not by time
+  or evaporation per se*, which is exactly what the no-drying composition
+  sweep isolates.
+- **Termination is reported honestly.** A stop at the time horizon is a
+  `time_horizon` stop, **not** a "drying time"; other statuses are
+  `solvent_target` (dryness), `height_floor`, `min_dt` (stiffness), and
+  `step_budget`.
 
-- **Seeds implanted in the wet film dissolve.** In the solvent-rich film
-  the crystallizable species sits below the r14 solubility φ\*, so the
-  crystal-contact penalty beats the undercooling and the seed
-  redissolves (terminal crystalline area ≈ 0, ψ_max small).
-- **Seeds implanted mid-drying grow.** Once drying has concentrated the
-  species above φ\*, and continuing solvent loss keeps deepening the
-  quench, the same seed grows to a crystalline film (terminal area large,
-  ψ_max near 1).
-- **Crystallization strictly follows solvent loss.** The φ_s at the two
-  implant times differ (wet ≫ dry); the fate is set entirely by *when*
-  the seed is introduced relative to the drying — the evaporation-induced
-  ordering.
-- **Seeding has margin.** The implant radius clears the Gibbs–Thomson
-  critical radius and the amplitude is ≈0.95; a sub-critical embryo
-  (too small, or half-amplitude) redissolves even mid-drying. Read the
-  **terminal** state, not a mid-growth transient.
-
-**Recorded simplification.** This tutorial uses a constant Onsager
-mobility (with the cuDSS solver) instead of the production Vignes
-composition-singular mobility of `tests/test_multiphase_s3.py`; the
-qualitative arc (dissolve-when-wet vs grow-when-dry) is unchanged, the
-drying-front sharpness is softened.
-
-If a mid-drying seed dissolves, increase the implant radius/amplitude or
-the implant time; if a wet seed grows, the solubility (χ_ca) is too low.
+**Recorded simplification.** Constant Onsager mobility with cuDSS instead
+of the production Vignes composition-singular mobility
+(`tests/test_multiphase_s3.py`); the qualitative arc is unchanged, the
+drying-front sharpness is softened. Read the **terminal** state, not a
+mid-growth transient. Third-significant-figure differences from a different
+card are normal.

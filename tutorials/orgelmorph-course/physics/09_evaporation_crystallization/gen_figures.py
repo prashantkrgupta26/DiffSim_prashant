@@ -2,7 +2,10 @@
 
     python gen_figures.py --device cuda:0
 
-Writes ../../latex/figures/p9_*.png and ../../latex/numbers/p9.tex.
+Writes ../../latex/figures/p9_*.png and ../../latex/numbers/p9.tex from
+REAL runs.  Figures:
+  p9_arc.png         the dry-implant arc (fields + drying/area curves)
+  p9_wet_vs_dry.png  wet-implant vs dry-implant + the solubility validation
 """
 import argparse
 import os
@@ -12,19 +15,21 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from arc import build_mesh_dm, run_arc
+import arc as A
+from arc import (build_mesh_dm, run_arc, embryo_composition_sweep)
 
 FIGDIR = os.path.join(os.path.dirname(__file__), "..", "..", "latex",
                       "figures")
 NUMTEX = os.path.join(os.path.dirname(__file__), "..", "..", "latex",
                       "numbers", "p9.tex")
+CHI_CA = 1.6
 
 
 def fig_arc(dry, fname):
     """The stage strip (wet -> implant -> final) plus the drying/area
     histories, for the growing (dry-implant) run."""
     stages = [("wet film", dry["snaps"]["wet"]),
-              ("seed implant", dry["snaps"]["implant"]),
+              ("embryo implant", dry["snaps"]["implant"]),
               ("crystalline film", dry["snaps"]["final"])]
     fig, axes = plt.subplots(2, 3, figsize=(12.0, 7.4), dpi=150)
     for ax, (title, (gf, gpsi, h)) in zip(axes[0], stages):
@@ -41,15 +46,15 @@ def fig_arc(dry, fname):
     ax = axes[1, 1]
     ax.plot(dry["t"], dry["area"], "C3-", lw=2)
     ax.set_xlabel("time $t$"); ax.set_ylabel("crystalline area")
-    ax.set_title("crystallization"); ax.grid(alpha=0.3)
+    ax.set_title("embryo growth"); ax.grid(alpha=0.3)
     ax = axes[1, 2]
     gf, gpsi, h = dry["snaps"]["final"]
     im2 = ax.imshow(gpsi.T, origin="lower", cmap="magma", vmin=0, vmax=1)
     ax.set_title("final crystallinity $\\psi$", fontsize=11)
     ax.set_xticks([]); ax.set_yticks([])
     fig.colorbar(im2, ax=ax, fraction=0.046, pad=0.04)
-    fig.suptitle("The evaporation-induced crystallization arc: wet film "
-                 "-> phase separation -> nucleation -> crystalline film",
+    fig.suptitle("Evaporation-conditioned embryo growth: wet film -> phase "
+                 "separation -> embryo growth -> crystalline film",
                  fontsize=12, y=1.0)
     fig.savefig(os.path.join(FIGDIR, fname), bbox_inches="tight",
                 facecolor="white")
@@ -57,37 +62,67 @@ def fig_arc(dry, fname):
     print("wrote", fname)
 
 
-def fig_wet_vs_dry(wet, dry, fname):
-    fig, axes = plt.subplots(1, 2, figsize=(8.4, 4.1), dpi=150)
-    for ax, (r, lab) in zip(axes, [(wet, "WET implant"),
-                                   (dry, "DRY implant")]):
+def fig_wet_vs_dry(wet, dry, sw, fname):
+    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.2), dpi=150)
+    im = None
+    for ax, r, lab in ((axes[0], wet, "WET implant: dissolves"),
+                       (axes[1], dry, "DRY implant: grows")):
         gf, gpsi, h = r["snaps"]["final"]
-        ax.imshow(gf.T, origin="lower", cmap="viridis", vmin=0,
-                  vmax=max(0.6, gf.max()))
+        im = ax.imshow(gf.T, origin="lower", cmap="viridis", vmin=0,
+                       vmax=max(0.6, gf.max()))
         ax.contour(gpsi.T, levels=[0.5], colors="r", linewidths=1.2)
         ax.set_title(f"{lab}\n$\\phi_s$={r['phis_implant']:.2f} at implant, "
-                     f"area {r['area_final']:.3f}", fontsize=10)
+                     f"area {r['area_final']:.2f}", fontsize=10)
         ax.set_xticks([]); ax.set_yticks([])
-    fig.suptitle("Same seeds: dissolve when wet, grow when dry "
-                 "(evaporation-induced)", fontsize=12, y=1.03)
+    fig.colorbar(im, ax=axes[:2], fraction=0.012, pad=0.02, label=r"$\phi_0$")
+    # solubility validation panel
+    phi = np.array([r["phi_f"] for r in sw["runs"]])
+    grew = np.array([r["grew"] for r in sw["runs"]])
+    ax = axes[2]
+    if grew.any():
+        ax.scatter(phi[grew], np.ones(grew.sum()), marker="^", s=90,
+                   color="C2", label="grows")
+    if (~grew).any():
+        ax.scatter(phi[~grew], np.zeros((~grew).sum()), marker="v", s=90,
+                   facecolors="none", edgecolors="C3", label="dissolves")
+    ax.axvline(sw["phi_star_derived"], color="k", ls="--", lw=1.5,
+               label=rf"derived $\phi^*={sw['phi_star_derived']:.2f}$")
+    if np.isfinite(sw["crossover_lo"]) and np.isfinite(sw["crossover_hi"]):
+        ax.axvspan(sw["crossover_lo"], sw["crossover_hi"], color="C0",
+                   alpha=0.15, label="measured crossover")
+    ax.set_xlabel(r"uniform small-molecule fraction $\phi_0$")
+    ax.set_ylim(-0.4, 1.4)
+    ax.set_yticks([0, 1]); ax.set_yticklabels(["dissolve", "grow"])
+    ax.set_title("Solubility validation (no drying)", fontsize=10)
+    ax.legend(fontsize=7, loc="center left"); ax.grid(alpha=0.3)
+    fig.suptitle("Same embryo, opposite fate: the drying-conditioned "
+                 "composition vs the derived solubility $\\phi^*$",
+                 fontsize=12, y=1.02)
     fig.savefig(os.path.join(FIGDIR, fname), bbox_inches="tight",
                 facecolor="white")
     plt.close(fig)
     print("wrote", fname)
 
 
-def write_numbers(wet, dry):
+def write_numbers(wet, dry, sw):
     def mac(name, val):
         return rf"\newcommand{{\{name}}}{{{val}}}"
     lines = ["% AUTO-GENERATED by gen_figures.py - do not edit.",
              mac("PnineWetPhis", f"{wet['phis_implant']:.3f}"),
-             mac("PnineWetStart", f"{wet['area_implant']:.4f}"),
-             mac("PnineWetEnd", f"{wet['area_final']:.4f}"),
+             mac("PnineWetStart", f"{wet['area_implant']:.3f}"),
+             mac("PnineWetEnd", f"{wet['area_final']:.3f}"),
              mac("PnineWetPsimax", f"{wet['psi_max']:.2f}"),
+             mac("PnineWetTerm", wet["termination"].replace("_", "\\_")),
              mac("PnineDryPhis", f"{dry['phis_implant']:.3f}"),
-             mac("PnineDryStart", f"{dry['area_implant']:.4f}"),
-             mac("PnineDryEnd", f"{dry['area_final']:.4f}"),
+             mac("PnineDryStart", f"{dry['area_implant']:.3f}"),
+             mac("PnineDryEnd", f"{dry['area_final']:.3f}"),
              mac("PnineDryPsimax", f"{dry['psi_max']:.2f}"),
+             mac("PnineDryTerm", dry["termination"].replace("_", "\\_")),
+             mac("PninePhiStar", f"{sw['phi_star_derived']:.3f}"),
+             mac("PnineCrossLo", f"{sw['crossover_lo']:.2f}"),
+             mac("PnineCrossHi", f"{sw['crossover_hi']:.2f}"),
+             mac("PnineChiCA", f"{CHI_CA:g}"),
+             mac("PnineDrive", f"{A.drive_r14():+.3f}"),
              mac("PnineKe", f"{dry['k_e']:g}")]
     os.makedirs(os.path.dirname(NUMTEX), exist_ok=True)
     with open(NUMTEX, "w") as fh:
@@ -102,11 +137,13 @@ def main():
     args = ap.parse_args()
     os.makedirs(FIGDIR, exist_ok=True)
     dm, mesh, cons = build_mesh_dm(args.level, device=args.device)
+    sw = embryo_composition_sweep(dm, mesh, cons, chi_ca_val=CHI_CA,
+                                  device=args.device)
     wet = run_arc(dm, mesh, cons, wet=True, device=args.device)
     dry = run_arc(dm, mesh, cons, wet=False, device=args.device)
     fig_arc(dry, "p9_arc.png")
-    fig_wet_vs_dry(wet, dry, "p9_wet_vs_dry.png")
-    write_numbers(wet, dry)
+    fig_wet_vs_dry(wet, dry, sw, "p9_wet_vs_dry.png")
+    write_numbers(wet, dry, sw)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,12 @@
 """OrgElMorph course - Physics P8: figures + numbers macros.
 
-    python gen_figures.py --device cuda:0
+    python gen_figures.py --device cuda:1
 
-Writes ../../latex/figures/p8_*.png and ../../latex/numbers/p8.tex.
+Writes ../../latex/figures/p8_*.png and ../../latex/numbers/p8.tex from
+REAL runs.  Figures:
+  p8_fdt.png     the central FDT verification (dt-independence + mesh scaling)
+  p8_sweep.png   the noise-amplitude ensemble sweep (X, nuclei density)
+  p8_fields.png  representative final nucleation fields per amplitude
 """
 import argparse
 import os
@@ -12,7 +16,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from nucleation import build_mesh_dm, sweep
+from nucleation import build_mesh_dm, sweep, verify_fdt
 
 FIGDIR = os.path.join(os.path.dirname(__file__), "..", "..", "latex",
                       "figures")
@@ -20,22 +24,64 @@ NUMTEX = os.path.join(os.path.dirname(__file__), "..", "..", "latex",
                       "numbers", "p8.tex")
 
 
+def fig_fdt(vf, fname):
+    fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.2), dpi=150)
+    dts = np.array(vf["dts"])
+    var = np.array(vf["var"])
+    axes[0].semilogx(dts, var, "C0-o", ms=7)
+    axes[0].axhline(var.mean(), color="k", ls="--", lw=1,
+                    label=f"mean {var.mean():.3e}")
+    axes[0].set_xlabel("time step $\\Delta t$")
+    axes[0].set_ylabel(r"equilibrium variance $\langle\mathrm{Var}\,\psi\rangle$")
+    axes[0].set_title(f"dt-independent (CoV = {vf['dt_cov']:.3f})\n"
+                      "=> FDT normalization verified", fontsize=10)
+    axes[0].set_ylim(0, var.max() * 1.4)
+    axes[0].legend(fontsize=8); axes[0].grid(alpha=0.3)
+    lv = [r["level"] for r in vf["mesh_runs"]]
+    vv = np.array(vf["var_times_vcell"])
+    vs = [r["var"] for r in vf["mesh_runs"]]
+    x = np.arange(len(lv))
+    ax2 = axes[1]
+    ax2.bar(x - 0.2, vs, 0.4, color="C1", label=r"Var $\psi$")
+    ax2b = ax2.twinx()
+    ax2b.bar(x + 0.2, vv, 0.4, color="C2",
+             label=r"Var $\psi\cdot V_{\rm cell}$")
+    ax2.set_xticks(x); ax2.set_xticklabels([f"level {l}" for l in lv])
+    ax2.set_ylabel(r"Var $\psi$ (grows as $1/V_{\rm cell}$)", color="C1")
+    ax2b.set_ylabel(r"Var $\psi\cdot V_{\rm cell}$ (~const)", color="C2")
+    ax2.set_title(f"equipartition: Var$\\cdot V$ const "
+                  f"(CoV = {vf['mesh_cov']:.3f})", fontsize=10)
+    fig.suptitle("Central FDT verification: fix the physical noise, measure "
+                 "the equilibrium variance", fontsize=12, y=1.02)
+    fig.savefig(os.path.join(FIGDIR, fname), bbox_inches="tight",
+                facecolor="white")
+    plt.close(fig)
+    print("wrote", fname)
+
+
 def fig_sweep(s, fname):
-    runs = s["runs"]
     fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.2), dpi=150)
-    for r in runs:
+    for e in s["ensembles"]:
+        r = e["runs"][0]
         axes[0].plot(r["t"], r["X"], lw=2,
-                     label=f"noise = {r['noise_psi']:g}")
+                     label=f"noise = {e['noise_psi']:g}")
     axes[0].set_xlabel("time $t$")
-    axes[0].set_ylabel("crystalline fraction $X$")
+    axes[0].set_ylabel("crystalline fraction $X$ (one seed)")
     axes[0].set_title("Nucleation onset vs noise amplitude")
     axes[0].legend(); axes[0].grid(alpha=0.3)
-    axes[1].plot(s["levels"], s["X_end"], "C3-o", ms=6)
-    axes[1].set_xlabel("FDT noise amplitude (noise_psi)")
-    axes[1].set_ylabel("final crystalline fraction $X$")
-    axes[1].set_title("Threshold-like onset")
+    lv = np.array(s["levels"])
+    Xm = np.array(s["X_mean"]); Xsd = np.array(s["X_sd"])
+    dens = np.array(s["density"])
+    axes[1].errorbar(lv, Xm, yerr=Xsd, fmt="C3-o", ms=6, capsize=4,
+                     label=r"$X$ mean $\pm$ sd")
+    axes[1].set_xlabel("FDT noise amplitude (noise\\_psi)")
+    axes[1].set_ylabel("final $X$ (ensemble)", color="C3")
+    axb = axes[1].twinx()
+    axb.plot(lv, dens, "C0-s", ms=6, label="nuclei density")
+    axb.set_ylabel("nuclei density", color="C0")
+    axes[1].set_title("Ensemble: X and nuclei density vs amplitude")
     axes[1].grid(alpha=0.3)
-    fig.suptitle("Thermal noise is the physical seed of nucleation",
+    fig.suptitle("Noise-amplitude (kBT calibration) ensemble sweep",
                  fontsize=12, y=1.02)
     fig.savefig(os.path.join(FIGDIR, fname), bbox_inches="tight",
                 facecolor="white")
@@ -44,41 +90,46 @@ def fig_sweep(s, fname):
 
 
 def fig_fields(s, fname):
-    runs = s["runs"]
-    fig, axes = plt.subplots(1, len(runs), figsize=(3.4 * len(runs), 3.6),
+    ens = s["ensembles"]
+    fig, axes = plt.subplots(1, len(ens), figsize=(3.4 * len(ens), 3.6),
                              dpi=150)
-    for ax, r in zip(axes, runs):
+    for ax, e in zip(axes, ens):
+        r = e["runs"][0]
         im = ax.imshow(r["psi"].T, origin="lower", cmap="magma",
                        vmin=0, vmax=1)
-        ax.set_title(f"noise = {r['noise_psi']:g}\n$X$ = {r['X_end']:.3f}, "
-                     f"{r['n_grains']} grains", fontsize=10)
+        ax.set_title(f"noise = {e['noise_psi']:g}\n"
+                     f"$X$ = {e['X_mean']:.3f}, "
+                     f"{e['nuclei_density_mean']:.0f} nuclei", fontsize=10)
         ax.set_xticks([]); ax.set_yticks([])
     fig.colorbar(im, ax=axes, fraction=0.02, pad=0.02,
                  label=r"crystallinity $\psi$")
-    fig.suptitle("More noise nucleates more grains (fixed undercooling, "
-                 "same time)", fontsize=12, y=1.04)
+    fig.suptitle("Representative final fields (one seed per amplitude)",
+                 fontsize=12, y=1.04)
     fig.savefig(os.path.join(FIGDIR, fname), bbox_inches="tight",
                 facecolor="white")
     plt.close(fig)
     print("wrote", fname)
 
 
-def write_numbers(s):
+def write_numbers(vf, s):
+    ens = s["ensembles"]
+
     def mac(name, val):
         return rf"\newcommand{{\{name}}}{{{val}}}"
-    runs = s["runs"]
     lines = ["% AUTO-GENERATED by gen_figures.py - do not edit.",
-             mac("PeightNlevels", f"{len(runs)}"),
-             mac("PeightNoiseZero", f"{runs[0]['noise_psi']:g}"),
-             mac("PeightXzero", f"{runs[0]['X_end']:.3f}"),
-             mac("PeightNoiseHi", f"{runs[-1]['noise_psi']:g}"),
-             mac("PeightXhi", f"{runs[-1]['X_end']:.3f}"),
-             mac("PeightGrainsHi", f"{runs[-1]['n_grains']}")]
-    # first noise level that nucleated (X_end > 0.02)
-    onset = next((r["noise_psi"] for r in runs if r["X_end"] > 0.02),
-                 None)
-    lines.append(mac("PeightOnset",
-                     "none" if onset is None else f"{onset:g}"))
+             mac("PeightDtCov", f"{vf['dt_cov']:.3f}"),
+             mac("PeightMeshCov", f"{vf['mesh_cov']:.3f}"),
+             mac("PeightVarMean", f"{vf['var_mean']:.3e}"),
+             mac("PeightNlevels", f"{len(ens)}"),
+             mac("PeightNoiseZero", f"{ens[0]['noise_psi']:g}"),
+             mac("PeightXzero", f"{ens[0]['X_mean']:.3f}"),
+             mac("PeightNoiseHi", f"{ens[-1]['noise_psi']:g}"),
+             mac("PeightProbHi", f"{ens[-1]['nucleation_prob']['p']:.2f}"),
+             mac("PeightXhi", f"{ens[-1]['X_mean']:.3f}"),
+             mac("PeightXhiSd", f"{ens[-1]['X_sd']:.3f}"),
+             mac("PeightDensHi", f"{ens[-1]['nuclei_density_mean']:.1f}"),
+             mac("PeightSeeds", f"{ens[-1]['n']}"),
+             mac("PeightClipHi", f"{ens[-1]['sat_frac_mean']:.3f}")]
     os.makedirs(os.path.dirname(NUMTEX), exist_ok=True)
     with open(NUMTEX, "w") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -87,15 +138,17 @@ def write_numbers(s):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--device", default="cuda:1")
     ap.add_argument("--level", type=int, default=5)
     args = ap.parse_args()
     os.makedirs(FIGDIR, exist_ok=True)
+    vf = verify_fdt()
     dm, mesh, cons = build_mesh_dm(args.level, device=args.device)
     s = sweep(dm, mesh, cons, device=args.device)
+    fig_fdt(vf, "p8_fdt.png")
     fig_sweep(s, "p8_sweep.png")
     fig_fields(s, "p8_fields.png")
-    write_numbers(s)
+    write_numbers(vf, s)
 
 
 if __name__ == "__main__":

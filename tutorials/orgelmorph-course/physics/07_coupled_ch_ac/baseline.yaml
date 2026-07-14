@@ -1,0 +1,24 @@
+# P7 coupled CH+AC -- scientific invariants (tolerance-based, NOT
+# bit-identical).  Measured at level 5 (32x32), cuDSS; bounds carry
+# headroom so a different card passes.
+checks:
+  # four-fold chi convention (p1 ABSOLUTE pure limits)
+  chi_limits_p1.aa:  {reference: 1.2, atol: 1.0e-9}
+  chi_limits_p1.ca:  {reference: 2.6, atol: 1.0e-9}
+  chi_limits_p1.ac:  {reference: 2.1, atol: 1.0e-9}
+  chi_limits_p1.cc:  {reference: 3.0, atol: 1.0e-9}
+  # commensurate controls (SAME mask + metric)
+  controls.ch_only:        {min: -0.05, max: 0.05}    # CH alone ~0 on footprint
+  controls.coupled_nochi:  {min: 0.15}                # crystal-bulk channel large
+  controls.full:           {min: 0.20}                # full contrast largest
+  controls.cryst_channel:  {min: 0.15}                # crystal-bulk > 0
+  controls.chi_channel:    {min: 0.005}               # chi-expulsion adds a bit
+  # seed sensitivity: contrast is reproducible across seeds
+  seed_sensitivity.sd:     {max: 0.05}
+  seed_sensitivity.mean:   {min: 0.20}
+  # coupled energy budget: total decreases (Lyapunov)
+  energy.largest_positive_step: {max: 1.0e-3}
+  # causality
+  causality.frozen_chi_channel:  {min: 0.02}   # coupling demixes at fixed geometry
+  causality.kinetics_fast_contrast: {min: 0.20}
+  causality.kinetics_slow_contrast: {min: 0.20}
