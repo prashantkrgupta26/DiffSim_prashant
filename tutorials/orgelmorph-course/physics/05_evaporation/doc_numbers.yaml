@@ -1,0 +1,21 @@
+# P5 doc-vs-data mapping: each course-document macro (latex/numbers/p5.tex)
+# vs the reference-mode results.json path it must match, within tolerance.
+# Drives the docs-build staleness gate (common/check_doc_staleness.py).
+# gen_figures.py writes the macros FROM this same results.json, so a match is
+# guaranteed until someone hand-edits the .tex without re-generating.
+#
+# NOTE: paths point at the FLAT `checks.*` scalars only.  The per-run keys
+# (e.g. `ke0.300_ds0.200`) contain dots, which the dotted-path resolver would
+# mis-split, so every cited number is surfaced as a dot-free check scalar.
+tex: ../../latex/numbers/p5.tex
+macros:
+  PfiveBiMin:          {path: checks.Bi_min,                    rtol: 0.02}
+  PfiveBiMax:          {path: checks.Bi_max,                    rtol: 0.02}
+  PfiveWLslowThirty:   {path: checks.matched_wl_cells_slow_030, rtol: 0.05}
+  PfiveWLslowTwenty:   {path: checks.matched_wl_cells_slow_020, rtol: 0.05}
+  PfiveWLslowTen:      {path: checks.matched_wl_cells_slow_010, rtol: 0.05}
+  PfiveWLfastTwenty:   {path: checks.matched_wl_cells_fast_020, rtol: 0.05}
+  PfiveWLfastTen:      {path: checks.matched_wl_cells_fast_010, rtol: 0.05}
+  PfiveContrastThirty: {path: checks.contrast_slow_030,         rtol: 0.03}
+  PfiveContrastTwenty: {path: checks.contrast_slow_020,         rtol: 0.03}
+  PfiveContrastTen:    {path: checks.contrast_slow_010,         rtol: 0.03}

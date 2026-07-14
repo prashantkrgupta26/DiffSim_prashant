@@ -1,0 +1,48 @@
+# P5 tolerance baseline — reference mode (level 6, 7-run (k_e, D_s) sweep).
+#
+# Scientific invariants within DOCUMENTED tolerances, NOT bitwise GPU identity.
+# Ground truth captured on RTX 6000 Ada (CUDA 12.9 / driver 13.2, cuDSS):
+#   per-solute moving-frame drift ~1.6e-15 (machine); budget closure ~6.7e-16;
+#   all 7 runs exit phis_stop, phi_s monotone; Bi in [0.75, 6.0].
+#   Matched-dryness (phi_s=0.20) wavelength: slow(Bi=1.5) 33.4 cells,
+#   fast(Bi=3.0) 26.1 cells.  Bi-collapse spread 6.1%.  Contrast at phi_s=0.20
+#   is 0.365 +/- 0.9% across ALL rates (rate-independent) and rises with
+#   dryness 0.316 -> 0.368 -> 0.418.
+#
+# The HARD, resolution-robust gates are: exact per-solute conservation, the
+# height/solvent budget closure, the Bi-collapse, and the contrast being set
+# by dryness (rate-independent + rising).  The wavelength numbers are noisier
+# (single seed, ~2 lateral domains) and carry a wider rtol band.  Keys are the
+# dotted path into results.json (everything lives under `checks`).
+checks:
+  # --- exact conservation (the moving-frame contract) -------------------
+  checks.balance_polymer_rel_max:    {max: 1.0e-9}
+  checks.balance_fullerene_rel_max:  {max: 1.0e-9}
+  checks.budget_closure_max:         {max: 1.0e-9}
+
+  # --- drying is honest: all runs actually dried, phi_s monotone --------
+  checks.all_monotone_drying:        {equals: true}
+  checks.fast_exit_reason:           {equals: phis_stop}
+  checks.slow_exit_reason:           {equals: phis_stop}
+
+  # --- Biot regime: the sweep spans the Bi=1 crossover ------------------
+  checks.Bi_min:                     {reference: 0.75, rtol: 0.02}
+  checks.Bi_max:                     {reference: 6.00, rtol: 0.02}
+  checks.n_runs:                     {equals: 7}
+
+  # --- morphology collapses onto Bi (the key scientific invariant) ------
+  checks.bi_collapse_spread:         {max: 0.15}
+
+  # --- degree of demixing (contrast) is set by DRYNESS, not rate --------
+  checks.contrast_rate_spread_020:   {max: 0.03}      # near rate-independent
+  checks.contrast_rises_slow:        {equals: true}   # rises as the film dries
+  checks.contrast_rises_fast:        {equals: true}
+  checks.contrast_slow_030:          {reference: 0.3162, rtol: 0.05}
+  checks.contrast_slow_020:          {reference: 0.3675, rtol: 0.05}
+  checks.contrast_slow_010:          {reference: 0.4183, rtol: 0.05}
+
+  # --- matched-dryness domain scale (noisier: wider band) ---------------
+  checks.matched_wl_cells_slow_020:  {reference: 33.37, rtol: 0.12}
+  checks.matched_wl_cells_fast_020:  {reference: 26.09, rtol: 0.12}
+  checks.matched_wl_cells_slow_010:  {reference: 35.67, rtol: 0.12}
+  checks.matched_wl_cells_fast_010:  {reference: 25.49, rtol: 0.12}

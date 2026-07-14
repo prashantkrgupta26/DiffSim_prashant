@@ -1,0 +1,66 @@
+# P5 — evaporation (the drying film). Canonical run record.
+#
+# The scientific claim is MATCHED-TERMINAL-STATE: compare morphology at the
+# SAME mean solvent fraction phi_s (dryness), not at a common time, so drying
+# RATE is not confounded with final STATE (correction 1). Every rate in
+# `ke_grid` must dry PAST the smallest matched phi_s, so the rates are chosen
+# so all reach phi_s <= phis_stop within t_end.
+#
+# Two sweeps share one mesh:
+#   * ke_grid x ds_base   -> the matched-state / drying-curve rows + figures.
+#   * ke_regime x ds_grid -> the 2-D Biot regime map (Bi = k_e h0 / D_s;
+#     drying vs solute diffusion). Sweeping BOTH k_e and the solute
+#     mobility D_s moves along the single controlling group Bi.
+#
+# Cost modes (spec: quick <2 min, reference 5-30 min, research documented):
+#   quick      level 5 (32x32), 3 runs, smoke (CI micro tier). Level 5 is the
+#              COARSEST mesh that still conserves solute to machine precision;
+#              level 4 (16x16) leaks ~10% at the under-resolved demixed surface
+#              layer, so quick uses level 5 to keep conservation a real
+#              cross-mode invariant.
+#   reference  level 6 (64x64), 7 runs — the EXPECTED numbers
+#   research   level 7 (128x128), finer regime grid
+
+level: 6                 # 2^level lateral cells; 6 = 64x64
+ke_grid: [0.3, 0.45, 0.6]   # k_e rows for the matched-state sweep (at ds_base)
+ds_base: 0.2             # baseline solute Onsager mobility D_s (matched row)
+ke_regime: [0.3, 0.6]    # k_e values of the 2-D Biot regime map
+ds_grid: [0.1, 0.2, 0.4] # D_s values of the 2-D Biot regime map
+matched_phis: [0.30, 0.20, 0.10]   # dryness levels to compare morphology at
+
+chi: [1.5, 0.3, 0.3]     # (chi_pf, chi_ps, chi_fs) full-species Flory-Huggins
+N: [5.0, 5.0, 1.0]       # (polymer, fullerene, solvent) degrees of polymerization
+kappa: [3.0e-4, 3.0e-4]  # gradient-energy coeffs (interface width)
+phi0: [0.22, 0.22]       # initial (polymer, fullerene); solvent = 1-0.44 = 0.56
+amp: 0.01                # initial random perturbation amplitude
+h0: 1.0                  # initial film height
+
+dt: 1.0e-3
+dt_max: 0.01
+t_end: 8.0
+phis_stop: 0.08          # dryness cutoff (below smallest matched phi_s so it
+                         # brackets 0.10 for interpolation)
+h_min: 0.12              # physical height floor
+nchecks: 40              # trajectory checkpoints (metric-vs-phi_s resolution)
+seed: 7
+precision: fp64
+
+modes:
+  quick:
+    level: 5
+    ke_grid: [0.4, 0.6]   # both dry fast enough to keep quick < 2 min
+    ke_regime: []         # no extra regime runs in the smoke tier
+    ds_grid: [0.2]
+    nchecks: 25
+  reference:
+    level: 6
+    ke_grid: [0.3, 0.45, 0.6]
+    ke_regime: [0.3, 0.6]
+    ds_grid: [0.1, 0.2, 0.4]
+    nchecks: 40
+  research:
+    level: 7
+    ke_grid: [0.3, 0.4, 0.5, 0.6]
+    ke_regime: [0.3, 0.45, 0.6]
+    ds_grid: [0.1, 0.2, 0.4]
+    nchecks: 60
