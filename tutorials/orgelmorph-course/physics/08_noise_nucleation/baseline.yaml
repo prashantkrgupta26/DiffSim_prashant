@@ -1,0 +1,14 @@
+# P8 FDT noise + nucleation -- scientific invariants (tolerance-based,
+# NOT bit-identical).  FDT well on a coarse CPU/splu mesh; nucleation
+# ensemble at level 5, cuDSS.  Bounds carry headroom for a different card.
+checks:
+  # 1. CENTRAL FDT verification: equilibrium variance converges (dt) and
+  #    scales as 1/V_cell (mesh) -- the discrete FDT normalization is right.
+  fdt.dt_cov:    {max: 0.10}    # measured ~0.02; dt-independent => verified
+  fdt.mesh_cov:  {max: 0.35}    # measured ~0.11; Var*V_cell ~ const
+  # 2. nucleation ensemble sweep
+  sweep.zero_noise_X:    {max: 0.01}   # zero noise stays amorphous
+  sweep.zero_noise_prob: {max: 0.01}   # zero noise never nucleates
+  sweep.hi_prob:         {min: 0.5}    # noise nucleates (P ~ 1 here)
+  sweep.hi_density:      {min: 5.0}    # many nuclei form
+  sweep.density_increasing: {equals: true}   # more noise -> more nuclei
