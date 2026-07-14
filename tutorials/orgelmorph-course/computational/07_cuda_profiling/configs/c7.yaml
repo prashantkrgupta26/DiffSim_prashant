@@ -1,0 +1,18 @@
+# C7 — CUDA profiling and memory (canonical run record).
+# Profiles ONE complete Cahn-Hilliard step (level 6 by default) plus the
+# device primitives. Timings are hardware-dependent; the baseline checks
+# scientific INVARIANTS (bandwidth >> PCIe, factor >> solve, memory-bound),
+# not absolute nanoseconds.
+level: 6
+bw_nelems: 1048576   # 2^20
+launch_reps: 2000
+run_nsys: true
+precision: fp64
+
+modes:
+  quick:
+    level: 5
+  reference:
+    level: 6
+  research:
+    level: 7
