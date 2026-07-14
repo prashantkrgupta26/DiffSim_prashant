@@ -257,3 +257,207 @@ $F_{\text{int}}$, and predict how each scales during coarsening.}
 equilibrium. Test it: double $M$ and check whether the \emph{final}
 morphology and energy are unchanged while the \emph{approach} rescales
 in time.}
+
+% ====================================================================
+\chapter{Adaptive time stepping}
+\label{ch:p2}
+
+\begin{keybox}
+\textbf{Key idea.} Coarsening is multi-scale \emph{in time}: the
+spinodal quench is violent (interfaces form in a few very small time
+steps) and then coarsening slows down geometrically (domains merge ever
+more rarely). A single fixed time step cannot serve both regimes. An
+\emph{error-controlled} step---small during the quench, large through
+the tail---resolves the physics the fixed step misses, at a fraction of
+the cost.
+\end{keybox}
+
+\section{The model}
+
+The equation is unchanged from Chapter~\ref{ch:p1}: the conserved
+gradient flow \eqref{eq:ch} of the Ginzburg--Landau energy \eqref{eq:F}.
+What changes is the time integration. Writing the time derivative with a
+backward-difference formula (BDF) of order $p$,
+%
+\begin{equation}
+  \dd{c}{t}\Big|_{t_{n+1}} \approx \frac{1}{\Delta t}\Big(\sigma\,c^{n+1}
+  - \text{hist}\big(c^{n},c^{n-1}\big)\Big),
+\end{equation}
+%
+turns each step into a nonlinear (Newton) solve. The question is how to
+\emph{choose} $\Delta t$.
+
+\paragraph{Local truncation error control (step doubling).} From a state
+$c^n$, take one step of size $\Delta t$ to get $c_{\Delta t}$, and
+\emph{separately} two steps of $\Delta t/2$ to get $c_{\Delta t/2}$. The
+two differ by the local truncation error (LTE),
+%
+\begin{equation}
+  \text{LTE} \;\approx\; \frac{\lVert c_{\Delta t} - c_{\Delta t/2}\rVert_2}
+  {2^{p}-1}.
+\end{equation}
+%
+Accept the (more accurate) half-step solution if $\text{LTE}<\text{tol}$,
+and propose the next step from the standard controller
+%
+\begin{equation}
+  \Delta t_{\text{new}} = \Delta t \cdot \mathrm{clamp}\!\Big(
+  \text{safety}\,(\text{tol}/\text{LTE})^{1/(p+1)},\;\tfrac12,\;2\Big);
+\end{equation}
+%
+otherwise \emph{reject}, halve $\Delta t$, and retry. This is the
+classic Wodo--Ganapathysubramanian phase-field controller (JCP 230
+(2011) 6037). The time step \emph{grows} through coarsening---the
+property that makes long phase-field horizons affordable.
+
+\begin{keybox}
+\textbf{Why the BDF2 must be variable-coefficient.} A constant-coefficient
+BDF2 is only second-order when the step is \emph{constant}. Under an
+adaptive $\Delta t$ the step ratio $r=\Delta t_n/\Delta t_{n-1}$ varies,
+so the stepper rebuilds the BDF2 weights from the actual
+$(\Delta t_n,\Delta t_{n-1})$ every step; $r=1$ reproduces the
+fixed-step scheme bit-exactly. The order verification lives in the
+Computational track (temporal adaptivity).
+\end{keybox}
+
+\section{Coefficients}
+
+\begin{keybox}
+\textbf{Controller knobs and their meaning.}
+\emph{tol} (the accuracy target on the relative LTE; smaller $\Rightarrow$
+smaller steps and a more accurate trajectory). \emph{$p$} the BDF order
+(here $2$). \emph{safety} $\in(0,1)$ the fraction of the predicted
+optimal step actually taken (robustness margin; $0.85$ is typical).
+\emph{$\Delta t_{\min},\Delta t_{\max}$} hard bounds. The \emph{physics}
+coefficients ($M,\kappa$, the free energy) are exactly those of
+Chapter~\ref{ch:p1}: adaptivity changes cost and accuracy, not the
+model.
+\end{keybox}
+
+\section{Run it}
+
+\begin{runbox}
+\textbf{Run it.}
+\begin{lstlisting}
+cd physics/02_ch_adaptive_stepping
+python run.py            # naive fixed vs adaptive, 64x64
+\end{lstlisting}
+It marches the same binary quench to $t=\PtwoTend$ with a naive fixed
+step ($\Delta t=\PtwoDtfixed$) and with the adaptive controller
+($\text{tol}=\PtwoTol$), and prints the cost/accuracy comparison.
+Compare with \file{EXPECTED.md} and the figures below.
+\end{runbox}
+
+\paragraph{What you should see.} The adaptive step size spans several
+orders of magnitude---collapsing to $\Delta t\!\approx\!\PtwoDtmin$
+through the quench (where the truncation error is largest) and climbing
+to $\Delta t\!\approx\!\PtwoDtmax$ through coarsening. The naive fixed
+step ($\PtwoNfixed$ steps) is \emph{both} more expensive than the
+adaptive run ($\PtwoNadapt$ steps, $\PtwoSpeedup\times$ fewer) \emph{and}
+less accurate: its energy is stuck at $\PtwoFfixed$, well above the
+adaptive run's more-relaxed $\PtwoFadapt$, because it under-resolves the
+quench. A fixed step \emph{safe} for the whole quench (i.e.\ $\Delta t
+\le \PtwoDtmin$) would need on the order of $\PtwoImplied$ steps---the
+cost the controller avoids.
+
+\begin{keybox}
+\textbf{The morphology is step-sequence dependent---like the seed.}
+Two integrators that take different step sequences produce different
+\emph{coarsened microstructures} (which domain merges when is
+chaotically sensitive), exactly as changing the RNG seed does in
+Chapter~\ref{ch:p1}. What is \emph{robust} is the physics: the free
+energy, the characteristic domain scale, and the phase values. So we
+compare those statistics, not the pixelwise field.
+\end{keybox}
+
+% --- generated by gen_figures.py ---
+\begin{figure}[h]\centering
+  \includegraphics[width=\linewidth]{figures/p2_adaptivity.png}
+  \caption{Left: the adaptive time step over the quench---tiny through
+    the spinodal onset, growing by orders of magnitude through
+    coarsening (the fixed step is the dashed line). Right: the
+    free-energy history; the adaptive run (fewer steps) reaches a
+    \emph{lower} (more relaxed) energy than the naive fixed step, which
+    lags because it under-resolves the quench.}
+  \label{fig:p2adapt}
+\end{figure}
+
+\begin{figure}[h]\centering
+  \includegraphics[width=0.8\linewidth]{figures/p2_morphology.png}
+  \caption{Final coarsened morphology from the two integrators. The
+    exact pattern differs (step-sequence sensitivity, as with the RNG
+    seed), while the domain scale and phase values agree.}
+  \label{fig:p2morph}
+\end{figure}
+
+\begin{keybox}
+\textbf{Measured self-check} (your \file{run.py} should reproduce these
+to a few significant figures).
+\begin{center}\small
+\begin{tabular}{lcc}
+\toprule
+ & naive fixed & adaptive \\
+\midrule
+time steps taken            & \PtwoNfixed & \PtwoNadapt \\
+final free energy $F$       & \PtwoFfixed & \PtwoFadapt \\
+$\Delta t$ range            & \PtwoDtfixed\ (held) & $\PtwoDtmin \to \PtwoDtmax$ \\
+domain scale (cells)        & \PtwoDscaleFixed & \PtwoDscaleAdapt \\
+phase values $[c_{\min},c_{\max}]$ & \multicolumn{2}{c}{\PtwoCrange} \\
+\bottomrule
+\end{tabular}
+\end{center}
+Step-count saving $\PtwoSpeedup\times$; energy difference $|\Delta F| =
+\PtwodF$ (the fixed step lags, not a match: it is less accurate).
+\end{keybox}
+
+\section{Code walk-through}
+
+\paragraph{1. The adaptive march.} The controller is a library function;
+the tutorial calls it in short checkpoint windows so it can record the
+energy and step size along the way:
+\begin{lstlisting}
+from diffsim.physics.cahn_hilliard import adaptive_march
+ts, dts = adaptive_march(stepper, t_end, tol=2e-3,
+                         dt_max=0.05, dt_min=1e-6)
+\end{lstlisting}
+\code{adaptive\_march} owns the accept/reject ladder above; it returns
+the accepted $(t,\Delta t)$ pairs, from which the \file{gen\_figures.py}
+builds the $\Delta t$ history.
+
+\paragraph{2. The variable-step BDF2.} Inside \code{stepper.step()} the
+BDF2 weights are recomputed every step from $(\Delta t_n,\Delta
+t_{n-1})$, so a rejected-and-halved step stays second-order
+consistent---you do not have to do anything: the accuracy the controller
+assumes is actually delivered.
+
+\paragraph{3. The cost/accuracy readout.} \code{compare()} runs both
+integrators to the same horizon and returns the step counts, the energy
+histories, and the robust statistics (domain scale, phase values) that
+\emph{should} agree even though the fields do not.
+
+\section{Explore on your own}
+
+\question{Tighten the tolerance (\code{--tol 5e-4}). How do the number of
+steps, the final energy, and $\Delta t_{\max}$ change? Does the final
+energy \emph{converge} as tol shrinks (evidence the adaptive result is
+accurate), and roughly at what tol does it stop moving?}
+
+\question{The adaptive run needed $\Delta t\!\sim\!\PtwoDtmin$ during the
+quench. Estimate the largest fixed $\Delta t$ that reproduces the
+adaptive final energy, and compare its step count to the adaptive
+count. What is the true speed-up at matched accuracy?}
+
+\question{Each adaptive step costs one full plus two half solves (step
+doubling). Given that, at what point in the coarsening does adaptivity
+start \emph{paying for itself}, and why is it a net loss during the
+quench?}
+
+\question{Change the RNG seed and rerun both integrators. Which of the
+reported quantities move (morphology, domain scale, energy, phase
+values) and which do not? Relate this to the seed discussion in
+Chapter~\ref{ch:p1}.}
+
+\question{Increase $\kappa$ (wider interfaces). Does the quench become
+\emph{less} stiff (larger $\Delta t_{\min}$)? Explain the link between
+the interface width and the smallest time step the controller must
+take.}
