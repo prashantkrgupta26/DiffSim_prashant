@@ -186,9 +186,10 @@ builds $\chi_{aa}$ (all pairs) and the crystal-contact $\chi_{ca}$;
 (absolute) vs r14 (increment) pure limits against the production evaluator
 \code{\_np\_chi\_eff}.
 
-\paragraph{2. Commensurate controls.} \code{run(mode=...)} selects
-\code{ch\_only}/\code{coupled\_nochi}/\code{full}; \code{contrast\_on\_mask}
-scores every control on the one shared mask.
+\paragraph{2. Commensurate controls.} The \texttt{run} entry point takes \texttt{mode} one of
+\texttt{ch\_only}, \texttt{coupled\_nochi}, or \texttt{full}; the
+\texttt{contrast\_on\_mask} routine scores every control on the one
+shared mask.
 
 \paragraph{3. Energy + causality.} \code{coupled\_energy} integrates the
 exact free-energy split; \code{freeze\_psi=True} ($L_\psi{=}0$) gives the
