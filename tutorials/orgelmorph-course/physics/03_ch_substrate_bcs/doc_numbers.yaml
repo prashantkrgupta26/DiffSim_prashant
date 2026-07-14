@@ -1,0 +1,22 @@
+# P3 doc-vs-data mapping: each course-document macro (latex/numbers/p3.tex)
+# vs the reference-mode results.json path it must match, within tolerance.
+# Drives the docs-build staleness gate (common/check_doc_staleness.py).
+tex: ../../latex/numbers/p3.tex
+macros:
+  PthreeNeutralSub:   {path: cases.neutral.substrate_phi,  rtol: 0.05}
+  PthreeNeutralEnr:   {path: cases.neutral.enrichment,     atol: 0.03}
+  PthreeAttractSub:   {path: cases.attract.substrate_phi,  rtol: 0.03}
+  PthreeAttractEnr:   {path: cases.attract.enrichment,     rtol: 0.10}
+  PthreeRepelSub:     {path: cases.repel.substrate_phi,    rtol: 0.03}
+  PthreeRepelEnr:     {path: cases.repel.enrichment,       rtol: 0.10}
+  PthreeOpposingSub:  {path: cases.opposing.substrate_phi, rtol: 0.05}
+  PthreeOpposingAir:  {path: cases.opposing.air_phi,       rtol: 0.05}
+  PthreeConfinedSub:  {path: cases.confined.substrate_phi, rtol: 0.05}
+  PthreeConfinedEnr:  {path: cases.confined.enrichment,    rtol: 0.12}
+  PthreeDemixSub:     {path: cases.demix.substrate_phi,    rtol: 0.03}
+  PthreeDemixEnr:     {path: cases.demix.enrichment,       rtol: 0.10}
+  PthreeFbulk:        {path: cases.attract.F_bulk,         rtol: 0.10}
+  PthreeFgrad:        {path: cases.attract.F_grad,         rtol: 0.20}
+  PthreeFwall:        {path: cases.attract.F_wall,         rtol: 0.05}
+  PthreeDeltaSlope:   {path: bdlayer.slope_1e,             atol: 0.10}
+  PthreeClipProjdof:  {path: clip.projected_dofs,          min: 1}
