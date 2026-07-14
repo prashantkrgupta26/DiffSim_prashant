@@ -63,6 +63,47 @@ def refine_elements(tree: Octree, mask: np.ndarray) -> Octree:
     levels = np.concatenate([keep_l, np.repeat(cl, 1 << tree.dim)])
     return _make(keys, levels, tree.dim, tree.periodic)
 
+def coarsen_elements(tree: Octree, mask: np.ndarray) -> Octree:
+    """Inverse of :func:`refine_elements`: replace complete sibling groups by
+    their parent. A parent is coarsened iff ALL 2**dim of its children are
+    present as leaves AND every one is marked in ``mask``. Marked leaves whose
+    sibling group is incomplete or partially marked are kept unchanged, as are
+    level-0 leaves (which have no parent). One level of coarsening per call;
+    loop for multi-level. Solution-adaptive AMR marks a region for coarsening
+    only when its running-error indicator is low across the whole sibling
+    group, so the all-siblings-marked rule is exactly the physical condition.
+    """
+    mask = np.asarray(mask, bool)
+    dim = tree.dim
+    nch = 1 << dim
+    lev = tree.levels.astype(np.int64)
+    can = mask & (lev > 0)
+    idx = np.where(lev > 0)[0]
+    if len(idx) == 0:
+        return tree
+    pk, pl = morton.parent(tree.keys[idx], tree.levels[idx], dim=dim)
+    # group siblings by (parent key, parent level)
+    order = np.lexsort((pl, pk))
+    io, pko, plo = idx[order], pk[order], pl[order]
+    grp_start = np.ones(len(io), bool)
+    grp_start[1:] = (pko[1:] != pko[:-1]) | (plo[1:] != plo[:-1])
+    gid = np.cumsum(grp_start) - 1
+    ng = gid[-1] + 1
+    size = np.bincount(gid, minlength=ng)
+    all_marked = np.bincount(gid, weights=can[io].astype(np.int64),
+                             minlength=ng)
+    coarsen_grp = (size == nch) & (all_marked == nch)
+    drop = np.zeros(len(tree), bool)
+    drop[io] = coarsen_grp[gid]
+    # emit surviving leaves + one parent per coarsened group
+    par_first = grp_start & coarsen_grp[gid]
+    new_pk = pko[par_first]
+    new_pl = plo[par_first].astype(np.uint8)
+    keys = np.concatenate([tree.keys[~drop], new_pk])
+    levels = np.concatenate([tree.levels[~drop], new_pl])
+    return _make(keys, levels, tree.dim, tree.periodic)
+
+
 def build_adaptive(refine_fn, max_level: int, dim: int = 3, periodic=None) -> Octree:
     tree = build_uniform(0, dim=dim, periodic=periodic)
     while True:
