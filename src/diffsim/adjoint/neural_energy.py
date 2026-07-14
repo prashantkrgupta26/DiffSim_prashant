@@ -172,3 +172,76 @@ class NeuralCHEnergy(torch.nn.Module):
         with torch.no_grad():
             return self.corr_fp(torch.tensor(np.asarray(c_np, np.float64))
                                  ).cpu().numpy()
+
+
+def _legendre(u, k):
+    """Shifted-Legendre P_k(u) and derivative dP_k/du on u in [-1,1].
+    k>=2 is the beyond-quadratic, gauge-anchored basis; k in {0,1} are the
+    {1, c} gauge modes themselves (P0 constant = T0, P1 linear = T1) and are
+    available only to DEMONSTRATE the alias they create (an un-anchored fit).
+    Closed form keeps the correction's f''(c) analytic."""
+    if k == 0:
+        return torch.ones_like(u), torch.zeros_like(u)
+    if k == 1:
+        return u, torch.ones_like(u)
+    if k == 2:
+        return 0.5 * (3.0 * u * u - 1.0), 3.0 * u
+    if k == 3:
+        return 0.5 * (5.0 * u ** 3 - 3.0 * u), 0.5 * (15.0 * u * u - 3.0)
+    if k == 4:
+        return (35.0 * u ** 4 - 30.0 * u * u + 3.0) / 8.0, \
+               (140.0 * u ** 3 - 60.0 * u) / 8.0
+    raise ValueError(f"basis degree {k} not in 2..4")
+
+
+class BasisCorrEnergy(torch.nn.Module):
+    r"""FH bulk energy + a low-dimensional gauge-anchored beyond-FH correction
+    f'_corr(c) = sum_k gamma_k P_k((c-mid)/half), on shifted-Legendre degrees
+    k>=2.  Because P_k for k>=2 are L2-orthogonal to {1, c} on [c_lo, c_hi] by
+    construction, the correction is gauge-anchored EXACTLY (no projection) —
+    P0/P1 (the unidentifiable T0/T1 modes) are simply not in the basis.
+
+    This is the interpretable sibling of NeuralCHEnergy: a handful of
+    coefficients whose Jacobian-Gramian conditioning is a clean identifiability
+    number (it reproduces the recorded M4 'T2..T4 alias the FH span over one
+    trajectory' finding), while NeuralCHEnergy is the general functional head.
+    Same .fp/.fpp contract for adjoint/torch_twin.CHTwin."""
+
+    def __init__(self, A=1.0, B=2.5, degrees=(2, 3, 4), coeffs=None,
+                 c_lo=0.05, c_hi=0.95):
+        super().__init__()
+        self.A = torch.nn.Parameter(torch.tensor(float(A)))
+        self.B = torch.nn.Parameter(torch.tensor(float(B)))
+        self.degrees = tuple(int(k) for k in degrees)
+        self.c_mid = 0.5 * (c_hi + c_lo)
+        self.c_half = 0.5 * (c_hi - c_lo)
+        g0 = (torch.zeros(len(self.degrees)) if coeffs is None
+              else torch.tensor([float(x) for x in coeffs]))
+        self.gamma = torch.nn.Parameter(g0)
+
+    def corr_fp(self, c):
+        u = (c - self.c_mid) / self.c_half
+        out = torch.zeros_like(c)
+        for i, k in enumerate(self.degrees):
+            pk, _ = _legendre(u, k)
+            out = out + self.gamma[i] * pk
+        return out
+
+    def corr_fpp(self, c):
+        u = (c - self.c_mid) / self.c_half
+        out = torch.zeros_like(c)
+        for i, k in enumerate(self.degrees):
+            _, dpk = _legendre(u, k)
+            out = out + self.gamma[i] * dpk / self.c_half
+        return out
+
+    def fp(self, c):
+        return _fp_fh(c, self.A, self.B) + self.corr_fp(c)
+
+    def fpp(self, c):
+        return _fpp_fh(c, self.A, self.B) + self.corr_fpp(c)
+
+    def corr_on(self, c_np):
+        with torch.no_grad():
+            return self.corr_fp(torch.tensor(np.asarray(c_np, np.float64))
+                                 ).cpu().numpy()

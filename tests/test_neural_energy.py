@@ -26,7 +26,7 @@ from diffsim.mesh.constraints import build_constraints
 from diffsim.mesh.basis import basis_tables
 from diffsim.assembly.operators import DeviceMesh
 from diffsim.adjoint.torch_twin import CHTwin
-from diffsim.adjoint.neural_energy import NeuralCHEnergy
+from diffsim.adjoint.neural_energy import NeuralCHEnergy, BasisCorrEnergy
 
 pytestmark = pytest.mark.ad
 
@@ -65,6 +65,40 @@ def test_curvature_consistency():
     rel = float(((fpp - dfp).abs().max() / dfp.abs().max()).detach())
     print(f"curvature rel |fpp - d fp/dc| = {rel:.2e}")
     assert rel < 1e-10, rel
+
+
+def test_basis_gauge_orthogonality():
+    """The Legendre correction (degrees 2,3,4) is L2-orthogonal to {1, c} over
+    the composition domain by construction — the P0/P1 gauge modes carry no
+    content in the basis (shifted-Legendre orthogonality)."""
+    c_lo, c_hi = 0.05, 0.95
+    en = BasisCorrEnergy(A=1.0, B=2.5, degrees=(2, 3, 4),
+                         coeffs=(0.4, 0.25, 0.15), c_lo=c_lo, c_hi=c_hi)
+    # exact Gauss-Legendre quadrature (integrand is a degree<=5 polynomial)
+    x, w = np.polynomial.legendre.leggauss(16)
+    mid, half = 0.5 * (c_hi + c_lo), 0.5 * (c_hi - c_lo)
+    cq = torch.tensor(mid + half * x)
+    wq = torch.tensor(half * w)
+    with torch.no_grad():
+        r = en.corr_fp(cq)
+    s0 = float((wq * r).sum())
+    s1 = float((wq * cq * r).sum())
+    print(f"basis gauge  <corr,1>={s0:+.2e}  <corr,c>={s1:+.2e}")
+    assert abs(s0) < 1e-12, s0
+    assert abs(s1) < 1e-12, s1
+
+
+def test_basis_curvature_consistency():
+    """BasisCorrEnergy f''(c) (closed form) == d f'/dc (autograd)."""
+    en = BasisCorrEnergy(A=1.0, B=2.5, degrees=(2, 3, 4),
+                         coeffs=(0.4, 0.25, 0.15))
+    c = torch.linspace(0.06, 0.94, 41, requires_grad=True)
+    fp = en.fp(c)
+    (dfp,) = torch.autograd.grad(fp.sum(), c)
+    fpp = en.fpp(c)
+    rel = float(((fpp - dfp).abs().max() / dfp.abs().max()).detach())
+    print(f"basis curvature rel = {rel:.2e}")
+    assert rel < 1e-12, rel
 
 
 @pytest.mark.parametrize("order,n_steps", [(1, 3), (2, 4)])
