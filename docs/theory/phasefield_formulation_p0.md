@@ -1,11 +1,11 @@
 # P0 — Ternary Phase-Field with Evaporation and Crystallization
 ## The M4 formulation memo (student-facing; the system everything else builds on)
 
-*Drafted 2026-07-08 (night). Sources: Raghu_Learning_Free_energy.pdf
-(coupled c-eta model), the group FEM guide (canonical AC/CH weak forms),
+*Drafted 2026-07-08 (night). Sources: a coupled c–eta learning-free-energy
+model, the group FEM guide (canonical AC/CH weak forms), and
 Wodo & Ganapathysubramanian JCP 2011 (adaptive implicit CH) and CMS 2012
-(solvent-based OSC fabrication — the replication target), both in
-MyPapers/LearningFreeEnergy/.*
+(solvent-based OSC fabrication — the replication target). See the course
+bibliography `latex/refs.bib` (keys `wodo2011adaptive`, `wodo2012morphology`).*
 
 ## 1. Fields and the simplex reduction
 

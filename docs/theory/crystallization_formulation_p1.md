@@ -1,7 +1,7 @@
 # P1 — Coupled Multi-CH x Multi-AC: Phase Separation + Crystallization
 
-Formulation memo for Baskar's ratification (2026-07-10). Anchors (all in
-MyPapers/OSC/): Siber-Ronsin-Harting 2512.16370 (the extended
+Formulation memo for Baskar's ratification (2026-07-10). Anchors (see the
+course bibliography `latex/refs.bib`): Siber-Ronsin-Harting 2512.16370 (the extended
 Flory-Huggins theory for crystalline multicomponent mixtures — THE free
 energy), 2310.11844 (binary crystallizing dynamics + morphology
 pathways), 2512.16390 (crystallization x spinodal interplay during
@@ -142,7 +142,7 @@ R3. THIS IS M5 — "OrgElMorph" (Organic Electronics Morphology). Spec:
     this week are M5's enabling tracks, recorded as delivered.
 
 ## 8. Fidelity checks vs Ronsin & Harting 2022 (2026-07-10; the ref-14
-framework paper, now in MyPapers/OSC/2204.11628_ronsin_harting_framework.pdf)
+framework paper, arXiv:2204.11628)
 
 THETA: the anchor framework prescribes NO theta kinetics — their theta_k
 is a HEURISTIC marker field (nucleus detection assigns grain IDs;
