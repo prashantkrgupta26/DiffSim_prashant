@@ -94,7 +94,11 @@ def surrogate_traction(dm, sf, geo, x_all, nu, ndof):
     dim = dm.dim
     mesh = dm.mesh
     p_face = np.unique(np.asarray(mesh.p_elem)[sf.elem])
-    assert len(p_face) == 1
+    if len(p_face) != 1:
+        from ..errors import ConfigError
+        raise ConfigError(
+            f"SBM face helper assumes uniform p on the face, got "
+            f"orders {p_face.tolist()}")
     pv = int(p_face[0])
     from ..mesh.faces import face_tables
     ftab = face_tables(pv, dim)

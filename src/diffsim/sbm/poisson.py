@@ -541,7 +541,11 @@ def surrogate_flux(dm, sf, geo, u_all, kappa=1.0):
     S14) in M1b."""
     mesh = dm.mesh
     p_face = np.unique(np.asarray(mesh.p_elem)[sf.elem])
-    assert len(p_face) == 1
+    if len(p_face) != 1:
+        from ..errors import ConfigError
+        raise ConfigError(
+            f"SBM face helper assumes uniform p on the face, got "
+            f"orders {p_face.tolist()}")
     pv = int(p_face[0])
     ftab = face_tables(pv, dm.dim)
     eids = mesh.bins[pv]
