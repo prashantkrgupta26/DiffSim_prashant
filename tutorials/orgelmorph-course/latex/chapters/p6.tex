@@ -11,6 +11,26 @@ separates growing from redissolving seeds; and the way the crystalline
 fraction advances in time is the Avrami (JMAK) law.
 \end{keybox}
 
+\begin{keybox}
+\textbf{Learning objectives.} By the end you can: write the non-conserved
+Allen--Cahn flow for $\psi$ and explain why crystal need not be conserved;
+predict the sign of $\text{drive}=\Delta h(T/T_m-1)$ and hence grow vs
+melt; measure $v(\Delta T)$ and explain its monotone rise (constant
+mobility, no transport maximum); derive and bracket the critical radius
+$r^\ast\propto\sigma/|\text{drive}|$; and fit the Avrami exponent
+$n\pm$CI, explaining why finite pre-placed seeds give $n$ below the ideal
+value.\\[2pt]
+\textbf{Prerequisites.} Non-conserved gradient flows, the Gibbs--Thomson
+balance, least-squares fitting with an uncertainty; Chapter~\ref{ch:p1}
+(free-energy/gradient-flow language and the measure-with-uncertainty
+habit).\\[2pt]
+\textbf{Expected cost.} Any CUDA GPU, 2-D, $<1$\,GB device memory;
+solver \code{cuDSS} (documented \code{splu} fallback). Quick mode
+comparable to P1's measured $\approx75$\,s wall (RTX~6000 Ada, mostly
+kernel compile); reference (four-experiment battery) a few minutes;
+research (\code{--level 6}) tens of minutes.
+\end{keybox}
+
 \section{The model}
 
 Let $\psi\in[0,1]$ be the local crystallinity of a crystallizable species.

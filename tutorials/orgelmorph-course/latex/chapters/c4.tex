@@ -13,6 +13,27 @@ symmetric-positive-definite sub-solves, is the choice at scale. \emph{Not}
 cuDSS on the raw CH block.
 \end{keybox}
 
+\begin{keybox}
+\textbf{Learning objectives.} By the end you can: explain why the mixed
+$(c,\mu)$ Jacobian becomes an indefinite saddle once $f''=3c^2-1<0$ in the
+spinodal band; reproduce the measured divergence (\code{cudss} on the
+polynomial saddle: $[-552,542]$ vs \code{splu}'s bounded $[-1.03,1.01]$);
+recognize the one-iterate-residual trap (\code{cudss}'s residual
+$\sim5\times10^{-13}$ is tiny even though its march diverges); describe how
+\code{blockch}/\code{blockch\_dev} splits the saddle into SPD sub-solves
+instead of ever forming one indefinite factorization; and read
+\code{recommend\_solver}'s measured rationale across the 2-D and 3-D
+regimes.\\[2pt]
+\textbf{Prerequisites.} Chapter~00 (environment green); Computational C1
+(this track); Physics~P1 (the $(c,\mu)$ Cahn--Hilliard model this chapter
+solves).\\[2pt]
+\textbf{Expected cost.} Any CUDA GPU; the live parts here are 2-D (largest
+live benchmark $\sim33$k dofs); the 3-D numbers are \emph{cited} from the
+dev notes, not re-run. Solver headline: \code{cudss} diverges on the raw
+polynomial CH saddle, \code{splu} is safe. The live run is comparable to
+Physics~P1's quick mode ($\approx75$\,s wall, RTX~6000~Ada).
+\end{keybox}
+
 This concept teaches how to choose, using a real marched divergence test
 --- the honest way to check a solver on the CH saddle --- plus the live
 2-D timing and the cited 3-D scaling tables.

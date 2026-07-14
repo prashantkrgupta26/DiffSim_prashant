@@ -10,6 +10,32 @@ and the 32-bit index arithmetic; and, crucially, the \emph{physics} at
 equal resolution is different. 2-D is not a cheap 3-D.
 \end{keybox}
 
+\begin{keybox}
+\textbf{Learning objectives.} By the end you can: explain why dofs
+scale as $2^{\dim}$ per refinement level ($\times4$ in 2-D, $\times8$ in
+3-D); derive the sparsity count
+$(2p+1)^{\dim}\times n_{\text{fields}}$ from element connectivity,
+basis order, fields, and dimension, and show why a naive
+``$3^{\dim}-1$'' finite-difference stencil undercounts it; produce a
+complete device-memory accounting (not just the CSR values) with
+\code{estimate\_capacity.py}; explain why int32 CSR indices are an
+\emph{implementation choice} with a real overflow risk once
+nnz$>2^{31}$, not a hardware limit; and show that 2-D is not a cheap
+3-D at equal resolution (interfacial-area density, $S(q)$ wavelength,
+and percolation differ).\\[2pt]
+\textbf{Prerequisites.} Finite-element connectivity and CSR sparsity
+patterns; Chapter~00 (environment green); Chapter~\ref{ch:c1} and
+Chapter~\ref{ch:c4} (this track).\\[2pt]
+\textbf{Expected cost.} Any CUDA GPU; the live 2-D/tiny-3-D runs use
+well under 1\,GB device memory (an 8\,GB card is ample). Solver
+\code{blockch} by default in \code{estimate\_capacity.py} (or
+\code{splu}/\code{cudss}). The $128^3$ and $256^3$ memory figures below
+are \emph{estimated} capacity-planning numbers, not runs: $128^3$ fits a
+48\,GB card, $256^3$ does not and is never actually launched here.
+Live-run cost is of the same order as physics P1's quick mode
+($\approx75$\,s wall, RTX~6000~Ada, mostly kernel compile).
+\end{keybox}
+
 This concept measures the 2-D-vs-3-D growth live on small meshes,
 accounts the memory completely, and shows that the morphology itself
 changes with dimension. It is the capstone of the computational track:

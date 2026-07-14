@@ -14,6 +14,28 @@ domain \emph{size} collapses onto a single Biot number
 $\mathrm{Bi}=k_e h_0/D_s$.
 \end{keybox}
 
+\begin{keybox}
+\textbf{Learning objectives.} By the end you can: write the moving-frame
+film equations ($K=\sum_i k_{e,i}\overline{\phi_i^{\text{top}}}$,
+$\dd{h}{t}=-K$) atop the ternary bulk dynamics of
+Chapter~\ref{ch:p4}; explain why a matched-\emph{time} rate comparison
+confounds rate with dryness and design the matched-$\phi_s$ fix; define
+$\mathrm{Bi}=k_e h_0/D_s$ and \emph{verify} that different $(k_e,D_s)$
+sharing a $\mathrm{Bi}$ collapse onto one morphology; keep apart
+``dryness sets the demixing degree'' from ``$\mathrm{Bi}$ sets the domain
+size''; and report per-solute conservation and the height budget as a
+resolution-limited invariant.\\[2pt]
+\textbf{Prerequisites.} The ternary free energy, spinodal, and mobility
+machinery of Chapter~\ref{ch:p4} (reused verbatim here); the interface
+width/resolution intuition of Chapter~\ref{ch:p1}; Chapter~00
+(environment green).\\[2pt]
+\textbf{Expected cost.} Any CUDA GPU, 2-D (level 5--7). Solver: cuDSS,
+with \code{splu} a documented fallback for small runs. Quick mode
+target $<2$\,min (comparable to Chapter~\ref{ch:p1}'s measured
+$\approx75$\,s); reference (7-run sweep) 5--30\,min; research widens to a
+finer $(k_e,D_s)$ regime grid.
+\end{keybox}
+
 \section{The model}
 
 We add a moving, evaporating top surface to the ternary system of
