@@ -66,10 +66,13 @@ if [[ ",$LABELS," != *",gpu,"* ]]; then
 fi
 
 # Resolve the latest runner version if not pinned (strip the leading 'v').
+# Capture the full response first — piping curl into `grep -m1` makes grep close
+# the pipe early, and under `set -o pipefail` curl's SIGPIPE (exit 23) would kill
+# the script.
 if [[ -z "$VERSION" ]]; then
   echo "Resolving latest actions/runner release ..."
-  VERSION="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest \
-    | grep -m1 '"tag_name"' | sed -E 's/.*"v?([0-9.]+)".*/\1/')"
+  _rel="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest)"
+  VERSION="$(printf '%s\n' "$_rel" | sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v?([0-9.]+)".*/\1/p' | head -n1)"
   [[ -n "$VERSION" ]] || { echo "Could not resolve latest version; pass --version x.y.z" >&2; exit 1; }
 fi
 echo "Runner version: $VERSION   labels: $LABELS   name: $NAME"
