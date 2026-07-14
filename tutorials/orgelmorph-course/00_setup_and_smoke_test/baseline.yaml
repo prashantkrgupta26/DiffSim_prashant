@@ -1,0 +1,17 @@
+# 00 smoke test — tolerance baseline. These are scientific-invariant checks,
+# NOT bitwise GPU identity: a correct smoke run separates a little (c leaves
+# the initial +/-0.05 band) and stays finite and bounded.
+checks:
+  all_finite:
+    equals: true
+  # A correct coarse smoke separates to O(1); a diverging solve blows up to
+  # O(1e3+). These bounds accept the transient overshoot a coarse 16x16 mesh
+  # shows early while still catching divergence.
+  c_max:
+    min: 0.05        # the field must move off its tiny initial perturbation
+    max: 8.0
+  c_min:
+    min: -8.0
+    max: 0.05
+  n_steps:
+    min: 1

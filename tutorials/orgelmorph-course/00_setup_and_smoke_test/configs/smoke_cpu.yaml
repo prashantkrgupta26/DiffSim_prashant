@@ -1,0 +1,11 @@
+# 00 smoke test — CPU. Same tiny march on the host (no GPU required), so the
+# harness/config/provenance/checker plumbing can be validated anywhere.
+# NOTE: most course chapters require CUDA; this CPU config only proves the
+# workflow plumbing, not the production device path.
+device: cpu
+level: 3            # 8x8
+steps: 10
+dt: 0.02
+kappa: 5.0e-4
+seed: 0
+precision: fp64

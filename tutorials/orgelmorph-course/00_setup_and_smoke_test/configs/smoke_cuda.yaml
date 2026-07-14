@@ -1,0 +1,9 @@
+# 00 smoke test — CUDA. Tiny binary Cahn-Hilliard march to exercise the
+# device toolchain + the full harness (config/provenance/results/check).
+device: cuda:0
+level: 4            # 16x16
+steps: 20
+dt: 0.02
+kappa: 5.0e-4
+seed: 0
+precision: fp64
