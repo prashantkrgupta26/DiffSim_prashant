@@ -43,6 +43,12 @@ from diffsim.mesh.constraints import build_constraints
 from diffsim.mesh.basis import basis_tables
 from diffsim.assembly.operators import DeviceMesh
 from diffsim.physics.cahn_hilliard import CahnHilliardStepper, adaptive_march
+from diffsim.octree.build import refine_elements
+from diffsim.octree.balance import balance2to1
+from diffsim.adaptivity.remesh import (conservative_transfer, nodal_transfer,
+                                       field_mass, consistent_mass_matrix)
+from diffsim.adaptivity.amr_march import (amr_march, build_ch_stepper, remesh,
+                                          free_energy)
 
 
 # --- 1. spatial octree refinement ------------------------------------
@@ -344,3 +350,215 @@ def bdf2_variable_order(level=4, device="cuda:0"):
                 const_errs=c_errs, const_orders=c_orders,
                 const_order=float(np.mean(c_orders)),
                 const_coeff_order=tuple(round(o, 2) for o in c_orders))
+
+
+# --- 4. DYNAMIC (solution-adaptive) AMR — the Phase-3 deliverable ------
+# Sections 1-3 above are honest that the octree refinement there is STATIC
+# (a fixed circle) and that the conservative-transfer demo is a numpy toy.
+# The functions below implement and MEASURE the real thing: the full
+# estimate -> mark -> refine/coarsen -> 2:1 balance -> rebuild -> transfer
+# (field AND BDF history) -> continue cycle, driving the production CH brick
+# through src/diffsim/adaptivity/{remesh,amr_march}.py.
+
+_AMR_EPS = 0.03
+
+
+def _droplet_ic(coords):
+    r = np.sqrt(((coords - 0.5) ** 2).sum(1))
+    return np.tanh((0.3 - r) / (np.sqrt(2.0) * _AMR_EPS))
+
+
+def _band(tree, r=0.3, band=1.5, cap=None):
+    rr = np.sqrt(((tree.centers() - 0.5) ** 2).sum(1))
+    m = np.abs(rr - r) < tree.h() * band
+    if cap is not None:
+        m &= tree.levels < cap
+    return m
+
+
+def _analytic_smooth(coords):
+    x, y = coords[:, 0], coords[:, 1]
+    return 0.3 * np.sin(2 * np.pi * x) * np.sin(2 * np.pi * y) + 0.5
+
+
+def fe_conservative_transfer():
+    """The REAL conservative transfer (not the numpy toy of section 1b): the
+    L2/Galerkin projection on the common refinement of two FE octree meshes,
+    which conserves INT c dV to solver tolerance under BOTH refinement and
+    coarsening, converges at 2nd order, and round-trips losslessly on a
+    representable field. Also shows the nodal-injection failure under
+    coarsening. Host-side (no GPU)."""
+    TB = basis_tables(1, dim=2)
+
+    def mk(tree):
+        m = build_mesh(tree, p=1)
+        return m, build_constraints(m)
+
+    coarse = build_uniform(4, dim=2)
+    fine = balance2to1(refine_elements(coarse, _band(coarse)))
+    cm, cc = mk(coarse)
+    fm, fc = mk(fine)
+
+    # refine + coarsen mass conservation
+    res = {}
+    for name, (om, oc), (nm, nc) in (("refine", (cm, cc), (fm, fc)),
+                                     ("coarsen", (fm, fc), (cm, cc))):
+        f0 = _analytic_smooth(om.node_coords[oc.free_nodes])
+        m0 = field_mass(om, oc, TB, f0)
+        (fn,) = conservative_transfer(om, oc, TB, nm, nc, TB, [f0])
+        res[name] = abs(field_mass(nm, nc, TB, fn) - m0)
+    # nodal (non-conservative) contrast on a genuinely lossy coarsening
+    of = build_uniform(5, dim=2)
+    ofm, ofc = mk(of)
+    og = build_uniform(3, dim=2)
+    ogm, ogc = mk(og)
+    f0 = _analytic_smooth(ofm.node_coords[ofc.free_nodes])
+    m0 = field_mass(ofm, ofc, TB, f0)
+    (fn_c,) = conservative_transfer(ofm, ofc, TB, ogm, ogc, TB, [f0])
+    (fn_n,) = nodal_transfer(ofm, ofc, ogm, ogc, [f0])
+    nodal_err = abs(field_mass(ogm, ogc, TB, fn_n) - m0) / abs(m0)
+    cons_err = abs(field_mass(ogm, ogc, TB, fn_c) - m0) / abs(m0)
+
+    # 2nd-order convergence of the projection
+    errs = []
+    for lvl in (3, 4, 5):
+        om, oc = mk(build_uniform(lvl + 1, dim=2))
+        nm, nc = mk(build_uniform(lvl, dim=2))
+        cf = _analytic_smooth(om.node_coords[oc.free_nodes])
+        (cn,) = conservative_transfer(om, oc, TB, nm, nc, TB, [cf])
+        exact = _analytic_smooth(nm.node_coords[nc.free_nodes])
+        Mm = consistent_mass_matrix(nm, TB)
+        e = np.asarray(nc.T @ (cn - exact))
+        errs.append(float(np.sqrt(e @ (Mm @ e))))
+    orders = [float(np.log2(errs[i] / errs[i + 1]))
+              for i in range(len(errs) - 1)]
+    return dict(mass_refine=float(res["refine"]),
+                mass_coarsen=float(res["coarsen"]),
+                nodal_coarsen_err=float(nodal_err),
+                cons_coarsen_err=float(cons_err),
+                order=float(np.mean(orders)), orders=orders)
+
+
+def dynamic_amr_cycle(device="cuda:0", t_end=5e-3, dt=2e-4, max_level=6):
+    """Run the solution-adaptive AMR march over a shrinking droplet and MEASURE
+    the cycle: mass conserved across every remesh, the free-energy jump across
+    a remesh (transfer error only), and the refined-region/interface overlap."""
+    out = amr_march(build_uniform(3, dim=2), _droplet_ic, M=1.0,
+                    kappa=_AMR_EPS ** 2, dt=dt, t_end=t_end, device=device,
+                    order=1, remesh_every=5, refine_frac=0.15,
+                    coarse_frac=0.03, max_level=max_level, min_level=3)
+    rec = out["rec"]
+    dm = np.abs(np.array(rec["remesh_mass_after"])
+                - np.array(rec["remesh_mass_before"]))
+    dE = np.abs(np.array(rec["remesh_E_after"])
+                - np.array(rec["remesh_E_before"]))
+    return dict(remeshes=len(dm),
+                mass_jump=float(dm.max()),
+                energy_jump=float(dE.max()),
+                overlap_min=float(min(rec["overlap"])),
+                overlap_mean=float(np.mean(rec["overlap"])),
+                dofs_peak=int(max(rec["dofs"])),
+                dofs_mean=float(np.mean(rec["dofs"])),
+                c_min=float(out["final_c"].min()),
+                c_max=float(out["final_c"].max()),
+                finite=bool(np.isfinite(out["final_c"]).all()),
+                out=out)
+
+
+def amr_error_vs_dofs(device="cuda:0", ref_level=7, amr_max=6, t_end=5e-3,
+                      dt=2e-4, uniform_levels=(4, 5, 6)):
+    """error-vs-dofs and error-vs-walltime for dynamic AMR versus a uniform-mesh
+    sweep, all scored against a uniform-fine (ref_level) reference. The AMR run
+    reaches uniform-fine-comparable accuracy at MEASURABLY fewer dofs."""
+    TB = basis_tables(1, dim=2)
+
+    def uniform_run(level):
+        st, mesh, cons = build_ch_stepper(build_uniform(level, dim=2), 1.0,
+                                          _AMR_EPS ** 2, dt, 1, "poly", device)
+        st.set_initial(_droplet_ic, mu_init="consistent")
+        t0 = time.perf_counter()
+        for _ in range(int(round(t_end / dt))):
+            st.step()
+        return dict(mesh=mesh, cons=cons, c=st.x[0::2].copy(),
+                    dofs=st.nfree, wall=time.perf_counter() - t0)
+
+    ref = uniform_run(ref_level)
+    rm, rc = ref["mesh"], ref["cons"]
+    Mref = consistent_mass_matrix(rm, TB)
+
+    def err(mesh, cons, c):
+        (cr,) = conservative_transfer(mesh, cons, TB, rm, rc, TB, [c])
+        e = np.asarray(rc.T @ (cr - ref["c"]))
+        return float(np.sqrt(e @ (Mref @ e)))
+
+    uni = []
+    for lvl in uniform_levels:
+        r = uniform_run(lvl)
+        r["err"] = err(r["mesh"], r["cons"], r["c"])
+        uni.append(dict(level=lvl, dofs=r["dofs"], err=r["err"],
+                        wall=r["wall"]))
+
+    t0 = time.perf_counter()
+    out = amr_march(build_uniform(3, dim=2), _droplet_ic, 1.0, _AMR_EPS ** 2,
+                    dt, t_end, device, order=1, remesh_every=5,
+                    refine_frac=0.15, coarse_frac=0.03, max_level=amr_max,
+                    min_level=3)
+    amr_wall = time.perf_counter() - t0
+    amr_err = err(out["mesh"], out["cons"], out["final_c"])
+    amr_dofs = int(max(out["rec"]["dofs"]))
+
+    ud = np.array([u["dofs"] for u in uni], float)
+    ue = np.array([u["err"] for u in uni], float)
+    order = np.argsort(ue)
+    uni_dofs_match = float(np.exp(np.interp(np.log(amr_err),
+                                            np.log(ue[order]),
+                                            np.log(ud[order]))))
+    # matched uniform wall for the same accuracy (log-interp on the curve)
+    uw = np.array([u["wall"] for u in uni], float)
+    uni_wall_match = float(np.exp(np.interp(np.log(amr_err),
+                                            np.log(ue[order]),
+                                            np.log(uw[order]))))
+    return dict(ref_level=ref_level, ref_dofs=ref["dofs"],
+                uniform=uni, amr_err=amr_err, amr_dofs=amr_dofs,
+                amr_wall=amr_wall, uni_dofs_match=uni_dofs_match,
+                dof_ratio=uni_dofs_match / amr_dofs,
+                wall_ratio=uni_wall_match / max(amr_wall, 1e-9))
+
+
+def spacetime_order(device="cuda:0", T=0.048, Nref=1200, Ns=(15, 30, 60)):
+    """A3 space-time interaction: measure the temporal order of a variable-step
+    BDF2 march that REMESHES at its midpoint. Both BDF history levels are
+    conservatively transferred, so order 2 is recovered across the remesh
+    ('both'); dropping the second level forces a BDF1 restart and inflates the
+    error constant ('drop') while a single restart still recovers order 2."""
+    def march(dt, N, mode):
+        st, mesh, cons = build_ch_stepper(build_uniform(4, dim=2), 1.0, 5e-4,
+                                          dt, order=2, energy="poly",
+                                          device=device)
+        st.set_initial(lambda x: 0.6 + 0.2 * np.cos(np.pi * x[:, 0])
+                       * np.cos(np.pi * x[:, 1]), mu_init="consistent")
+        rstep = int(round(0.5 * N))
+        for i in range(1, N + 1):
+            st.dt = dt
+            st.step()
+            if i == rstep:
+                nt = balance2to1(refine_elements(mesh.tree,
+                                                 _band(mesh.tree, cap=5)))
+                st, mesh, cons = remesh(st, mesh, cons, nt, 1.0, 5e-4,
+                                        "poly", device)
+                if mode == "drop":
+                    st.hist = [st.x[0::2].copy(), st.x[0::2].copy()]
+                    st.dt_prev = None
+        return st.x[0::2].copy()
+
+    res = {}
+    for mode in ("both", "drop"):
+        ref = march(T / Nref, Nref, mode)
+        errs = [float(np.abs(march(T / N, N, mode) - ref).max()) for N in Ns]
+        orders = [float(np.log2(errs[i] / errs[i + 1]))
+                  for i in range(len(errs) - 1)]
+        res[mode] = dict(errs=errs, orders=orders, order=float(np.mean(orders)))
+    return dict(dts=[T / N for N in Ns],
+                both_order=res["both"]["order"], both=res["both"],
+                drop_order=res["drop"]["order"], drop=res["drop"],
+                drop_err_penalty=res["drop"]["errs"][0] / res["both"]["errs"][0])

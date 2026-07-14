@@ -1,18 +1,28 @@
-# Computational C3 — Octree refinement and temporal adaptivity
+# Computational C3 — Octree refinement, dynamic AMR, and temporal adaptivity
 
-Resolution should follow the physics. This tutorial measures octree
-refinement and temporal adaptivity — **honestly**:
+Resolution should follow the physics. This tutorial measures spatial and
+temporal adaptivity — **honestly**, building from a static octree to real
+dynamic AMR:
 
-- **Octree refinement + hanging-node constraints** — `build_adaptive`
+- **Static octree refinement + hanging-node constraints** — `build_adaptive`
   puts small elements only where the field is sharp. Measured ≈ 3.6× fewer
   nodes than a uniform mesh at the same finest $h$, and the CH brick runs
   on the hanging-node mesh. **This refines to a *static* geometric
-  criterion — it is NOT solution-adaptive AMR.**
-- **What true dynamic AMR needs** — estimate → mark → refine/coarsen →
-  2:1 balance → rebuild → conservative transfer → BDF-history transfer →
-  continue. We measure the correctness-critical piece: **conservative
-  transfer** (naive injection loses ~20% of sub-cell mass; cell averaging
-  is exact). Full dynamic AMR is a Phase-3 deliverable.
+  criterion — the lead-in, not yet solution-adaptive AMR.**
+- **The conservative transfer AMR needs** — naive nodal injection loses
+  ~20% of sub-cell mass; the real fix is the **finite-element L2 (Galerkin)
+  projection on the common refinement**, which conserves ∫c dV to machine
+  precision under refine AND coarsen (measured ≈ 1e-16 both directions),
+  converges at 2nd order, and carries the two BDF history levels.
+- **Dynamic (solution-adaptive) AMR** — the full cycle: estimate (|∇c|) →
+  mark → refine/coarsen → 2:1 balance → rebuild mesh+constraints →
+  conservatively transfer c, μ AND both BDF history levels → continue.
+  Measured: mass conserved across every remesh (≈ 6e-17), free energy
+  continuous, refinement tracks the interface (overlap 1.00), and an
+  error-vs-dofs payoff — uniform-fine accuracy at ≈ 2.5× fewer dofs.
+- **Space-time interaction** — a remesh during a variable-step BDF2 march.
+  Transferring **both** history levels recovers order 2 across the remesh;
+  dropping the second level (a BDF1 restart) inflates the error.
 - **Temporal (LTE step ladder)** with **real cost accounting** —
   accepted/rejected steps, full+half solves, Newton iterations, wall time,
   and a **matched-accuracy fixed-dt sweep** (NOT the fictional
@@ -28,9 +38,9 @@ and temporal adaptivity"* (start with `adaptivity.py`).
 
 **Run:**
 ```bash
-python run.py                 # octree + transfer + real cost + BDF2 order
+python run.py                 # static octree + dynamic AMR + cost + BDF2
 ```
-`run.py` prints eight `PASS/FAIL` checks; compare with
+`run.py` prints the `PASS/FAIL` checks; compare with
 [`EXPECTED.md`](EXPECTED.md).
 
 **Regenerate the document's figures + numbers** (optional):
@@ -40,10 +50,16 @@ python gen_figures.py         # writes ../../latex/figures/c3_*.png + numbers/c3
 
 | file | role |
 |------|------|
-| `adaptivity.py` | the core: `octree_refinement`, `transfer_error`, `adaptive_cost`, `instrumented_march`, `bdf2_variable_order` — read this first |
-| `run.py` | the driver you run; prints the four studies |
-| `gen_figures.py` | regenerates the octree/transfer/ladder/cost figures and `numbers/c3.tex` |
+| `adaptivity.py` | the core: `octree_refinement`, `fe_conservative_transfer`, `dynamic_amr_cycle`, `amr_error_vs_dofs`, `spacetime_order`, `adaptive_cost`, `bdf2_variable_order` — read this first |
+| `run.py` | the driver you run; prints the six studies |
+| `gen_figures.py` | regenerates the octree/transfer/ladder/cost + AMR figures and `numbers/c3.tex` |
 | `EXPECTED.md` | reference numbers your run should reproduce |
+
+The dynamic-AMR core lives in reusable library code:
+`src/diffsim/adaptivity/remesh.py` (conservative transfer, common
+refinement, quadrature mass) and `src/diffsim/adaptivity/amr_march.py`
+(the estimate→mark→refine/coarsen→balance→rebuild→transfer→continue cycle),
+plus `octree.coarsen_elements`.
 
 The tutorial uses the production brick
 `src/diffsim/physics/cahn_hilliard.py` and its `adaptive_march`. The
