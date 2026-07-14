@@ -10,6 +10,17 @@
 # only overrides the DOMAIN to 3-D and the solver to blockch_dev —
 # never the physics.
 #
+# PREFLIGHT NOTE (--no-strict, recorded deviation): at 125 lateral cells
+# over the paper's 500 nm box (dx = 4 nm) the forming interface sits AT
+# ~2.2 elements (xi_early 0.0088 h0-units) — below the validated 2.5-elem
+# floor, so the interface-resolution check FAILs for all four rpm cases.
+# The 4-element rule would need >= ~227 lateral cells (~52M dofs), past
+# even the 80 GB card, so refinement is not an option on a single GPU;
+# we run --no-strict (preflight: warn) and monitor phi min/max in flight,
+# recording the check verdicts in each runlog — exactly the deviation the
+# sibling a100_wodo3d_hero kit takes for its N=100 rungs. WITHOUT this
+# flag the default strict preflight ABORTS every case before it marches.
+#
 # EXPECTED WALLS (honest basis): the G5 ladder measured 236 s/step
 # steady at 15.15M dofs on RTX 6000 Ada 48 GB (33.4 GB GPU / 37.7 GB
 # host peak; docs/dev/2026-07-09-blockch-preconditioner.md). A100-80
@@ -47,6 +58,7 @@ for rpm in 6000 3000 1500 500; do
       --set "domain.resolution=[125,125,250]" \
       --set numerics.linsolver=blockch_dev \
       --set stop.wall_cap=37800 \
+      --no-strict \
       > $OUT/negi_${rpm}rpm.log 2>&1 \
       || echo "RESULT case=${rpm}rpm OUTCOME=CRASHED-OR-AUTOPSY (see log)" \
          | tee -a $RES
