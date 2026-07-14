@@ -171,7 +171,7 @@ crystallization energetics) and their provenance in the literature.
 > concept has a runnable, self-checking tutorial (core module, `run.py`,
 > `gen_figures.py`, `EXPECTED.md`) and a chapter in the course document
 > with measured, locked numbers — see the built
-> `latex/orgelmorph_course.pdf` (85 pp). The Differentiable track is
+> `latex/orgelmorph_course.pdf` (178 pp). The Differentiable track is
 > built on a genuine, three-way-verified adjoint through the phase-field
 > solver (`src/diffsim/adjoint/`, `tests/test_phasefield_adjoint.py`):
 > the gradients are taken through the same operator the research code

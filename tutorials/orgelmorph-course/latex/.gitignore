@@ -1,0 +1,9 @@
+# tectonic default output — canonical deliverable is orgelmorph_course.pdf
+main.pdf
+# build intermediates
+*.aux
+*.log
+*.out
+*.toc
+*.bbl
+*.blg
