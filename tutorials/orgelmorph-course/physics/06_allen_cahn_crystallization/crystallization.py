@@ -65,6 +65,9 @@ physical and hardware-independent is the SIGN of the driving force at Tm,
 the SHAPE of the JMAK sigmoid, the MONOTONE v(dT) trend, and the
 EXISTENCE of a critical radius that shrinks with undercooling.
 """
+import os
+import sys
+
 import numpy as np
 
 from diffsim.octree.build import build_uniform
@@ -75,11 +78,22 @@ from diffsim.assembly.operators import DeviceMesh
 from diffsim.physics.multiphase import MultiPhaseStepper, grain_labels
 from diffsim.diagnostics import conservation as _cons
 
-# PCBM-class energetics (materials.yaml crystallization.PCBM_class /
-# 2310.11844 Table 1, nondimensionalized), the validated growth/melt set.
-CHI_AA = np.array([[0.0, 0.7248], [0.7248, 0.0]])
-CHI_CA = np.array([[0.0, 1.0836], [0.0, 0.0]])
-DSIG, DH, TM, EPS2 = 2.6355, 1.3072, 558.0, 1e-3
+# PCBM-class crystallization energetics are READ from the materials database
+# (materials.yaml crystallization.PCBM_class, the extended-Flory-Huggins "r14"
+# form of Siber-Ronsin-Harting), never hand-copied.  Call
+# ``CRYST.record()`` / ``save_resolved_materials(CRYST, ...)`` to archive the
+# resolved values + provenance next to a run's results.
+sys.path.insert(0, os.path.abspath(os.path.join(
+    os.path.dirname(__file__), os.pardir, os.pardir, "materials")))
+from loader import load_crystallization                      # noqa: E402
+
+CRYST = load_crystallization("PCBM_class")
+_chi_aa, _chi_ca = CRYST.value("chi_aa"), CRYST.value("chi_ca")
+CHI_AA = np.array([[0.0, _chi_aa], [_chi_aa, 0.0]])
+CHI_CA = np.array([[0.0, _chi_ca], [0.0, 0.0]])
+DSIG, DH, TM, EPS2 = (CRYST.value("dsig"), CRYST.value("dh"),
+                      CRYST.value("Tm"), CRYST.value("eps2"))
+CRYST_N = list(CRYST.value("N"))
 
 
 def build_mesh_dm(level=5, p=1, device="cuda:0"):
@@ -93,7 +107,7 @@ def build_mesh_dm(level=5, p=1, device="cuda:0"):
 def _stepper(dm, T, eps2=EPS2, L_psi=5.0, dt=2e-3):
     return MultiPhaseStepper(
         dm, M=1, K=1, chi_aa=CHI_AA, chi_ac=CHI_CA.T.copy(),
-        chi_ca=CHI_CA, N=[5.0298, 1.0], onsager=[[0.1]], kappa=[2e-4],
+        chi_ca=CHI_CA, N=CRYST_N, onsager=[[0.1]], kappa=[2e-4],
         dsig=[DSIG], dh=[DH], Tm=[TM], eps2=[eps2], L_psi=[L_psi],
         alpha_th=[0.0], beta_th=[0.0], L_th=[5.0], T=T, dt=dt,
         bulk="r14", kg_delta=1e-2, p_floor=1e-6,

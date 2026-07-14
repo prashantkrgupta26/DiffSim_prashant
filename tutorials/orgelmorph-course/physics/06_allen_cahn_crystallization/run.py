@@ -31,7 +31,8 @@ import numpy as np
 
 from crystallization import (
     build_mesh_dm, run_grow_melt, run_avrami, sweep_interface_velocity,
-    run_critical_radius, drive_of, TM)
+    run_critical_radius, drive_of, TM, CRYST)
+from loader import save_resolved_materials     # noqa: E402  (materials on path)
 
 # make the shared course harness importable (common/check_results.py)
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -140,6 +141,11 @@ def main():
     with open(rpath, "w") as fh:
         json.dump(results, fh, indent=2, sort_keys=True)
     print(f"\nresults -> {rpath}")
+    # archive the resolved crystallization energetics + provenance next to
+    # the results (so the run output is self-describing).
+    mpath = save_resolved_materials(
+        CRYST, os.path.join(args.output, "materials.resolved.json"))
+    print(f"materials -> {mpath}")
 
     if not args.no_check:
         baseline = os.path.join(_HERE, "baseline.yaml")

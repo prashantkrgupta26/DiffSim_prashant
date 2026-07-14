@@ -1,79 +1,376 @@
-# OrgElMorph course - material parameter sets, with provenance.
+# OrgElMorph course -- material parameter database (schema v2).
 #
-# These are the real systems the tutorials use once material identity
-# matters (from the ternary concepts onward). Early binary concepts use
-# nondimensional models; the mapping to these parameters is explained in
-# the course document.
+# Every parameter is a MAPPING carrying its own provenance, not a bare
+# number, so a run can record exactly where each value came from and how
+# trustworthy it is. The validated loader (materials/loader.py) enforces
+# this schema: for a `status: production` parameter it REQUIRES value +
+# units + definition; a `status: accelerated_tutorial` parameter may omit
+# them but must SAY so explicitly (honest pedagogy -- an accelerated value
+# is never silently passed off as a measured one).
 #
-# Flory-Huggins convention used by the bricks (kT/v0 units):
-#   f = sum_i (phi_i/N_i) ln phi_i + sum_{i<j} chi_ij phi_i phi_j
-#   chi = interaction parameter (enthalpic); N = degree of polymerization
-#   (entropic); Biot number Bi = k_e h0 / D_s sets the evaporation rate.
+# ---------------------------------------------------------------------------
+# Per-parameter schema
+# ---------------------------------------------------------------------------
+#   value              the number (or list of numbers)
+#   units              physical units, or "dimensionless"
+#   definition         exact math: where the symbol enters the model
+#   nondimensionalization  the scaling used to make it dimensionless
+#   status             production | accelerated_tutorial
+#   source:
+#     type             measured | fitted | literature | assumed
+#                      | accelerated_tutorial
+#     citation         DOI / full reference (refs.bib key in latex/refs.bib)
+#     location         table / figure / page in the source
+#   uncertainty:
+#     type             stddev | order_of_magnitude | range | none | unknown
+#     value            magnitude (number or [lo, hi]); null if unknown
+#   validity:
+#     temperature_K    temperature the value applies at (or null)
+#     composition      blend / regime the value applies to
+#   notes              free text
+#
+# ---------------------------------------------------------------------------
+# Flory-Huggins convention used throughout (dimensionless energy, kT/v0):
+#   f = sum_i (phi_i / N_i) ln phi_i  +  sum_{i<j} chi_ij phi_i phi_j
+# with chi_ij the (enthalpic) interaction parameters, N_i the degrees of
+# polymerization (entropic), v0 a reference site (monomer) volume, and kT
+# the thermal energy. The evaporation Biot number is Bi = k_e h0 / D_s.
+# ---------------------------------------------------------------------------
+
+schema_version: 2
 
 systems:
 
+  # =========================================================================
+  # P3HT:PCBM -- the archetypal OSC benchmark (Wodo & Ganapathysubramanian).
+  # Used from the ternary concepts onward as the "map a real blend" example.
+  # chi values are order-of-magnitude from the OSC literature, NOT a single
+  # calorimetric measurement, so they carry an order_of_magnitude uncertainty.
+  # =========================================================================
   P3HT_PCBM:
     description: >
       Poly(3-hexylthiophene) : phenyl-C61-butyric-acid-methyl-ester --
-      the archetypal organic-solar-cell blend; the Wodo-Ganapathysubramanian
-      (2012) evaporation-morphology benchmark system.
+      the archetypal organic-solar-cell blend and the
+      Wodo-Ganapathysubramanian (2012) evaporation-morphology benchmark.
     species: [polymer, fullerene, solvent]
-    N: [~, 1, 1]                 # polymer N large (~1e2-1e3); tutorials
-                                 # use the symmetric-entropy model, see P1
-    chi:
-      polymer_fullerene: 0.86    # order-1; blend is weakly immiscible
-      polymer_solvent: 0.4
-      fullerene_solvent: 0.3
-    provenance: >
-      Wodo & Ganapathysubramanian, Comput. Mater. Sci. 55 (2012) 113;
-      chi values order-of-magnitude from the OSC literature.
+    parameters:
+      chi_polymer_fullerene:
+        value: 0.86
+        units: dimensionless
+        definition: >
+          Flory interaction chi_pf between P3HT and PCBM in the enthalpic
+          term chi_pf * phi_p * phi_f of f.
+        nondimensionalization: energy measured in kT/v0; chi is already dimensionless
+        status: production
+        source:
+          type: literature
+          citation: wodo2012morphology
+          location: model section; order-of-magnitude from OSC literature
+        uncertainty: {type: order_of_magnitude, value: 0.5}
+        validity: {temperature_K: 298, composition: "P3HT:PCBM, weakly immiscible (chi ~ O(1))"}
+        notes: >
+          Order-1: the blend is only weakly immiscible. A single "true" chi
+          does not exist -- it depends on regioregularity, molecular weight
+          and temperature; treat as representative.
+      chi_polymer_solvent:
+        value: 0.4
+        units: dimensionless
+        definition: Flory interaction chi_ps between P3HT and the (good) solvent.
+        nondimensionalization: energy in kT/v0
+        status: production
+        source: {type: literature, citation: wodo2012morphology, location: OSC literature (order-of-magnitude)}
+        uncertainty: {type: order_of_magnitude, value: 0.3}
+        validity: {temperature_K: 298, composition: "good solvent (chi < 0.5, miscible)"}
+        notes: chi < 0.5 => solvent is thermodynamically good (fully miscible with polymer).
+      chi_fullerene_solvent:
+        value: 0.3
+        units: dimensionless
+        definition: Flory interaction chi_fs between PCBM and the solvent.
+        nondimensionalization: energy in kT/v0
+        status: production
+        source: {type: literature, citation: wodo2012morphology, location: OSC literature (order-of-magnitude)}
+        uncertainty: {type: order_of_magnitude, value: 0.3}
+        validity: {temperature_K: 298, composition: good solvent}
+        notes: ""
+      N:
+        value: [null, 1.0, 1.0]
+        units: dimensionless
+        definition: >
+          Degrees of polymerization (polymer, fullerene, solvent). Enters
+          the entropy (phi_i / N_i) ln phi_i; large N suppresses mixing
+          entropy of that species.
+        nondimensionalization: dimensionless by construction (sites per chain)
+        status: production
+        source:
+          type: literature
+          citation: wodo2012morphology
+          location: polymer N large (~1e2-1e3); fullerene & solvent single-site
+        uncertainty: {type: range, value: [100, 1000]}
+        validity: {temperature_K: 298, composition: "P3HT:PCBM"}
+        notes: >
+          Polymer N is null here because it is not a single number -- it spans
+          1e2-1e3 depending on molecular weight. The ternary_p4.yaml tutorial
+          entry pins a representative N1=100 for a runnable spinodal; the honest
+          statement is the range above. Fullerene and solvent are single-site.
 
+  # =========================================================================
+  # PDPP5T:PCBM class -- the Negi spin-coating / drying study.
+  # HONEST STATUS: the Negi et al. methodology paper (ACS Appl. Energy Mater.
+  # 2018) simulates spin-coating of a donor:PCBM blend from chloroform with a
+  # square-gradient + surface-energy model. The specific chi/N and the
+  # per-spin-speed Biot numbers below are ILLUSTRATIVE values used by the
+  # evaporation tutorial to place runs on the drying-vs-diffusion (Biot) axis;
+  # they are marked fitted/accelerated, NOT read off a single table.
+  # =========================================================================
   PDPP5T_PCBM:
     description: >
-      Diketopyrrolopyrrole-quinquethiophene : PCBM -- the Negi et al.
-      spin-coating study; used for the evaporation and mobility-closure
+      Diketopyrrolopyrrole-quinquethiophene : PCBM class -- the spin-coating /
+      evaporation study of Negi et al.; drives the drying and Biot-regime
       tutorials.
     species: [polymer, fullerene, solvent]
-    N: [87, 5, 1]
-    chi:
-      polymer_fullerene: 1.0
-      polymer_solvent: 0.1
-      fullerene_solvent: 0.9
-    biot:                         # per-species, four spin speeds
-      s6000rpm: 0.0073
-      s3000rpm: 0.0051
-      s1500rpm: 0.0033
-      s500rpm:  0.0019
-    diffusivity_ratio:            # constant per-species D~ (Negi SI)
-      polymer: 0.001
-      fullerene: 0.005
-    noise_b_reg: 1.0e-4
-    provenance: >
-      Negi, Wodo et al. (spin-coating morphology); parameters from the
-      paper and its SI (see MyPapers/OSC/ in the repository).
+    parameters:
+      chi_polymer_fullerene:
+        value: 1.0
+        units: dimensionless
+        definition: Flory interaction chi_pf (polymer-fullerene).
+        nondimensionalization: energy in kT/v0
+        status: accelerated_tutorial
+        source: {type: fitted, citation: negi2018spincoating, location: representative for the drying tutorial (not a table value)}
+        uncertainty: {type: order_of_magnitude, value: 0.5}
+        validity: {temperature_K: 298, composition: "donor:PCBM from chloroform"}
+        notes: Chosen order-1 so the blend demixes on drying within a cheap horizon.
+      chi_polymer_solvent:
+        value: 0.1
+        units: dimensionless
+        definition: Flory interaction chi_ps (polymer-solvent, good solvent).
+        nondimensionalization: energy in kT/v0
+        status: accelerated_tutorial
+        source: {type: fitted, citation: negi2018spincoating, location: representative}
+        uncertainty: {type: order_of_magnitude, value: 0.1}
+        validity: {temperature_K: 298, composition: good solvent}
+        notes: ""
+      chi_fullerene_solvent:
+        value: 0.9
+        units: dimensionless
+        definition: Flory interaction chi_fs (fullerene-solvent, poorer for PCBM).
+        nondimensionalization: energy in kT/v0
+        status: accelerated_tutorial
+        source: {type: fitted, citation: negi2018spincoating, location: representative}
+        uncertainty: {type: order_of_magnitude, value: 0.3}
+        validity: {temperature_K: 298, composition: "PCBM near its solubility limit"}
+        notes: chi_fs > chi_ps => PCBM precipitates first as the solvent leaves.
+      N:
+        value: [87.0, 5.0, 1.0]
+        units: dimensionless
+        definition: Degrees of polymerization (polymer, fullerene, solvent).
+        nondimensionalization: dimensionless (sites per chain)
+        status: accelerated_tutorial
+        source: {type: fitted, citation: negi2018spincoating, location: representative long-chain donor}
+        uncertainty: {type: range, value: [50, 200]}
+        validity: {temperature_K: 298, composition: "donor:PCBM"}
+        notes: N1=87 stands in for a long-chain donor; N2=5 a small-molecule fullerene aggregate.
+      biot:
+        value: {s6000rpm: 0.0073, s3000rpm: 0.0051, s1500rpm: 0.0033, s500rpm: 0.0019}
+        units: dimensionless
+        definition: >
+          Evaporation Biot number Bi = k_e h0 / D_s per spin speed (higher
+          rpm -> faster drying -> larger effective k_e -> larger Bi).
+        nondimensionalization: Bi = (evaporation flux k_e * film height h0) / (solvent diffusivity D_s)
+        status: accelerated_tutorial
+        source: {type: fitted, citation: negi2018spincoating, location: illustrative spin-speed ladder}
+        uncertainty: {type: order_of_magnitude, value: 0.005}
+        validity: {temperature_K: 298, composition: "spin-coating, chloroform"}
+        notes: >
+          Used only to demonstrate the Biot regime map; the ordering
+          (faster spin -> higher Bi) is the physical content, not the digits.
+      diffusivity_ratio:
+        value: {polymer: 0.001, fullerene: 0.005}
+        units: dimensionless
+        definition: Per-species solute diffusivity relative to the solvent D_s.
+        nondimensionalization: D_i / D_s (solvent diffusivity sets the time scale)
+        status: accelerated_tutorial
+        source: {type: fitted, citation: negi2018spincoating, location: SI-scale estimates}
+        uncertainty: {type: order_of_magnitude, value: null}
+        validity: {temperature_K: 298, composition: "donor:PCBM"}
+        notes: Polymer diffuses slowest; both << solvent.
+      noise_b_reg:
+        value: 1.0e-4
+        units: dimensionless
+        definition: Regularization floor on the fluctuation-dissipation mobility prefactor.
+        nondimensionalization: dimensionless (fraction of peak mobility)
+        status: accelerated_tutorial
+        source: {type: assumed, citation: negi2018spincoating, location: numerical regularization}
+        uncertainty: {type: none, value: null}
+        validity: {temperature_K: null, composition: any}
+        notes: Purely numerical; keeps the stochastic mobility non-singular near pure phases.
 
+  # =========================================================================
+  # Isoindigo:PC61BM -- Gu et al. (2017) solution shearing (flow/rheology
+  # validation system). chi and D are DELIBERATELY UNKNOWN here: the course
+  # treats them as parameters to be recovered in the Differentiable track.
+  # =========================================================================
   isoindigo_PCBM:
     description: >
-      Isoindigo-thienothiophene : PC61BM -- Gu et al. (2017) solution
-      shearing; the flow/rheology (M6) validation system.
+      poly-isoindigo-thienothiophene : PC61BM -- Gu et al. (2017) solution
+      shearing; the flow / parameter-recovery validation system.
     species: [small_molecule, fullerene, solvent]
-    chi:
-      note: >
-        partially unknown for isoindigo-TT; the course treats chi and D
-        as parameters to be recovered (see Differentiable track).
     solvent: chlorobenzene
-    provenance: >
-      Gu, Diao, Ganapathysubramanian, Toney, Bao, Org. Electron. 2017
-      (1-s2.0-S1566119916304608).
+    parameters:
+      chi_polymer_fullerene:
+        value: null
+        units: dimensionless
+        definition: "Flory interaction chi_pf (isoindigo-TT vs PCBM) -- to be recovered."
+        nondimensionalization: energy in kT/v0
+        status: accelerated_tutorial
+        source: {type: unknown, citation: gu2017isoindigo, location: not reported; recovered in Differentiable track}
+        uncertainty: {type: unknown, value: null}
+        validity: {temperature_K: 298, composition: "isoindigo-TT:PC61BM in chlorobenzene"}
+        notes: >
+          Intentionally null. The inverse-design chapters treat chi and D as
+          unknowns fit against the measured domain size / crystallinity.
+      solvent_boiling_K:
+        value: 405.0
+        units: K
+        definition: Chlorobenzene normal boiling point (sets the drying regime).
+        nondimensionalization: none (physical temperature)
+        status: production
+        source: {type: literature, citation: gu2017isoindigo, location: processing solvent (chlorobenzene)}
+        uncertainty: {type: stddev, value: 1.0}
+        validity: {temperature_K: null, composition: chlorobenzene}
+        notes: ""
 
-# Crystallization energetics (dimensionless, kT/v0), for the Allen-Cahn
-# and coupled concepts. From the Siber-Ronsin-Harting crystallizing
-# multicomponent theory (2310.11844 / 2512.16370 / 2512.16390).
+  # =========================================================================
+  # Drying demo ternary -- the P5 evaporation tutorial's DEFAULT blend.
+  # A pedagogical (not real) ternary chosen so a drying film demixes on a
+  # short horizon. Wired into physics/05_evaporation via the loader so no
+  # chi/N are hand-copied into the run. status: accelerated_tutorial.
+  # =========================================================================
+  drying_demo_ternary:
+    description: >
+      The P5 drying-film default: a symmetric pedagogical ternary whose chi
+      makes the film demix as the solvent leaves, on a cheap horizon. Not a
+      real material -- an accelerated teaching blend.
+    species: [solute1, solute2, solvent]
+    parameters:
+      chi:
+        value: [1.5, 0.3, 0.3]
+        units: dimensionless
+        definition: >
+          Flory triple (chi_12, chi_1s, chi_2s) in species order
+          (solute1, solute2, solvent). chi_12 large -> the two solutes demix
+          as they concentrate.
+        nondimensionalization: energy in kT/v0
+        status: accelerated_tutorial
+        source: {type: accelerated_tutorial, citation: siber2023crystalline, location: chosen for a cheap drying quench}
+        uncertainty: {type: none, value: null}
+        validity: {temperature_K: null, composition: pedagogical drying film}
+        notes: Matches the P5 baseline numbers exactly (loader must not change the run).
+      N:
+        value: [5.0, 5.0, 1.0]
+        units: dimensionless
+        definition: Degrees of polymerization (solute1, solute2, solvent).
+        nondimensionalization: dimensionless (sites per chain)
+        status: accelerated_tutorial
+        source: {type: accelerated_tutorial, citation: siber2023crystalline, location: mild asymmetry, cheap horizon}
+        uncertainty: {type: none, value: null}
+        validity: {temperature_K: null, composition: pedagogical drying film}
+        notes: ""
+
+# ===========================================================================
+# Crystallization energetics (dimensionless, kT/v0) for the Allen-Cahn and
+# coupled concepts. Extended-Flory-Huggins "r14" crystalline free energy of
+# Siber-Ronsin-Harting; PCBM-class energetics nondimensionalized. These are
+# an ACCELERATED PCBM-class set: the SIGN of the driving force at Tm and the
+# SHAPE of the growth kinetics are physical, but the kinetic prefactors and
+# demo temperatures are accelerated so the tutorial sweeps quickly.
+# ===========================================================================
 crystallization:
+
   PCBM_class:
-    dsigma: 2.6355     # amorphous-crystal surface parameter
-    dh: 1.3072         # latent heat
-    Tm: 558.0          # melting temperature (K)
-    eps2: 1.0e-3       # crystalline gradient coefficient
-    N: 5.03
-    provenance: 2310.11844 Table 1 (PCBM), dimensionless.
+    description: >
+      PCBM-class crystallization energetics (extended Flory-Huggins "r14"
+      form). Drives the non-conserved crystallinity order parameter psi in
+      the Allen-Cahn tutorial (P6) and the coupled CH+AC tutorial (P7).
+    parameters:
+      chi_aa:
+        value: 0.7248
+        units: dimensionless
+        definition: >
+          Amorphous-amorphous Flory interaction chi_aa between the two
+          amorphous components (2x2, off-diagonal), enthalpic mixing.
+        nondimensionalization: energy in kT/v0
+        status: accelerated_tutorial
+        source: {type: literature, citation: siber2025flory, location: PCBM-class parameter set (r14 free energy), nondimensionalized}
+        uncertainty: {type: order_of_magnitude, value: null}
+        validity: {temperature_K: 558, composition: "PCBM-class binary"}
+        notes: Off-diagonal of the symmetric 2x2 chi_aa; diagonal is zero.
+      chi_ca:
+        value: 1.0836
+        units: dimensionless
+        definition: >
+          Crystalline-amorphous Flory interaction chi_ca (crystal of species 1
+          against amorphous species 2); enters the r14 crystalline coupling.
+        nondimensionalization: energy in kT/v0
+        status: accelerated_tutorial
+        source: {type: literature, citation: siber2025flory, location: PCBM-class r14 set, nondimensionalized}
+        uncertainty: {type: order_of_magnitude, value: null}
+        validity: {temperature_K: 558, composition: "PCBM-class binary"}
+        notes: chi_ac is the transpose (chi_ac = chi_ca.T) in the stepper.
+      dsig:
+        value: 2.6355
+        units: dimensionless
+        definition: >
+          Amorphous-crystal surface (double-well barrier) parameter dsigma in
+          f_cr = phi[ q(psi) dsig + p(psi) drive ], q(psi)=psi^2(1-psi)^2.
+        nondimensionalization: energy in kT/v0
+        status: accelerated_tutorial
+        source: {type: literature, citation: siber2023crystalline, location: PCBM-class (2310.11844), nondimensionalized}
+        uncertainty: {type: order_of_magnitude, value: null}
+        validity: {temperature_K: 558, composition: "PCBM-class"}
+        notes: Sets the amorphous<->crystal barrier height (interface energy scale).
+      dh:
+        value: 1.3072
+        units: dimensionless
+        definition: >
+          Latent heat / crystallization enthalpy dh in the Turnbull driving
+          force drive = dh (T/Tm - 1); negative below Tm (growth).
+        nondimensionalization: energy in kT/v0
+        status: accelerated_tutorial
+        source: {type: literature, citation: siber2023crystalline, location: PCBM-class (2310.11844), nondimensionalized}
+        uncertainty: {type: order_of_magnitude, value: null}
+        validity: {temperature_K: 558, composition: "PCBM-class"}
+        notes: ""
+      Tm:
+        value: 558.0
+        units: K
+        definition: >
+          Melting temperature: the T where drive = dh(T/Tm - 1) changes sign
+          (crystal grows below, melts above).
+        nondimensionalization: none (physical temperature); T enters only via T/Tm
+        status: production
+        source: {type: literature, citation: siber2023crystalline, location: PCBM melting point (~285 C)}
+        uncertainty: {type: stddev, value: 5.0}
+        validity: {temperature_K: 558, composition: "PCBM"}
+        notes: PCBM melts near 285 C; this Tm is physical (the sign at Tm is the invariant).
+      eps2:
+        value: 1.0e-3
+        units: dimensionless
+        definition: >
+          Crystalline gradient coefficient eps2 in the Allen-Cahn flux
+          dpsi/dt = -L_psi[df/dpsi - eps2 lap psi]; sets the psi-interface width.
+        nondimensionalization: (length scale)^2 in the nondimensional domain
+        status: accelerated_tutorial
+        source: {type: assumed, citation: siber2023crystalline, location: interface-width choice for the mesh}
+        uncertainty: {type: none, value: null}
+        validity: {temperature_K: null, composition: any}
+        notes: Chosen so the crystal interface is resolved at the tutorial mesh level.
+      N:
+        value: [5.0298, 1.0]
+        units: dimensionless
+        definition: Degrees of polymerization (crystallizable species, second component).
+        nondimensionalization: dimensionless (sites per chain)
+        status: accelerated_tutorial
+        source: {type: literature, citation: siber2023crystalline, location: PCBM-class (2310.11844)}
+        uncertainty: {type: range, value: [1, 10]}
+        validity: {temperature_K: 558, composition: "PCBM-class"}
+        notes: ""
