@@ -1,0 +1,29 @@
+# C9 campaign tolerance baseline — checked against outputs/demo/summary.json
+# with common/check_results.py.  Scientific/bookkeeping invariants within
+# documented tolerances, NOT bitwise GPU identity.
+#
+#   python ../../common/check_results.py \
+#       --results outputs/demo/summary.json --baseline baseline.yaml
+#
+# sweep_points is sorted by (sweep, value); the stable index order is
+#   0 chi_confirm chi=0.86   1 chi_scan chi=0.36
+#   2 chi_scan   chi=0.86    3 chi_scan chi=1.36
+#
+# Ground truth (RTX 6000 Ada, splu, fh_A=0.15, level 5, 40 steps):
+#   chi 0.36 -> L_area 0.261 +/- 0.037;  0.86 -> 0.416;  1.36 -> 0.517
+#   confirm (seeds 11,12) 0.374;  sensitivity dL/dchi ~ 0.256
+#   8 completed, 1 injected fault surfaced, campaign_complete true.
+checks:
+  # --- bookkeeping invariants (the campaign contract) --------------------
+  n_completed:            {equals: 8}
+  n_failed_injected:      {equals: 1}
+  n_failed_real:          {equals: 0}
+  campaign_complete:      {equals: true}
+  # --- the monotone chi response (morphology physics) -------------------
+  sweep_points.1.value:   {reference: 0.36, atol: 1.0e-9}
+  sweep_points.1.mean:    {reference: 0.261, rtol: 0.15}
+  sweep_points.2.mean:    {reference: 0.416, rtol: 0.12}
+  sweep_points.3.mean:    {reference: 0.517, rtol: 0.10}
+  # ensembles must be COMPLETE (no silently-partial average)
+  sweep_points.1.ensemble_complete: {equals: true}
+  sweep_points.3.ensemble_complete: {equals: true}
