@@ -1,0 +1,20 @@
+# C8 — extending DiffSim: the sextic free-energy term (canonical run record).
+# The worked reference is a transparent readable-NumPy mixed Cahn-Hilliard
+# solver on the diffsim mesh infrastructure, so every contributor-workflow
+# stage is visible and cheap (runs on CPU).
+beta: 0.5           # the new sixth-order Landau coefficient (0 -> base model)
+mms_levels: [3, 4, 5]
+march_level: 5
+march_dt: 2.0e-3
+march_steps: 15
+quench_dt: 5.0e-2
+precision: fp64
+
+modes:
+  quick:
+    mms_levels: [3, 4, 5]
+  reference:
+    mms_levels: [3, 4, 5]
+  research:
+    mms_levels: [3, 4, 5, 6]
+    march_steps: 30

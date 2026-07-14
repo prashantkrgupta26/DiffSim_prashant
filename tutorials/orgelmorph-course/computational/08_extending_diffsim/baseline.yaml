@@ -1,0 +1,24 @@
+# C8 baseline — every gate a new free-energy term must pass.
+# Deterministic (CPU, fixed seeds); the FD-consistency and MMS-order checks are
+# hardware-independent. Bounds are one-sided where a "must be small/large" fact
+# is the point.
+checks:
+  # 1. the new term's own derivatives match finite difference
+  term_fp_err:            {max: 1.0e-4}
+  term_fpp_err:           {max: 1.0e-3}
+  # 2. the whole-system analytic Jacobian matches FD (the load-bearing gate)
+  jac_fd_rel:             {max: 1.0e-5}
+  jac_fd_rel_base:        {max: 1.0e-5}
+  # 3. limiting case beta -> 0 reduces to the base model
+  limiting_zero:          {equals: true}
+  # 4. MMS convergence at the p=1 spatial rate
+  mms_order:              {min: 1.7, max: 2.3}
+  # 5. mass conservation (no-flux, Model-B)
+  rel_mass_drift:         {max: 1.0e-10}
+  # 6. energy dissipation (Lyapunov)
+  energy_max_increment:   {max: 1.0e-9}
+  # 7. the new term does something physical: bounds a deep quench
+  quench_max_sextic:      {max: 100.0}
+  # 8. and costs almost nothing to assemble
+  newterm_overhead_pct:   {max: 25.0}
+  all_gates_pass:         {equals: true}
