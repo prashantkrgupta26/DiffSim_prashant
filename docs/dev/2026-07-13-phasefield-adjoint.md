@@ -100,7 +100,29 @@ adj/FD `6.8e-10`.  Sample (BDF2): dJ/dT = [+3.83e-1, +3.00e-1, +3.33e-1,
   (time-series dJ/dT_n, three-way).  Evaporation-rate k_e through the film march
   (top-flux + frame velocity) is a documented frontier (needs the wodo_film face
   infrastructure; the same IFT sweep applies with a boundary dR/dk_e term).
-- (c) learn-free-energy / (d) design-route: see G4/G5 below.
+- (c) LEARN FREE ENERGY — **delivered & verified** (G4 below).
+- (d) DESIGN PROCESS ROUTE — **delivered & verified** (G5 below).
+
+### G4 — learn a free-energy functional from a trajectory (`test_g4_learn_free_energy`)
+
+`PolyBasisEnergy`: bulk f'(c) = sum_i a_i c^{p_i} on a monomial basis;
+df'/da_i = c^{p_i} feeds the adjoint.  Truth f'(c)=c^3-c (a=[1,-1]).  Objective
+= L2 misfit over a TRAJECTORY of snapshots; gradient via CHAdjoint; fit by
+L-BFGS.
+- trajectory-loss gradient vs FD: rel `5.4e-10`, `3.2e-11`.
+- clean recovery (10 snaps): a=[0.99999986, -0.99999999], |a-truth| `1.4e-7`,
+  loss `1.5e-14`.
+- noisy data (sigma=0.01): recovery error K=1 `0.183` -> K=4 `0.0048`
+  (~40x better with more snapshots).
+
+### G5 — design a processing route (`test_g5_design_process_route`)
+
+PDE-constrained optimisation: optimise the temperature schedule T(t) to hit a
+TARGET crystalline fraction (mean psi) using the G3 schedule gradient + L-BFGS
+(bounded T in [0.2, 2.0]).  Target set by a ground-truth cold ramp (reachable).
+- achieved converges to target: target `0.23877`, achieved `0.23877`,
+  |diff| `4.2e-15`; objective `1.94e-04 -> 8.67e-30`.  Optimised schedule is
+  interior (not pinned at the bounds).
 
 ## Scope notes
 - Gate meshes are uniform (constraints.T == identity), natural no-flux BCs.
@@ -111,6 +133,27 @@ adj/FD `6.8e-10`.  Sample (BDF2): dJ/dT = [+3.83e-1, +3.00e-1, +3.33e-1,
   reuse the same IFT sweep with a larger block.
 
 ## Frontiers / next
-- G3 processing params (evap rate k_e, quench schedule T(t) — a time series;
-  note `dR/dT = dh/Tm` per GP is already implemented as the "T" param deriv).
-- G4 learn f(c) from a trajectory; G5 design a process schedule.
+- Evaporation-rate k_e through the wodo_film march (top-flux + frame velocity):
+  the only named processing param not yet wired — needs the face-integral
+  infrastructure; the same IFT sweep applies with a boundary dR/dk_e term.
+- Orientation theta (4th block dof) — KG-regularised |grad theta|, its own gate.
+- Multi-species M>1 / matrix Onsager mobilities: same sweep, larger block.
+- NN free-energy (MLP f(c)) — the G4 basis generalises; autograd twin already
+  differentiates arbitrary f' so an MLP parametrisation drops in.
+
+## Module layout
+- `src/diffsim/adjoint/phasefield.py` — CHDiscrete/CHForward/CHAdjoint,
+  PolyEnergy/FHEnergy/PolyBasisEnergy (binary CH + material params + G4 basis).
+- `src/diffsim/adjoint/crystallization.py` — CACHDiscrete/CACHForward/
+  CACHAdjoint (coupled CH x AC, crystallization params, G3 schedule + G5).
+- `src/diffsim/adjoint/torch_twin.py` — CHTwin, CACHTwin (autograd reference).
+- `tests/test_phasefield_adjoint.py` — 8 gates (G1, G2a/b/c, G3, G4, G5,
+  forward parity).
+
+## Merge checklist (supervisor)
+1. `PYTHONPATH=<worktree>/src pytest tests/test_phasefield_adjoint.py` — 8 green.
+2. Forward bricks unchanged: `git diff` touches only `adjoint/` + the test +
+   this note (no edit to physics/cahn_hilliard.py or multiphase.py).
+3. Forward parity gate confirms the numpy operator == production stepper.
+4. All three-way tolerances locked with >=2x headroom (adj/twin < 1e-10 vs
+   measured ~1e-16; adj/FD < 1e-6 vs measured ~1e-9).

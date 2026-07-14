@@ -54,6 +54,32 @@ class PolyEnergy:
         raise KeyError(name)
 
 
+class PolyBasisEnergy:
+    """Learnable bulk energy with f'(c) = sum_i a_i c^{p_i} on a monomial
+    basis (G4: 'learned thermodynamics').  Coefficient names are 'a{i}';
+    df'/da_i = c^{p_i} is exactly the basis function, so the adjoint learns
+    the free energy from morphology snapshots.  (A constant term in f' is
+    intentionally excluded — it shifts mu by a constant and leaves the
+    conserved c-dynamics invariant, hence is unidentifiable from c data.)"""
+
+    def __init__(self, powers, coeffs):
+        self.powers = list(powers)
+        self.coeffs = np.asarray(coeffs, np.float64)
+        self.param_names = tuple(f"a{i}" for i in range(len(self.powers)))
+
+    def fp(self, c):
+        return sum(self.coeffs[i] * c ** self.powers[i]
+                   for i in range(len(self.powers)))
+
+    def fpp(self, c):
+        return sum(self.coeffs[i] * self.powers[i] * c ** (self.powers[i] - 1)
+                   for i in range(len(self.powers)))
+
+    def dfp_dparam(self, c, name):
+        i = int(name[1:])
+        return c ** self.powers[i]
+
+
 class FHEnergy:
     """Flory-Huggins f(c) = A[c ln c + (1-c)ln(1-c)] + B c(1-c),
     f'  = A[ln c - ln(1-c)] + B(1 - 2c),  f'' = A[1/c + 1/(1-c)] - 2B.
