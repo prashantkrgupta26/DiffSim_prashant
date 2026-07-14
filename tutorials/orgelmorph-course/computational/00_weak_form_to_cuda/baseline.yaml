@@ -1,0 +1,26 @@
+# C0 tolerance baseline - reference mode.
+#
+# Scientific invariants within documented tolerances, NOT bitwise identity.
+# The load-bearing quantities are the observed CONVERGENCE ORDERS (must land in
+# the theoretical bands) and the Jacobian-consistency contrast (complete brick
+# matches the finite difference; the hands-on starter does not).
+#
+# Ground truth captured on CPU (splu), diffsim @ e4ee475:
+#   p1 order 2.010 (L2 3.32e-3 -> 5.08e-5, levels 3-6), Newton 6 its/level
+#   p2 order 2.984 (L2 1.59e-3 -> 3.22e-6, levels 2-5)
+#   analytic-vs-FD 7.9e-9 (complete) vs 4.9e-3 (starter, reaction Jac missing)
+#   transparent stiffness == assemble_brick_csr(PoissonBrick) to 0.0
+checks:
+  p1_order:                     {reference: 2.01, atol: 0.15}
+  p2_order:                     {reference: 2.98, atol: 0.20}
+  p1.l2.0:                      {reference: 3.319e-3, rtol: 0.10}
+  p1.l2.3:                      {reference: 5.078e-5, rtol: 0.12}
+  p2.l2.3:                      {reference: 3.218e-6, rtol: 0.15}
+  # analytic Jacobian matches a finite difference of the residual (completed)
+  jac_fd_rel_error:             {max: 1.0e-6}
+  # the hands-on STARTER (reaction Jacobian omitted) does NOT -- the red state
+  jac_fd_rel_error_starter:     {min: 1.0e-4}
+  # transparent stiffness IS the production Warp-kernel assembly
+  stiffness_vs_production_max:  {max: 1.0e-10}
+  newton_iters_level5:          {max: 10}
+  all_gates_pass:               {equals: true}
