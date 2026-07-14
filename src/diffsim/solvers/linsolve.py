@@ -421,7 +421,7 @@ def _blockch_pair_fill_kernel():
 
 def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
                          device="cuda:0", cache=None, cache_key=None,
-                         idx_dev=None):
+                         idx_dev=None, jv=None):
     """G5: _blockch_pairs with a DEVICE-RESIDENT setup. A's values live
     on the GPU (warp array vals_d, e.g. DeviceNSAssembler.vals_d);
     indptr/indices are the assembler's HOST pattern mirrors. Symbolic
@@ -611,8 +611,15 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
 
     opA = CSROperator.from_device_arrays(*setup["A_idx_d"], vals_d, N,
                                          device)
+    # MATRIX-FREE OUTER (2026-07-14): when jv is supplied the outer
+    # FGMRES sees A ONLY through the caller's matrix-free J @ v closure
+    # (the device element-block apply — no monolithic CSR); the blockch
+    # W-factor inners still ride the stored pair-block gathers (the
+    # "inners stored, outer matrix-free" design).  Without jv the stored
+    # full-A device spmv is used (the B2 path, unchanged).
+    A_matvec = jv if jv is not None else opA.matvec_numpy
     it = [0]
-    x, info = _lgmres(LinearOperator((N, N), opA.matvec_numpy), b,
+    x, info = _lgmres(LinearOperator((N, N), A_matvec), b,
                       M=LinearOperator((N, N), apply),
                       rtol=tol, atol=1e-13, maxiter=100,
                       callback=lambda _: it.__setitem__(0, it[0] + 1))
@@ -661,7 +668,7 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
             return z
 
         it[0] = 0
-        x, info = _lgmres(LinearOperator((N, N), opA.matvec_numpy), b,
+        x, info = _lgmres(LinearOperator((N, N), A_matvec), b,
                           M=LinearOperator((N, N), apply_fb),
                           rtol=tol, atol=1e-13, maxiter=40,
                           callback=lambda _:

@@ -1543,7 +1543,8 @@ class MultiPhaseStepper:
                  T_mode="scalar", T_field=None, D_T=None,
                  wall_g=None, wall_h=None, wall_face=(1, 0),
                  delta_a=None, m_a=None, a_reg=1e-8, tstep="bdf1",
-                 film=None, assembly="host", block_sparse=False):
+                 film=None, assembly="host", block_sparse=False,
+                 matfree=False):
         from ..physics.poisson import gauss_points
         self.dm = dm
         self.M, self.K = int(M), int(K)
@@ -1708,6 +1709,15 @@ class MultiPhaseStepper:
         self.block_sparse = bool(block_sparse)
         assert not (block_sparse and assembly == "host"), \
             "block_sparse is a device-assembly pattern option"
+        # M5 matrix-free OUTER: the outer FGMRES sees J only through the
+        # device element-block apply (apply_Jv); the blockch W-factor
+        # inners stay stored.  For the 256^3 (M, K)=(3, 2) system whose
+        # CSR fits on no single card (dev note 2026-07-14).  Requires
+        # assembly="device" + linsolver blockch/blockch_dev.
+        self.matfree = bool(matfree)
+        assert not (matfree and assembly != "device"), \
+            "matfree requires assembly='device'"
+        self._mf_ctx = self._mf_face = self._mf_strong = None
         self._asm = None            # DeviceNSAssembler (lazy, per mesh)
         self._cudss_dev = None      # device-CSR DirectSolver plan
         self._n_dev_plans = 0       # nnz-stability regression counter
@@ -2562,50 +2572,108 @@ class MultiPhaseStepper:
         # element-batch buffers (Ae transient capped ~2 GB, G5 rung c)
         self._dev_bufs = {}
 
-    def _assemble_device(self, x, ctx):
-        """Device-path assembly at one Newton iterate: device GP-field
-        eval (gp_multifield, the _pack_fields mirror), BATCHED element
-        launches scattered through the slot maps into the device CSR
-        values, host-valued O(surface) face terms slot-added, strong
-        rows applied in-kernel.  Fills asm.vals_d / asm.F_d in place
-        (free dofs == full dofs: identity constraints asserted)."""
+    def _init_matfree_assembly(self):
+        """M3: matrix-free-ONLY setup — the GP-field + element-batch
+        buffers apply_Jv needs, over a DeviceNSAssembler in matvec_only
+        mode (bins + device conn; NO CSR pattern, NO vals_d, NO int32-nnz
+        ceiling).  This is the TRUE footprint of the matrix-free outer at
+        sizes whose stored CSR fits on no card.  No wall/flux slot or
+        strong-row CSR setup (apply_Jv carries face terms via the host
+        _build_face_jac correction and strong rows via the index list);
+        asserts wall/Dirichlet absent (film top-flux is fine)."""
+        from ..assembly.device_assembly import DeviceNSAssembler
+        n = self.Tc.shape[0]
+        assert self.Tc.shape[0] == self.Tc.shape[1] and \
+            (self.Tc - sp.identity(n, format="csr")).nnz == 0, \
+            "matrix-free requires identity constraints"
+        assert not self.wall_on and self.dirichlet is None, (
+            "matrix-free-only setup: wall/Dirichlet need the CSR slot "
+            "path (use assembly='device' + matfree there)")
+        nd = self.ndof
+        d = self.dm.device
+        self._asm = DeviceNSAssembler(self.dm, ndof=nd,
+                                      node_pattern=True, matvec_only=True)
+        self._vals_dev, self._grads_dev = {}, {}
+        self._zsrc_d, self._zqpsi_d, self._zqphi_d = {}, {}, {}
+        for pv, b in self.dm.bins.items():
+            ngp = len(self.mesh.conn_of[pv]) * b["nqp"]
+            self._vals_dev[pv] = wp.zeros((ngp, nd), dtype=wp.float64,
+                                          device=d)
+            self._grads_dev[pv] = wp.zeros((ngp, nd, self.dm.dim),
+                                           dtype=wp.float64, device=d)
+            if self.src_fns is None:
+                self._zsrc_d[pv] = wp.zeros((ngp, nd), dtype=wp.float64,
+                                            device=d)
+            if not (self.noise_psi > 0.0 and self.K):
+                self._zqpsi_d[pv] = wp.zeros((ngp, self.Kp),
+                                             dtype=wp.float64, device=d)
+            if not self.noise_phi > 0.0:
+                self._zqphi_d[pv] = wp.zeros(
+                    (ngp, self.M, self.dm.dim), dtype=wp.float64, device=d)
+        self._dev_bufs = {}
+
+    def _dev_inputs(self, ctx):
+        """Per-attempt device GP inputs (hist/src/noise/T), uploaded
+        ONCE per ctx and cached on ctx['_dev'] (iterate-independent;
+        zero buffers reused when an input is inactive)."""
+        dev = ctx.get("_dev")
+        if dev is not None:
+            return dev
+        d = self.dm.device
+        arr = lambda a_: wp.array(np.ascontiguousarray(a_),
+                                  dtype=wp.float64, device=d)
+        tq_gp = ctx["tq_gp"]
+        dev = dict(
+            hist={pv: arr(v) for pv, v in ctx["hist_gp"].items()},
+            src=({pv: arr(v) for pv, v in ctx["src_gp"].items()}
+                 if self.src_fns is not None else self._zsrc_d),
+            qpsi=({pv: arr(v) for pv, v in ctx["qpsi_gp"].items()}
+                  if (self.noise_psi > 0.0 and self.K)
+                  else self._zqpsi_d),
+            qphi=({pv: arr(v) for pv, v in ctx["qphi_gp"].items()}
+                  if self.noise_phi > 0.0 else self._zqphi_d),
+            tq=(None if tq_gp is None
+                else {pv: arr(v) for pv, v in tq_gp.items()}))
+        ctx["_dev"] = dev
+        return dev
+
+    def _gp_eval_dev(self, x, ctx):
+        """Device GP-field eval of x into _vals_dev/_grads_dev (the
+        _pack_fields mirror).  Per-bin buffers are independent, so the
+        result is order-invariant — shared by the CSR-scatter assembly
+        (_assemble_device) and the matrix-free apply (apply_Jv)."""
         from ..assembly.gp_field import make_gp_multifield
         asm = self._asm
         d = self.dm.device
         nd = self.ndof
-        arr = lambda a_: wp.array(np.ascontiguousarray(a_),
-                                  dtype=wp.float64, device=d)
-        sigma, t_new = ctx["sigma"], ctx["t_new"]
-        drive_d, K_tot = ctx["drive_d"], ctx["K_tot"]
-        minv, mlat, mvert = ctx["minv"], ctx["mlat"], ctx["mvert"]
-        tq_gp, dtea, dtref = ctx["tq_gp"], ctx["dtea"], ctx["dtref"]
-        # per-attempt GP inputs: uploaded ONCE per ctx (iterate-
-        # independent; zero buffers reused when the input is inactive)
-        dev = ctx.get("_dev")
-        if dev is None:
-            dev = dict(
-                hist={pv: arr(v) for pv, v in ctx["hist_gp"].items()},
-                src=({pv: arr(v) for pv, v in ctx["src_gp"].items()}
-                     if self.src_fns is not None else self._zsrc_d),
-                qpsi=({pv: arr(v) for pv, v in ctx["qpsi_gp"].items()}
-                      if (self.noise_psi > 0.0 and self.K)
-                      else self._zqpsi_d),
-                qphi=({pv: arr(v) for pv, v in ctx["qphi_gp"].items()}
-                      if self.noise_phi > 0.0 else self._zqphi_d),
-                tq=(None if tq_gp is None
-                    else {pv: arr(v) for pv, v in tq_gp.items()}))
-            ctx["_dev"] = dev
-        # iterate upload: [n_nodes, ndof] node-major view of x
-        X_d = arr(x.reshape(self.dm.n_nodes, nd))
-        asm.zero_fill()
-        p = self._par
+        X_d = wp.array(np.ascontiguousarray(
+            x.reshape(self.dm.n_nodes, nd)), dtype=wp.float64, device=d)
         for k_bin, (pv, b, ne, nbf, _gd) in enumerate(asm._bins):
-            nqp = b["nqp"]
-            gpk = make_gp_multifield(nbf, nqp, self.dm.dim, nd)
+            gpk = make_gp_multifield(nbf, b["nqp"], self.dm.dim, nd)
             wp.launch(gpk, dim=ne,
                       inputs=[b["conn"], b["h"], b["N"], b["dN"], X_d,
                               self._vals_dev[pv], self._grads_dev[pv]],
                       device=d)
+
+    def _fill_element_batches(self, ctx):
+        """Generator over element-Jacobian fill: launch make_mpf_newton
+        into the batch buffers (Ae [<=nb_cap, nl, nl], be) for every
+        element batch and YIELD (k_bin, e0, nb, Ae, be).  The GP fields
+        (_gp_eval_dev) must be current.  THE single source of the
+        element-block fill — consumed by _assemble_device (scatter into
+        the global CSR) AND by apply_Jv (matrix-free element matvec),
+        so the two paths cannot drift."""
+        asm = self._asm
+        d = self.dm.device
+        nd = self.ndof
+        sigma = ctx["sigma"]
+        drive_d, K_tot = ctx["drive_d"], ctx["K_tot"]
+        minv, mlat, mvert = ctx["minv"], ctx["mlat"], ctx["mvert"]
+        dtea, dtref = ctx["dtea"], ctx["dtref"]
+        dev = self._dev_inputs(ctx)
+        p = self._par
+        for k_bin, (pv, b, ne, nbf, _gd) in enumerate(asm._bins):
+            nqp = b["nqp"]
             nl = nd * nbf
             if k_bin not in self._dev_bufs:
                 nb_cap = min(ne, max(1, (2 << 30) // (nl * nl * 8)))
@@ -2655,7 +2723,32 @@ class MultiPhaseStepper:
                     wp.float64(self.kg_delta),
                     wp.float64(self.p_floor),
                     Ae, be], device=d)
-                asm.scatter_batch(k_bin, e0, Ae, be, nb)
+                yield k_bin, e0, nb, Ae, be
+
+    def _assemble_device(self, x, ctx):
+        """Device-path assembly at one Newton iterate: device GP-field
+        eval (gp_multifield, the _pack_fields mirror), BATCHED element
+        launches scattered through the slot maps into the device CSR
+        values, host-valued O(surface) face terms slot-added, strong
+        rows applied in-kernel.  Fills asm.vals_d / asm.F_d in place
+        (free dofs == full dofs: identity constraints asserted).
+
+        GP eval + element-block fill are factored into _gp_eval_dev /
+        _fill_element_batches (the SAME blocks apply_Jv consumes); this
+        method scatters them into the CSR.  Bit-identical to the former
+        inline loop: GP writes per-bin-independent buffers, so hoisting
+        the eval only reorders launches."""
+        asm = self._asm
+        d = self.dm.device
+        nd = self.ndof
+        arr = lambda a_: wp.array(np.ascontiguousarray(a_),
+                                  dtype=wp.float64, device=d)
+        t_new = ctx["t_new"]
+        K_tot, minv = ctx["K_tot"], ctx["minv"]
+        self._gp_eval_dev(x, ctx)
+        asm.zero_fill()
+        for k_bin, e0, nb, Ae, be in self._fill_element_batches(ctx):
+            asm.scatter_batch(k_bin, e0, Ae, be, nb)
         # A2 wall face terms (host-valued; same weak terms as the
         # host path — module docstring A2)
         if self.wall_on:
@@ -2700,6 +2793,98 @@ class MultiPhaseStepper:
                     bv.append(gv[k2] - x[i * nd + f])
             asm.apply_strong_rows(np.asarray(bv, np.float64))
 
+    # == M5 matrix-free OUTER (2026-07-14-matrixfree-outer) =============
+    # The monolithic Jacobian J is NEVER stored: J @ v is applied
+    # batch-wise through the SAME device element blocks the CSR scatter
+    # uses (fill Ae per batch -> Ae @ v_e -> scatter into y), plus the
+    # O(surface) face-term + strong-row corrections.  Enables the
+    # 256x256x128 (M=3, K=2) system whose stored CSR (~148 GB) fits on
+    # NO single card; the blockch W-factor inners stay stored (node-
+    # pattern sized).  See docs/dev/2026-07-14-matrixfree-outer.md.
+    def _matfree_setup(self, x, ctx):
+        """Freeze the linearization point for the matrix-free J @ v:
+        GP-eval x ONCE (Ae is x-only, identical across the outer Krylov
+        matvecs — recomputed per apply since the full element-block set
+        is too large to store, e.g. ~430 GB at 256^3), and precompute
+        the x-independent face-term Jacobian correction (host CSR, tiny)
+        + strong-row indices."""
+        assert self._asm.node_mode, (
+            "matrix-free apply: node-graph pattern (large 3-D) only")
+        assert self.dirichlet is None or True   # handled in apply_Jv
+        self._gp_eval_dev(x, ctx)
+        self._mf_ctx = ctx
+        self._mf_face = self._build_face_jac(x, ctx)
+        if self.dirichlet is not None:
+            nd = self.ndof
+            self._mf_strong = np.array(
+                [i * nd + f for f, gfn in enumerate(self.g_fns)
+                 if gfn is not None for i in self.dirichlet], np.int64)
+        else:
+            self._mf_strong = None
+
+    def _build_face_jac(self, x, ctx):
+        """The face-term Jacobian entries (A2 wall (mu_i,phi_i) block +
+        S3a top-flux (phi_i,phi_i) block) as a host CSR over the full
+        (== free) dof space.  These entries are x-INDEPENDENT within an
+        attempt (geometric face-mass * frozen coefficients), so the CSR
+        is built once per outer solve and applied on the host as a small
+        correction to the device element matvec.  Returns None when no
+        face terms are active."""
+        nd = self.ndof
+        K_tot, minv = ctx["K_tot"], ctx["minv"]
+        N = self.nfree * nd
+        rows, cols, vals = [], [], []
+        if self.wall_on:
+            nfn = self.wall_faces.shape[1]
+            wf = (self.y_comp / self.h_curr) if self.film_on else 1.0
+            for i in range(self.M):
+                gi, hi = self.wall_g[i], self.wall_h[i]
+                if hi == 0.0:
+                    continue
+                gd = nd * self.wall_faces + (2 * i + 1)
+                cd = nd * self.wall_faces + 2 * i
+                rows.append(np.repeat(gd, nfn, axis=1).ravel())
+                cols.append(np.tile(cd, (1, nfn)).ravel())
+                vals.append((-2.0 * hi * wf) * self.wall_face_M.ravel())
+        if self.film_on and K_tot > 0.0:
+            nfn = self.top_faces.shape[1]
+            for i in range(self.M):
+                coef = (K_tot - self.k_e[i]) * minv * self.y_comp
+                if coef == 0.0:
+                    continue
+                gd = nd * self.top_faces + 2 * i
+                rows.append(np.repeat(gd, nfn, axis=1).ravel())
+                cols.append(np.tile(gd, (1, nfn)).ravel())
+                vals.append((-coef * self.top_face_M).ravel())
+        if not rows:
+            return None
+        return sp.coo_matrix(
+            (np.concatenate(vals),
+             (np.concatenate(rows), np.concatenate(cols))),
+            shape=(N, N)).tocsr()
+
+    def apply_Jv(self, v):
+        """Matrix-free J @ v at the frozen _matfree_setup point.  Host
+        v -> device; per element batch: refill Ae (make_mpf_newton) and
+        Ae @ v_e scatter-added into y (never assembles the global CSR);
+        then the host face-term correction and strong-row identity.
+        Returns host y.  Cost basis = one element-fill pass per matvec
+        (the outer-FGMRES J.v; see the dev note's measured table)."""
+        asm = self._asm
+        d = self.dm.device
+        v_d = wp.array(np.ascontiguousarray(v), dtype=wp.float64,
+                       device=d)
+        y_d = wp.zeros(asm.Nfull, dtype=wp.float64, device=d)
+        for k_bin, e0, nb, Ae, be in self._fill_element_batches(
+                self._mf_ctx):
+            asm.apply_batch_matvec(k_bin, e0, Ae, nb, v_d, y_d)
+        y = y_d.numpy()
+        if self._mf_face is not None:
+            y += self._mf_face @ v
+        if self._mf_strong is not None:
+            y[self._mf_strong] = v[self._mf_strong]
+        return y
+
     def _solve_dev(self):
         """Linear solve on the device-resident CSR.  cudss: zero-copy
         torch CSR (dlpack over asm.vals_d) with STABLE operands — plan
@@ -2719,12 +2904,15 @@ class MultiPhaseStepper:
             # contract as the host branch.
             from ..solvers.linsolve import blockch_pairs_device
             asm.device_operator()      # ensures the _op_idx upload
+            # matfree: the outer FGMRES matvec is the CSR-free element
+            # apply; the W-factor inners still gather from vals_d.
+            jv = self.apply_Jv if self.matfree else None
             try:
                 return blockch_pairs_device(
                     asm.indptr, asm.indices, asm.vals_d,
                     asm.F_d.numpy(), self._blockch_meta(), tol=1e-10,
                     device=self.dm.device, cache=self._solver_cache,
-                    cache_key="mpf_dev", idx_dev=asm._op_idx)
+                    cache_key="mpf_dev", idx_dev=asm._op_idx, jv=jv)
             except RuntimeError:
                 return np.full(asm.Nfull, np.nan)
         if self.linsolver == "cudss":
@@ -2784,6 +2972,12 @@ class MultiPhaseStepper:
 
         x = self.x.copy()
         r = assemble(x)
+        if self.matfree:
+            # freeze the x-independent face Jacobian + strong rows once
+            # per attempt; apply_Jv rides the CURRENT _vals_dev (updated
+            # by each assemble() at the accepted iterate) so the outer
+            # matvec always linearizes at the point being solved.
+            self._matfree_setup(x, ctx)
         for it in range(self.newton_max):
             dx = self._solve_dev()
             if not np.isfinite(dx).all():

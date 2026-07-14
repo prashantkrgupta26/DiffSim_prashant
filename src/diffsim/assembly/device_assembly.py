@@ -38,7 +38,7 @@ class DeviceNSAssembler:
     per step on device."""
 
     def __init__(self, dm, sigma_like=1.0, coloring=False, ndof=None,
-                 node_pattern=None, blockmask=None):
+                 node_pattern=None, blockmask=None, matvec_only=False):
         # ndof: dofs per node (default dim+1 = the NS layout; 4 for the
         # ternary CH film system, 2 for binary CH — M4 device-bound)
         # blockmask (B5): bool [ndof, ndof] compile-time dof-pair block
@@ -85,6 +85,21 @@ class DeviceNSAssembler:
                     "node-graph pattern requires identity constraints and "
                     "no coloring")
             self.Nfull = dm.n_nodes * ndof
+            if matvec_only:
+                # MATRIX-FREE ONLY (M3): build ONLY what apply_batch_matvec
+                # needs (bins + per-bin device conn); SKIP the CSR pattern
+                # entirely — no indices (nnz int32, ~91 GB host at 256^3),
+                # no vals_d (~148 GB), and NO int32-nnz ceiling.  This is
+                # the true footprint of the matrix-free outer solve.
+                self.node_mode = True
+                self._blockmask = blockmask
+                self._bins, self._conn_d = [], []
+                for pv, b in dm.bins.items():
+                    ne, nbf = dm.mesh.conn_of[pv].shape
+                    self._bins.append((pv, b, ne, nbf, None))
+                    self._conn_d.append(b["conn"])
+                self.nnz = None
+                return
             self._init_node_pattern(dm, ndof)
             return
         # CONSTRAINT-AWARE (D1 item 3, cuFEM design): element entries are
@@ -585,6 +600,26 @@ class DeviceNSAssembler:
                   inputs=[be_d.reshape((-1,)), gdof_v, self.F_d],
                   device=d)
 
+    def apply_batch_matvec(self, k_bin, e0, Ae_d, nb, v_d, y_d):
+        """Matrix-FREE element apply: for the nb elements [e0, e0+nb) of
+        bin k_bin, compute y_e = Ae @ v_e (element-local gather of v via
+        conn, dense nl x nl multiply) and scatter-ADD into y_d — the
+        matvec analogue of scatter_batch (which writes the SAME Ae into
+        the global CSR).  Never touches vals_d: this is the launch unit
+        of the matrix-free OUTER operator (no monolithic CSR stored).
+        Node-graph pattern only (identity constraints); Ae_d flat or
+        [>=nb, nl, nl] batch-local (the make_mpf_newton buffer)."""
+        assert self.node_mode, (
+            "apply_batch_matvec: node-graph pattern only")
+        d = self.dm.device
+        pv, b, ne, nbf, gdof = self._bins[k_bin]
+        ndof = self.ndof
+        nl = nbf * ndof
+        wp.launch(_matvec_node_kernel(), dim=nb * nl,
+                  inputs=[Ae_d.reshape((-1,)), self._conn_d[k_bin],
+                          wp.int32(e0), wp.int32(nbf), wp.int32(ndof),
+                          v_d, y_d], device=d)
+
     def scatter_bin(self, k_bin, Ae_d, be_d):
         """Scatter one bin's device element blocks (Ae [ne, nl, nl],
         be [ne, nl]; nl = nbf*ndof, dof-major layout node*ndof + comp)
@@ -1028,6 +1063,43 @@ def _scatter_node_vec_kernel():
 
     _kernel_cache[key] = scnv
     return scnv
+
+
+def _matvec_node_kernel():
+    """Element-local matrix-free matvec (node-graph pattern): one thread
+    per output row entry (el, rl).  rl = a*ndof + ca is the local dof;
+    its global row is conn[e, a]*ndof + ca — the SAME local->global map
+    _scatter_node_kernel uses to place Ae into the CSR.  The thread
+    reads the nl-long Ae row and gathers v at the matching global column
+    dofs (conn[e, ac]*ndof + cc), accumulates in float64, and atomic-adds
+    into y.  Result == (global CSR) @ v to summation-order tolerance."""
+    key = ("dev_matvec_node",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique")
+    def mvn(Ae: wp.array(dtype=wp.float64),
+            conn: wp.array2d(dtype=wp.int32),
+            e0: wp.int32, nbf: wp.int32, ndof: wp.int32,
+            v: wp.array(dtype=wp.float64),
+            y: wp.array(dtype=wp.float64)):
+        i = wp.tid()
+        nl = nbf * ndof
+        el = i / nl
+        rl = i % nl
+        a = rl / ndof
+        ca = rl % ndof
+        e = e0 + el
+        base = el * nl * nl + rl * nl
+        acc = wp.float64(0.0)
+        for cl in range(nl):
+            ac = cl / ndof
+            cc = cl % ndof
+            acc += Ae[base + cl] * v[conn[e, ac] * ndof + cc]
+        wp.atomic_add(y, conn[e, a] * ndof + ca, acc)
+
+    _kernel_cache[key] = mvn
+    return mvn
 
 
 def _scatter_vec_weighted_kernel():
