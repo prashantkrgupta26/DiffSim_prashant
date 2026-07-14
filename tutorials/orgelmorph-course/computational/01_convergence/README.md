@@ -1,15 +1,22 @@
 # Computational C1 — Convergence: basis order and time integration
 
 The flagship computational concept. A discretization is only trustworthy
-if it converges at the rate the theory predicts, and the only honest way
-to know is to *measure* it. This tutorial promotes the two Cahn–Hilliard
-convergence gates that ship with the solver into a taught study:
+if it converges at the rate the theory predicts — and only if you measure
+the *right* error. This tutorial promotes the Cahn–Hilliard convergence
+gates that ship with the solver into a taught study that **separates the
+error sources** and **controls the algebraic error**:
 
-- **Spatial** — the method of manufactured solutions (MMS): plug a known
-  field into the equations, add its residual as a source, and check the
-  $L^2$ error falls like $h^{p+1}$ for $p=1$ and $p=2$.
-- **Temporal** — self-convergence against a fine-$\Delta t$ reference:
-  BDF1 (backward Euler) is first order in $\Delta t$, BDF2 is second.
+- **Spatial** — a *steady* manufactured solution (MMS), so the time error
+  drops out and the measured error is pure spatial error. We report `L2`
+  and `H1` for **both** fields `c` and `mu` over ≥4 mesh levels: `L2 ~
+  h^(p+1)`, `H1 ~ h^p` for `p=1` and `p=2`.
+- **Algebraic control** — tighten the Newton tolerance and show the
+  discretization error does not move (the plot is not solver-limited).
+- **Temporal** — self-convergence against a *verified* fine-`dt`
+  reference (halve its `dt`, order stable, Richardson bound): BDF1 is
+  first order, BDF2 second, over 4 `dt` levels.
+- **Deliberate failures** — wrong BC, wrong source, under-resolved
+  feature, under-resolved reference: four ways to get a wrong order.
 
 **Read** the course document, Computational Chapter *"Convergence"*
 (start with `convergence.py` — the importable core it walks through).

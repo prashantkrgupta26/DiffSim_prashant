@@ -380,6 +380,16 @@ class CahnHilliardStepper:
                 np.clip(x[0::2], 1e-3, 1.0 - 1e-3, out=x[0::2])
             if np.abs(dx).max() < self.newton_tol:
                 break
+        # Additive instrumentation (no behaviour change): expose the last
+        # step's Newton convergence so tutorials/research can separate
+        # ALGEBRAIC error (solver) from DISCRETIZATION error, and account
+        # for real solver work (Newton iterations, adaptive-step cost).
+        self.last_newton = {
+            "iters": int(it + 1),
+            "dx_inf": float(np.abs(dx).max()),
+            "converged": bool(np.abs(dx).max() < self.newton_tol),
+            "newton_tol": float(self.newton_tol),
+        }
         self.x = x
         self.hist = [x[0::2].copy(), self.hist[0]]
         self.t = t_new
