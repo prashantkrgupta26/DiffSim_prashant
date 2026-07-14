@@ -1,18 +1,50 @@
 [project]
 name = "diffsim"
 version = "0.0.1"
+description = "GPU-native, differentiable finite-element multiphysics on adaptive octrees"
+readme = "README.md"
 requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Baskar Ganapathysubramanian", email = "baskigs@gmail.com" },
+]
+maintainers = [
+  { name = "Baskar Ganapathysubramanian", email = "baskigs@gmail.com" },
+]
+keywords = [
+  "finite-element", "differentiable-simulation", "GPU", "adjoint",
+  "shifted-boundary-method", "phase-field", "multiphysics", "warp",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Physics",
+  "Topic :: Scientific/Engineering :: Mathematics",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Operating System :: POSIX :: Linux",
+  "Environment :: GPU :: NVIDIA CUDA :: 12",
+]
 dependencies = ["warp-lang>=1.7,<2", "numpy>=1.26,<3", "scipy>=1.11,<2", "torch>=2.4,<3"]
 
+[project.urls]
+Homepage = "https://github.com/BaskarGS/diffsim"
+Repository = "https://github.com/BaskarGS/diffsim"
+Documentation = "https://github.com/BaskarGS/diffsim/tree/master/docs"
+Issues = "https://github.com/BaskarGS/diffsim/issues"
+
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
 # cuDSS GPU direct solver (measured stepping default at 200k+ dofs)
 cudss = ["nvmath-python[cu12]>=0.2"]
 # AMGX has no PyPI package: build github.com/NVIDIA/AMGX, then
 # pip install pyamgx --no-build-isolation with AMGX_DIR set (see README)
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]   # PEP 639 SPDX license expression + license-files
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.package-data]
@@ -21,6 +53,30 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+# Lightweight, non-cosmetic gate (critical-eval P1.6): catch real defects
+# (undefined names, unused imports, broken f-strings) without imposing a large
+# style reformat on the scientific source.  Warp @wp.func kernels use free
+# functions injected by codegen, so keep the rule set tight.
+line-length = 100
+target-version = "py310"
+extend-exclude = ["previous_codes", "docs", "tutorials", "benchmarks"]
+
+# High-signal, currently-GREEN gate: real bugs only, so CI stays a true
+# pass/fail signal rather than a wall of style noise.
+#   E9  syntax errors (this set already caught a 3.11-only star-subscript in
+#       leray.py that broke the declared requires-python >=3.10)
+#   F63 invalid comparisons / assert-tuple   F7 statement/logic errors
+#   F82 undefined names
+# Deferred to a follow-up sweep (recorded in the hardening dev note): F401
+# (unused imports, ~18 in src) and F841 (unused locals, ~17) — both need
+# per-item review because Warp @wp.func codegen injects free symbols.
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]
+# F821 (undefined name) fires inside Warp kernels where symbols are injected by
+# the codegen factory; the brick/kernel modules are verified by the test suite.
+ignore = ["F821"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -31,4 +87,5 @@ markers = [
   "tier4: geometry oracles, classification, surrogate extraction",
   "tier5: SBM solves, MMS orders, backend cross-verification",
   "ad: adjoint/gradient checks (Tier AD)",
+  "geometry: geometry-oracle / trimesh tests",
 ]
