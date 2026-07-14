@@ -283,7 +283,11 @@ def test_wodo_bdf2_adaptive_dt_and_rejects(device):
     print(f"wodo device x BDF2 parity {perr:.1e}")
     assert perr < 1e-11, perr
 
-    with pytest.raises(AssertionError):
+    # BDF2 + FDT noise is a rejected config: the deterministic-only guard
+    # now raises a typed ConfigError (was a bare assert before the
+    # critical-eval hardening). Accept either so the gate is robust to -O.
+    from diffsim.errors import ConfigError
+    with pytest.raises((ConfigError, AssertionError)):
         WodoFilmStepper(_strip_dm(1, 3, 2, device), tstep="bdf2",
                         noise=1e-3)
 
