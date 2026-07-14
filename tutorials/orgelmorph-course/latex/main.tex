@@ -21,7 +21,7 @@
 % these from numbers/pN.tex; the fallbacks keep the document compiling
 % before a run has produced them).
 \makeatletter
-\@for\@m:=%
+\@for\@nf:=%
   PtwoTend,PtwoDtfixed,PtwoTol,PtwoNfixed,PtwoNadapt,PtwoSpeedup,%
   PtwoDtmin,PtwoDtmax,PtwoImplied,PtwoFfixed,PtwoFadapt,PtwodF,%
   PtwoDscaleFixed,PtwoDscaleAdapt,PtwoCrange,%
@@ -39,7 +39,7 @@
   PeightGrainsHi,PeightOnset,%
   PnineWetPhis,PnineWetStart,PnineWetEnd,PnineWetPsimax,PnineDryPhis,%
   PnineDryStart,PnineDryEnd,PnineDryPsimax,PnineKe\do{%
-    \expandafter\providecommand\csname\@m\endcsname{--}}
+    \expandafter\providecommand\csname\@nf\endcsname{--}}
 \makeatother
 
 \title{\textbf{OrgElMorph}\\[4pt]

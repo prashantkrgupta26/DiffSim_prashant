@@ -109,8 +109,13 @@ crystallization energetics) and their provenance in the literature.
 | Computational | C1 convergence (basis & time) · C2 boundary conditions · C3 adaptivity · C4 the solver ecosystem · C5 2-D vs 3-D |
 | Differentiable | D1 what differentiable simulation is · D2 morphology sensitivity · D3 recovering parameters · D4 process gradients · D5 crystallinity sensitivity · D6 learning the free energy from snapshots · D7 inverse-design capstone |
 
-> Status: this course is under construction. The **Physics track
-> (P1–P9)** is a complete build — each concept has a runnable tutorial
+> Status. The **Physics track (P1–P9)** and **Computational track
+> (C1–C5)** are complete builds — every concept has a runnable tutorial
 > (core module, `run.py`, `gen_figures.py`, `EXPECTED.md`) and a chapter
-> in the course document with measured, locked numbers. The
-> Computational and Differentiable tracks are in progress.
+> in the course document with measured, locked numbers (see the built
+> `latex/orgelmorph_course.pdf`). The **Differentiable track (D1–D7)**
+> chapters are in progress; the *machinery* they teach — a genuine,
+> three-way-verified adjoint through the phase-field solver (gradients
+> w.r.t. material and processing parameters, free-energy-functional
+> learning, and process design) — is built and lives in
+> `src/diffsim/adjoint/` (`tests/test_phasefield_adjoint.py`).
