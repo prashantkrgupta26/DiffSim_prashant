@@ -1,5 +1,6 @@
 import numpy as np
 from .krylov import cg, bicgstab
+from .result import NonlinearSolveResult
 
 
 class _NpOp:
@@ -42,7 +43,9 @@ class NonlinearSolver:
         hist = [f0]
         for it in range(1, self.max_it + 1):
             if hist[-1] < max(self.rtol * f0, self.atol):
-                return u, {"iters": it - 1, "fnorm_history": hist, "converged": True}
+                return NonlinearSolveResult(
+                    u=u, converged=True, iterations=it - 1,
+                    residual_norm=float(hist[-1]), fnorm_history=hist)
             # Eisenstat-Walker forcing unless fixed rtol given
             eta = self.linear_rtol or min(0.1, np.sqrt(hist[-1] / fprev) if it > 1 else 0.1)
             op = _NpOp(self._jac_action(u, Fu), len(u), self.device)
@@ -62,4 +65,7 @@ class NonlinearSolver:
             fprev = hist[-1]
             hist.append(fnew)
         converged = hist[-1] < max(self.rtol * f0, self.atol)
-        return u, {"iters": self.max_it, "fnorm_history": hist, "converged": converged}
+        return NonlinearSolveResult(
+            u=u, converged=converged, iterations=self.max_it,
+            residual_norm=float(hist[-1]), fnorm_history=hist,
+            reason="converged" if converged else "maxiter")

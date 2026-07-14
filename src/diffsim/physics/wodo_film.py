@@ -191,6 +191,7 @@ import scipy.sparse as sp
 import warp as wp
 
 from ..assembly.operators import _kernel_cache
+from ..errors import BackendError, ConfigError, reraise_if_bug
 from ..mesh.nodes import _local_offsets
 from .ternary_ch import TernaryCHStepper, _rlog, _rinv
 
@@ -451,16 +452,19 @@ class WodoFilmStepper(TernaryCHStepper):
         # only under BDF1 — under BDF2 the content drift is the BDF2
         # global error (order drift, not a leak; the same recorded
         # limit as multiphase film mode).
-        assert tstep in ("bdf1", "bdf2"), tstep
-        if tstep == "bdf2":
-            assert float(noise) == 0.0, \
-                "BDF2 is deterministic-only (FDT-noise weak order " \
-                "under BDF2 is a recorded scope limit — A4b)"
+        if tstep not in ("bdf1", "bdf2"):
+            raise ConfigError(f"tstep must be 'bdf1' or 'bdf2', got {tstep!r}")
+        if tstep == "bdf2" and float(noise) != 0.0:
+            raise ConfigError(
+                "BDF2 is deterministic-only (FDT-noise weak order "
+                "under BDF2 is a recorded scope limit — A4b)")
         self.tstep = tstep
         self.hist2 = None       # (p1, p2) at t_{n-1}; None => bootstrap
         self.dt_prev = None     # dt of the last ACCEPTED step
         self.var_mob = bool(var_mob)
-        assert mob_model in ("wodo", "negi"), mob_model
+        if mob_model not in ("wodo", "negi"):
+            raise ConfigError(
+                f"mob_model must be 'wodo' or 'negi', got {mob_model!r}")
         self.mob_model = mob_model
         # v2.1: scalar (both species, the historical meaning) or a
         # (D_p, D_f) pair (per-species ratios, front-end)
@@ -468,7 +472,10 @@ class WodoFilmStepper(TernaryCHStepper):
             self.D_ratio = (float(D_ratio), float(D_ratio))
         else:
             self.D_ratio = tuple(float(d) for d in D_ratio)
-            assert len(self.D_ratio) == 2, D_ratio
+            if len(self.D_ratio) != 2:
+                raise ConfigError(
+                    f"D_ratio must be a scalar or a (D_p, D_f) pair, "
+                    f"got {D_ratio!r}")
         self.b_reg = float(b_reg)
         # v1.3 Chebyshev delta-f'(phi_p) coefficients (T2..T4)
         self.ch2, self.ch3, self.ch4 = (float(c) for c in f_cheb)
@@ -503,7 +510,10 @@ class WodoFilmStepper(TernaryCHStepper):
         tol = 1e-12
         self.y_comp = float(ymax)     # computational vertical extent
         self.top_nodes = np.where(coords[:, vax] > ymax - tol)[0]
-        assert len(self.top_nodes) > 0
+        if len(self.top_nodes) == 0:
+            raise ConfigError(
+                "no nodes found on the top (moving) surface — check the "
+                "mesh vertical extent")
         faces, fmass = [], []
         for pv, conn in self.mesh.conn_of.items():
             # 1-D consistent edge mass on the unit interval, per degree
@@ -617,9 +627,13 @@ class WodoFilmStepper(TernaryCHStepper):
                     self._cudss.reset_operands(a=A, b=b)
                 self._cudss.factorize()
                 return np.asarray(self._cudss.solve())
-            except Exception:
-                # bad state (singular factor / pattern mismatch): drop the
-                # plan and signal divergence to the dt heuristic
+            except Exception as e:
+                # EXPECTED numerical failure (singular factor / pattern
+                # mismatch): drop the plan and signal divergence to the dt
+                # heuristic.  Programming/environment errors (API change,
+                # OOM, missing dep) must NOT masquerade as a hard timestep —
+                # surface them with a traceback (P0.3).
+                reraise_if_bug(e)
                 self._cudss = None
                 return np.full(A.shape[0], np.nan)
         from scipy.sparse.linalg import splu
@@ -647,7 +661,10 @@ class WodoFilmStepper(TernaryCHStepper):
                 self._b_t.copy_(self._F_view)
             self._cudss_dev.factorize()
             return np.asarray(self._cudss_dev.solve().cpu())
-        except Exception:
+        except Exception as e:
+            # expected numerical failure -> NaN divergence signal; surface
+            # programming/environment errors instead of swallowing (P0.3)
+            reraise_if_bug(e)
             self._cudss_dev = None
             return np.full(asm.Nfull, np.nan)
 
@@ -783,9 +800,10 @@ class WodoFilmStepper(TernaryCHStepper):
         inside top-element blocks, so every (row, col) pair exists in
         the element-pattern CSR."""
         from ..assembly.device_assembly import DeviceNSAssembler
-        assert self._proj_identity, (
-            "device-bound film v1.2: identity constraints only "
-            "(uniform strips; no hanging nodes)")
+        if not self._proj_identity:
+            raise BackendError(
+                "device-bound film v1.2: identity constraints only "
+                "(uniform strips; no hanging nodes)")
         # _node_pattern: optional override (tests force old/new pattern
         # builds; None = the assembler's size-based auto switch)
         self._asm = DeviceNSAssembler(

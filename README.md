@@ -49,10 +49,20 @@ Krylov iterations and direct solves are *routed around*, never differentiated
 through. Every gradient is verified three ways (custom adjoint, autograd twin,
 finite differences); that gate has already caught a real compiler bug.
 
-**GPU-resident.** NVIDIA Warp generates the hot FP64 kernels; the solve stays on
-the device (fused single-sync Krylov, or cuDSS direct via a zero-copy handoff);
-host↔device traffic is reserved for output. The full assemble→solve→adjoint loop
-runs without leaving the GPU.
+**GPU-resident where it counts.** NVIDIA Warp generates the hot FP64 element
+kernels, and the production stepping paths keep the heavy work on the device.
+The device-resident CSR assembly runs the per-step scatter with no host
+round-trip — measured **7–11× faster** than the host-assembly path across 2-D
+L6–L8, which closes the host-finalization gap and leaves the march
+**solver-bound** — and the solve stays on the GPU through the fused single-sync
+Krylov or a zero-copy cuDSS handoff (the block-CH *device* solver runs **8.4×
+faster than host cuDSS** on the S2 morphology system). What is *not* yet fully
+device-resident is stated plainly: the generic SciPy brick-assembly reference
+path, several adjoint reductions, and the verification twins deliberately cross
+to the host. Which physics/solver/adjoint combinations are device-resident,
+hybrid, or reference-only — with their transfer counts and the numbers above —
+is recorded per path in the [device-assembly](docs/dev/2026-07-13-m5-device-assembly.md)
+and [block-CH](docs/dev/2026-07-13-blockch-mpf.md) dev notes.
 
 **Taught properly.** The code is written to be read — every numerical decision is
 documented where it lives, every claimed property has a test that measures it,
@@ -156,7 +166,10 @@ benchmarks/         literature-anchored validation drivers, grouped by physics
   poisson-sbm/  navier-stokes/  heat-mass/  phase-field/
   inverse-heroes/  performance/           (each with its own README)
 tutorials/          the curriculum: tracks A–F + P, one runnable chapter each
-tests/              the ~350-test suite; baselines/ holds locked values
+tests/              the test suite (467 tests collected across 61 modules,
+                    Jul 2026; the CPU-runnable subset runs in CI, the GPU
+                    tiers on a self-hosted runner); baselines/ holds locked
+                    values
 docs/
   projects/         the per-solver project pages (start here)
   theory/           formulations, memos, student briefs

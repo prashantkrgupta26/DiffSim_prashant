@@ -1,0 +1,127 @@
+name: CI
+
+# critical-eval P0.1 remediation. Two gates:
+#   * cpu  — always runs on GitHub-hosted runners: lint, syntax (incl. the
+#            requires-python>=3.10 floor), the Warp-free correctness tests,
+#            wheel build + AMGX package-data check, install-from-wheel smoke.
+#   * gpu-smoke — a self-hosted NVIDIA runner tier subset + one adjoint check.
+#            GATED OFF by default; Baskar enables it (runner + repo variable) —
+#            see docs/dev/2026-07-14-critical-eval-hardening.md.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    name: cpu (lint + package + Warp-free tests)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the declared floor — compiling here catches 3.11+-only
+        # syntax slipping into the source (e.g. star-in-subscript).
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install CPU tooling (no Warp/Torch)
+        run: |
+          python -m pip install --upgrade pip
+          # runtime deps needed by the Warp-free paths + tooling; Warp/Torch
+          # are intentionally omitted — the CPU job never touches device code.
+          pip install numpy scipy pytest ruff build
+          # make the package importable without pulling its GPU deps
+          pip install -e . --no-deps
+
+      - name: Lint (ruff — high-signal rules)
+        run: ruff check src/ tests/
+
+      - name: Syntax / requires-python floor (compileall)
+        run: python -m compileall -q src/
+
+      - name: Import smoke (public API + errors, lazy — no Warp)
+        run: |
+          python - <<'PY'
+          import diffsim
+          from diffsim.errors import (DiffSimError, ConfigError, BackendError,
+                                      SolverError, ConvergenceError)
+          from diffsim.solvers.result import (LinearSolveResult,
+                                              NonlinearSolveResult)
+          assert issubclass(ConfigError, ValueError)
+          assert issubclass(ConvergenceError, SolverError)
+          print("diffsim", diffsim.__version__, "public API import OK")
+          PY
+
+      - name: Warp-free correctness tests
+        run: pytest tests/test_errors.py -q
+
+      - name: Build wheel + sdist
+        run: python -m build
+
+      - name: Check AMGX config JSON shipped in the wheel
+        run: |
+          python - <<'PY'
+          import glob, zipfile, sys
+          whl = sorted(glob.glob("dist/*.whl"))[-1]
+          names = zipfile.ZipFile(whl).namelist()
+          amgx = [n for n in names if "amgx_configs" in n and n.endswith(".json")]
+          print("wheel:", whl)
+          print("AMGX configs:", amgx)
+          if not amgx:
+              sys.exit("AMGX JSON package-data missing from wheel")
+          PY
+
+      - name: Install from wheel (no deps) + import
+        run: |
+          python -m venv /tmp/whlenv
+          /tmp/whlenv/bin/pip install --upgrade pip
+          /tmp/whlenv/bin/pip install numpy scipy --quiet
+          /tmp/whlenv/bin/pip install dist/*.whl --no-deps
+          /tmp/whlenv/bin/python -c "import diffsim; print('installed', diffsim.__version__)"
+
+  gpu-smoke:
+    name: gpu-smoke (self-hosted — GATED)
+    # DISABLED until Baskar registers a self-hosted NVIDIA runner AND sets the
+    # repository variable ENABLE_GPU_CI = "true" (Settings > Secrets and
+    # variables > Actions > Variables). Until then this job is skipped, not
+    # failed. Handoff steps: docs/dev/2026-07-14-critical-eval-hardening.md.
+    if: ${{ vars.ENABLE_GPU_CI == 'true' }}
+    runs-on: [self-hosted, gpu]
+    needs: cpu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Environment report
+        run: |
+          nvidia-smi
+          python --version
+
+      - name: Install (editable, with GPU deps)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Tier smoke (fast tiers, exclude the heavy tier5 solves)
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+        run: pytest -q -m "tier1 or tier2 or tier3" --maxfail=1
+
+      - name: Adjoint gate (one three-way gradient check)
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+        run: pytest -q tests/test_neumann_shape_gradient.py --maxfail=1

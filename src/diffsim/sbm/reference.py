@@ -20,7 +20,9 @@ def solve_dense_torch(dm, sf, oracle, g_fn_torch, f_fn, kappa=1.0,
     full autograd graph to oracle.params (and g's parameters if any)."""
     mesh = dm.mesh
     dim = mesh.dim
-    assert len(mesh.bins) == 1, "twin supports uniform-p meshes only"
+    if len(mesh.bins) != 1:
+        from ..errors import ConfigError
+        raise ConfigError("twin supports uniform-p meshes only")
     pv = int(mesh.p)
     tb = dm.tables_by_p[pv]
     ftab = face_tables(pv, dim)

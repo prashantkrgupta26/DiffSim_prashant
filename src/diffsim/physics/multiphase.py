@@ -361,6 +361,7 @@ import scipy.sparse as sp
 import warp as wp
 
 from ..assembly.operators import _kernel_cache
+from ..errors import ConfigError, reraise_if_bug
 from .ternary_ch import _rlog, _rinv
 from .wodo_film import _binv2, _binv3
 
@@ -505,17 +506,24 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
            tfield, dth, aniso, film)
     if key in _kernel_cache:
         return _kernel_cache[key]
-    assert bulk in ("p1", "r14"), bulk
-    assert mob in ("const", "fastmode", "fastmode_n", "slowmode_n"), mob
-    if mob == "fastmode":
-        assert M == 1, "fastmode Onsager closure: M = 1 only " \
-            "(fastmode_n is the generic-M mode)"
-    assert theta in ("kwc", "frozen"), theta
+    if bulk not in ("p1", "r14"):
+        raise ConfigError(f"bulk must be 'p1' or 'r14', got {bulk!r}")
+    if mob not in ("const", "fastmode", "fastmode_n", "slowmode_n"):
+        raise ConfigError(
+            f"mob must be one of const/fastmode/fastmode_n/slowmode_n, "
+            f"got {mob!r}")
+    if mob == "fastmode" and M != 1:
+        raise ConfigError("fastmode Onsager closure: M = 1 only "
+                          "(fastmode_n is the generic-M mode)")
+    if theta not in ("kwc", "frozen"):
+        raise ConfigError(f"theta must be 'kwc' or 'frozen', got {theta!r}")
     if aniso:
-        assert dim == 2, "anisotropic growth: 2-D only (A3 contract)"
-        assert theta == "frozen", \
-            "anisotropy requires marker (frozen) theta: the KWC " \
-            "back-torque d f_grad/d theta is a recorded extension"
+        if dim != 2:
+            raise ConfigError("anisotropic growth: 2-D only (A3 contract)")
+        if theta != "frozen":
+            raise ConfigError(
+                "anisotropy requires marker (frozen) theta: the KWC "
+                "back-torque d f_grad/d theta is a recorded extension")
     TH_FROZEN = theta == "frozen"
     TFIELD = bool(tfield)
     DTH = bool(dth)
@@ -1583,12 +1591,14 @@ class MultiPhaseStepper:
             and (self.beta_th == 0.0).all() else "kwc"
         self.T, self.T_fn = float(T), T_fn
         # A1 — temperature mode + D(T) hook (module docstring)
-        assert T_mode in ("scalar", "field"), T_mode
+        if T_mode not in ("scalar", "field"):
+            raise ConfigError(
+                f"T_mode must be 'scalar' or 'field', got {T_mode!r}")
         self.T_mode = T_mode
-        if T_mode == "field":
-            assert T_fn is None, \
-                "field mode replaces the T_fn schedule (annealing " \
-                "protocols become Dirichlet BCs)"
+        if T_mode == "field" and T_fn is not None:
+            raise ConfigError(
+                "field mode replaces the T_fn schedule (annealing "
+                "protocols become Dirichlet BCs)")
         self.D_T = None if D_T is None \
             else (float(D_T[0]), float(D_T[1]))
         if self.D_T is not None:
@@ -1664,12 +1674,13 @@ class MultiPhaseStepper:
         # A4b time scheme (module docstring): bdf1 default; bdf2 =
         # variable-step, deterministic-only (noise weak order out of
         # scope — recorded), BDF1 bootstrap on the first step
-        assert tstep in ("bdf1", "bdf2"), tstep
+        if tstep not in ("bdf1", "bdf2"):
+            raise ConfigError(f"tstep must be 'bdf1' or 'bdf2', got {tstep!r}")
         self.tstep = tstep
-        if tstep == "bdf2":
-            assert noise_psi == 0.0 and noise_phi == 0.0, \
-                "BDF2 is deterministic-only (FDT-noise weak order " \
-                "under BDF2 is a recorded scope limit)"
+        if tstep == "bdf2" and not (noise_psi == 0.0 and noise_phi == 0.0):
+            raise ConfigError(
+                "BDF2 is deterministic-only (FDT-noise weak order "
+                "under BDF2 is a recorded scope limit)")
         self.hist2 = None       # x^{n-1} (None => BDF1 bootstrap)
         self.dt_prev = None     # dt_{n-1} of the last ACCEPTED step
         self.newton_tol, self.newton_max = newton_tol, newton_max
@@ -1950,7 +1961,11 @@ class MultiPhaseStepper:
                     self._cudss.reset_operands(a=A, b=b)
                 self._cudss.factorize()
                 return np.asarray(self._cudss.solve())
-            except Exception:
+            except Exception as e:
+                # expected numerical failure (singular factor / pattern
+                # flap) -> NaN divergence signal for the reject ladder;
+                # surface programming/environment bugs instead (P0.3)
+                reraise_if_bug(e)
                 try:
                     self._cudss.free()
                 except Exception:
@@ -2731,16 +2746,18 @@ class MultiPhaseStepper:
                     self._b_t.copy_(self._F_view)
                 self._cudss_dev.factorize()
                 return np.asarray(self._cudss_dev.solve().cpu())
-            except Exception:
+            except Exception as e:
+                reraise_if_bug(e)          # surface bugs, not NaN (P0.3)
                 try:
                     self._cudss_dev.free()
                 except Exception:
                     pass
                 self._cudss_dev = None
                 return np.full(asm.Nfull, np.nan)
-        assert self.linsolver == "splu", (
-            "assembly='device': linsolver in ('cudss', 'splu', "
-            "'blockch', 'blockch_dev')")
+        if self.linsolver != "splu":
+            raise ConfigError(
+                "assembly='device': linsolver in ('cudss', 'splu', "
+                "'blockch', 'blockch_dev')")
         from scipy.sparse.linalg import splu
         A = sp.csr_matrix((asm.vals_d.numpy(), asm.indices,
                            asm.indptr), shape=(asm.Nfull,) * 2)

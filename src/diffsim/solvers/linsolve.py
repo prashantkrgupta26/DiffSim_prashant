@@ -23,6 +23,8 @@ operator caching by `cache` (a dict the caller owns): constant matrices
 """
 import numpy as np
 
+from ..errors import BackendError, ConvergenceError
+
 _CUDSS_OPTS = ...          # lazily built by cudss_options()
 
 
@@ -105,14 +107,14 @@ def _blockch_pairs(A, b, meta, tol, device):
             z, info = _cg(Amm, y, M=MjM, rtol=1e-10, atol=0.0,
                           maxiter=1000, callback=_cb)
             if info != 0:
-                raise RuntimeError(f"blockch mass CG not converged: {info}")
+                raise ConvergenceError(f"blockch mass CG not converged: {info}")
             return z
 
         def w1solve(y):
             z, info = _cg(W1, y, M=Mj1, rtol=1e-8, atol=0.0,
                           maxiter=3000, callback=_cb)
             if info != 0:
-                raise RuntimeError(f"blockch W1 CG not converged: {info}")
+                raise ConvergenceError(f"blockch W1 CG not converged: {info}")
             return z
 
         def w2solve(y):
@@ -120,7 +122,7 @@ def _blockch_pairs(A, b, meta, tol, device):
                              maxiter=3000, restart=100, callback=_cb,
                              callback_type="legacy")
             if info != 0:
-                raise RuntimeError(f"blockch W2 GMRES not converged: {info}")
+                raise ConvergenceError(f"blockch W2 GMRES not converged: {info}")
             return z
 
         return msolve, w1solve, w2solve
@@ -143,7 +145,7 @@ def _blockch_pairs(A, b, meta, tol, device):
             x_, info = krylov(op, y, tol=rtol, atol=1e-13,
                               maxiter=4000, diag=dg, check_every=50)
             if not info.get("converged"):
-                raise RuntimeError(f"blockch {label} device solve: {info}")
+                raise ConvergenceError(f"blockch {label} device solve: {info}")
             inner_it[0] += info.get("iters", 0)
             return x_
 
@@ -164,7 +166,7 @@ def _blockch_pairs(A, b, meta, tol, device):
                              maxiter=3000, restart=100, callback=_cb,
                              callback_type="legacy")
             if info != 0:
-                raise RuntimeError(
+                raise ConvergenceError(
                     f"blockch {label} GMRES not converged: {info}")
             return z
 
@@ -184,7 +186,7 @@ def _blockch_pairs(A, b, meta, tol, device):
                                     maxiter=4000, diag=dg,
                                     check_every=50)
             if not info.get("converged"):
-                raise RuntimeError(
+                raise ConvergenceError(
                     f"blockch {label} device solve: {info}")
             inner_it[0] += info.get("iters", 0)
             return x_
@@ -262,7 +264,7 @@ def _blockch_pairs(A, b, meta, tol, device):
                                    maxiter=800, restart=160, callback=_cb,
                                    callback_type="legacy")
                 if sinfo != 0:
-                    raise RuntimeError(
+                    raise ConvergenceError(
                         f"blockch fallback Schur GMRES: {sinfo}")
                 return zz
 
@@ -287,7 +289,7 @@ def _blockch_pairs(A, b, meta, tol, device):
                           rtol=tol, atol=1e-13, maxiter=40,
                           callback=lambda _: it.__setitem__(0, it[0] + 1))
         if info != 0:
-            raise RuntimeError(
+            raise ConvergenceError(
                 f"blockch fallback FGMRES not converged: {info}")
         it[0] += 1000           # mark fallback path in the iters record
     return x, (it[0], inner_it[0])
@@ -324,8 +326,8 @@ def _block_maps(indptr, indices, ndof, row_off, col_offs):
         if rowptr is None:
             rowptr, colnodes = rp, cn
         else:
-            assert len(cn) == len(colnodes) and (cn == colnodes).all(), \
-                "blocks do not share one node pattern"
+            if not (len(cn) == len(colnodes) and (cn == colnodes).all()):
+                raise BackendError("blocks do not share one node pattern")
     return rowptr, colnodes, pos
 
 
@@ -341,11 +343,11 @@ def _pair_pattern_maps(indptr, indices, ndof, off):
                                   (off, off + 1))
     rp2, cn2, posr2 = _block_maps(indptr, indices, ndof, off + 1,
                                   (off, off + 1))
-    assert cn1 is not None and cn2 is not None and \
-        len(cn1) == len(cn2) and (cn1 == cn2).all() and \
-        all(len(p) == len(cn1)
-            for p in (*posr1.values(), *posr2.values())), \
-        "pair blocks do not share one node pattern"
+    if not (cn1 is not None and cn2 is not None
+            and len(cn1) == len(cn2) and (cn1 == cn2).all()
+            and all(len(p) == len(cn1)
+                    for p in (*posr1.values(), *posr2.values()))):
+        raise BackendError("pair blocks do not share one node pattern")
     rowptr, colnodes = rp1, cn1
     pos = {"cc": posr1[off], "cm": posr1[off + 1],
            "mc": posr2[off], "mm": posr2[off + 1]}
@@ -367,13 +369,12 @@ def _ac_pattern_maps(indptr, indices, ndof, off):
     rp1, cn1, posr1 = _block_maps(indptr, indices, ndof, off, (off,))
     rp2, cn2, posr2 = _block_maps(indptr, indices, ndof, off + 1,
                                   (off, off + 1))
-    assert cn1 is not None and cn2 is not None and \
-        len(cn1) == len(cn2) and (cn1 == cn2).all(), \
-        "AC ss/tt blocks do not share one node pattern"
+    if not (cn1 is not None and cn2 is not None
+            and len(cn1) == len(cn2) and (cn1 == cn2).all()):
+        raise BackendError("AC ss/tt blocks do not share one node pattern")
     ts = posr2[off] if len(posr2[off]) else None
-    if ts is not None:
-        assert len(ts) == len(cn1), \
-            "AC ts block pattern differs from ss/tt"
+    if ts is not None and len(ts) != len(cn1):
+        raise BackendError("AC ts block pattern differs from ss/tt")
     pos = {"ss": posr1[off], "ts": ts, "tt": posr2[off + 1]}
     probe = _sp.csr_matrix(
         (np.arange(len(cn1), dtype=np.float64), cn1, rp1),
@@ -450,7 +451,10 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
     N = len(indptr) - 1
     n = N // ndof
     nnz = len(indices)
-    assert nnz < 2 ** 31, "int32 device slot maps (add int64 variant)"
+    if nnz >= 2 ** 31:
+        raise BackendError(
+            f"blockch device nnz {nnz} >= 2^31: int32 device slot maps "
+            f"overflow (add an int64 variant)")
     fp = (N, nnz, len(meta["pairs"]), len(meta.get("ac", ())))
     setup = (cache or {}).get(("blockch_dev_setup", cache_key))
     if setup is None or setup["fp"] != fp:
@@ -514,7 +518,7 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
         x_, info = krylov(op, y, tol=rtol, atol=1e-13, maxiter=4000,
                           diag=dg, check_every=50)
         if not info.get("converged"):
-            raise RuntimeError(f"blockch {label} device solve: {info}")
+            raise ConvergenceError(f"blockch {label} device solve: {info}")
         inner_it[0] += info.get("iters", 0)
         return x_
 
@@ -635,7 +639,7 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
                                    maxiter=800, restart=160, callback=_cb,
                                    callback_type="legacy")
                 if sinfo != 0:
-                    raise RuntimeError(
+                    raise ConvergenceError(
                         f"blockch fallback Schur GMRES: {sinfo}")
                 return zz
 
@@ -663,7 +667,7 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
                           callback=lambda _:
                           it.__setitem__(0, it[0] + 1))
         if info != 0:
-            raise RuntimeError(
+            raise ConvergenceError(
                 f"blockch fallback FGMRES not converged: {info}")
         it[0] += 1000
     if cache is not None:
@@ -672,11 +676,31 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
 
 
 def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
-                 device="cuda:0", cache=None, cache_key=None):
+                 device="cuda:0", cache=None, cache_key=None,
+                 return_result=False):
     """Solve A x = b (scipy CSR A, host b). Returns host x.
 
     sym=True routes to CG/SPD paths. cache/cache_key: reuse device uploads
-    or factorizations for constant matrices across steps."""
+    or factorizations for constant matrices across steps.
+
+    return_result=True wraps the solution in a
+    :class:`diffsim.solvers.result.LinearSolveResult` (converged/iterations/
+    backend telemetry) instead of returning a bare array — non-invasive opt-in
+    (critical-eval P2.1).  A returned result always has ``converged=True``: the
+    iterative/direct backends raise :class:`~diffsim.errors.ConvergenceError`
+    on failure rather than returning an unconverged vector."""
+    if return_result:
+        from .result import LinearSolveResult
+        x = solve_linear(A, b, solver=solver, sym=sym, tol=tol,
+                         maxiter=maxiter, device=device, cache=cache,
+                         cache_key=cache_key)
+        iters = None
+        if cache is not None and cache_key is not None:
+            rec = cache.get(("blockch_iters", cache_key))
+            if rec is not None:
+                iters = rec[0]
+        return LinearSolveResult(x=x, converged=True, iterations=iters,
+                                 backend=solver, reason="converged")
     A = A.tocsr()
     if cache is not None and cache_key is not None \
             and solver not in ("blockch",):
@@ -692,7 +716,8 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         if old is None:
             cache[("fingerprint", cache_key)] = fp
         elif old != fp:
-            raise ValueError(
+            from ..errors import ConfigError
+            raise ConfigError(
                 f"solve_linear cache_key={cache_key!r} reused with a "
                 f"different matrix (was {old}, now {fp}) — cached "
                 f"factorizations are for constant matrices")
@@ -721,7 +746,7 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         x, info = krylov(op, b, tol=tol, atol=1e-13, maxiter=maxiter,
                          diag=diag, check_every=100)
         if not info.get("converged"):
-            raise RuntimeError(f"fused solve failed: {info}")
+            raise ConvergenceError(f"fused solve failed: {info}")
         return x
 
     if solver == "amgx":
@@ -768,7 +793,7 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                          rtol=tol, atol=1e-13, maxiter=100,
                          callback=lambda _: it.__setitem__(0, it[0] + 1))
         if info != 0:
-            raise RuntimeError(f"blocktri FGMRES not converged: {info}")
+            raise ConvergenceError(f"blocktri FGMRES not converged: {info}")
         return x
 
     if solver == "blockch":
@@ -870,7 +895,7 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                 x_, info = krylov(op, y, tol=rtol, atol=1e-13,
                                   maxiter=4000, diag=dg, check_every=50)
                 if not info.get("converged"):
-                    raise RuntimeError(f"blockch {label} device solve: "
+                    raise ConvergenceError(f"blockch {label} device solve: "
                                        f"{info}")
                 inner_it[0] += info.get("iters", 0)
                 return x_
@@ -886,7 +911,7 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                 z, info = _cg(Amm, y, M=MjM, rtol=1e-10, atol=0.0,
                               maxiter=1000, callback=_cb)
                 if info != 0:
-                    raise RuntimeError(
+                    raise ConvergenceError(
                         f"blockch mass CG not converged: {info}")
                 return z
 
@@ -894,7 +919,7 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                 z, info = _cg(W1, y, M=Mj1, rtol=1e-8, atol=0.0,
                               maxiter=3000, callback=_cb)
                 if info != 0:
-                    raise RuntimeError(
+                    raise ConvergenceError(
                         f"blockch W1 CG not converged: {info}")
                 return z
 
@@ -903,7 +928,7 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                                  maxiter=3000, restart=100, callback=_cb,
                                  callback_type="legacy")
                 if info != 0:
-                    raise RuntimeError(
+                    raise ConvergenceError(
                         f"blockch W2 GMRES not converged: {info}")
                 return z
 
@@ -939,7 +964,7 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                                    restart=160, callback=_cb,
                                    callback_type="legacy")
                 if sinfo != 0:
-                    raise RuntimeError(
+                    raise ConvergenceError(
                         f"blockch fallback Schur GMRES: {sinfo}")
                 return zz
 
@@ -958,7 +983,7 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                               callback=lambda _:
                               it.__setitem__(0, it[0] + 1))
             if info != 0:
-                raise RuntimeError(
+                raise ConvergenceError(
                     f"blockch fallback FGMRES not converged: {info}")
             it[0] += 1000        # mark fallback path in the iters record
         if cache is not None:
@@ -983,4 +1008,5 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
             A, np.ascontiguousarray(b, np.float64),
             options=_opts))
 
-    raise ValueError(f"unknown solver '{solver}'")
+    from ..errors import ConfigError
+    raise ConfigError(f"unknown solver '{solver}'")
