@@ -41,6 +41,26 @@
   PnineDryStart,PnineDryEnd,PnineDryPsimax,PnineKe\do{%
     \expandafter\providecommand\csname\@nf\endcsname{--}}
 \makeatother
+% Differentiable D1-D7 macro fallbacks (each concept's gen_figures.py
+% overrides these from numbers/dN.tex; the fallbacks keep the document
+% compiling before a run has produced them).
+\makeatletter
+\@for\@nf:=%
+  DoneSteps,DoneSide,DoneNn,DoneGradM,DoneGradKappa,DoneGradChi,DoneGradA,%
+  DoneAgreeTwin,DoneAgreeFD,DoneFDfloor,%
+  DtwoSteps,DtwoChi,DtwoKappa,DtwoJ,DtwoGradChi,DtwoGradKappa,DtwoRelFD,%
+  DthreeSteps,DthreeIter,DthreeChiTruth,DthreeChiRec,DthreeKappaTruth,%
+  DthreeKappaRec,DthreeErrChi,DthreeErrKappa,DthreeLossStart,DthreeLossEnd,%
+  DfourSteps,DfourJ,DfourRelFD,DfourPsiTgt,DfourGradTa,DfourGradTb,%
+  DfourGradTc,DfourGradTd,%
+  DfiveSteps,DfiveJ,DfiveFrac,DfivePsiTgt,DfiveRelFD,DfiveGradDh,DfiveGradTm,%
+  DfiveGradDsig,DfiveGradEps,DfiveGradL,%
+  DsixSnaps,DsixNseeds,DsixNoise,DsixAzero,DsixAone,DsixErrClean,%
+  DsixLossClean,DsixKfirst,DsixKlast,DsixErrKone,DsixErrKlast,DsixImprove,%
+  DsevenSteps,DsevenIter,DsevenTarget,DsevenAchieved,DsevenMzero,DsevenDiff,%
+  DsevenJstart,DsevenJend\do{%
+    \expandafter\providecommand\csname\@nf\endcsname{--}}
+\makeatother
 
 \title{\textbf{OrgElMorph}\\[4pt]
   \large An Onboarding Course in Organic-Electronics Morphology Simulation\\[2pt]
