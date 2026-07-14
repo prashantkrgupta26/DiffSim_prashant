@@ -6,91 +6,173 @@
 composition (Cahn--Hilliard) and crystallinity (Allen--Cahn) evolve
 together and feed back. The signature of the coupling is
 \emph{crystallization-driven demixing} --- as a species crystallizes it
-expels the others, sharpening a composition pattern that phase separation
-alone would not produce.
+enriches its own phase and expels the others, sharpening a composition
+pattern that phase separation alone would not produce.
 \end{keybox}
 
-\section{The model: the four-fold $\chi$}
+\section{The model: the four-fold $\chi$ (p1 vs r14)}
 
 With crystallinity, the interaction between two species depends on whether
 each is amorphous or crystalline, so the single Flory $\chi$ becomes
-\emph{four} matrices:
+\emph{four} matrices $\chi_{aa},\chi_{ac},\chi_{ca},\chi_{cc}$ (with
+$\chi_{ca}=\chi_{ac}^{\!\top}$). \textbf{The convention differs between the
+two bulk free energies}, and getting this right is the crux of the chapter.
+
+This chapter runs the \textbf{p1} bulk, whose $\chi_{\text{eff}}$ is the
+\emph{mutually-weighted} combination of all four terms:
 %
 \begin{equation}
-  \chi_{\text{eff}}(i,j) = \chi_{aa}
-   + \psi_i^2\,\chi_{ca} + \psi_j^2\,\chi_{ac}
-   + \psi_i^2\psi_j^2\,\chi_{cc},
-   \qquad \chi_{ca}=\chi_{ac}^{\!\top},
+  \chi_{\text{eff}}^{\text{p1}}(i,j) =
+    (1-\psi_i)(1-\psi_j)\,\chi_{aa} + (1-\psi_i)\psi_j\,\chi_{ac}
+  + \psi_i(1-\psi_j)\,\chi_{ca} + \psi_i\psi_j\,\chi_{cc}.
 \end{equation}
 %
-coupling the Cahn--Hilliard composition fields to the Allen--Cahn
-crystallinity fields. Making $\chi_{ca}$ \emph{larger} than $\chi_{aa}$
+At the four \emph{pure} limits this collapses to a single matrix each, so
+in p1 the four $\chi$ are \textbf{absolute} pair interactions:
+$\chi_{\text{eff}}(0,0)=\chi_{aa}$, $(1,0)=\chi_{ca}$, $(0,1)=\chi_{ac}$,
+$(1,1)=\chi_{cc}$ (measured here $\ensuremath{\PsevenChiAA}$,
+$\ensuremath{\PsevenChiCA}$, $\ensuremath{\PsevenChiAC}$,
+$\ensuremath{\PsevenChiCC}$). By contrast the \textbf{r14} bulk uses
+$\psi^2$-weighted \emph{increments} on top of $\chi_{aa}$,
+%
+\begin{equation}
+  \chi_{\text{eff}}^{\text{r14}}(i,j) = \chi_{aa}
+   + \psi_i^2\,\chi_{ca} + \psi_j^2\,\chi_{ac}
+   + \psi_i^2\psi_j^2\,\chi_{cc},
+\end{equation}
+%
+so there the same crystalline-amorphous input $\chi_{ca}$ means an
+\emph{increment} $\chi_{aa}+\chi_{ca}$ at the pure limit (e.g.
+$\ensuremath{\PsevenChiCAincr}$), \emph{not} an absolute value.
+\file{test\_chi\_limits.py} verifies all four pure limits for both
+conventions against the production evaluator.
+
+Making the crystal-contact interaction \emph{larger} than $\chi_{aa}$
 means ``a crystal of species $i$ dislikes amorphous species $j$ more than
-two amorphous phases dislike each other'' --- so crystallizing $i$ pushes
-$j$ out. That is the thermodynamic origin of crystallization-driven
+two amorphous phases dislike each other'' --- crystallizing $i$ pushes $j$
+out. Together with the crystal-bulk energy (which enriches $i$ where it
+crystallizes) this is the thermodynamic origin of crystallization-driven
 demixing.
 
+\section{Measuring the coupling: commensurate controls}
+
 \begin{keybox}
-\textbf{Coefficients.} The bulk Cahn--Hilliard $\chi_{aa}$ and the
-crystal-contact $\chi_{ca}$ (with $\chi_{ca}>\chi_{aa}$ for expulsion),
-plus the crystallization energetics of Chapter~\ref{ch:p6} ($\Delta h$,
-$\Delta\sigma$, $T$, $T_m$, $\varepsilon^2$, $L_\psi$). The
-\emph{demixing metric} is the purity contrast: the mean composition of
-the crystallizing species \emph{inside} the crystal ($\psi>0.5$) minus
-\emph{outside}.
+\textbf{No divide-by-floor.} We do \emph{not} compare a crystal run against
+a differently-masked no-crystal run (that amplified a
+near-zero denominator). We run \textbf{three commensurate controls} ---
+\code{ch\_only} ($K{=}0$), \code{coupled\_nochi} (crystal present but
+$\chi_{ca}{=}\chi_{aa}$), and \code{full} ($\chi_{ca}{>}\chi_{aa}$) --- and
+score all three with the \emph{same} mask (the full run's $\psi>0.5$
+footprint) and the \emph{same} metric (the species-0 composition contrast
+$\langle\phi_0\rangle_{\text{in}}-\langle\phi_0\rangle_{\text{out}}$). We
+report \emph{absolute} contrasts and the attributable increments; a
+relative amplification is quoted \emph{only} when the denominator is
+resolved.
 \end{keybox}
 
+The controls decompose the demixing into two physical channels:
+%
+\begin{align}
+  \text{crystal-bulk channel} &=
+     \text{coupled\_nochi} - \text{ch\_only}
+     = \ensuremath{\PsevenCrystChannel}, \\
+  \text{$\chi$-expulsion channel} &=
+     \text{full} - \text{coupled\_nochi}
+     = \ensuremath{\PsevenChiChannel}.
+\end{align}
+%
+On the crystal footprint ordinary Cahn--Hilliard produces essentially no
+contrast (\code{ch\_only} $=\ensuremath{\PsevenCtrlChonly}$). \emph{Most}
+of the demixing is the \textbf{crystal-bulk} channel --- the
+$\phi_k^2\,W(\psi_k)$ term enriches the crystallizing species where it
+orders, present even with $\chi_{ca}{=}\chi_{aa}$. The \textbf{$\chi$
+expulsion} adds a further, smaller increment (full
+$=\ensuremath{\PsevenCtrlFull}$; relative to \code{coupled\_nochi} that is
+$\ensuremath{\PsevenRelFullNochi}\times$, denominator resolved). The
+contrast is reproducible across seeds (Sec.~\ref{sec:p7run}).
+
+\section{Coupled energy budget}
+
+The coupled film is a gradient flow of a single free energy
+$F=F_{\text{entropy}}+F_{\chi}+F_{\text{cryst}}+F_{\text{grad}\,\phi}
++F_{\text{grad}\,\psi}$, evaluated by quadrature with the exact production
+densities (\code{coupled\_energy}). Over the quench the total decreases
+monotonically ($F:\ensuremath{\PsevenEnergyStart}\to
+\ensuremath{\PsevenEnergyEnd}$, largest positive step
+$\ensuremath{\PsevenEnergyMaxPos}$) --- the coupling redistributes energy
+between the mixing, $\chi$ and crystal terms but cannot increase the total
+(Fig.~\ref{fig:p7budget}, left).
+
+\section{Causality}
+
+Correlation is not cause; we perturb the coupling to check its direction.
+\textbf{Frozen geometry:} freeze the crystal ($L_\psi{=}0$) and run the
+composition with vs without the $\chi$ coupling --- the coupling still adds
+demixing at \emph{fixed} geometry (increment
+$\ensuremath{\PsevenFrozenChi}$), so the coupling, not the \emph{act} of
+crystallizing, drives it. \textbf{Kinetics at fixed coupling:} a fast
+($L_\psi{=}6$) and a slow ($L_\psi{=}1$) run both reach a large contrast
+($\ensuremath{\PsevenKinFast}$ vs $\ensuremath{\PsevenKinSlow}$) --- the
+\emph{coupling} sets the demixing magnitude while the kinetic rate sets
+only the timing.
+
 \section{Run it}
+\label{sec:p7run}
 
 \begin{runbox}
 \textbf{Run it.}
 \begin{lstlisting}
 cd physics/07_coupled_ch_ac
-python run.py            # crystallization ON vs OFF, then the (M,K) ladder
+python test_chi_limits.py   # the four-fold chi convention (p1 & r14)
+python run.py               # controls + budget + causality + checks
 \end{lstlisting}
-It runs $(M,K)=(2,1)$ with crystallization ON and OFF, prints the
-demixing purity contrast, and repeats the ON case at $(3,1)$ and $(3,2)$.
-Compare with \file{EXPECTED.md} and the figures.
+\code{run.py} runs the three commensurate controls, the seed-sensitivity
+sweep, the coupled energy budget and the causality experiments, writes
+\file{outputs/results.json}, and checks it against \file{baseline.yaml}
+(tolerance-based). Compare with \file{EXPECTED.md} and the figures.
 \end{runbox}
 
-\paragraph{What you should see.} With crystallization ON, the
-crystallizing species concentrates strongly inside the crystal
-(inside $\PsevenInside$ vs outside $\PsevenOutside$; contrast
-$\PsevenContrastOn$). With crystallization OFF (the same blend, $K=0$)
-the composition only demixes by ordinary Cahn--Hilliard, a much smaller
-contrast $\PsevenContrastOff$ --- crystallization amplifies the demixing
-by $\PsevenAmplify\times$. The same machinery scales up the ladder:
-$(3,1)$ gives contrast $\PsevenContrastThreeone$ and $(3,2)$ gives
-$\PsevenContrastThreetwo$.
+\paragraph{What you should see.} On the shared crystal-footprint mask the
+composition contrast is $\ensuremath{\PsevenCtrlChonly}$ (CH only),
+$\ensuremath{\PsevenCtrlNochi}$ (crystal-bulk channel) and
+$\ensuremath{\PsevenCtrlFull}$ (full) --- so crystallization-driven
+demixing is dominated by the crystal-bulk channel with a smaller
+$\chi$-expulsion increment. The total free energy decreases monotonically,
+and the causality experiments confirm the coupling (not the kinetics)
+causes the demixing.
 
 % --- generated by gen_figures.py ---
 \begin{figure}[h]\centering
   \includegraphics[width=\linewidth]{figures/p7_demixing.png}
-  \caption{Crystallization-driven demixing at $(M,K)=(2,1)$. Left:
-    crystallization off (pure Cahn--Hilliard composition). Middle/right:
-    crystallization on --- the crystal (red outline) purifies its species,
-    a sharper composition pattern than phase separation alone produces.}
+  \caption{Three commensurate controls scored on the \emph{same} mask (the
+    full crystal footprint, red outline) with the \emph{same} contrast
+    metric: \code{ch\_only}, \code{coupled\_nochi} and \code{full}
+    $\phi_0$ fields, and the contrast decomposition into the crystal-bulk
+    and $\chi$-expulsion channels (right).}
   \label{fig:p7demix}
 \end{figure}
 
 \begin{figure}[h]\centering
   \includegraphics[width=\linewidth]{figures/p7_ladder.png}
-  \caption{The same coupled model up the $(M,K)$ ladder:
-    $(2,1)\to(3,1)\to(3,2)$. Adding species and crystallizable phases is
-    a change of two integers; the physics (crystallization-driven
-    demixing) carries over.}
-  \label{fig:p7ladder}
+  \caption{Left: the coupled free-energy budget --- entropy, $\chi$,
+    crystal and gradient terms, whose \emph{total} decreases monotonically.
+    Right: causality --- the $\chi$ coupling demixes at frozen geometry,
+    and fast/slow crystallization both reach a large contrast (coupling
+    sets the magnitude, kinetics the timing).}
+  \label{fig:p7budget}
 \end{figure}
 
 \begin{keybox}
-\textbf{Measured self-check.}
+\textbf{Measured self-check} (level 5, cuDSS; tolerance-checked in
+\file{baseline.yaml}).
 \begin{center}\small
 \begin{tabular}{lc}
 \toprule
-$(2,1)$ crystallizer $\phi_0$: inside $\to$ outside crystal & $\PsevenInside \to \PsevenOutside$ \\
-demixing contrast: ON vs OFF & $\PsevenContrastOn$ vs $\PsevenContrastOff$ \\
-amplification (ON/OFF) & $\PsevenAmplify\times$ \\
-contrast at $(3,1)$ / $(3,2)$ & $\PsevenContrastThreeone$ / $\PsevenContrastThreetwo$ \\
+$\chi_{\text{eff}}$ p1 pure limits $aa/ca/ac/cc$ & $\ensuremath{\PsevenChiAA}/\ensuremath{\PsevenChiCA}/\ensuremath{\PsevenChiAC}/\ensuremath{\PsevenChiCC}$ \\
+contrast: ch\_only / coupled\_nochi / full & $\ensuremath{\PsevenCtrlChonly}$ / $\ensuremath{\PsevenCtrlNochi}$ / $\ensuremath{\PsevenCtrlFull}$ \\
+crystal-bulk / $\chi$-expulsion channel & $\ensuremath{\PsevenCrystChannel}$ / $\ensuremath{\PsevenChiChannel}$ \\
+total $F$ (start $\to$ end) & $\ensuremath{\PsevenEnergyStart} \to \ensuremath{\PsevenEnergyEnd}$ \\
+frozen-geometry $\chi$-channel & $\ensuremath{\PsevenFrozenChi}$ \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -98,41 +180,42 @@ contrast at $(3,1)$ / $(3,2)$ & $\PsevenContrastThreeone$ / $\PsevenContrastThre
 
 \section{Code walk-through}
 
-\paragraph{1. Four $\chi$ matrices.} \code{\_chis} builds the amorphous
-$\chi_{aa}$ (all pairs) and the stronger crystal-contact $\chi_{ca}$
-(a crystallizing species vs the others); passing them to
-\code{MultiPhaseStepper(chi\_aa=..., chi\_ac=..., chi\_ca=...)} turns on
-the coupling.
+\paragraph{1. Four $\chi$ matrices + the convention test.} \code{\_chis}
+builds $\chi_{aa}$ (all pairs) and the crystal-contact $\chi_{ca}$;
+\code{chi\_eff\_limits} and \file{test\_chi\_limits.py} pin the p1
+(absolute) vs r14 (increment) pure limits against the production evaluator
+\code{\_np\_chi\_eff}.
 
-\paragraph{2. ON vs OFF control.} The same call with $K=0$ drops the
-crystal terms, isolating the pure-Cahn--Hilliard demixing --- the control
-that makes the crystallization contribution measurable.
+\paragraph{2. Commensurate controls.} \code{run(mode=...)} selects
+\code{ch\_only}/\code{coupled\_nochi}/\code{full}; \code{contrast\_on\_mask}
+scores every control on the one shared mask.
 
-\paragraph{3. The purity contrast.} The demixing metric splits the field
-by the crystal mask $\psi>0.5$ and differences the mean composition,
-inside vs outside.
+\paragraph{3. Energy + causality.} \code{coupled\_energy} integrates the
+exact free-energy split; \code{freeze\_psi=True} ($L_\psi{=}0$) gives the
+frozen-geometry control, and varying \code{L\_psi} gives the kinetics
+control.
 
 \section{Explore on your own}
 
-\question{Sweep $\chi_{ca}$ from $\chi_{aa}$ (no extra crystal repulsion)
-upward. At what point does crystallization-driven demixing switch on, and
-how does the purity contrast scale with $\chi_{ca}-\chi_{aa}$?}
+\question{Sweep $\chi_{ca}$ from $\chi_{aa}$ upward. How does the
+\emph{$\chi$-expulsion channel} (full $-$ coupled\_nochi) scale with
+$\chi_{ca}-\chi_{aa}$, and does it ever overtake the crystal-bulk channel?}
 
-\question{Turn crystallization on \emph{after} the blend has partly
-demixed (delay the seed). Does the crystal template on the existing
-composition pattern, or reshape it? What does this say about processing
-order (phase-separate then crystallize vs simultaneously)?}
+\question{Switch the bulk to \code{r14}. Re-derive the pure-limit $\chi$
+you must input to match the p1 \emph{absolute} interactions of this chapter
+(hint: subtract $\chi_{aa}$). Verify with \file{test\_chi\_limits.py}.}
 
-\question{At $(3,2)$ two species crystallize. Do their crystals compete
-for the same regions, or segregate? How does the second crystallizable
-phase change the amorphous matrix left behind?}
+\question{Turn crystallization on \emph{after} the blend has partly demixed
+(delay the seed). Does the crystal template on the existing composition
+pattern or reshape it? Relate to processing order (phase-separate then
+crystallize vs simultaneously).}
 
-\question{Compare the coarsening rate with and without crystallization.
-Does the growing crystal \emph{pin} the composition pattern (slower
-coarsening), and why would a device designer want that?}
+\question{At $(M,K)=(3,2)$ two species crystallize. Do their crystals
+compete for the same regions or segregate? Re-run the commensurate controls
+and decompose each crystallizer's demixing.}
 
-\question{The contrast is a purity measure. Relate it to what a solar
-cell wants (pure domains for transport, but a bicontinuous network for
-charge separation). Is more contrast always better?}
+\question{The contrast is a purity measure. Relate it to what a solar cell
+wants (pure domains for transport, a bicontinuous network for charge
+separation). Is more contrast always better?}
 
 % ====================================================================
