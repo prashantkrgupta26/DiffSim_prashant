@@ -137,8 +137,13 @@ class LerayProjectionStepper:
             if grad:
                 h = dm.mesh.tree.h()[dm.mesh.bins[pv]]
                 g = np.einsum("qad,ea...->eqd...", tb.dN, vals)
-                g = g * (2.0 / h)[:, None, None, *([None] * (full.ndim - 1))] \
-                    if full.ndim > 1 else g * (2.0 / h)[:, None, None]
+                if full.ndim > 1:
+                    # star-in-subscript is 3.11+ (PEP 646); build the index
+                    # tuple explicitly so requires-python >=3.10 holds
+                    idx = (slice(None), None, None) + (None,) * (full.ndim - 1)
+                    g = g * (2.0 / h)[idx]
+                else:
+                    g = g * (2.0 / h)[:, None, None]
                 gout[pv] = g.reshape((-1, dm.dim) + full.shape[1:])
         return (out, gout) if grad else out
 
