@@ -1,0 +1,22 @@
+# P4 doc-vs-data mapping: each course-document macro (latex/numbers/p4.tex)
+# vs the reference-mode results.json path it must match, within tolerance.
+# Drives the docs-build staleness gate (common/check_doc_staleness.py).
+tex: ../../latex/numbers/p4.tex
+macros:
+  PfourChiab:       {path: chi.0,                          rtol: 0.001}
+  PfourChias:       {path: chi.1,                          rtol: 0.001}
+  PfourChibs:       {path: chi.2,                          rtol: 0.001}
+  PfourNone:        {path: N.0,                            rtol: 0.001}
+  PfourSpreadStart: {path: spread_start,                   rtol: 0.10}
+  PfourSpreadEnd:   {path: spread_end,                     rtol: 0.15}
+  PfourPhaseA:      {path: clustering.phaseA_mean.0,       rtol: 0.15, extract: low}
+  PfourPhaseB:      {path: clustering.phaseB_mean.0,       rtol: 0.15, extract: low}
+  PfourPopA:        {path: clustering.population.0,        rtol: 0.10}
+  PfourSens:        {path: clustering.endpoint_sensitivity, rtol: 0.5}
+  PfourLever:       {path: lever.residual,                 max: 1.5e-3}
+  PfourDet:         {path: spinodal_ic.det,                rtol: 0.01}
+  PfourChiCrit:     {path: spinodal_ic.chi12_crit,         rtol: 0.01}
+  PfourAsymChiCrit: {path: nshift.asym_chi12_crit,         rtol: 0.01}
+  PfourDeltaChiCrit: {path: nshift.delta_chi12_crit,       rtol: 0.01}
+  PfourBinodalA:    {path: binodal.phaseA.0,               rtol: 0.15, extract: low}
+  PfourBinodalB:    {path: binodal.phaseB.0,               rtol: 0.15, extract: low}

@@ -1,0 +1,114 @@
+# OrgElMorph course - P4 ternary Flory-Huggins parameter sets.
+#
+# Structured, provenance-carrying inputs for the ternary Cahn-Hilliard
+# tutorial (chapter P4). The run READS chi and N from here through
+# materials/loader.py -- no numbers are hand-copied into code. Each entry
+# gives value / units / definition / source / uncertainty so the
+# provenance is auditable (spec Phase 1 P4: "materials loader + schema,
+# no manual copying").
+#
+# Flory-Huggins convention (kT/v0 units), solvent eliminated:
+#   f = sum_i (phi_i/N_i) ln phi_i + sum_{i<j} chi_ij phi_i phi_j
+#   species order is (solute1, solute2, solvent); index s = solvent.
+
+blends:
+
+  synthetic_demix:
+    description: >
+      The tutorial's default STRONG-quench blend. chi_12 is deliberately
+      large so the symmetric blend at (0.35, 0.35) sits well inside the
+      ternary spinodal (det H < 0) and demixes on a short, cheap horizon --
+      a clean pedagogical spinodal quench, not a fitted real system.
+    chi_12:
+      value: 3.5
+      units: dimensionless (kT/v0)
+      definition: solute1-solute2 Flory interaction parameter
+      source: synthetic (chosen for a clearly unstable quench)
+      uncertainty: n/a (pedagogical)
+    chi_1s:
+      value: 1.0
+      units: dimensionless (kT/v0)
+      definition: solute1-solvent Flory interaction parameter
+      source: synthetic
+      uncertainty: n/a
+    chi_2s:
+      value: 0.6
+      units: dimensionless (kT/v0)
+      definition: solute2-solvent Flory interaction parameter
+      source: synthetic
+      uncertainty: n/a
+    N:
+      value: [1.0, 1.0, 1.0]
+      units: dimensionless
+      definition: degrees of polymerization (solute1, solute2, solvent)
+      source: symmetric-entropy model (all species one site)
+      uncertainty: n/a
+
+  synthetic_demix_asymN:
+    description: >
+      Same chi as synthetic_demix but with an ASYMMETRIC degree of
+      polymerization for solute1 (a long-chain polymer). Used to show how
+      the entropy term ln(phi_i)/N_i shifts the spinodal / critical chi_12
+      relative to the symmetric-N case.
+    chi_12:
+      value: 3.5
+      units: dimensionless (kT/v0)
+      definition: solute1-solute2 Flory interaction parameter
+      source: synthetic (matched to synthetic_demix)
+      uncertainty: n/a
+    chi_1s:
+      value: 1.0
+      units: dimensionless (kT/v0)
+      definition: solute1-solvent Flory interaction parameter
+      source: synthetic
+      uncertainty: n/a
+    chi_2s:
+      value: 0.6
+      units: dimensionless (kT/v0)
+      definition: solute2-solvent Flory interaction parameter
+      source: synthetic
+      uncertainty: n/a
+    N:
+      value: [2.0, 1.0, 1.0]
+      units: dimensionless
+      definition: degrees of polymerization (solute1 longer-chain, solute2, solvent)
+      source: >
+        synthetic (polymer entropy suppressed by 1/N1). N1=2 is a
+        deliberately MILD asymmetry: it shifts the spinodal clearly
+        (critical chi_12 drops from ~2.84 to ~1.98 at (0.35,0.35)) while
+        keeping the log-barrier strong enough for a cheap, robust quench.
+        A real polymer N ~ 1e2-1e3 shifts it much further but is very stiff.
+      uncertainty: N1 nominal (real polymer N ~ 1e2-1e3)
+
+  # A real system, mapped from the shared materials.yaml (P3HT:PCBM),
+  # for the "map a real blend" exercise. chi order-of-magnitude only.
+  P3HT_PCBM:
+    description: >
+      Poly(3-hexylthiophene) : PCBM -- the Wodo-Ganapathysubramanian
+      (2012) evaporation-morphology benchmark blend, weakly immiscible.
+    chi_12:
+      value: 0.86
+      units: dimensionless (kT/v0)
+      definition: polymer-fullerene Flory interaction parameter
+      source: Wodo & Ganapathysubramanian, Comput. Mater. Sci. 55 (2012) 113
+      uncertainty: order-of-magnitude (OSC literature)
+    chi_1s:
+      value: 0.4
+      units: dimensionless (kT/v0)
+      definition: polymer-solvent Flory interaction parameter
+      source: OSC literature (order-of-magnitude)
+      uncertainty: order-of-magnitude
+    chi_2s:
+      value: 0.3
+      units: dimensionless (kT/v0)
+      definition: fullerene-solvent Flory interaction parameter
+      source: OSC literature (order-of-magnitude)
+      uncertainty: order-of-magnitude
+    N:
+      value: [100.0, 1.0, 1.0]
+      units: dimensionless
+      definition: degrees of polymerization (polymer, fullerene, solvent)
+      source: >
+        polymer N large (~1e2-1e3); tutorial uses N1=100 as a
+        representative long-chain value (materials.yaml lists N as null)
+      uncertainty: N1 spans 1e2-1e3
