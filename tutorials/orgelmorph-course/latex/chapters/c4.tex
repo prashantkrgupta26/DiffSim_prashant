@@ -1,0 +1,181 @@
+\chapter{The solver ecosystem}
+\label{ch:c4}
+\begin{keybox}
+\textbf{Key idea.} There is no single best linear solver. A direct
+factorization (cuDSS) is unbeatable in 2-D and up to a memory wall in
+3-D; past that wall it dies, and a block preconditioner
+(\texttt{blockch}) wins by an order of magnitude; past the point where
+even the matrix will not fit, only a matrix-free method survives.
+Choosing the solver is choosing where on that curve your problem sits.
+\end{keybox}
+
+This concept teaches how to choose, using a small live 2-D comparison
+plus the measured 3-D scaling tables from the device-assembly and
+\texttt{blockch} development notes.
+
+\section{Three families of solver}
+
+Each Newton iterate solves $A\,\delta = r$, where $A$ is the mixed
+$(c,\mu)$ Cahn--Hilliard Jacobian --- a \emph{saddle}-structured sparse
+matrix. Three families compete:
+\begin{itemize}[nosep]
+  \item \textbf{Direct} (LU factorization: \code{splu} on the CPU,
+        \textbf{cuDSS} on the GPU). Robust, tuning-free, exact to
+        round-off. But the triangular factors \emph{fill in}: their
+        nonzeros grow far faster than $A$'s, cheaply in 2-D and
+        punishingly in 3-D, until the factors do not fit in memory.
+  \item \textbf{Block-preconditioned iterative} (\textbf{blockch} /
+        \code{blockch\_dev}). An outer FGMRES wrapped around a block
+        factorization that \emph{never} forms the global LU. It is
+        latency-bound at small $n$ (loses badly in 2-D), but its memory
+        and per-solve cost scale gently --- so it wins in 3-D past the
+        point cuDSS runs out of memory.
+  \item \textbf{Matrix-free}. Never stores $A$ at all --- applies the
+        action $A\mathbf v$ batch-wise through the element kernels. The
+        only survivor once even the sparse $A$ overflows 32-bit indexing
+        or the card's memory.
+\end{itemize}
+
+\begin{keybox}
+\textbf{Why the choice flips with dimension.} In 2-D the interface is a
+curve and the matrix bandwidth is modest, so direct fill-in is cheap ---
+cuDSS dominates. In 3-D the interface is a surface, the bandwidth
+explodes, and the LU factors blow past the card's memory; that is
+exactly where the block preconditioner takes over, and beyond \emph{it},
+matrix-free. Solver choice is a function of where on the cost curve your
+problem sits.
+\end{keybox}
+
+\section{The 2-D crossover, measured live}
+
+We assemble the \emph{real} Cahn--Hilliard Jacobian at three mesh sizes
+and time the linear solve (factorize $+$ solve) with CPU-direct
+(\code{splu}) and GPU-direct (cuDSS). Isolating the solve matters: the
+full step is host-assembly-bound in this brick, which would swamp the
+solver signal.
+
+\begin{runbox}
+\textbf{Run it.}
+\begin{lstlisting}
+cd computational/04_solvers
+python run.py            # live 2-D benchmark + cited 3-D + the rule
+\end{lstlisting}
+\end{runbox}
+
+At $\CfourSmallDofs$ dofs, cuDSS is $\sim\CfourSmallSpeedup\times$ the
+speed of \code{splu} --- i.e.\ \emph{slower}: the GPU's launch and
+transfer overhead dominates a tiny solve. By $\CfourBigDofs$ dofs cuDSS
+is $\sim\CfourBigSpeedup\times$ \emph{faster} and pulling away. The
+crossover sits near $10^4$ dofs (Fig.~\ref{fig:c4cross}). The block
+preconditioner is $26$--$500\times$ slower than cuDSS across this whole
+2-D range (dev note, cited) --- you would never use it here.
+
+\begin{figure}[h]\centering
+  \includegraphics[width=0.66\linewidth]{figures/c4_crossover.png}
+  \caption{Direct-solver crossover in 2-D on the real Cahn--Hilliard
+    Jacobian: CPU \code{splu} wins at small sizes (GPU overhead
+    dominates), GPU cuDSS wins as the problem grows and keeps scaling
+    better. Timings vary run-to-run; the crossover shape does not.}
+  \label{fig:c4cross}
+\end{figure}
+
+\section{The 3-D story, measured (and cited)}
+
+The 3-D numbers take minutes per step to produce, so we cite the
+development notes' measured tables rather than re-run them. The picture
+is decisive (Fig.~\ref{fig:c4cited}):
+
+\begin{itemize}[nosep]
+  \item cuDSS's factorization fill hits the 48\,GB card at
+        $\sim\CfourCudssCeiling$ dofs --- beyond that the factorization
+        crawls into hybrid memory and never returns.
+  \item \code{blockch\_dev} beats cuDSS $\CfourBlockchSpeedup\times$ on
+        the slab64 solve (2.10 vs 17.7 s/call) \emph{and} keeps marching
+        at $\CfourCudssCeiling$ dofs, where cuDSS ceilings.
+  \item a \emph{block-masked} cuDSS pattern cuts the 3-D fill
+        ($17.7\to\CfourMaskedScall$ s/call) --- a strong option under
+        $\sim5\times10^5$ dofs, but the memory wall above it is
+        unchanged in kind.
+  \item \textbf{AMGX verdict: no.} At production $\Delta t$ the inner
+        solves are mass-dominated (well-conditioned), so algebraic
+        multigrid has no $O(h^{-1})$ growth to flatten and adds nothing.
+  \item matrix-free (and \code{blockch}) push the ceiling to
+        $\CfourMatrixfreeDofs$ dofs ($128^2\times64$) on a single
+        48\,GB card --- a size cuDSS cannot touch on any card here.
+\end{itemize}
+
+\begin{figure}[h]\centering
+  \includegraphics[width=0.74\linewidth]{figures/c4_cited3d.png}
+  \caption{Cited 3-D per-solve cost (dev notes): cuDSS versus
+    \code{blockch\_dev}. blockch is $\CfourBlockchSpeedup\times$ cheaper
+    at slab64 and keeps marching at the size where cuDSS's factorization
+    ceilings on a 48\,GB card.}
+  \label{fig:c4cited}
+\end{figure}
+
+\begin{keybox}
+\textbf{The decision, as a rule} (\code{choose\_solver} in the
+tutorial):
+\begin{center}\small
+\begin{tabular}{lll}
+\toprule
+regime & dofs (order) & solver \\
+\midrule
+2-D, small        & $<10^4$          & \code{splu} (CPU direct) \\
+2-D, large        & $>10^4$          & \textbf{cuDSS} (GPU direct) \\
+3-D, small        & $<5\times10^5$   & cuDSS / masked cuDSS \\
+3-D, large        & up to $\sim1.5\times10^6$ & \code{blockch\_dev} \\
+3-D, extreme      & $>$ int32 / memory & matrix-free (or multi-GPU) \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{keybox}
+
+\section{Code walk-through}
+
+\paragraph{Capturing the real operator.}
+\begin{lstlisting}
+A, b, dofs, nnz = capture_ch_system(level)   # intercepts the solve
+\end{lstlisting}
+The benchmark does not invent a matrix --- it runs one real CH Newton
+iterate and intercepts the stepper's linear solve to grab the exact
+saddle Jacobian $A$ and residual $b$.
+
+\paragraph{The fair timing.}
+\begin{lstlisting}
+t_splu  = time(lambda: splu(A.tocsc()).solve(b))          # CPU, refactor
+t_cudss = time(lambda: solve_linear(A, b, solver="cudss", cache={}))  # GPU
+\end{lstlisting}
+Both refactor on every call (fresh \code{cache=\{\}}), so the comparison
+includes factorization --- the honest cost of a direct solve inside a
+Newton loop where $A$ changes each iterate.
+
+\section{Explore on your own}
+
+\question{Extend the live 2-D sweep to level~8 ($\sim1.3\times10^5$
+dofs). Does cuDSS's lead over \code{splu} keep growing, and does the
+solve time scale closer to $O(n)$ or $O(n^{1.5})$? What does the
+observed exponent say about 2-D direct fill-in?}
+
+\question{Time \emph{just the solve} versus \emph{factorize $+$ solve} by
+reusing one factorization for many right-hand sides. In a Newton loop
+$A$ changes every iterate, so you cannot reuse --- but where in this
+simulator \emph{could} you (hint: a fixed-point or a frozen-Jacobian
+scheme), and how much would it save?}
+
+\question{The dev note reports \code{blockch\_dev} at $8.4\times$ cuDSS
+on the slab64 \emph{solve} but only $2.6\times$ on the \emph{step}. What
+does the rest of the step cost, and why does the solver speedup not carry
+through one-to-one to wall-clock? (Look at the assembly and outer-FGMRES
+costs.)}
+
+\question{Using the cited fill behavior, estimate the dofs at which
+cuDSS would ceiling on an 80\,GB A100. Then decide: for a
+$96\times96\times48$ film, which solver, and would masked cuDSS change
+your answer?}
+
+\question{AMGX was measured to add nothing because the inners are
+mass-dominated at production $\Delta t$. Construct the one regime where
+that argument breaks (hint: what happens to the conditioning when the
+adaptive ladder collapses $\Delta t$ during a deep quench?), and say what
+you would measure to confirm it.}

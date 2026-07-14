@@ -1,0 +1,197 @@
+\chapter{Spatial and temporal adaptivity}
+\label{ch:c3}
+\begin{keybox}
+\textbf{Key idea.} Resolution should follow the physics. In space,
+\emph{octree refinement} puts small elements only where the field is
+sharp (the interfaces) and leaves the bulk coarse. In time, an
+\emph{LTE-controlled} step ladder shrinks $\Delta t$ during the violent
+onset and grows it through slow coarsening --- but growing $\Delta t$
+safely forces BDF2 to carry its \emph{variable-coefficient} form, or its
+order silently collapses.
+\end{keybox}
+
+This concept measures both adaptivities on the Cahn--Hilliard brick. It
+builds directly on the convergence study (Chapter~\ref{ch:c1}: the BDF2
+order that adaptivity must preserve) and enables the long phase-field
+horizons the physics track needs.
+
+\section{Spatial adaptivity: octree refinement}
+
+A spinodal field is sharp at its interfaces and smooth everywhere else.
+A uniform mesh fine enough to resolve the interfaces wastes almost all
+its elements on the flat bulk. An \emph{octree} mesh refines
+adaptively: starting from one cell, it subdivides only where a criterion
+says to. Here we refine any element within a band of a circular
+interface and leave the rest coarse.
+
+\begin{keybox}
+\textbf{Hanging nodes.} When a fine element meets a coarse one, the fine
+element has a node in the middle of the coarse element's edge --- a
+\emph{hanging node} that is not a true degree of freedom. It is
+\emph{constrained} to the average of its coarse neighbors, and that
+constraint lives in the matrix $T$ (recall $A = T^{\!\top}KT$). The
+solver never sees the hanging nodes as unknowns; \code{build\_constraints}
+builds $T$, and the \emph{same} stepper runs unchanged --- which is why
+the tutorial can just hand the CH brick an adaptive mesh and step.
+\end{keybox}
+
+The measured result: refining along one circle at level $\CthreeMaxLevel$
+gives $\CthreeAdaptNodes$ nodes against $\CthreeUniformNodes$ for the
+uniform mesh at the same finest $h$ --- a $\CthreeNodeSavings\times$
+reduction in degrees of freedom (Fig.~\ref{fig:c3octree}), and the CH
+brick steps on it. In 3-D the savings compound (a surface is a
+vanishing fraction of a volume), which is what makes device-scale films
+tractable at all (Chapter~\ref{ch:c5}).
+
+\begin{figure}[h]\centering
+  \includegraphics[width=0.62\linewidth]{figures/c3_octree.png}
+  \caption{Octree refinement along a circular interface: small elements
+    hug the interface (red), large elements fill the bulk. The adaptive
+    mesh has $\CthreeAdaptNodes$ nodes versus $\CthreeUniformNodes$ for
+    a uniform mesh at the same finest resolution
+    ($\CthreeNodeSavings\times$ fewer dofs). Element color is refinement
+    level.}
+  \label{fig:c3octree}
+\end{figure}
+
+\section{Temporal adaptivity: the LTE step ladder}
+
+Phase separation is violent at onset and glacial during coarsening ---
+the natural time scale spans orders of magnitude. A fixed $\Delta t$
+must be small enough for the onset, wasting effort forever after. The
+\emph{adaptive} march sizes each step to the physics using a
+\emph{local truncation error} (LTE) estimate: it takes one step of size
+$\Delta t$ and two of size $\Delta t/2$ from the same state, and the
+difference (scaled by $2^{q}-1$) estimates the error of the step. If it
+is below tolerance, accept and \emph{grow} $\Delta t$; otherwise reject,
+halve, and retry.
+
+\begin{runbox}
+\textbf{Run it.}
+\begin{lstlisting}
+cd computational/03_adaptivity
+python run.py            # octree + time-ladder + BDF2 order
+\end{lstlisting}
+Compare the printed studies with \file{EXPECTED.md} and
+Fig.~\ref{fig:c3octree}--\ref{fig:c3ladder}.
+\end{runbox}
+
+The measured ladder over a quench to $t=0.8$: $\Delta t$ collapses to
+its floor $\CthreeDtMin$ during onset, then climbs to $\CthreeDtMax$
+during coarsening --- a range of $\CthreeSpan\times$
+(Fig.~\ref{fig:c3ladder}). It reaches $t=0.8$ in $\CthreeNadaptive$
+steps; a fixed march safe throughout would need the onset step size the
+whole way --- about $\CthreeNfixed$ steps, a $\CthreeSavings\times$
+saving.
+
+\begin{figure}[h]\centering
+  \includegraphics[width=0.72\linewidth]{figures/c3_ladder.png}
+  \caption{The accepted time step over a quench (log scale). $\Delta t$
+    is tiny during the spinodal onset and grows more than four orders of
+    magnitude through coarsening. $\CthreeNadaptive$ adaptive steps
+    replace $\sim\CthreeNfixed$ fixed steps ($\CthreeSavings\times$).}
+  \label{fig:c3ladder}
+\end{figure}
+
+\section{Why variable-coefficient BDF2}
+
+Growing $\Delta t$ safely has a hidden cost. The textbook BDF2
+coefficients $\tfrac32,\,[2,-\tfrac12]$ are derived assuming a
+\emph{constant} step. Feed them a step that changed from the last one
+and the scheme is only \emph{formally} second order --- its \emph{measured}
+order collapses toward 1. The retrofit measured exactly this: on an
+alternating $(\Delta t,\Delta t/2)$ sequence the constant-coefficient
+form converged at order $\CthreeConstOrderLo/\CthreeConstOrderHi$
+(audit doc, G3). The fix is to rebuild the coefficients each step from
+the actual ratio $r=\Delta t/\Delta t_{\text{prev}}$:
+%
+\begin{equation}
+  c_0 = \frac{1+2r}{1+r},\qquad
+  \text{history weights } \big[\,1+r,\; -\tfrac{r^2}{1+r}\,\big],
+\end{equation}
+%
+which reduces to the constant-step form at $r=1$ (bit-exactly, so
+fixed-$\Delta t$ runs are unchanged) and stays consistent when $r\ne1$.
+The tutorial re-measures it on the same alternating sequence: order
+$\CthreeVarOrder$ --- second order restored.
+
+\begin{keybox}
+\textbf{This is why C1 and C3 are one story.} Adaptivity is worthless if
+it silently destroys the accuracy you measured in Chapter~\ref{ch:c1}.
+The LTE controller and the variable-coefficient scheme are a matched
+pair: the controller \emph{varies} $\Delta t$; the variable-coefficient
+BDF2 is what keeps the order-2 accuracy while it does.
+\end{keybox}
+
+\begin{keybox}
+\textbf{Measured self-check} (fixed seed in \file{adaptivity.py}; node
+counts are exact, step counts are seed/card-dependent).
+\begin{center}\small
+\begin{tabular}{lcc}
+\toprule
+study & measured & note \\
+\midrule
+octree nodes (adaptive / uniform) & $\CthreeAdaptNodes$ / $\CthreeUniformNodes$ & $\CthreeNodeSavings\times$ fewer \\
+adaptive steps to $t=0.8$         & $\CthreeNadaptive$ & vs $\sim\CthreeNfixed$ fixed \\
+$\Delta t$ range                  & $\CthreeDtMin \to \CthreeDtMax$ & $\CthreeSpan\times$ \\
+step savings                      & $\CthreeSavings\times$ & \\
+variable-coeff BDF2 order         & $\CthreeVarOrder$ & vs $\CthreeConstOrderLo/\CthreeConstOrderHi$ const-coeff \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{keybox}
+
+\section{Code walk-through}
+
+\paragraph{Octree from a refinement predicate.}
+\begin{lstlisting}
+def refine_fn(centers, h):        # True where to subdivide
+    r = |centers - 0.5|
+    return abs(r - 0.30) < 1.5*h  # a band around the circle
+atree = build_adaptive(refine_fn, max_level=6, dim=2)
+\end{lstlisting}
+\code{build\_adaptive} subdivides until no flagged element can refine
+further; \code{build\_constraints} then ties the hanging nodes.
+
+\paragraph{The LTE-controlled march.}
+\begin{lstlisting}
+ts, dts = adaptive_march(st, t_end=0.8, tol=5e-4)   # returns the ladder
+\end{lstlisting}
+Inside, each step is step-doubled; accepted steps update $\Delta t$ by
+$\text{safety}\cdot(\text{tol}/\text{LTE})^{1/(q+1)}$ (clamped). Rejects
+rewind the state \emph{and} $\Delta t_{\text{prev}}$ --- so the BDF2
+history spacing is never corrupted by a rejected step.
+
+\paragraph{Measuring the variable-dt order.}
+\begin{lstlisting}
+ref = fixed_march(dt=2e-4)                    # fine reference
+errs = [max|var_march((dt, dt/2)) - ref|  for dt in (8e-3,4e-3,2e-3)]
+order = mean(log2(errs[i]/errs[i+1]))         # ~2.0, not ~1.0
+\end{lstlisting}
+The alternating $(\Delta t,\Delta t/2)$ sequence forces a fresh ratio
+$r$ on every step --- the hardest test of the variable-coefficient form.
+
+\section{Explore on your own}
+
+\question{Tighten the LTE tolerance from $5\times10^{-4}$ to
+$10^{-4}$. How do the step count and the peak $\Delta t$ change? Verify
+that the accuracy improves roughly in proportion to the tolerance (the
+controller is doing its job).}
+
+\question{Widen the octree refinement band from $1.5h$ to $3h$. How many
+more nodes does it add, and does the CH step's cost track the node count
+or the element count? Which is the right ``size'' of an adaptive mesh?}
+
+\question{Refine along \emph{two} circles instead of one. Predict the
+node count before running (a surface scales as its length here), then
+check. How would this scaling differ in 3-D?}
+
+\question{Force the constant-coefficient bug back: run the alternating
+sequence but with a \emph{fixed} $\Delta t$ (so $r\equiv1$) and confirm
+you recover order 2 --- then argue why the alternating sequence, not the
+fixed one, is the test that exposes the variable-coefficient issue.}
+
+\question{The onset drives $\Delta t$ to its floor. Lower the floor
+\code{dt\_min} by $10\times$ and see whether the onset resolves better or
+just wastes steps. What physically sets the smallest \emph{useful}
+$\Delta t$ during spinodal onset?}
