@@ -1,0 +1,49 @@
+# P10 tolerance baseline - reference mode (level 5, 4-rung ladder + level-6 mesh
+# rung + 2 time steps + 2 chi values, 9 films). Scientific invariants within
+# DOCUMENTED tolerances, NOT bitwise GPU identity. Ground truth on RTX 6000 Ada
+# (CUDA 12.9 / driver 13.2, cuDSS):
+#   all 4 rungs exit phis_stop, phi_s monotone; Bi in [1.5, 3.0].
+#   fullerene per-solute balance 1.2e-15 (machine); polymer balance 1.8e-4
+#   (large-N surface layer, resolution-dependent, tracked not hidden).
+#   contrast rises wet->dry 0.282 -> 0.339 -> 0.384 (slow rung), rate-spread
+#   1.6% at matched dryness; Bi-collapse wl spread 1.6%. Mesh contrast change
+#   1.4%, time contrast change 0.1%. chi_pf sweep: contrast monotone, spans 21%.
+#
+# The HARD, resolution-robust gates: fullerene conservation, drying honesty, the
+# Bi/contrast collapse, mesh+time robustness of the contrast, and the monotone
+# chi sensitivity. The "faster = finer" WAVELENGTH ordering (finer_ordering_mid)
+# is DELIBERATELY NOT gated -- it is the capstone's documented non-robust claim.
+# Keys are the dotted path into results.json (everything lives under `checks`).
+checks:
+  # --- the reproduced ladder is honest ----------------------------------
+  checks.n_rungs:                    {equals: 4}
+  checks.all_dried:                  {equals: true}
+  checks.all_monotone_drying:        {equals: true}
+  checks.Bi_min:                     {reference: 1.5, rtol: 0.02}
+  checks.Bi_max:                     {reference: 3.0, rtol: 0.02}
+
+  # --- conservation: fullerene machine-precision (hard), polymer tracked -
+  checks.balance_fullerene_rel_max:  {max: 1.0e-9}
+  checks.balance_polymer_rel_max:    {max: 1.0e-2}
+
+  # --- ROBUST: demixing degree set by dryness, rate-independent ----------
+  checks.contrast_rises_slow:        {equals: true}
+  checks.contrast_rises_fast:        {equals: true}
+  checks.contrast_rate_spread_mid:   {max: 0.05}
+  checks.bi_collapse_wl_spread_mid:  {max: 0.08}
+  checks.contrast_slow_hi:           {reference: 0.2822, rtol: 0.05}
+  checks.contrast_slow_mid:          {reference: 0.3390, rtol: 0.05}
+  checks.contrast_slow_lo:           {reference: 0.3844, rtol: 0.05}
+  checks.contrast_fast_mid:          {reference: 0.3338, rtol: 0.05}
+
+  # --- morphology wavelength (noisier: wider band) ----------------------
+  checks.wl_cells_slow_mid:          {reference: 18.06, rtol: 0.12}
+  checks.wl_cells_fast_mid:          {reference: 18.34, rtol: 0.12}
+
+  # --- ROBUST under mesh + time refinement -------------------------------
+  checks.mesh_contrast_rel_change:   {max: 0.05}
+  checks.time_contrast_rel_change:   {max: 0.02}
+
+  # --- ROBUST: demixing degree is a monotone function of chi_pf ----------
+  checks.sens_contrast_monotone_in_chi: {equals: true}
+  checks.sens_contrast_rel_span:     {min: 0.10}
