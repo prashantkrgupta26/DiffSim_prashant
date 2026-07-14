@@ -109,6 +109,8 @@ crystallization energetics) and their provenance in the literature.
 | Computational | C1 convergence (basis & time) · C2 boundary conditions · C3 adaptivity · C4 the solver ecosystem · C5 2-D vs 3-D |
 | Differentiable | D1 what differentiable simulation is · D2 morphology sensitivity · D3 recovering parameters · D4 process gradients · D5 crystallinity sensitivity · D6 learning the free energy from snapshots · D7 inverse-design capstone |
 
-> Status: this course is under construction. **Physics Concept 1** is
-> the complete reference build; the remaining concepts follow its
-> template.
+> Status: this course is under construction. The **Physics track
+> (P1–P9)** is a complete build — each concept has a runnable tutorial
+> (core module, `run.py`, `gen_figures.py`, `EXPECTED.md`) and a chapter
+> in the course document with measured, locked numbers. The
+> Computational and Differentiable tracks are in progress.

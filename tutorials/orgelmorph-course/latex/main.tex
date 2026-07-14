@@ -17,6 +17,30 @@
 \providecommand{\FHFstart}{--}\providecommand{\FHFend}{--}
 \providecommand{\FHFintpeak}{--}\providecommand{\FHFintend}{--}
 \providecommand{\FHcrange}{--}\providecommand{\FHmass}{--}
+% Physics P2-P9 macro fallbacks (each concept's gen_figures.py overrides
+% these from numbers/pN.tex; the fallbacks keep the document compiling
+% before a run has produced them).
+\makeatletter
+\@for\@m:=%
+  PtwoTend,PtwoDtfixed,PtwoTol,PtwoNfixed,PtwoNadapt,PtwoSpeedup,%
+  PtwoDtmin,PtwoDtmax,PtwoImplied,PtwoFfixed,PtwoFadapt,PtwodF,%
+  PtwoDscaleFixed,PtwoDscaleAdapt,PtwoCrange,%
+  PthreeChi,PthreeNeutralSub,PthreeNeutralEnr,PthreeAttractSub,%
+  PthreeAttractEnr,PthreeRepelSub,PthreeRepelEnr,PthreeMassdrift,%
+  PfourChiab,PfourChias,PfourChibs,PfourPhione,PfourPhitwo,%
+  PfourSpreadStart,PfourSpreadEnd,PfourPhaseA,PfourPhaseB,PfourDrift,%
+  PfiveKeSlow,PfiveKeFast,PfiveTdrySlow,PfiveTdryFast,PfivePhisSlow,%
+  PfivePhisFast,PfiveDomSlow,PfiveDomFast,PfiveHslow,PfiveHfast,%
+  PsixTm,PsixGrowStart,PsixGrowEnd,PsixGrowRatio,PsixMeltStart,%
+  PsixMeltEnd,PsixAvramiN,PsixAvramiXend,PsixSeeds,PsixGrains,%
+  PsevenInside,PsevenOutside,PsevenContrastOn,PsevenContrastOff,%
+  PsevenAmplify,PsevenAreaOn,PsevenContrastThreeone,PsevenContrastThreetwo,%
+  PeightNlevels,PeightNoiseZero,PeightXzero,PeightNoiseHi,PeightXhi,%
+  PeightGrainsHi,PeightOnset,%
+  PnineWetPhis,PnineWetStart,PnineWetEnd,PnineWetPsimax,PnineDryPhis,%
+  PnineDryStart,PnineDryEnd,PnineDryPsimax,PnineKe\do{%
+    \expandafter\providecommand\csname\@m\endcsname{--}}
+\makeatother
 
 \title{\textbf{OrgElMorph}\\[4pt]
   \large An Onboarding Course in Organic-Electronics Morphology Simulation\\[2pt]

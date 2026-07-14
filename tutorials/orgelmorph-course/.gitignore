@@ -1,5 +1,6 @@
 # tutorial run outputs (regenerable)
 */*/out/
+**/out_*.npz
 **/__pycache__/
 # LaTeX build intermediates (the built PDF IS committed)
 latex/*.aux
