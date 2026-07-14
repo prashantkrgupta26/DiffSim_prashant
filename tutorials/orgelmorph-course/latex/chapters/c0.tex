@@ -78,7 +78,7 @@ $u$-independent and is assembled once.
 Gauss sum $\int(\cdot)\dV=\sum_q(\cdot)|J|\,w_q$. On the octree's cube
 elements the reference-to-physical map is a scaling by $h/2$, so
 $|J|=(h/2)^{\text{dim}}$ and physical gradients are reference gradients
-times $\code{dscale}=2/h$. The tables $N_a(x_q)$, $\grad N_a(x_q)$ and
+times \code{dscale} ($=2/h$). The tables $N_a(x_q)$, $\grad N_a(x_q)$ and
 $w_q$ come from \file{mesh/basis.py} (\code{basis\_tables},
 \code{gauss\_1d}); inside a kernel they are read through the
 \file{assembly/femelm.py} accessors \code{fe\_N}, \code{fe\_dN\_s},
@@ -137,8 +137,8 @@ that does it, then open the production kernel it mirrors.
         matrix $T$ from \code{build\_constraints}; strong Dirichlet is row
         replacement (\code{\_BCOperator}, \file{assembly/dirichlet.py}; and
         the CH stepper's own row replacement in \code{step}).
-  \item \textbf{Newton.} \code{NonlinearSolver} (\file{solvers/newton.py})
-        or the monolithic loop in \code{CahnHilliardStepper.step}: assemble
+  \item \textbf{Newton.} \code{NonlinearSolver} (\file{solvers/newton.py}),
+        or \code{CahnHilliardStepper.step}'s monolithic loop: assemble
         $J,R$; solve $J\,\delta u=-R$; line-search; update.
   \item \textbf{Linear solve.} \code{solve\_linear}
         (\file{solvers/linsolve.py}) dispatches \code{splu} (host direct),
@@ -146,7 +146,7 @@ that does it, then open the production kernel it mirrors.
         preconditioner), returning a \code{LinearSolveResult}
         (\file{solvers/result.py}).
   \item \textbf{Device update.} The solution vector updates the field
-        state; host/device transfers are the \code{wp.array(\dots)} uploads
+        state; host/device transfers are the \code{wp.array(...)} uploads
         and \code{.numpy()} pulls around \code{wp.launch}.
 \end{enumerate}
 
@@ -285,7 +285,7 @@ cons = build_constraints(mesh)               # mesh/constraints.py
 dm   = DeviceMesh.from_mesh(mesh, cons, basis_tables(p, 2), device)
 \end{lstlisting}
 The same four calls every tutorial makes; \code{basis\_tables} gives $N$,
-$\grad N$ (reference) and $w_q$, and the octree factors $\code{dscale}=2/h$,
+$\grad N$ (reference) and $w_q$, and the octree factors \code{dscale} ($=2/h$),
 $|J|=(h/2)^{\dim}$ convert to physical space.
 
 \paragraph{2. Element residual + Jacobian (quadrature by \code{einsum}).}
