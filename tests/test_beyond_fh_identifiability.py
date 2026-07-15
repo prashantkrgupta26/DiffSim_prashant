@@ -47,6 +47,19 @@ def test_anchored_recovery():
     assert r["coeff_err"] < 1e-3, r["coeff_err"]
 
 
+def test_higher_order_recovery():
+    """End-to-end FIT: {P2..P5} recovered from a composition-diverse ensemble
+    but NOT from one narrow trajectory (the high modes are unconstrained)."""
+    m = _demo(0)
+    r = m.run_recovery_demo(level=3, n_steps=4, iters=350, verbose=False)
+    e_s, e_d = r["coeff_err_single"], r["coeff_err_diverse"]
+    print(f"higher-order recovery  single_err={e_s:.2e}  diverse_err={e_d:.2e}"
+          f"  ratio={e_s / max(e_d, 1e-30):.1f}x")
+    assert e_d < 0.1, e_d                 # diverse recovers the truth
+    assert e_s > 0.3, e_s                 # single fails
+    assert e_s / max(e_d, 1e-30) > 5.0, (e_s, e_d)
+
+
 def test_composition_coverage_conditioning():
     """The composition-coverage half of rung 2: a higher-degree gauge-anchored
     basis {P2..P5} is better conditioned (more identifiable) under

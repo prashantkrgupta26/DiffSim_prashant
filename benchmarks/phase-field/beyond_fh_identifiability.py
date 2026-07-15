@@ -186,6 +186,104 @@ def fit_anchored(dm, c0_np, data, A, B, n_steps, dt, order, snap_at,
     return model
 
 
+def snapshots_list(energy, dm, c0_np, n_steps, dt, order, snap_at):
+    """March and return the per-snapshot composition fields (detached data)."""
+    twin = CHTwin(dm, energy=energy, dt=dt, order=order, device="cpu")
+    out = twin.march(torch.tensor(c0_np), None, torch.tensor(1.0),
+                     torch.tensor(0.01), {}, n_steps)
+    return [out[k][0].detach().clone() for k in snap_at]
+
+
+def fit_basis(dm, protocols, A, B, degrees, n_steps, dt, order, snap_at,
+              iters=500, lr=5e-3, reg=1e-4, log=False):
+    """Fit the gauge-anchored beyond-FH coefficients (FH frozen) to the protocol
+    snapshots via Adam, with a small Tikhonov penalty.  The penalty is
+    load-bearing: where the data leaves a coefficient direction unconstrained
+    (single narrow trajectory, ill-conditioned high modes) it pulls that
+    direction toward zero -> a WRONG recovery; where the data constrains it
+    (composition-diverse) the misfit dominates and the truth is recovered.  It
+    also keeps the near-null direction from wandering the composition out of
+    [0,1] (FH-log NaN).  Returns the best (lowest data-misfit) model."""
+    model = BasisCorrEnergy(A=A, B=B, degrees=degrees)
+    model.A.requires_grad_(False)
+    model.B.requires_grad_(False)
+    twin = CHTwin(dm, energy=model, dt=dt, order=order, device="cpu")
+    M, kap = torch.tensor(1.0), torch.tensor(0.01)
+    opt = torch.optim.Adam([model.gamma], lr=lr)
+    best_g = model.gamma.detach().clone()
+    best_misfit = float("inf")
+    for it in range(iters):
+        opt.zero_grad()
+        misfit = torch.zeros(())
+        for (c0_np, data) in protocols:
+            out = twin.march(torch.tensor(c0_np), None, M, kap, {}, n_steps)
+            for j, k in enumerate(snap_at):
+                misfit = misfit + 0.5 * ((out[k][0] - data[j]) ** 2).sum()
+        loss = misfit + reg * (model.gamma ** 2).sum()
+        if not torch.isfinite(loss):
+            break
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_([model.gamma], 2.0)
+        opt.step()
+        fm = float(misfit.detach())
+        if fm < best_misfit:
+            best_misfit, best_g = fm, model.gamma.detach().clone()
+        if log and (it % 100 == 0 or it == iters - 1):
+            print(f"    it {it:4d}  misfit {fm:.3e}  "
+                  f"gamma {model.gamma.detach().numpy()}")
+    with torch.no_grad():
+        model.gamma.copy_(best_g)
+    return model
+
+
+def run_recovery_demo(level=3, n_steps=6, dt=0.01, order=1, iters=500,
+                      verbose=True):
+    """End-to-end HIGHER-ORDER recovery: fit {P2..P5} from a single narrow
+    trajectory (fails — the high modes are unconstrained) vs a composition-
+    diverse ensemble (recovers the truth)."""
+    dm, mesh = make_dm(level)
+    coords = mesh.node_coords
+    snap_at = list(range(1, n_steps, 2))
+    A, B = 1.0, 2.5
+    degrees = (2, 3, 4, 5)
+    g_truth = np.array([0.20, 0.12, 0.08, 0.05])
+    truth = BasisCorrEnergy(A=A, B=B, degrees=degrees, coeffs=tuple(g_truth))
+    for p in truth.parameters():
+        p.requires_grad_(False)
+
+    def protocol(c0_np):
+        return (c0_np, snapshots_list(truth, dm, c0_np, n_steps, dt, order,
+                                      snap_at))
+
+    single = [protocol(interior_ic(coords, c_mean=0.5, amp=0.05, seed=1,
+                                   clip=(0.42, 0.58)))]
+    diverse = [protocol(interior_ic(coords, c_mean=cm, amp=0.18, seed=sd,
+                                    clip=(0.15, 0.85)))
+               for cm, sd in [(0.35, 2), (0.5, 3), (0.65, 4)]]
+
+    m_single = fit_basis(dm, single, A, B, degrees, n_steps, dt, order,
+                         snap_at, iters=iters, log=verbose)
+    m_diverse = fit_basis(dm, diverse, A, B, degrees, n_steps, dt, order,
+                          snap_at, iters=iters, log=verbose)
+
+    def cerr(m):
+        return float(np.linalg.norm(m.gamma.detach().numpy() - g_truth)
+                     / np.linalg.norm(g_truth))
+    e_s, e_d = cerr(m_single), cerr(m_diverse)
+    if verbose:
+        print(f"\n  BEYOND-FH HIGHER-ORDER RECOVERY (level {level}, "
+              f"{n_steps} steps, basis P2..P5)")
+        print(f"  truth        = {g_truth}")
+        print(f"  single fit   = {m_single.gamma.detach().numpy()}  "
+              f"coeff_err {e_s:.3e}")
+        print(f"  diverse fit  = {m_diverse.gamma.detach().numpy()}  "
+              f"coeff_err {e_d:.3e}")
+        print(f"  diverse recovers {e_s / max(e_d, 1e-30):.1f}x better")
+    return dict(coeff_err_single=e_s, coeff_err_diverse=e_d,
+                gamma_single=m_single.gamma.detach().numpy().tolist(),
+                gamma_diverse=m_diverse.gamma.detach().numpy().tolist())
+
+
 def run_demo(level=3, n_steps=6, dt=0.01, order=1, fit_iters=300, verbose=True):
     dm, mesh = make_dm(level)
     coords = mesh.node_coords

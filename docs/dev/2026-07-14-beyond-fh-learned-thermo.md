@@ -107,14 +107,17 @@ deterministically. Gated at `test_composition_coverage_conditioning`.
    helper gathers a uniform-mesh nodal field onto the FFT grid (exact). **h(t)**
    is next (it is already a forward state `WodoFilmStepper.h_curr`; needs the
    taped film path — step 2).
-2. **End-to-end recovery of a *higher-order* functional** (not just
-   conditioning). The conditioning improvement from composition coverage is
-   shown (above); the remaining step is a robust recovery *fit* of {P2..P5}
-   from a composition-diverse ensemble and/or the differentiable S(q,t) loss,
-   demonstrating the coefficients are actually recovered where a single
-   narrow trajectory fails. Note: naive fitting through the stiff CH forward
-   with near-wall ICs hits FH-log NaN; keep ICs interior and regularise, or fit
-   through S(q,t) which is smoother.
+2. **End-to-end recovery of a *higher-order* functional — DONE**
+   (`run_recovery_demo`, `test_higher_order_recovery`). An actual *fit* of
+   {P2..P5} (FH frozen, Adam through the twin, small Tikhonov penalty): from ONE
+   narrow trajectory the recovery FAILS (coeff_err ~0.9–1.0 — the unconstrained
+   high modes collapse toward 0 under the penalty), while from a
+   composition-diverse ensemble it RECOVERS the truth to **coeff_err ~4e-5**
+   (truth [0.20,0.12,0.08,0.05] → [0.19999,0.11999,0.07999,0.04999]) — a
+   >2e4× recovery gap. This is the rung-2 headline demonstrated end to end.
+   (Robustness: interior ICs to keep the FH logs off the wall, gauge-anchored
+   basis, Tikhonov penalty so the ill-conditioned single fit is *pulled to a
+   wrong answer* rather than wandering to NaN.)
 3. **Port the head to the production ternary film** (`physics/wodo_film.py`).
    Today the differentiable adjoint (Stack B) covers binary CH + coupled CH×AC;
    the ternary film uses FD Gauss–Newton (`m4_learn_fmix.py`). The MLP head is
