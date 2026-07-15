@@ -81,18 +81,27 @@ term is not merely hard to fit — it is unidentifiable.
 
 ## Recorded next steps
 
-1. **Composition-diverse / instrument-space recovery of a *higher-order*
+1. **Differentiable instrument-space observable — DONE for S(q)**
+   (`src/diffsim/diagnostics/structure_factor_torch.py`,
+   `tests/test_structure_factor_torch.py`). A Torch twin of the numpy
+   `structure_factor` estimator (torch.fft + index_add radial binning): value
+   parity with numpy ~1e-16 (2-D/3-D), S(q) gradient vs FD 1.2e-9, and — wired
+   through the autograd twin — an `||S_sim(q)-S_data(q)||^2` misfit backprops to
+   the beyond-FH coefficients matching FD to **1.8e-11**. A `grid_index_from_coords`
+   helper gathers a uniform-mesh nodal field onto the FFT grid (exact). **h(t)**
+   is next (it is already a forward state `WodoFilmStepper.h_curr`; needs the
+   taped film path — step 2).
+2. **Composition-diverse / instrument-space recovery of a *higher-order*
    functional** where even the anchored basis aliases over a single shallow
    trajectory's narrow composition range (the M4 "T2..T4 alias over one
-   trajectory, Gramian eig ~1e-5" regime). This needs either (a) differentiable
-   **S(q,t)** and **h(t)** observables — currently `diagnostics/morphology.py`
-   S(q) and `film/analysis.py` L_c(t) are numpy-only, a real gap — or (b)
-   composition-diverse protocols (multiple c0/quench depths). Note: naive
-   fitting through the stiff CH forward with near-wall ICs hits FH-log NaN; keep
-   ICs interior and regularise, or fit through S(q,t) which is smoother.
-2. **Port the head to the production ternary film** (`physics/wodo_film.py`).
+   trajectory, Gramian eig ~1e-5" regime). Now unblocked by the differentiable
+   S(q) loss above; or composition-diverse protocols (multiple c0/quench
+   depths). Note: naive fitting through the stiff CH forward with near-wall ICs
+   hits FH-log NaN; keep ICs interior and regularise, or fit through S(q,t)
+   which is smoother.
+3. **Port the head to the production ternary film** (`physics/wodo_film.py`).
    Today the differentiable adjoint (Stack B) covers binary CH + coupled CH×AC;
    the ternary film uses FD Gauss–Newton (`m4_learn_fmix.py`). The MLP head is
    the general drop-in once the film has a taped/adjoint path (or via FD-GN on
    the anchored coefficients as an interim).
-3. **k_e on the IFT sweep** (the one processing param still FD-only).
+4. **k_e on the IFT sweep** (the one processing param still FD-only).
