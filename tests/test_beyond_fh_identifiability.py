@@ -45,3 +45,16 @@ def test_anchored_recovery():
     r = m.run_demo(level=3, n_steps=4, fit_iters=250, verbose=False)
     print(f"anchored coeff recovery rel_err = {r['coeff_err']:.2e}")
     assert r["coeff_err"] < 1e-3, r["coeff_err"]
+
+
+def test_composition_coverage_conditioning():
+    """The composition-coverage half of rung 2: a higher-degree gauge-anchored
+    basis {P2..P5} is better conditioned (more identifiable) under
+    composition-diverse protocols than from one narrow trajectory."""
+    m = _demo(0)
+    r = m.run_coverage_demo(level=3, n_steps=4, verbose=False)
+    ratio = r["cond_single"] / r["cond_diverse"]
+    print(f"coverage cond single={r['cond_single']:.2e} "
+          f"diverse={r['cond_diverse']:.2e}  ratio={ratio:.1f}x")
+    assert r["cond_diverse"] < 60.0, r["cond_diverse"]
+    assert ratio > 3.0, ratio

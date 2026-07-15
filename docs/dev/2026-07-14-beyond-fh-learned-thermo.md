@@ -79,6 +79,22 @@ This is the load-bearing result: **gauge anchoring is what makes learning a
 free-energy *functional* on top of FH well-posed.** Without it, the beyond-FH
 term is not merely hard to fit — it is unidentifiable.
 
+### Composition coverage (the other half of rung 2)
+
+Even a *gauge-anchored* higher-degree basis {P2, P3, P4, P5} is only weakly
+identifiable from ONE shallow trajectory: over the narrow composition range it
+visits, the high Legendre modes are near-collinear. `run_coverage_demo`
+(fit-free, conditioning only) measures the d(snapshots)/d(coeffs) Jacobian:
+
+| protocol | visited composition | cond |
+|---|---|---|
+| single (narrow) | 0.46–0.56 | ~2e2–5e2 |
+| composition-diverse | 0.21–0.85 | ~14–18 |
+
+a **~15–30× conditioning improvement** from composition-diverse protocols
+(multiple means/quench depths) — the recorded rung-2 prescription, shown
+deterministically. Gated at `test_composition_coverage_conditioning`.
+
 ## Recorded next steps
 
 1. **Differentiable instrument-space observable — DONE for S(q)**
@@ -91,14 +107,14 @@ term is not merely hard to fit — it is unidentifiable.
    helper gathers a uniform-mesh nodal field onto the FFT grid (exact). **h(t)**
    is next (it is already a forward state `WodoFilmStepper.h_curr`; needs the
    taped film path — step 2).
-2. **Composition-diverse / instrument-space recovery of a *higher-order*
-   functional** where even the anchored basis aliases over a single shallow
-   trajectory's narrow composition range (the M4 "T2..T4 alias over one
-   trajectory, Gramian eig ~1e-5" regime). Now unblocked by the differentiable
-   S(q) loss above; or composition-diverse protocols (multiple c0/quench
-   depths). Note: naive fitting through the stiff CH forward with near-wall ICs
-   hits FH-log NaN; keep ICs interior and regularise, or fit through S(q,t)
-   which is smoother.
+2. **End-to-end recovery of a *higher-order* functional** (not just
+   conditioning). The conditioning improvement from composition coverage is
+   shown (above); the remaining step is a robust recovery *fit* of {P2..P5}
+   from a composition-diverse ensemble and/or the differentiable S(q,t) loss,
+   demonstrating the coefficients are actually recovered where a single
+   narrow trajectory fails. Note: naive fitting through the stiff CH forward
+   with near-wall ICs hits FH-log NaN; keep ICs interior and regularise, or fit
+   through S(q,t) which is smoother.
 3. **Port the head to the production ternary film** (`physics/wodo_film.py`).
    Today the differentiable adjoint (Stack B) covers binary CH + coupled CH×AC;
    the ternary film uses FD Gauss–Newton (`m4_learn_fmix.py`). The MLP head is

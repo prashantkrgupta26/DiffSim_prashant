@@ -191,7 +191,10 @@ def _legendre(u, k):
     if k == 4:
         return (35.0 * u ** 4 - 30.0 * u * u + 3.0) / 8.0, \
                (140.0 * u ** 3 - 60.0 * u) / 8.0
-    raise ValueError(f"basis degree {k} not in 2..4")
+    if k == 5:
+        return (63.0 * u ** 5 - 70.0 * u ** 3 + 15.0 * u) / 8.0, \
+               (315.0 * u ** 4 - 210.0 * u * u + 15.0) / 8.0
+    raise ValueError(f"basis degree {k} not in 0..5")
 
 
 class BasisCorrEnergy(torch.nn.Module):

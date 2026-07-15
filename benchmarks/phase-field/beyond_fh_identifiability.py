@@ -52,7 +52,7 @@ def make_dm(level, device="cpu"):
     return dm, mesh
 
 
-def interior_ic(coords, c_mean=0.5, amp=0.12, seed=1):
+def interior_ic(coords, c_mean=0.5, amp=0.12, seed=1, clip=(0.30, 0.70)):
     """A safely-interior initial composition (kept well inside [0,1] so the FH
     logs never hit a wall — the identifiability, not a boundary artefact, is
     what we are isolating)."""
@@ -60,7 +60,7 @@ def interior_ic(coords, c_mean=0.5, amp=0.12, seed=1):
     x, y = coords[:, 0], coords[:, 1]
     f = (c_mean + amp * np.cos(np.pi * x) * np.cos(np.pi * y)
          + 0.25 * amp * np.cos(2 * np.pi * x + g.uniform(0, 1)))
-    return np.clip(f, 0.30, 0.70)
+    return np.clip(f, clip[0], clip[1])
 
 
 def _march_obs(energy, dm, c0_np, n_steps, dt, order, snap_at):
@@ -95,6 +95,72 @@ def conditioning(sv):
     sv = np.asarray(sv)
     smin = sv[sv > 0].min() if np.any(sv > 0) else 0.0
     return (sv[0] / smin) if smin > 0 else np.inf
+
+
+def coverage_singular_values(dm, c0_list, A, B, degrees, coeffs, n_steps, dt,
+                             order, snap_at, max_rows=96, seed=0):
+    """Singular values of d(snapshots)/d(gamma) — the beyond-FH coefficient
+    Jacobian — with the observations stacked across ALL protocols in c0_list.
+    FH (A,B) held fixed; only the (gauge-anchored) coefficients vary.  One
+    narrow trajectory aliases the higher Legendre modes (near-collinear columns
+    over the small composition range); composition-diverse coverage separates
+    them."""
+    en = BasisCorrEnergy(A=A, B=B, degrees=degrees, coeffs=coeffs)
+    en.A.requires_grad_(False)
+    en.B.requires_grad_(False)
+    en.gamma.requires_grad_(True)
+    obs = torch.cat([_march_obs(en, dm, c0, n_steps, dt, order, snap_at)
+                     for c0 in c0_list])
+    npar = len(degrees)
+    g = np.random.default_rng(seed)
+    idx = (np.arange(obs.numel()) if obs.numel() <= max_rows
+           else np.sort(g.choice(obs.numel(), max_rows, replace=False)))
+    Jc = np.zeros((idx.size, npar))
+    for r, i in enumerate(idx):
+        (gG,) = torch.autograd.grad(obs[int(i)], [en.gamma], retain_graph=True)
+        Jc[r] = gG.detach().numpy()
+    return np.linalg.svd(Jc, compute_uv=False)
+
+
+def run_coverage_demo(level=3, n_steps=6, dt=0.01, order=1, verbose=True):
+    """The composition-coverage half of rung 2: a higher-degree gauge-anchored
+    basis {P2..P5} recovered from ONE narrow trajectory is ill-conditioned (the
+    modes alias over the small visited composition range); composition-diverse
+    protocols separate them.  Fit-free (conditioning only) — robust."""
+    dm, mesh = make_dm(level)
+    coords = mesh.node_coords
+    snap_at = list(range(1, n_steps, 2))
+    A, B = 1.0, 2.5
+    degrees = (2, 3, 4, 5)
+    coeffs = (0.20, 0.12, 0.08, 0.05)
+
+    # SINGLE shallow protocol: narrow composition band around 0.5
+    single = [interior_ic(coords, c_mean=0.5, amp=0.05, seed=1,
+                          clip=(0.42, 0.58))]
+    # COMPOSITION-DIVERSE: three means, deeper amplitude, wide interior band
+    diverse = [interior_ic(coords, c_mean=cm, amp=0.18, seed=sd,
+                           clip=(0.15, 0.85))
+               for cm, sd in [(0.35, 2), (0.5, 3), (0.65, 4)]]
+
+    def visited(cl):
+        a = np.concatenate(cl)
+        return float(a.min()), float(a.max())
+
+    sv_s = coverage_singular_values(dm, single, A, B, degrees, coeffs, n_steps,
+                                    dt, order, snap_at)
+    sv_d = coverage_singular_values(dm, diverse, A, B, degrees, coeffs, n_steps,
+                                    dt, order, snap_at)
+    cond_s, cond_d = conditioning(sv_s), conditioning(sv_d)
+    if verbose:
+        v_s, v_d = visited(single), visited(diverse)
+        print(f"\n  BEYOND-FH COMPOSITION-COVERAGE (level {level}, "
+              f"{n_steps} steps, BDF{order}, basis P2..P5)")
+        print(f"  single  visited {v_s[0]:.2f}-{v_s[1]:.2f}  "
+              f"cond = {cond_s:.3e}")
+        print(f"  diverse visited {v_d[0]:.2f}-{v_d[1]:.2f}  "
+              f"cond = {cond_d:.3e}")
+        print(f"  coverage improves conditioning {cond_s / cond_d:.1f}x")
+    return dict(cond_single=cond_s, cond_diverse=cond_d)
 
 
 def fit_anchored(dm, c0_np, data, A, B, n_steps, dt, order, snap_at,
