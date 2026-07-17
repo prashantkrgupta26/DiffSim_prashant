@@ -31,3 +31,9 @@ def test_lib_log_path_and_tmux_name():
         capture_output=True, text=True).stdout.split("\n")
     assert out[0] == "/logs/solve-20260717-1.log"
     assert out[1] == "diffsim-20260717-1"   # '/' sanitized to '-'
+
+def test_nova_stubs_are_guarded():
+    for s in ("nova-sync-submit.sh", "nova-poll.sh"):
+        r = _sh(s)
+        assert r.returncode == 64, f"{s} rc={r.returncode}"
+        assert "not yet wired" in r.stderr
