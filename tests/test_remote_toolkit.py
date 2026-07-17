@@ -51,3 +51,14 @@ needs_box = pytest.mark.skipif(not _gpubox_up(), reason="gpubox unreachable")
 def test_doctor_green():
     r = _sh("remote-doctor.sh", "--fix")
     assert r.returncode == 0, f"doctor failed:\n{r.stdout}\n{r.stderr}"
+
+@needs_box
+def test_sync_refuses_under_lock():
+    lock = _source_var("GPUBOX_LOCK")
+    _sp.run(["ssh", "gpubox", f"touch '{lock}'"], check=True)
+    try:
+        r = _sh("gpubox-sync.sh", "--dry-run")
+        assert r.returncode == 3, f"expected refusal (3), got {r.returncode}\n{r.stderr}"
+        assert "run-lock" in r.stderr
+    finally:
+        _sp.run(["ssh", "gpubox", f"rm -f '{lock}'"], check=True)
