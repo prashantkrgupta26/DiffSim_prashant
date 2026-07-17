@@ -12,7 +12,10 @@ if ! ssh -o BatchMode=yes -o ConnectTimeout=8 "$GPUBOX_HOST" true 2>/dev/null; t
 fi
 
 rlog "dispatching headless box-Claude…"
-# Pass the entire remote command as a single string so the login shell
-# sources the full profile (which adds ~/.local/bin/claude to PATH).
+# Reference the box's Claude by absolute path ($CLAUDE_BIN) so we neither depend
+# on a login shell sourcing PATH nor need a bash -lc wrapper — keeping the remote
+# quoting to a single level.
+# NOTE: $task is single-double-quoted on the remote side; avoid literal double
+# quotes in the task text (a fixed limitation of shipping a prompt over ssh).
 # shellcheck disable=SC2029  # deliberate: $task/$BOX_CLAUDE_FLAGS/$model_flag expand on the Mac side
-ssh "$GPUBOX_HOST" "bash -lc \"cd '$GPUBOX_REPO_ABS' && claude -p \\\"$task\\\" $BOX_CLAUDE_FLAGS $model_flag\""
+ssh "$GPUBOX_HOST" "cd '$GPUBOX_REPO_ABS' && $CLAUDE_BIN -p \"$task\" $BOX_CLAUDE_FLAGS $model_flag"

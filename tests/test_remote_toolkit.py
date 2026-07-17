@@ -47,6 +47,22 @@ def _gpubox_up():
 
 needs_box = pytest.mark.skipif(not _gpubox_up(), reason="gpubox unreachable")
 
+def _box_claude_authed():
+    # Headless dispatch needs the box's Claude CLI logged in. Mirrors _gpubox_up:
+    # evaluated at import to gate the dispatch test with a skip (not a failure)
+    # when the OAuth session is absent/expired.
+    if not _gpubox_up():
+        return False
+    claude_bin = _source_var("CLAUDE_BIN")
+    r = _sp.run(["ssh", "-o", "BatchMode=yes", "gpubox",
+                 f"{claude_bin} auth status 2>/dev/null"],
+                capture_output=True, text=True)
+    return '"loggedIn": true' in r.stdout
+
+needs_box_auth = pytest.mark.skipif(
+    not _box_claude_authed(),
+    reason="box-Claude not authenticated — run `claude auth login` on gpubox")
+
 @needs_box
 def test_doctor_green():
     r = _sh("remote-doctor.sh", "--fix")
@@ -85,7 +101,7 @@ def test_run_poll_lock_lifecycle():
     assert "hello-from-box" in p.stdout
     assert _sp.run(["ssh", "gpubox", f"test -e '{lock}'"]).returncode != 0
 
-@needs_box
+@needs_box_auth
 def test_dispatch_roundtrip():
     r = _sh("gpubox-dispatch.sh", "Reply with exactly the token PONG and nothing else.")
     assert "PONG" in r.stdout.upper(), f"stdout={r.stdout!r} stderr={r.stderr!r}"

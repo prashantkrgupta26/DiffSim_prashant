@@ -15,6 +15,9 @@ export GPUBOX_LOGDIR="${GPUBOX_LOGDIR:-$GPUBOX_REPO_ABS/logs}"
 export GPUBOX_GIT_REMOTE="${GPUBOX_GIT_REMOTE:-gpubox}"             # name of ssh git remote on the Mac
 export GPUBOX_GIT_URL="${GPUBOX_GIT_URL:-$GPUBOX_HOST:$GPUBOX_REPO}"
 
+# Absolute path to the box's Claude CLI — referenced directly so dispatch does
+# not depend on a login shell sourcing PATH (and to keep remote quoting shallow).
+export CLAUDE_BIN="${CLAUDE_BIN:-/home/bglab/.local/bin/claude}"
 # Headless box-Claude flags (accepted security trade-off: single-user box).
 export BOX_CLAUDE_FLAGS="${BOX_CLAUDE_FLAGS:---dangerously-skip-permissions}"
 export BOX_MODEL="${BOX_MODEL:-}"   # empty = box default; set to override
