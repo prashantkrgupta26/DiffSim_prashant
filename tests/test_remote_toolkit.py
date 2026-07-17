@@ -1,4 +1,6 @@
 import pathlib, subprocess
+import subprocess as _sp   # alias used in integration tests: _sp.run(["ssh", ...])
+import pytest
 REPO = pathlib.Path(__file__).resolve().parents[1]
 RD = REPO / "scripts" / "remote"
 
@@ -38,14 +40,11 @@ def test_nova_stubs_are_guarded():
         assert r.returncode == 64, f"{s} rc={r.returncode}"
         assert "not yet wired" in r.stderr
 
-import subprocess as _sp   # for _sp.run(["ssh", ...]) in integration tests
+# NOTE: _sh() is defined once at the top — do not redefine in later task additions.
 def _gpubox_up():
     return _sp.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
                     "gpubox", "true"]).returncode == 0
 
-# NOTE: _sh() is defined once in Task 1's test additions — do not redefine here.
-
-import pytest
 needs_box = pytest.mark.skipif(not _gpubox_up(), reason="gpubox unreachable")
 
 @needs_box
