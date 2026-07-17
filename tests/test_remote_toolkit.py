@@ -122,3 +122,19 @@ def test_fetch_noop_clean():
     r = _sh("gpubox-fetch.sh")
     assert r.returncode == 0, f"stderr={r.stderr}"
     assert _sp.run(["git", "-C", str(REPO), "remote", "get-url", "gpubox"]).returncode == 0
+
+@needs_box
+def test_fetch_artifacts_pulls_files(tmp_path):
+    # Create a marker artifact in a temp subdir on the box, pull it, verify contents.
+    repo_abs = _source_var("GPUBOX_REPO_ABS")
+    sub = "_artifact_test"
+    _sp.run(["ssh", "gpubox",
+             f"mkdir -p '{repo_abs}/{sub}' && echo hello-artifact > '{repo_abs}/{sub}/marker.txt'"],
+            check=True)
+    try:
+        dest = tmp_path / "pulled"
+        r = _sh("fetch-artifacts.sh", sub, str(dest))
+        assert r.returncode == 0, f"stderr={r.stderr}"
+        assert (dest / "marker.txt").read_text().strip() == "hello-artifact"
+    finally:
+        _sp.run(["ssh", "gpubox", f"rm -rf '{repo_abs}/{sub}'"], check=True)
