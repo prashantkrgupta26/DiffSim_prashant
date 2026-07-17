@@ -21,3 +21,13 @@ def test_config_exports_core_vars():
     assert _source_var("GPUBOX_LOCK").endswith(".remote-run.lock")
     assert _source_var("GPUBOX_GIT_URL") == "gpubox:Baskar/DiffSim"
     assert _source_var("BOX_CLAUDE_FLAGS") == "--dangerously-skip-permissions"
+
+def test_lib_log_path_and_tmux_name():
+    out = subprocess.run(
+        ["bash", "-c",
+         f'source "{RD}/lib.sh"; '
+         f'remote_log_path /logs 20260717-1 solve; echo; '
+         f'remote_tmux_name "20260717/1"'],
+        capture_output=True, text=True).stdout.split("\n")
+    assert out[0] == "/logs/solve-20260717-1.log"
+    assert out[1] == "diffsim-20260717-1"   # '/' sanitized to '-'
