@@ -105,3 +105,9 @@ def test_run_poll_lock_lifecycle():
 def test_dispatch_roundtrip():
     r = _sh("gpubox-dispatch.sh", "Reply with exactly the token PONG and nothing else.")
     assert "PONG" in r.stdout.upper(), f"stdout={r.stdout!r} stderr={r.stderr!r}"
+
+@needs_box
+def test_fetch_noop_clean():
+    r = _sh("gpubox-fetch.sh")
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    assert _sp.run(["git", "-C", str(REPO), "remote", "get-url", "gpubox"]).returncode == 0
