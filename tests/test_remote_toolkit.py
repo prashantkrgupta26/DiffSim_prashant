@@ -62,3 +62,26 @@ def test_sync_refuses_under_lock():
         assert "run-lock" in r.stderr
     finally:
         _sp.run(["ssh", "gpubox", f"rm -f '{lock}'"], check=True)
+
+import time
+@needs_box
+def test_run_poll_lock_lifecycle():
+    r = _sh("gpubox-run.sh", "echo hello-from-box; sleep 3", "smoke")
+    assert r.returncode == 0, r.stderr
+    sess, log = r.stdout.strip().split("\t")
+    assert sess.startswith("diffsim-")
+    lock = _source_var("GPUBOX_LOCK")
+    # lock exists while running
+    assert _sp.run(["ssh", "gpubox", f"test -e '{lock}'"]).returncode == 0
+    # poll until DONE (cap ~30s)
+    done = False
+    for _ in range(15):
+        p = _sh("gpubox-poll.sh", log)
+        if "status=DONE" in p.stdout + p.stderr:
+            done = True; break
+        time.sleep(2)
+    assert done, "run never reported DONE"
+    # log captured output, lock cleared
+    p = _sh("gpubox-poll.sh", log)
+    assert "hello-from-box" in p.stdout
+    assert _sp.run(["ssh", "gpubox", f"test -e '{lock}'"]).returncode != 0
