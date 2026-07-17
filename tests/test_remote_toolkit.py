@@ -1,4 +1,4 @@
-import pathlib, subprocess
+import pathlib, subprocess, time
 import subprocess as _sp   # alias used in integration tests: _sp.run(["ssh", ...])
 import pytest
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -63,7 +63,6 @@ def test_sync_refuses_under_lock():
     finally:
         _sp.run(["ssh", "gpubox", f"rm -f '{lock}'"], check=True)
 
-import time
 @needs_box
 def test_run_poll_lock_lifecycle():
     r = _sh("gpubox-run.sh", "echo hello-from-box; sleep 3", "smoke")
