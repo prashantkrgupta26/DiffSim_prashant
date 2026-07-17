@@ -6,6 +6,7 @@ def _source_var(var):
     out = subprocess.run(
         ["bash", "-c", f'source "{RD}/config.sh"; printf "%s" "${{{var}}}"'],
         capture_output=True, text=True)
+    assert out.returncode == 0, f"sourcing config.sh failed: {out.stderr}"
     return out.stdout.strip()
 
 def _sh(script, *args):
