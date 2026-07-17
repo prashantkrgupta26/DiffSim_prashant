@@ -84,3 +84,8 @@ def test_run_poll_lock_lifecycle():
     p = _sh("gpubox-poll.sh", log)
     assert "hello-from-box" in p.stdout
     assert _sp.run(["ssh", "gpubox", f"test -e '{lock}'"]).returncode != 0
+
+@needs_box
+def test_dispatch_roundtrip():
+    r = _sh("gpubox-dispatch.sh", "Reply with exactly the token PONG and nothing else.")
+    assert "PONG" in r.stdout.upper(), f"stdout={r.stdout!r} stderr={r.stderr!r}"
