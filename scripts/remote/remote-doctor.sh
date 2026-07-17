@@ -15,7 +15,7 @@ check() { if eval "$2" >/dev/null 2>&1; then rlog "OK   $1"; else rerr "FAIL $1"
 
 rlog "gpubox preflight ($GPUBOX_HOST)"
 check "ssh key reachable"          "ssh -o BatchMode=yes -o ConnectTimeout=8 $GPUBOX_HOST true"
-check "claude on box"              "ssh $GPUBOX_HOST 'bash -lc \"command -v claude\"'"
+check "claude bin present"         "ssh $GPUBOX_HOST test -x $CLAUDE_BIN"
 check "venv python present"        "ssh $GPUBOX_HOST test -x $GPUBOX_VENV_PY"
 check "tmux present"               "ssh $GPUBOX_HOST 'command -v tmux'"
 check "rsync present on box"       "ssh $GPUBOX_HOST 'command -v rsync'"
@@ -26,6 +26,12 @@ if ssh -o BatchMode=yes -o ConnectTimeout=6 "$NOVA_HOST" true 2>/dev/null; then
   rlog "OK   nova master socket alive"
 else
   rlog "INFO nova needs interactive Duo auth (run: ssh $NOVA_HOST true)"
+fi
+
+if ssh -o BatchMode=yes -o ConnectTimeout=8 "$GPUBOX_HOST" "$CLAUDE_BIN auth status 2>/dev/null" | grep -q '"loggedIn": true'; then
+  rlog "OK   box-Claude authenticated"
+else
+  rlog "INFO box-Claude not logged in — run 'claude auth login' on gpubox to enable dispatch"
 fi
 
 [ "$fail" -eq 0 ] && rlog "doctor: all gpubox checks passed" || rerr "doctor: failures above"

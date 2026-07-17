@@ -17,9 +17,17 @@ sess="$(remote_tmux_name "$run_id")"
 ssh "$GPUBOX_HOST" bash -s <<EOF
 set -e
 mkdir -p "$GPUBOX_LOGDIR"
+if [ -e "$GPUBOX_LOCK" ]; then
+  echo "run-lock present ($GPUBOX_LOCK) — a solve is already in flight; refusing to launch a second run." >&2
+  exit 3
+fi
 : > "$GPUBOX_LOCK"
-tmux new-session -d -s "$sess" \
-  "cd '$GPUBOX_REPO_ABS'; trap 'rm -f \"$GPUBOX_LOCK\"' EXIT; { $cmd ; } 2>&1 | tee '$log'"
+if ! tmux new-session -d -s "$sess" \
+  "trap 'rm -f \"$GPUBOX_LOCK\"' EXIT; cd '$GPUBOX_REPO_ABS' && { $cmd ; } 2>&1 | tee '$log'"; then
+  rm -f "$GPUBOX_LOCK"
+  echo "tmux failed to launch — cleared lock." >&2
+  exit 5
+fi
 EOF
 rlog "launched tmux=$sess"
 rlog "log=$log"

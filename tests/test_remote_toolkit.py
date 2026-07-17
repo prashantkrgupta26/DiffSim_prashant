@@ -107,6 +107,17 @@ def test_dispatch_roundtrip():
     assert "PONG" in r.stdout.upper(), f"stdout={r.stdout!r} stderr={r.stderr!r}"
 
 @needs_box
+def test_run_refuses_when_locked():
+    lock = _source_var("GPUBOX_LOCK")
+    _sp.run(["ssh", "gpubox", f"touch '{lock}'"], check=True)
+    try:
+        r = _sh("gpubox-run.sh", "echo nope", "smoke")
+        assert r.returncode == 3, f"expected refusal (3), got {r.returncode}\n{r.stderr}"
+        assert "run-lock" in r.stderr
+    finally:
+        _sp.run(["ssh", "gpubox", f"rm -f '{lock}'"], check=True)
+
+@needs_box
 def test_fetch_noop_clean():
     r = _sh("gpubox-fetch.sh")
     assert r.returncode == 0, f"stderr={r.stderr}"
