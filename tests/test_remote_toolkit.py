@@ -37,3 +37,18 @@ def test_nova_stubs_are_guarded():
         r = _sh(s)
         assert r.returncode == 64, f"{s} rc={r.returncode}"
         assert "not yet wired" in r.stderr
+
+import subprocess as _sp   # for _sp.run(["ssh", ...]) in integration tests
+def _gpubox_up():
+    return _sp.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                    "gpubox", "true"]).returncode == 0
+
+# NOTE: _sh() is defined once in Task 1's test additions — do not redefine here.
+
+import pytest
+needs_box = pytest.mark.skipif(not _gpubox_up(), reason="gpubox unreachable")
+
+@needs_box
+def test_doctor_green():
+    r = _sh("remote-doctor.sh", "--fix")
+    assert r.returncode == 0, f"doctor failed:\n{r.stdout}\n{r.stderr}"
