@@ -2,9 +2,14 @@
 
 Gate summary
 ------------
-G_B4_1  Coupled steady MMS (all five fields, real closures, numerical
-        manufactured source): orders p1→≥2 (φ̂,n̂ p2→≥3).
-G_B4_2  Newton quadratic convergence on the bilayer at V̂_app=0, dark.
+G_B4_1  Coupled steady MMS (all five fields, real closures, ANALYTIC strong-form
+        manufactured source, SUPG-consistent, PERTURBED-guess solve): orders
+        p1→≥2 (all five), p2→≥3 (φ̂,n̂).  RED companion proves a broken coupling
+        term breaks the order (test_coupled_mms_broken_coupling_red).
+G_B4_2  Newton quadratic convergence on the well-posed coupled MMS system.
+G_B4_2b Bilayer-primal evidence (B5 motivation anchor): the depleted bilayer in
+        primal variables is LINEAR (positivity-boundary stall), terminates
+        cleanly, and the Jacobian FD there is < 3e-6 (not a Jacobian bug).
 G_B4_3  Jacobian FD consistency (the load-bearing gate) — dissociation-field
         coupling active (|∇φ̂|>0): directional FD < 3e-6.
 G_B4_4  Light-on smoke: BDF1 march, carriers rise, finite, no negativity.
@@ -228,8 +233,16 @@ def _bilayer_system(level=4, p=1, device="cpu", zeta=1e-3, dark=True):
         langevin=langevin, onsager=onsager,
         tau_inv_d=tau_inv, tau_inv_a=tau_inv, supg=1.0)
 
-    bc = bilayer_electrode_bcs(sysm, mesh, cons, Eg_hat=Eg_hat, V_app_hat=0.0)
-    ic = continuation_ic(sysm, mesh, Eg_hat=Eg_hat, V_app_hat=0.0)
+    # minority_ln = −60 (the CPU electrode floor): the minority-carrier Dirichlet
+    # value is e^(−60), a DEEP depletion decoupled from Ê_g (≈42.5).  This −60
+    # floor is what puts the primal solution on the positivity boundary and makes
+    # Newton LINEAR here (documented mechanism — see test_bilayer_primal_reporting
+    # and bilayer_electrode_bcs' docstring); passed explicitly at BOTH the BC and
+    # IC call sites so the electrode value and the continuation IC floor agree.
+    bc = bilayer_electrode_bcs(sysm, mesh, cons, Eg_hat=Eg_hat, V_app_hat=0.0,
+                               minority_ln=-60.0)
+    ic = continuation_ic(sysm, mesh, Eg_hat=Eg_hat, V_app_hat=0.0,
+                         minority_ln=-60.0)
     return sysm, dm, mesh, cons, ic, bc, Eg_hat
 
 
@@ -254,10 +267,11 @@ def test_newton_quadratic(device):
     the linear-rate bilayer finding is recorded (see the B4 report).
     """
     fields = _mms_fields()
-    sysm, dm, mesh, cons = _coupled_mms_system(4, 1, device)
-    src, u_star = _mms_source_from_fields(sysm, dm, fields)
+    sysm, dm, mesh, cons, xq = _coupled_mms_system(4, 1, device)
+    src_gp = _mms_strong_source_gp(sysm, dm, xq)
+    sysm.mms_source = _mms_source_nodal(sysm, dm, xq, src_gp)
     _mms_dirichlet_all(sysm, mesh, cons, fields)
-    sysm.mms_source = src
+    u_star = {f: fields[f](dm.mesh.node_coords) for f in range(NDOF)}
 
     rng = np.random.default_rng(0)
     ic = {f: u_star[f] + 0.15 * rng.standard_normal(dm.n_nodes)
@@ -283,32 +297,284 @@ def test_newton_quadratic(device):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# G_B4_1 — Coupled steady MMS (all five fields, real closures, numerical source)
+# G_B4_2b — Bilayer-primal evidence (B5 MOTIVATION ANCHOR)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _bilayer_primal_system(level=3, p=1, device="cpu", zeta=1e-3,
+                           Eg_hat=4.0, minority_ln=-4.0):
+    """Reduced-DRIVE bilayer (donor|acceptor) at V̂_app=0, dark, in PRIMAL
+    (n̂,p̂) variables, with the FULL A3 closures + electrode Dirichlet BCs +
+    continuation IC.  Uses the module's shipped ``bilayer_electrode_bcs`` and
+    ``continuation_ic`` — the previously-uncalled bilayer plumbing.
+
+    The physical device (Ê_g ≈ 42.5, minority ≈ e⁻⁶⁰) is numerically INTRACTABLE
+    in primal variables: the continuation IC's Boltzmann majority ≈ e^{Ê_g} ≈
+    e⁴² ≈ 3e18 makes the very first Newton residual ~1e18 and the line search
+    fails at iteration 1 (verified).  This test therefore uses a REDUCED drive
+    (Ê_g=4, minority floor e⁻⁴) that keeps the potentials/densities O(1)–O(10)
+    so the Jacobian FD is meaningfully well-scaled, while STILL sitting on the
+    minority-carrier positivity boundary — reproducing the same linear-rate
+    pathology at a tractable scale.  The full-strength failure is documented in
+    the B4 report as the sharpest B5 (log-density) motivation.
+    """
+    from diffsim.physics.exciton_closures import (
+        LangevinRecombination, OnsagerBraunDissociation, RegionMobility)
+    from diffsim.physics.exciton_system import (
+        bilayer_electrode_bcs, continuation_ic)
+    from diffsim.xdd.params import XDDParams
+
+    dm, mesh, cons = _make_dm(level, p, device)
+    xq = gauss_points(mesh, dm.tables_by_p)
+    params = XDDParams()
+    s = params.scales()
+
+    dist_gp = {pv: (xq[pv][:, 1] - 0.5) * _DIST_SCALE for pv in xq}
+    regmob = RegionMobility(params, width=params.interface_thk)
+    mu_n = {}; mu_p = {}; mu_xd = {}; mu_xa = {}; eps = {}
+    for pv in xq:
+        d = regmob(dist_gp[pv])
+        mu_n[pv] = np.clip(d["mu_n_hat"], 1e-3, None)
+        mu_p[pv] = np.clip(d["mu_p_hat"], 1e-3, None)
+        mu_xd[pv] = np.clip(d["mu_xd_hat"], 1e-3, None)
+        mu_xa[pv] = np.clip(d["mu_xa_hat"], 1e-3, None)
+        eps[pv] = d["eps_r"] / max(params.eps_A, params.eps_D)
+
+    langevin = LangevinRecombination(params, strategy="sum", zeta=zeta,
+                                     spatial="uniform")
+    onsager = OnsagerBraunDissociation(params, width=params.interface_thk)
+    tau_inv = s.t0 / params.tau_x_donor
+
+    sysm = XDDSystem(
+        dm, lam2=s.lambda2, eps_gp=eps, mu_n_gp=mu_n, mu_p_gp=mu_p,
+        mu_xd_gp=mu_xd, mu_xa_gp=mu_xa, dist_gp=dist_gp,
+        langevin=langevin, onsager=onsager,
+        tau_inv_d=tau_inv, tau_inv_a=tau_inv, supg=1.0)
+
+    # explicit minority_ln at BOTH call sites (electrode floor == IC floor)
+    bc = bilayer_electrode_bcs(sysm, mesh, cons, Eg_hat=Eg_hat, V_app_hat=0.0,
+                               minority_ln=minority_ln)
+    ic = continuation_ic(sysm, mesh, Eg_hat=Eg_hat, V_app_hat=0.0,
+                         minority_ln=minority_ln)
+    return sysm, dm, mesh, cons, ic, bc
+
+
+def test_bilayer_primal_reporting(device):
+    """G_B4_2b (B5 MOTIVATION ANCHOR): the depleted bilayer in PRIMAL variables
+    converges only LINEARLY — it does NOT show the Newton quadratic tail — and
+    this is a FORMULATION limit, not a Jacobian bug.  Committed evidence:
+
+      1. solve_newton terminates CLEANLY (no exception/NaN) — here it iterates
+         to the cap without hitting tol (converged=False is an accepted, clean
+         outcome for the depleted primal problem).
+      2. The observed convergence-rate class is LINEAR: the increment ratio
+         ‖δ_{k+1}‖/‖δ_k‖ sits at ≈1.0 (NOT →0, i.e. NOT quadratic).  MECHANISM:
+         the solution sits on the minority-carrier positivity boundary, so the
+         fraction-to-boundary globalisation CLAMPS every step to the same tiny
+         increment — the classic primal-DD depletion stall.  The B5 log-density
+         reformulation lifts n̂,p̂ off the boundary and restores the quadratic
+         rate (B5's log-density gate will DEMAND quadratic at this same config).
+      3. The Jacobian FD check AT this bilayer state passes < 3e-6 — proving the
+         5-field Jacobian is CORRECT here; the linear rate is the primal
+         formulation, not an assembly error.
+
+    The full-strength device (Ê_g≈42.5, minority≈e⁻⁶⁰) is even worse — the
+    primal Newton fails at iteration 1 (residual ~1e18 from the Boltzmann
+    majority); see _bilayer_primal_system's docstring and the B4 report.
+    """
+    sysm, dm, mesh, cons, ic, bc = _bilayer_primal_system(
+        level=3, p=1, device=device, Eg_hat=4.0, minority_ln=-4.0)
+
+    # (1) clean termination — no exception, no NaN
+    st, info = sysm.solve_newton({f: ic[f].copy() for f in range(NDOF)},
+                                 max_iter=20, verbose=False)
+    for f in range(NDOF):
+        assert np.all(np.isfinite(st[f])), f"G_B4_2b: NaN in field {f}"
+    print(f"G_B4_2b: converged={info['converged']} iters={info['iters']}")
+
+    # (2) LINEAR (not quadratic) rate class: increment-ratio tail near 1.0
+    dn = info["dnorms"]
+    ratios = [dn[k + 1] / dn[k] for k in range(len(dn) - 1) if dn[k] > 1e-13]
+    assert len(ratios) >= 3, f"G_B4_2b: too few steps to assess rate: {dn}"
+    tail = float(np.median(ratios[-5:]))
+    print(f"G_B4_2b: increment-ratio tail (median) = {tail:.4f} "
+          f"[all: {[f'{r:.3f}' for r in ratios[-5:]]}]")
+    # LINEAR class: ratio bounded away from 0 (quadratic → 0) AND ≲ 1.  The
+    # positivity-boundary clamp pins it at ≈1.0 (the documented stall).
+    assert 0.05 < tail <= 1.05, (
+        f"G_B4_2b: rate not linear-class (tail={tail:.3f}); "
+        "quadratic would drive the ratio toward 0")
+
+    # (3) Jacobian FD AT the bilayer state — the committed "not a Jacobian bug"
+    # evidence (central difference, worst of several random directions).
+    u0 = _flat_free(sysm, st)
+    J = _jac_free(sysm, st)
+    eps = 1e-7
+    rng = np.random.default_rng(4)
+    worst = 0.0
+    for _ in range(4):
+        v = rng.standard_normal(len(u0))
+        v /= np.linalg.norm(v)
+        Rp = _residual_free(sysm, _unflat_free(sysm, u0 + eps * v))
+        Rm = _residual_free(sysm, _unflat_free(sysm, u0 - eps * v))
+        fd = (Rp - Rm) / (2.0 * eps)
+        Jv = J @ v
+        worst = max(worst, np.linalg.norm(fd - Jv)
+                    / max(np.linalg.norm(Jv), 1e-30))
+    print(f"G_B4_2b: bilayer Jacobian FD worst rel err = {worst:.3e}")
+    assert worst < 3e-6, f"G_B4_2b: bilayer FD mismatch {worst:.3e} (>3e-6)"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# G_B4_1 — Coupled steady MMS (all five fields, real closures, ANALYTIC source)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Manufacture distinct smooth fields for all five dofs with CONSTANT coefficients
-# and the REAL A3 closures; the manufactured source is computed NUMERICALLY by
-# evaluating the strong form (with closures) on the manufactured fields at GPs
-# (sympy-free numerical manufactured source — documented).
+# GENUINE strong-form MMS.  Manufacture five smooth fields with ANALYTIC ∇ and Δ
+# (sin/cos products, written out per field).  At each GP the STRONG-form residual
+# of each equation is evaluated ANALYTICALLY using the REAL A3 closures on the
+# ANALYTIC field values/gradients (numpy at GP coords — the forbidden thing is
+# FEM-INTERPOLATED derivatives, which the OLD gate used, making u*_nodal exact by
+# construction and thus verifying NO coupling).  The manufactured source is fed
+# SUPG-consistently through the SAME load assembly the physics uses (B2 G6
+# pattern); the coupled system is then solved from a PERTURBED guess and L2 error
+# vs the analytic fields is measured over a mesh ladder.  A deliberately broken
+# coupling now BREAKS the order (see test_coupled_mms_broken_coupling_red).
+
+# Manufactured fields with analytic derivatives.  Amplitudes chosen so n̂,p̂ stay
+# strictly positive and X̂ ≥ 0 over [0,1]².
+_MMS_AF, _MMS_AN, _MMS_AP, _MMS_AXD, _MMS_AXA = 0.3, 0.2, 0.2, 0.1, 0.1
+_PI = np.pi
+
 
 def _mms_fields():
-    phi = lambda x: 0.3 * np.sin(np.pi * x[:, 0]) * np.sin(np.pi * x[:, 1])
-    n   = lambda x: 0.5 + 0.2 * np.sin(np.pi * x[:, 0]) * np.cos(np.pi * x[:, 1])
-    p   = lambda x: 0.5 + 0.2 * np.cos(np.pi * x[:, 0]) * np.sin(np.pi * x[:, 1])
-    xd  = lambda x: 0.4 + 0.1 * np.sin(np.pi * x[:, 0])
-    xa  = lambda x: 0.4 + 0.1 * np.sin(np.pi * x[:, 1])
+    phi = lambda x: _MMS_AF * np.sin(_PI * x[:, 0]) * np.sin(_PI * x[:, 1])
+    n   = lambda x: 0.5 + _MMS_AN * np.sin(_PI * x[:, 0]) * np.cos(_PI * x[:, 1])
+    p   = lambda x: 0.5 + _MMS_AP * np.cos(_PI * x[:, 0]) * np.sin(_PI * x[:, 1])
+    xd  = lambda x: 0.4 + _MMS_AXD * np.sin(_PI * x[:, 0])
+    xa  = lambda x: 0.4 + _MMS_AXA * np.sin(_PI * x[:, 1])
     return phi, n, p, xd, xa
 
 
-def _mms_source_from_fields(sysm, dm, fields):
-    """Numerical manufactured source: the strong-form residual of the
-    manufactured fields (with the real closures) as a nodal load per field."""
-    coords = dm.mesh.node_coords
-    state = {f: fn(coords) for f, fn in enumerate(fields)}
-    sysm.mms_source = None
-    sysm._current_state = state
-    R = sysm.residual_full(state)      # residual with ZERO source = source load
-    return {f: R[f].copy() for f in range(NDOF)}, state
+def _mms_analytic(x):
+    """Analytic values, gradients (∇) and Laplacians (Δ) of the five fields at
+    coords x[:, :2].  All hand-written (sin/cos products); NO FEM interpolation.
+    Returns a dict of per-field (val, grad[:, 2], lap)."""
+    sx, cx = np.sin(_PI * x[:, 0]), np.cos(_PI * x[:, 0])
+    sy, cy = np.sin(_PI * x[:, 1]), np.cos(_PI * x[:, 1])
+    out = {}
+    # φ = AF sx sy
+    out[IPHI] = (
+        _MMS_AF * sx * sy,
+        np.stack([_MMS_AF * _PI * cx * sy, _MMS_AF * _PI * sx * cy], axis=1),
+        -2.0 * _PI ** 2 * _MMS_AF * sx * sy,
+    )
+    # n = 0.5 + AN sx cy
+    out[IN] = (
+        0.5 + _MMS_AN * sx * cy,
+        np.stack([_MMS_AN * _PI * cx * cy, -_MMS_AN * _PI * sx * sy], axis=1),
+        -2.0 * _PI ** 2 * _MMS_AN * sx * cy,
+    )
+    # p = 0.5 + AP cx sy
+    out[IP] = (
+        0.5 + _MMS_AP * cx * sy,
+        np.stack([-_MMS_AP * _PI * sx * sy, _MMS_AP * _PI * cx * cy], axis=1),
+        -2.0 * _PI ** 2 * _MMS_AP * cx * sy,
+    )
+    # Xd = 0.4 + AXD sx  (1-D in x)
+    out[IXD] = (
+        0.4 + _MMS_AXD * sx,
+        np.stack([_MMS_AXD * _PI * cx, np.zeros_like(sx)], axis=1),
+        -_PI ** 2 * _MMS_AXD * sx,
+    )
+    # Xa = 0.4 + AXA sy  (1-D in y)
+    out[IXA] = (
+        0.4 + _MMS_AXA * sy,
+        np.stack([np.zeros_like(sy), _MMS_AXA * _PI * cy], axis=1),
+        -_PI ** 2 * _MMS_AXA * sy,
+    )
+    return out
+
+
+def _mms_strong_source_gp(sysm, dm, xq, *, break_gamma=1.0):
+    """ANALYTIC strong-form residual of each equation at the GPs, using the REAL
+    A3 closures evaluated on the ANALYTIC field values/gradients.
+
+    Strong forms (steady, constant coefficients per the brief):
+      φ̂ :  −λ²ε̂ Δφ̂  − (p̂ − n̂)
+      n̂ :  −μ̂_n Δn̂  + a_n·∇n̂  − (D̂ − R̂),   a_n = −μ̂_n ∇φ̂
+      p̂ :  −μ̂_p Δp̂  + a_p·∇p̂  − (D̂ − R̂),   a_p = +μ̂_p ∇φ̂
+      X̂_D: −μ̂_xd ΔX̂_D + (1/τ̂_d + k̂_d) X̂_D − R̂
+      X̂_A: −μ̂_xa ΔX̂_A + (1/τ̂_a + k̂_a) X̂_A − R̂
+    with D̂ = k̂_d X̂_D + k̂_a X̂_A, R̂ = γ̂ n̂ p̂ (all at ANALYTIC field values).
+    ``break_gamma`` scales the γ̂n̂p̂ coupling in the n/p-row source (=1 correct;
+    used to prove a broken coupling breaks the MMS order).
+    Returns {field: {pv: ndarray[ngp]}}.
+    """
+    src = {f: {} for f in range(NDOF)}
+    for pv in dm.bins:
+        A = _mms_analytic(xq[pv])
+        phi_v, phi_g, phi_l = A[IPHI]
+        n_v, n_g, n_l = A[IN]
+        p_v, p_g, p_l = A[IP]
+        xd_v, xd_g, xd_l = A[IXD]
+        xa_v, xa_g, xa_l = A[IXA]
+        dist = sysm.dist_gp[pv]
+        gmag = np.sqrt(np.sum(phi_g * phi_g, axis=1))
+
+        # REAL closures at ANALYTIC values/gradients
+        if sysm.langevin is not None:
+            R, _, _ = sysm.langevin(n_v, p_v, dist)
+        else:
+            R = np.zeros_like(n_v)
+        if sysm.onsager is not None:
+            kd_, ka_, _ = sysm.onsager(gmag, dist)
+            kd = np.broadcast_to(kd_, n_v.shape)
+            ka = np.broadcast_to(ka_, n_v.shape)
+        else:
+            kd = np.zeros_like(n_v); ka = np.zeros_like(n_v)
+        Dhat = kd * xd_v + ka * xa_v
+
+        mu_n = sysm.mu_n_gp[pv]; mu_p = sysm.mu_p_gp[pv]
+        mu_xd = sysm.mu_xd_gp[pv]; mu_xa = sysm.mu_xa_gp[pv]
+        a_n = -mu_n[:, None] * phi_g
+        a_p = +mu_p[:, None] * phi_g
+
+        # net carrier reaction source (D̂ − R̂); break_gamma perturbs R̂ only
+        s_carr = Dhat - break_gamma * R
+
+        src[IPHI][pv] = -sysm.lam2 * sysm.eps_gp[pv] * phi_l - (p_v - n_v)
+        src[IN][pv] = (-mu_n * n_l + np.sum(a_n * n_g, axis=1) - s_carr)
+        src[IP][pv] = (-mu_p * p_l + np.sum(a_p * p_g, axis=1) - s_carr)
+        src[IXD][pv] = (-mu_xd * xd_l
+                        + (sysm.tau_inv_d + kd) * xd_v - R)
+        src[IXA][pv] = (-mu_xa * xa_l
+                        + (sysm.tau_inv_a + ka) * xa_v - R)
+    return src
+
+
+def _mms_source_nodal(sysm, dm, xq, src_gp):
+    """Route the analytic GP source through the SAME load assembly the physics
+    uses (SUPG-consistent for the carriers, B2 G6 pattern) → nodal mms_source.
+
+    φ̂ / X̂ rows: plain mass load ∫ f N_a.  n̂/p̂ rows: the carrier load
+    ∫ (N_a + τ_M a·∇N_a) f — identical to how residual_full consumes the
+    physical reaction source, so residual-based SUPG stabilisation is consistent.
+    """
+    from diffsim.physics.exciton_system import _load_block
+    z_aq = {pv: np.zeros((len(sysm.dist_gp[pv]), dm.dim)) for pv in dm.bins}
+    s2t = sysm._sig2tau()
+    # carrier advection from the ANALYTIC ∇φ̂ (frozen for the SUPG τ/a·∇N_a test)
+    aq_n = {}; aq_p = {}
+    for pv in dm.bins:
+        A = _mms_analytic(xq[pv])
+        phi_g = A[IPHI][1]
+        aq_n[pv] = -sysm.mu_n_gp[pv][:, None] * phi_g
+        aq_p[pv] = +sysm.mu_p_gp[pv][:, None] * phi_g
+    Fphi = _load_block(dm, z_aq, sysm.mu_n_gp, src_gp[IPHI], 0.0, 0.0)
+    Fn = _load_block(dm, aq_n, sysm.mu_n_gp, src_gp[IN], s2t, sysm.supg)
+    Fp = _load_block(dm, aq_p, sysm.mu_p_gp, src_gp[IP], s2t, sysm.supg)
+    Fxd = _load_block(dm, z_aq, sysm.mu_xd_gp, src_gp[IXD], 0.0, 0.0)
+    Fxa = _load_block(dm, z_aq, sysm.mu_xa_gp, src_gp[IXA], 0.0, 0.0)
+    return {IPHI: Fphi, IN: Fn, IP: Fp, IXD: Fxd, IXA: Fxa}
 
 
 def _mms_dirichlet_all(sysm, mesh, cons, fields):
@@ -345,46 +611,99 @@ def _coupled_mms_system(level, p, device="cpu"):
         mu_xd_gp=mu_xd, mu_xa_gp=mu_xa, dist_gp=dist_gp,
         langevin=langevin, onsager=onsager,
         tau_inv_d=1.0, tau_inv_a=1.0, supg=1.0)
-    return sysm, dm, mesh, cons
+    return sysm, dm, mesh, cons, xq
+
+
+def _mms_solve_ladder(p, device, levels=(3, 4), break_gamma=1.0,
+                      require_converged=True):
+    """Solve the coupled MMS on a mesh ladder from a PERTURBED guess (not
+    u*_nodal); return {field: [L2 errors]} vs the ANALYTIC fields.
+
+    When ``require_converged`` is False (the broken-coupling RED path) the
+    best-effort iterate is measured even if Newton stalls — a stalled residual
+    is itself part of the RED signal (the manufactured field is no longer a
+    fixed point of the discrete operator)."""
+    fields = _mms_fields()
+    exact = [fields[f] for f in range(NDOF)]
+    errs = {f: [] for f in range(NDOF)}
+    for lv in levels:
+        sysm, dm, mesh, cons, xq = _coupled_mms_system(lv, p, device)
+        src_gp = _mms_strong_source_gp(sysm, dm, xq, break_gamma=break_gamma)
+        sysm.mms_source = _mms_source_nodal(sysm, dm, xq, src_gp)
+        _mms_dirichlet_all(sysm, mesh, cons, fields)
+        # PERTURBED initial guess — NOT the manufactured nodal interpolant.  The
+        # coupled Newton must genuinely converge the discrete problem.
+        coords = dm.mesh.node_coords
+        rng = np.random.default_rng(7 + lv)
+        ic = {}
+        for f in range(NDOF):
+            base = exact[f](coords)
+            ic[f] = base + 0.10 * rng.standard_normal(dm.n_nodes) * (
+                1.0 if f == IPHI else 0.15)
+        ic[IN] = np.abs(ic[IN]) + 0.05
+        ic[IP] = np.abs(ic[IP]) + 0.05
+        st, info = sysm.solve_newton(ic, max_iter=12)
+        if require_converged:
+            assert info["converged"], f"G_B4_1 lv{lv}: Newton failed: {info}"
+        for f in range(NDOF):
+            errs[f].append(l2_error(dm, st[f], exact[f]))
+    return errs
 
 
 @pytest.mark.parametrize("p,order_lo", [(1, 1.9), (2, 2.9)])
 def test_coupled_mms(p, order_lo, device):
-    """G_B4_1: coupled steady MMS, all five fields, numerical manufactured
-    source with the REAL A3 closures.  Orders p1→≥2, p2→≥3 (φ̂,n̂ at least).
+    """G_B4_1: coupled steady MMS, all five fields, REAL A3 closures, ANALYTIC
+    strong-form manufactured source.  Orders p1→≥2 (all five), p2→≥3 (φ̂,n̂).
 
-    Numerical manufactured source (documented, sympy-free): the source load per
-    field is the strong-form residual of the manufactured fields evaluated with
-    the real closures — computed as residual_full(u*) with zero source.  The
-    manufactured field is then the exact discrete solution; L2 convergence is
-    measured on all five fields.
+    The source is the analytic strong-form residual of the manufactured fields
+    (real closures on analytic values/gradients), routed SUPG-consistently
+    through the physics' own load assembly.  Solved from a PERTURBED guess and
+    measured against the analytic fields — this genuinely verifies the coupling
+    (a broken coupling term degrades the order; see the RED companion test).
     """
     from diffsim.diagnostics.convergence import observed_order
-    fields = _mms_fields()
-    exact = [fields[f] for f in range(NDOF)]
     levels = (3, 4)
     hs = [2.0 ** (-lv) for lv in levels]
-    errs = {f: [] for f in range(NDOF)}
-    for lv in levels:
-        sysm, dm, mesh, cons = _coupled_mms_system(lv, p, device)
-        src, u_star = _mms_source_from_fields(sysm, dm, fields)
-        _mms_dirichlet_all(sysm, mesh, cons, fields)
-        sysm.mms_source = src
-        # IC = manufactured fields (linear problem apart from closures; converges
-        # in a few Newton steps since u* is the exact solution)
-        st, info = sysm.solve_newton({f: u_star[f].copy() for f in range(NDOF)},
-                                     max_iter=6)
-        for f in range(NDOF):
-            errs[f].append(l2_error(dm, st[f], exact[f]))
+    errs = _mms_solve_ladder(p, device, levels=levels)
     labels = ["phi", "n", "p", "Xd", "Xa"]
+    strict = {IPHI, IN} if p >= 2 else set(range(NDOF))
     for f in range(NDOF):
         order = observed_order(hs, errs[f])
         print(f"G_B4_1 p{p} {labels[f]}: errs {[f'{e:.2e}' for e in errs[f]]} "
               f"order {order:.2f}")
-    # gate: all five ≥ order_lo (p1) / φ̂,n̂ ≥ order_lo (p2 stricter fields)
     for f in range(NDOF):
         order = observed_order(hs, errs[f])
-        assert order >= order_lo, (labels[f], order, errs[f])
+        if f in strict or p < 2:
+            assert order >= order_lo, (labels[f], order, errs[f])
+
+
+def test_coupled_mms_broken_coupling_red(device):
+    """G_B4_1 RED evidence: negating the γ̂n̂p̂ recombination coupling in the
+    manufactured n/p-row source makes the analytic source INCONSISTENT with the
+    discrete operator, so the manufactured field is NO LONGER the solution and
+    the p1 order collapses below 2.  This proves the MMS actually exercises the
+    coupling (the old interpolation-only gate could not detect this).
+    """
+    from diffsim.diagnostics.convergence import observed_order
+    levels = (3, 4)
+    hs = [2.0 ** (-lv) for lv in levels]
+    good = _mms_solve_ladder(1, device, levels=levels, break_gamma=1.0)
+    bad = _mms_solve_ladder(1, device, levels=levels, break_gamma=-1.0,
+                            require_converged=False)
+    o_good_n = observed_order(hs, good[IN])
+    o_bad_n = observed_order(hs, bad[IN])
+    print(f"G_B4_1 RED: n-order good(γ̂)={o_good_n:.2f} "
+          f"broken(−γ̂)={o_bad_n:.2f}; "
+          f"n-err L4 good={good[IN][-1]:.2e} broken={bad[IN][-1]:.2e}")
+    # correct coupling recovers ≥2; broken coupling destroys the MMS: the
+    # manufactured field is no longer the discrete solution, so the order
+    # collapses below 2 AND the fine-grid error inflates by orders of magnitude
+    # (the discrete solution now sits O(1) away from the analytic field, and
+    # Newton stalls rather than converging — see require_converged=False).
+    assert o_good_n >= 1.9, ("good order regressed", o_good_n)
+    assert o_bad_n < 1.5, ("broken coupling did NOT degrade order", o_bad_n)
+    assert bad[IN][-1] > 10.0 * good[IN][-1], (
+        "broken coupling did not inflate error", bad[IN][-1], good[IN][-1])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -443,7 +762,13 @@ def _lighton_system(level=3, p=1, device="cpu"):
 def test_lighton_smoke(device):
     """G_B4_4: BDF1 march under constant generation — carriers rise from
     equilibrium, stay finite/non-negative, residual < tol each step, total
-    electron content rises monotonically then saturates."""
+    electron content rises monotonically then saturates.
+
+    NOTE: the recombination SINK is NOT meaningfully exercised in this transient
+    smoke (weak-R regime, zeta=1e-4 — accumulation-limited rise, no
+    recombination plateau); strong-recombination coverage is deferred to the
+    B5/C-block gates.
+    """
     sysm, dm, mesh, cons = _lighton_system(level=3, p=1, device=device)
     n = dm.n_nodes
     # start from a small positive equilibrium (interior, well-posed)
@@ -505,20 +830,21 @@ def test_block_gs_equivalence(device):
         return ic
 
     # monolithic
-    sysm_m, dm, mesh, cons = _coupled_mms_system(3, 1, device)
-    src, u_star = _mms_source_from_fields(sysm_m, dm, fields)
+    sysm_m, dm, mesh, cons, xq = _coupled_mms_system(3, 1, device)
+    u_star = {f: fields[f](dm.mesh.node_coords) for f in range(NDOF)}
+    src_gp = _mms_strong_source_gp(sysm_m, dm, xq)
     _mms_dirichlet_all(sysm_m, mesh, cons, fields)
-    sysm_m.mms_source = src
+    sysm_m.mms_source = _mms_source_nodal(sysm_m, dm, xq, src_gp)
     ic = _perturbed_ic(dm, u_star)
     st_m, info_m = sysm_m.solve_newton({f: ic[f].copy() for f in range(NDOF)},
                                        max_iter=10)
     assert info_m["converged"], f"G_B4_5: monolithic failed: {info_m}"
 
     # block-GS on the SAME problem + SAME IC
-    sysm_b, dm2, mesh2, cons2 = _coupled_mms_system(3, 1, device)
-    src2, u_star2 = _mms_source_from_fields(sysm_b, dm2, fields)
+    sysm_b, dm2, mesh2, cons2, xq2 = _coupled_mms_system(3, 1, device)
+    src_gp2 = _mms_strong_source_gp(sysm_b, dm2, xq2)
     _mms_dirichlet_all(sysm_b, mesh2, cons2, fields)
-    sysm_b.mms_source = src2
+    sysm_b.mms_source = _mms_source_nodal(sysm_b, dm2, xq2, src_gp2)
     st_b, info_b = sysm_b.solve_block_gs(
         {f: ic[f].copy() for f in range(NDOF)},
         block_tol=1e-9, max_block=80, verbose=True)
