@@ -13,11 +13,22 @@ full Jacobian, positivity line search, BDF wrapper, block-GS mode, electrode
 BC helper) into it would push it well past the ~1500-line ceiling the brief
 sets.  This module imports the bricks and composes them.
 
+CARRIER DRIFT — CONSERVATIVE signed form (CPU DDEquation.h parity; corrects a
+brief-introduced sign/form defect found by Block C's physics gate).  The drift
+is assembled in CONSERVATIVE weak form via the B2 carrier kernel with the
+signed drift-weight aq = sign·μ̂∇φ̂ (sign=−1 electrons → residual −μ̂_n n̂(∇φ̂·∇w),
+eqm n̂∝e^{+φ̂}; sign=+1 holes → +μ̂_p p̂(∇φ̂·∇w), eqm p̂∝e^{−φ̂}).  SUPG upwind
+velocity U = −aq (U_n=+μ̂∇φ̂, U_p=−μ̂∇φ̂).  With this fix the electrode BCs
+(n̂=1 at the +φ̂ anode) and the continuation IC (n̂=e^{+(φ̂−φ̂a)}) ALIGN with the
+kernel equilibrium — see bilayer_electrode_bcs / continuation_ic.
+
 RESIDUAL (strong form → Galerkin, per field; hist = BDF history term)
 ---------------------------------------------------------------------
   φ̂ :  λ²ε̂ K φ̂  −  M(p̂ − n̂)                                   [B1]
-  n̂ :  [σ M + μ̂_n(K + drift(−∇φ̂)) + SUPG] n̂  −  M(D̂ − R̂)  − hist_n   [B2]
-  p̂ :  [σ M + μ̂_p(K + drift(+∇φ̂)) + SUPG] p̂  −  M(R̂ − D̂)  − hist_p  ... wait
+  n̂ :  [σ M + μ̂_n K + C_φ(−) + SUPG] n̂  −  M(D̂ − R̂)  − hist_n   [B2]
+  p̂ :  [σ M + μ̂_p K + C_φ(+) + SUPG] p̂  −  M(D̂ − R̂)  − hist_p
+       where C_φ(±)ĉ ≡ ±μ̂ ĉ(∇φ̂·∇w) is the conservative drift matrix (CPU
+       A22 = μ̂_n(K − C_φ), A33 = μ̂_p(K + C_φ) with C_φ the ∇φ̂-weighted block)
   X̂_i: [σ_tot,i M + μ̂_{X,i} K] X̂_i  −  M(Ĝ_i + R̂_feed,i)  − hist_X
 
   with  D̂ = k̂_d X̂_D + k̂_a X̂_A     (excitons dissociate → free carriers)
@@ -31,12 +42,14 @@ JACOBIAN — the full Newton matrix (this module's core).  Assembled as a 5×5
 block sparse system (scipy ``bmat``); every block is n_free × n_free.
   diagonal:
     J_φφ = λ²ε̂ K
-    J_nn = σ M + μ̂_n(K + drift(−∇φ̂)) + SUPG + γ̂ p̂ · M    (∂R̂/∂n̂ = γ̂p̂)
-    J_pp = σ M + μ̂_p(K + drift(+∇φ̂)) + SUPG + γ̂ n̂ · M
+    J_nn = σ M + μ̂_n K + C_φ(−) + SUPG + γ̂ p̂ · M    (∂R̂/∂n̂ = γ̂p̂)
+    J_pp = σ M + μ̂_p K + C_φ(+) + SUPG + γ̂ n̂ · M
     J_XiXi = σ_tot,i M + μ̂_{X,i} K
-  off-diagonal (each a GP-weighted mass / advection block):
+  off-diagonal:
     J_φn = +M            J_φp = −M                       (B1 source)
-    J_nφ = drift cross-term  −μ̂_n n̂ ∇δφ̂·∇w  (CPU A21)
+    J_nφ = CONSERVATIVE drift cross-term  ∫ sign·μ̂ n̂ (∇δφ̂·∇w) = −μ̂_n n̂(∇δφ̂·∇w)
+             — a weighted STIFFNESS block (CPU A21 = −(∇w, μ̂_n n̂ ∇δφ̂)); the
+             p-row mirror J_pφ = +μ̂_p p̂(∇δφ̂·∇w) = +(∇w, μ̂_p p̂ ∇δφ̂) (CPU A31)
            + dissociation-field coupling  −∂D̂/∂|∇φ̂| (∇φ̂·∇δφ̂/|∇φ̂|)
              via A3 dk_dgrad; |∇φ̂|=0 → dk=0 (b→0 limit)
     J_np = +γ̂ n̂ · M      (∂(−R̂)/∂p̂ enters n-row source as −(−γ̂n̂)=+γ̂n̂ M)
@@ -364,11 +377,15 @@ def _tau_gp(dm, aq_gp, mu_gp, sig2tau, supg):
 def _supg_mass_block(dm, w_gp, aq_gp, mu_gp, sig2tau, supg):
     """SUPG-augmented source-coupling block for the carrier rows.
 
-    The carrier load uses the augmented test function (N_a + τ_M a·∇N_a):
-        ∫ (N_a + τ_M a·∇N_a) w_q N_b dJxW
+    The carrier load uses the augmented test function (N_a + τ_M U·∇N_a) with
+    the drift velocity U = −aq (CONSERVATIVE form; aq = sign·μ̂∇φ̂ is the drift
+    WEIGHT, the carrier be kernel uses U = −aq for the SUPG augmentation):
+        ∫ (N_a + τ_M U·∇N_a) w_q N_b dJxW
     where w_q = ∂f/∂field is the GP weight from differentiating the source.
-    Galerkin part = _mass_block(w); this adds the τ_M(a·∇N_a) part so the
-    source-coupling Jacobian matches the SUPG-consistent residual load.
+    Galerkin part = _mass_block(w); this adds the τ_M(U·∇N_a) part so the
+    source-coupling Jacobian matches the SUPG-consistent residual load.  The
+    caller passes aq (the drift weight); U = −aq is formed here — τ_M uses |U|
+    = |aq| (magnitude, sign-invariant).
     """
     galerkin = _mass_block(dm, w_gp)
     if supg == 0.0:
@@ -387,10 +404,10 @@ def _supg_mass_block(dm, w_gp, aq_gp, mu_gp, sig2tau, supg):
         he = h_all[eids]
         jac = (0.5 * he) ** dm.dim
         dscale = 2.0 / he
-        a = aq_gp[pv].reshape(ne, nqp, dm.dim)
+        a = -aq_gp[pv].reshape(ne, nqp, dm.dim)   # U = −aq (drift velocity)
         wgt = w_gp[pv].reshape(ne, nqp)
         tau_e = tau[pv].reshape(ne, nqp)
-        # a·∇N_a : [ne,nqp,nbf]
+        # U·∇N_a : [ne,nqp,nbf]
         agN = np.einsum("eqd,qad->eqa", a, dN) * dscale[:, None, None]
         # block[e,a,b] = sum_q (jac w_q)*tau*wgt * (a·∇N_a) * N_b
         coeff = wt[None, :] * jac[:, None] * tau_e * wgt      # [ne,nqp]
@@ -405,19 +422,20 @@ def _supg_mass_block(dm, w_gp, aq_gp, mu_gp, sig2tau, supg):
 
 
 def _supg_drift_phi_block(dm, sign_mu_gp, c_gp, gradc_gp, tau_gp):
-    """Exact SUPG-advection dependence of a carrier row on φ̂.
+    """Exact SUPG-advection dependence of a carrier row on φ̂ (CONSERVATIVE form).
 
-    The SUPG residual  τ (a·∇N_a)(σ c + a·∇c − μ̂ ∇²c)  with a = sign·μ̂·∇φ̂
-    depends on φ̂ through a in BOTH the test augmentation (a·∇N_a) and the
-    strong-residual advection (a·∇c).  Freezing τ (the sanctioned omission),
-    δa = sign·μ̂·∇δφ̂, giving two bilinear (test N_a, trial N_b=δφ̂) terms:
+    The SUPG residual  τ (U·∇N_a)(σ c + U·∇c − μ̂ ∇²c)  with drift velocity
+    U = −aq = −sign·μ̂·∇φ̂ depends on φ̂ through U in BOTH the test augmentation
+    (U·∇N_a) and the strong-residual advection (U·∇c).  Freezing τ (the
+    sanctioned omission), δU = −sign·μ̂·∇δφ̂, giving two bilinear (test N_a,
+    trial N_b=δφ̂) terms:
 
-      A: τ (δa·∇N_a) res_c  =  τ (sign·μ̂)(∇N_a·∇N_b) res_c
-      B: τ (a·∇N_a)(δa·∇c)  =  τ (a·∇N_a)(sign·μ̂)(∇N_b·∇c)
+      A: τ (δU·∇N_a) res_c  =  τ (−sign·μ̂)(∇N_a·∇N_b) res_c
+      B: τ (U·∇N_a)(δU·∇c)  =  τ (U·∇N_a)(−sign·μ̂)(∇N_b·∇c)
 
-    Inputs are GP fields: sign_mu_gp = sign·μ̂, c = the carrier field (n̂ or p̂),
-    gradc = ∇c, and res_c the frozen strong residual σc + a·∇c − μ̂∇²c.
-    tau_gp already carries supg·τ_M (0 → block is 0).
+    Inputs are GP fields: sign_mu_gp = −sign·μ̂ (the δU coefficient), c_gp["aq"]
+    = U the drift velocity, gradc = ∇c, and c_gp["res"] the frozen strong
+    residual σc + U·∇c − μ̂∇²c − f.  tau_gp already carries supg·τ_M (0 → block 0).
     """
     h_all = dm.mesh.tree.h()
     rows, cols, vals = [], [], []
@@ -723,25 +741,35 @@ class XDDSystem:
         Jphin = M
         Jphip = -M
 
-        # carrier ∂/∂φ̂: Galerkin drift cross-term + exact SUPG-advection φ̂
-        # coupling + dissociation-field coupling
+        # carrier ∂/∂φ̂: CONSERVATIVE Galerkin drift cross-term + exact
+        # SUPG-advection φ̂ coupling + dissociation-field coupling.
         gradn = _gp_grad(dm, state[IN])
         gradp = _gp_grad(dm, state[IP])
         n_gp = cl["n_gp"]; p_gp = cl["p_gp"]
         lapn = _gp_lap(dm, state[IN]); lapp = _gp_lap(dm, state[IP])
-        # Galerkin drift: ∂(a·∇c)N_a/∂φ̂ = sign·μ̂(∇δφ̂·∇c)N_a → ∫(sign μ̂)(∇c·∇N_b)N_a
-        c_ndrift = {pv: -self.mu_n_gp[pv] for pv in dm.bins}   # sign=-1 electrons
-        c_pdrift = {pv: +self.mu_p_gp[pv] for pv in dm.bins}   # sign=+1 holes
-        Jnphi = _drift_cross_block(dm, c_ndrift, gradn)
-        Jpphi = _drift_cross_block(dm, c_pdrift, gradp)
-        # exact SUPG-advection φ̂ coupling (frozen τ only).  The SUPG
-        # contribution to the carrier residual is τ(a·∇N_a)·(res(c) − f), where
-        # f is the FULL carrier source (D̂ − R̂ + hist); its φ̂-derivative via
-        # the test augmentation uses (res(c) − f) — NOT res(c) alone.  With a
-        # large recombination source this term dominates, so it must be exact.
+        # CONSERVATIVE Galerkin drift residual (n-row):  ∫ sign·μ̂ n̂ (∇φ̂·∇N_a).
+        # ∂/∂φ̂_c = ∫ sign·μ̂ n̂_q (∇N_c·∇N_a)  — a weighted STIFFNESS block
+        # (density n̂_q inside, ∇N_b·∇N_a against it), NOT the old
+        # (∇c·∇N_b)N_a advection-mass block.  Assemble via _poisson_block with
+        # coefficient (sign·μ̂·ĉ) and lam2=1.
+        smu_n = {pv: -self.mu_n_gp[pv] for pv in dm.bins}   # sign=-1 electrons
+        smu_p = {pv: +self.mu_p_gp[pv] for pv in dm.bins}   # sign=+1 holes
+        cdrift_n = {pv: smu_n[pv] * n_gp[pv] for pv in dm.bins}
+        cdrift_p = {pv: smu_p[pv] * p_gp[pv] for pv in dm.bins}
+        Jnphi = _poisson_block(dm, cdrift_n, 1.0)
+        Jpphi = _poisson_block(dm, cdrift_p, 1.0)
+        # exact SUPG-advection φ̂ coupling (frozen τ only).  The SUPG residual is
+        # τ(U·∇N_a)·(res(c) − f), U = −aq the drift velocity, res(c) the strong
+        # residual on the advective part σĉ + U·∇ĉ − μ̂∇²ĉ, f the FULL carrier
+        # source (D̂ − R̂ + hist).  δU = −sign·μ̂∇δφ̂, so the smu coefficient is
+        # −sign·μ̂ (= −smu_n for electrons) and the velocity factor is U = −aq.
         if self.supg != 0.0:
             tau_n = _tau_gp(dm, aq_n, self.mu_n_gp, s2t, self.supg)
             tau_p = _tau_gp(dm, aq_p, self.mu_p_gp, s2t, self.supg)
+            U_n = {pv: -aq_n[pv] for pv in dm.bins}
+            U_p = {pv: -aq_p[pv] for pv in dm.bins}
+            neg_smu_n = {pv: -smu_n[pv] for pv in dm.bins}    # −sign·μ̂ = +μ̂_n
+            neg_smu_p = {pv: -smu_p[pv] for pv in dm.bins}    # −sign·μ̂ = −μ̂_p
             Dhat_j = {pv: cl["kd"][pv] * cl["xd_gp"][pv]
                           + cl["ka"][pv] * cl["xa_gp"][pv] for pv in dm.bins}
             f_carr = {pv: Dhat_j[pv] - cl["R"][pv] + self._hist_gp(IN, pv)
@@ -749,23 +777,23 @@ class XDDSystem:
             f_carr_p = {pv: Dhat_j[pv] - cl["R"][pv] + self._hist_gp(IP, pv)
                         for pv in dm.bins}
             resn = {pv: (self.sigma * n_gp[pv]
-                         + np.sum(aq_n[pv] * gradn[pv], axis=1)
+                         + np.sum(U_n[pv] * gradn[pv], axis=1)
                          - self.mu_n_gp[pv] * lapn[pv] - f_carr[pv])
                     for pv in dm.bins}
             resp = {pv: (self.sigma * p_gp[pv]
-                         + np.sum(aq_p[pv] * gradp[pv], axis=1)
+                         + np.sum(U_p[pv] * gradp[pv], axis=1)
                          - self.mu_p_gp[pv] * lapp[pv] - f_carr_p[pv])
                     for pv in dm.bins}
-            cn_ctx = {"res": resn, "aq": aq_n}
-            cp_ctx = {"res": resp, "aq": aq_p}
+            cn_ctx = {"res": resn, "aq": U_n}
+            cp_ctx = {"res": resp, "aq": U_p}
             Jnphi = Jnphi + _supg_drift_phi_block(
-                dm, c_ndrift, cn_ctx, gradn, tau_n)
+                dm, neg_smu_n, cn_ctx, gradn, tau_n)
             Jpphi = Jpphi + _supg_drift_phi_block(
-                dm, c_pdrift, cp_ctx, gradp, tau_p)
+                dm, neg_smu_p, cp_ctx, gradp, tau_p)
         # dissociation-field coupling on carrier source −D̂:
         #   ∂(−D̂)/∂φ̂ = −(dkd X̂_D + dka X̂_A)/|∇φ̂| (∇φ̂·∇δφ̂)
         # Galerkin part via the drift-cross block; SUPG part via the augmented
-        # test function (the source is SUPG-weighted in the carrier load).
+        # test function (the source is SUPG-weighted with U = −aq).
         dDdmag = {pv: cl["dkd"][pv] * cl["xd_gp"][pv]
                        + cl["dka"][pv] * cl["xa_gp"][pv] for pv in dm.bins}
         cdiss = {pv: -_safe_div(dDdmag[pv], cl["gmag"][pv]) for pv in dm.bins}
@@ -773,9 +801,9 @@ class XDDSystem:
         Jpphi = Jpphi + _drift_cross_block(dm, cdiss, cl["gradphi"])
         if self.supg != 0.0:
             Jnphi = Jnphi + _supg_drift_cross_block(
-                dm, cdiss, cl["gradphi"], aq_n, tau_n)
+                dm, cdiss, cl["gradphi"], U_n, tau_n)
             Jpphi = Jpphi + _supg_drift_cross_block(
-                dm, cdiss, cl["gradphi"], aq_p, tau_p)
+                dm, cdiss, cl["gradphi"], U_p, tau_p)
 
         # carrier ∂/∂p̂, ∂/∂n̂ (recombination cross) — SUPG-augmented (source):
         #   n-row source −(−R̂) so ∂/∂p̂ = +γ̂n̂ (N_a+τa·∇N_a) M = +dRp block
@@ -1192,6 +1220,14 @@ def bilayer_electrode_bcs(sysm, mesh, cons, *, Eg_hat, V_app_hat=0.0,
     PRIMAL Newton well-posed — the full e⁻⁶⁰ depletion is the B5 log-density
     regime per the SP-1 plan).  Excitons: natural.  Lateral walls: natural.
     ``h_axis`` selects the device-height coordinate (default y = axis 1).
+
+    EQUILIBRIUM ALIGNMENT (post drift-sign fix): the majority carrier is n̂=1 at
+    the +φ̂ anode, e^m at the cathode — i.e. n̂ ∝ e^{+(φ̂−φ̂a)}, the Boltzmann
+    equilibrium of the CONSERVATIVE kernel (eqm n̂∝e^{+φ̂}).  With the corrected
+    conservative drift these electrode values are the discrete kernel
+    equilibrium (the e⁻⁶⁰-class depletion at the minority contact is the TRUE
+    steady state — before the fix the kernel equilibrium was the OPPOSITE sign,
+    n̂∝e^{−φ̂}, which is why Block C's dark bilayer march filled the bulk).
     """
     coords = mesh.node_coords
     hc = coords[:, h_axis]
@@ -1241,8 +1277,12 @@ def continuation_ic(sysm, mesh, *, Eg_hat, V_app_hat=0.0, h_axis=1,
     # the linear φ̂ and the anode/cathode Dirichlet values:
     #   n̂ = exp(φ̂ − φ̂_anode)   (electrons follow +φ̂; n̂=1 at the anode)
     #   p̂ = exp(φ̂_anode − φ̂)   (holes follow −φ̂; p̂=1 at the cathode)
-    # This is the near-solution IC — the residual is small and Newton shows its
-    # quadratic tail.  With minority_ln = −Ê_g the cathode/anode floors match.
+    # POST drift-sign fix these ALIGN with the CONSERVATIVE kernel equilibrium
+    # (eqm n̂∝e^{+φ̂}) — the IC is now the discrete near-solution (previously the
+    # kernel equilibrium was the opposite sign, so this IC sat ~100× off in the
+    # carrier-row residual; Block C's kernel-equilibrium residual test).  The
+    # residual is small and Newton shows its quadratic tail; with
+    # minority_ln = −Ê_g the cathode/anode floors match.
     st[IN] = np.exp(phi_lin - phi_a)
     st[IP] = np.exp(phi_a - phi_lin)
     st[IXD] = np.zeros(len(coords))

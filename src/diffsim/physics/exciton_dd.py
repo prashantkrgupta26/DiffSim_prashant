@@ -13,38 +13,41 @@ B1  Poisson (this brick):
     ε̂(x) = ε_r(x) / max(ε_A, ε_D)  — supplied as a GP field by the caller
     (same GP-field contract as kappa in scalar_transport.py).
 
-B2  Carrier drift-diffusion (n̂ electrons / p̂ holes) — NONCONSERVATIVE form:
-    Strong:  ∂_t n̂  + a·∇n̂  − μ̂∇²n̂  = f
-    with advection velocity  a = sign · μ̂(x) · ∇φ̂  (frozen at GPs from the
-    M2 one-way-coupler contract).
-      sign = −1  for electrons: a_n = −μ̂_n ∇φ̂
-      sign = +1  for holes:     a_p = +μ̂_p ∇φ̂  (holes drift DOWN potential)
+B2  Carrier drift-diffusion (n̂ electrons / p̂ holes) — CONSERVATIVE signed form
+    (CPU DDEquation.h parity):
+    Strong (nondim): ∂_t ĉ + ∇·(sign·μ̂(x) ĉ ∇φ̂) − μ̂∇²ĉ = f
+    CPU weak residuals (the parity target — quote verbatim):
+      be_n += μ̂_n(−n̂·(∇φ̂·∇w) + ∇n̂·∇w)   // electrons: eqm n̂ ∝ e^{+φ̂}
+      be_p += μ̂_p(+p̂·(∇φ̂·∇w) + ∇p̂·∇w)   // holes:     eqm p̂ ∝ e^{−φ̂}
 
-    FORM CHOICE — NONCONSERVATIVE  (matching scalar_transport.py's convention):
-    The kernel accumulates (a·∇n̂, w) + μ̂(∇n̂, ∇w), NOT ∇·(an̂).
-    The difference is n̂(∇·a); for the MMS tests (σ = BDF coefficient) the
-    source must match this convention — see _carrier_source() in
-    tests/test_exciton_dd.py for the explicit hand derivation.
+    FORM CHOICE — CONSERVATIVE  (drift term carries the DENSITY, weighted by
+    ∇φ̂·∇w against the TEST function — NOT the advective a·∇ĉ).  This is the
+    corrected form: the previous nonconservative a·∇ĉ (sign=∓μ̂∇φ̂) gave the
+    WRONG equilibrium (n̂∝e^{−φ̂}) and DROPPED the ±μ̂n̂Δφ̂ reaction term (LARGE
+    in devices: Δφ̂ = −(p̂−n̂)/(λ²ε̂), λ² small).  Block C physics gate caught it.
 
-    Equivalence to the CPU residual convention μ(−n∇φ·∇w + ∇n·∇w):
-    Integrating the conservative flux −μn∇φ + μ∇n by parts gives exactly
-    the Galerkin terms above (boundary terms zero for homogeneous Dirichlet)
-    ONLY when ∇·(μ∇φ) = 0.  For a manufactured φ̂ this does not hold in
-    general, so the source differs between conservative/nonconservative forms
-    by n̂·∇·a.  The kernel implements nonconservative, matching scalar_transport.
+    aq_gp CONVENTION (unchanged literals, reinterpreted role): the caller passes
+        aq_gp = sign · μ̂(x) · ∇φ̂     (sign=−1 electrons, +1 holes)
+    which is the SIGNED DRIFT WEIGHT vector.  The kernel forms the drift residual
+    as (aq·∇w) ĉ  — gradient on the TEST function N_a, density on the TRIAL N_b:
+      electrons: aq=−μ̂_n∇φ̂ → drift residual −μ̂_n n̂(∇φ̂·∇w)   ✓ CPU A22 sign
+      holes:     aq=+μ̂_p∇φ̂ → drift residual +μ̂_p p̂(∇φ̂·∇w)   ✓ CPU A33 sign
 
     Galerkin weak form (σ = BDF coefficient, f includes history term):
-      σ(n̂, w) + (a·∇n̂, w) + μ̂(∇n̂, ∇w) + SUPG = (f, w) + SUPG_rhs
+      σ(ĉ, w) + (aq·∇w) ĉ + μ̂(∇ĉ, ∇w) + SUPG = (f, w) + SUPG_rhs
 
-    SUPG: Tezduyar-class τ_M via tau_m_metric(|a|, h, μ̂, sig²τ, dim) exactly
-    as scalar_transport.py.  Complete VMS residual (-μ̂ lapN) for p2 exactness:
-      res_b = σ N_b + a·∇N_b − μ̂ lapN_b      (on the trial function N_b)
-      SUPG contribution: τ_M (a·∇w, res_b)    (test function augmentation)
+    SUPG: Tezduyar-class τ_M via tau_m_metric(|U|, h, μ̂, sig²τ, dim).  The
+    upwind velocity is U = −aq (CPU: U_n=+μ̂∇φ̂ for electrons, U_p=−μ̂∇φ̂):
+    physically carriers move along their drift velocity U, and the conservative
+    drift weight aq=sign·μ̂∇φ̂ = −U.  Test-function augmentation is (U·∇w).
+    The strong residual of the conservative form includes the −/+μ̂ĉΔφ̂ term;
+    since Δφ̂ at GPs is not passed to the standalone carrier kernel we stabilise
+    the ADVECTIVE part U·∇ĉ = −(aq·∇ĉ) plus σ and −μ̂∇²ĉ (as the CPU effectively
+    does — the ±μ̂ĉΔφ̂ divergence part of the residual is the recorded SUPG
+    omission; the Galerkin drift term is exact regardless).
 
-    ONE factory pair parameterised by the `sign` kernel arg (float).  The
-    caller computes aq_gp = sign * mu_gp * grad_phi_gp and passes it directly;
-    sign is absorbed into aq — the kernel itself is sign-agnostic (aq is used
-    as-is).  See assemble_xdd_carrier for the calling convention.
+    ONE factory pair; sign is absorbed into aq_gp by the caller — the kernel is
+    sign-agnostic.  See assemble_xdd_carrier for the calling convention.
 
 B3  Exciton diffusion-reaction (X̂_D donor / X̂_A acceptor) — NO SUPG:
     Strong (nondim, per species i ∈ {D, A}):
@@ -295,17 +298,20 @@ def assemble_xdd_poisson(dm, eps_gp, rho_gp, *, lam2=None, params=None,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def make_xdd_carrier_Ae(nbf: int, nqp: int, dim: int):
-    """Element stiffness for the XDD carrier brick (SUPG, nonconservative form).
+    """Element stiffness for the XDD carrier brick (SUPG, CONSERVATIVE form).
 
-    Implements:
-        σ(N_b, N_a) + (a·∇N_b, N_a) + μ̂(∇N_b, ∇N_a) + τ_M(a·∇N_a, res_b)
-    where res_b = σ N_b + a·∇N_b − μ̂ lapN_b  (VMS-complete strong residual).
+    Implements (aq = sign·μ̂·∇φ̂ from the caller; U = −aq the drift velocity):
+        σ(N_b, N_a) + (aq·∇N_a) N_b + μ̂(∇N_b, ∇N_a) + τ_M(U·∇N_a, res_b)
+    where the CONSERVATIVE drift term (aq·∇N_a) N_b carries the density N_b and
+    weights ∇φ̂·∇N_a against the TEST function (CPU DDEquation.h parity: the
+    electron block is −μ̂_n n̂(∇φ̂·∇w), hole +μ̂_p p̂(∇φ̂·∇w)).
+    res_b = σ N_b + (U·∇N_b) − μ̂ lapN_b is the VMS strong residual on the
+    advective part (U·∇ĉ), the SUPG-stabilised piece; the ±μ̂ĉΔφ̂ divergence
+    part is the recorded SUPG omission (Δφ̂ not available in this kernel).
 
-    Sign of advection is baked into aq_gp by the caller:
-        electrons:  aq_gp = −μ̂ ∇φ̂
-        holes:      aq_gp = +μ̂ ∇φ̂
-
-    This is ONE factory — sign is not a kernel arg; the caller varies aq_gp.
+    Sign is baked into aq_gp by the caller (electrons aq=−μ̂∇φ̂, holes +μ̂∇φ̂);
+    U = −aq is formed inside the kernel for the SUPG upwind direction.
+    ONE factory — sign is not a kernel arg; the caller varies aq_gp.
     Cache key: ("xdd_carrier_Ae", nbf, nqp, dim).
     """
     key = ("xdd_carrier_Ae", nbf, nqp, dim)
@@ -344,7 +350,7 @@ def make_xdd_carrier_Ae(nbf: int, nqp: int, dim: int):
             gp   = e * nqp + q
             kap  = kq[gp]       # μ̂ at this Gauss point
 
-            # |a| for tau_m_metric
+            # |U| for tau_m_metric (U = −aq is the drift velocity; |U|=|aq|)
             amag = wp.float64(0.0)
             for d in range(dim):
                 amag += aq[gp, d] * aq[gp, d]
@@ -354,36 +360,39 @@ def make_xdd_carrier_Ae(nbf: int, nqp: int, dim: int):
 
             for a in range(nbf):
                 Na = Ntab[q, a]
-                # a·∇N_a  (test function augmentation for SUPG)
-                agw = wp.float64(0.0)
+                # aq·∇N_a  (conservative drift: ∇φ̂-weight on the TEST function)
+                # U·∇N_a = −(aq·∇N_a)  (SUPG test augmentation, U = −aq)
+                agNa = wp.float64(0.0)
                 for d in range(dim):
-                    agw += aq[gp, d] * dNtab[q, a, d] * dscale
+                    agNa += aq[gp, d] * dNtab[q, a, d] * dscale
+                Ugw = -agNa
 
                 for b in range(nbf):
                     Nb = Ntab[q, b]
-                    # a·∇N_b  (advection on trial function)
-                    agu = wp.float64(0.0)
+                    # U·∇N_b = −(aq·∇N_b)  (advection on trial for the residual)
+                    agNb = wp.float64(0.0)
                     # ∇N_a·∇N_b (diffusion)
                     lap = wp.float64(0.0)
                     for d in range(dim):
-                        agu += aq[gp, d] * dNtab[q, b, d] * dscale
+                        agNb += aq[gp, d] * dNtab[q, b, d] * dscale
                         lap += (dNtab[q, a, d] * dNtab[q, b, d]
                                 * dscale * dscale)
+                    Ugu = -agNb
 
-                    # VMS-complete strong residual on trial N_b:
-                    #   res_b = σ N_b + a·∇N_b − μ̂ lapN_b
-                    # The lapN term is zero at p1 (Q1 Laplacians = 0) but
-                    # required at p2 for third-order L2 convergence (same
-                    # finding as scalar_transport.py — see its PROVENANCE note).
-                    resu = (sigma * Nb + agu
+                    # VMS strong residual on trial N_b (advective part):
+                    #   res_b = σ N_b + U·∇N_b − μ̂ lapN_b
+                    # lapN is zero at p1 (Q1 Laplacians = 0) but required at p2
+                    # for third-order L2 convergence (scalar_transport finding).
+                    resu = (sigma * Nb + Ugu
                             - kap * lapNtab[q, b] * dscale * dscale)
 
-                    # Galerkin: σ(N_b N_a) + (a·∇N_b) N_a + μ̂(∇N_b·∇N_a)
-                    # SUPG:     τ_M (a·∇N_a) res_b
+                    # Galerkin: σ(N_b N_a) + (aq·∇N_a) N_b  [CONSERVATIVE drift]
+                    #           + μ̂(∇N_b·∇N_a)
+                    # SUPG:     τ_M (U·∇N_a) res_b
                     wp.atomic_add(
                         Ae, e, a, b,
-                        (sigma * Na * Nb + Na * agu + kap * lap
-                         + tauM * agw * resu) * dJxW)
+                        (sigma * Na * Nb + agNa * Nb + kap * lap
+                         + tauM * Ugw * resu) * dJxW)
 
     _kernel_cache[key] = xdd_carrier_Ae
     return xdd_carrier_Ae
@@ -396,9 +405,10 @@ def make_xdd_carrier_Ae(nbf: int, nqp: int, dim: int):
 def make_xdd_carrier_be(nbf: int, nqp: int, dim: int):
     """Element load for the XDD carrier brick.
 
-    Implements: (f, N_a) + τ_M (a·∇N_a, f)
+    Implements: (f, N_a) + τ_M (U·∇N_a, f),  U = −aq the drift velocity
     where f is the full source (D̂ − R̂ + BDF-history for B4;
-    the manufactured source for MMS tests).
+    the manufactured source for MMS tests).  The SUPG augmentation matches the
+    Ae kernel's U·∇N_a test augmentation (conservative-form consistency).
 
     Cache key: ("xdd_carrier_be", nbf, nqp, dim).
     """
@@ -445,12 +455,14 @@ def make_xdd_carrier_be(nbf: int, nqp: int, dim: int):
                                        wp.float64(dim_f))
 
             for a in range(nbf):
-                agw = wp.float64(0.0)
+                # U·∇N_a = −(aq·∇N_a)  (SUPG test augmentation, U = −aq drift vel)
+                Ugw = wp.float64(0.0)
                 for d in range(dim):
-                    agw += aq[gp, d] * dNtab[q, a, d] * dscale
-                # (f, N_a) + τ_M (a·∇N_a, f)  — same structure as scalar_be
+                    Ugw += aq[gp, d] * dNtab[q, a, d] * dscale
+                Ugw = -Ugw
+                # (f, N_a) + τ_M (U·∇N_a, f)  — SUPG-consistent with the Ae kernel
                 wp.atomic_add(be, e, a,
-                              (Ntab[q, a] + tauM * agw) * fv * dJxW)
+                              (Ntab[q, a] + tauM * Ugw) * fv * dJxW)
 
     _kernel_cache[key] = xdd_carrier_be
     return xdd_carrier_be
@@ -468,12 +480,13 @@ def assemble_xdd_carrier(dm, aq_gp, mu_gp, fq_gp, *, sigma=0.0,
     ----------
     dm : DeviceMesh
     aq_gp : dict {p: np.ndarray[ngp, dim]}
-        Advection field at Gauss points.  Caller builds this as
-        ``sign * mu_gp * grad_phi_gp``:
-          electrons → sign=-1  →  aq = −μ̂ ∇φ̂
-          holes     → sign=+1  →  aq = +μ̂ ∇φ̂
-        The sign convention is fully absorbed by the caller; this assembly
-        helper and the kernel are sign-agnostic.
+        Signed drift-weight field at Gauss points (CONSERVATIVE form).  Caller
+        builds this as ``sign * mu_gp * grad_phi_gp``:
+          electrons → sign=-1  →  aq = −μ̂ ∇φ̂  (drift residual −μ̂n̂(∇φ̂·∇w))
+          holes     → sign=+1  →  aq = +μ̂ ∇φ̂  (drift residual +μ̂p̂(∇φ̂·∇w))
+        The kernel forms the conservative drift term (aq·∇w) ĉ and uses U=−aq
+        as the SUPG upwind velocity.  Sign is fully absorbed by the caller;
+        this helper and the kernel are sign-agnostic.
     mu_gp : dict {p: np.ndarray[ngp]}
         Mobility μ̂(x) at GPs (diffusivity in the drift-diffusion PDE).
     fq_gp : dict {p: np.ndarray[ngp]}

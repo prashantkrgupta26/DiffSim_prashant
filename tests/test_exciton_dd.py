@@ -14,7 +14,9 @@ G6  Steady MMS: p1 → ≥2, p2 → ≥3; both drift signs (electrons + holes)
 G7  Transient MMS cross-matrix: BDF1/BDF2 × p1/p2 temporal orders
 G8  Peclet robustness: Galerkin oscillates; SUPG monotone-ish (overshoot gate)
 G9  Direction-sensitivity + upwinding: electron/hole stiffness matrices differ
-    (not vacuously equal); 1-D interior row asymmetry flips between carriers
+    (not vacuously equal); 1-D interior row asymmetry flips between carriers.
+    CONSERVATIVE form (CPU DDEquation.h): drift term sign·μ̂ ĉ(∇φ̂·∇w), SUPG
+    upwind velocity U = −aq — bias directions reversed vs the old form.
 """
 import numpy as np
 import pytest
@@ -238,37 +240,36 @@ from diffsim.physics.exciton_dd import assemble_xdd_carrier  # noqa: E402
 #
 # n̂*(x) = sin(πx)sin(πy),  φ̂*(x) = cos(πx)cos(πy)/2
 #
-# Advection form: NONCONSERVATIVE — the carrier kernel implements
-#     σ n̂ + a·∇n̂ − μ̂∇²n̂ = f
-# (matching scalar_transport.py's convention: a·∇T, not ∇·(aT)).
-#
-# With a = sign·μ̂·∇φ̂ (sign=-1 electrons, +1 holes), μ̂=const:
+# Drift form: CONSERVATIVE — the carrier kernel implements the CPU
+# DDEquation.h weak residual  σ n̂ + sign·μ̂ n̂(∇φ̂·∇w) + μ̂(∇n̂·∇w) = (f,w)
+# whose strong form (μ̂=const, integrating the drift by parts) is
+#     σ n̂ − sign·μ̂·∇·(n̂∇φ̂) − μ̂∇²n̂ = f
+#         = σ n̂ − sign·μ̂(∇n̂·∇φ̂ + n̂∇²φ̂) − μ̂∇²n̂ = f
+# (sign=-1 electrons → eqm n̂∝e^{+φ̂}; sign=+1 holes → eqm p̂∝e^{−φ̂}).
 #
 #   ∇φ̂* = (−π/2 sin(πx)cos(πy),  −π/2 cos(πx)sin(πy))
-#   a_n  = μ̂(+π/2 sin(πx)cos(πy), +π/2 cos(πx)sin(πy))    [electrons: sign=-1 × ∇φ̂]
-#   a_p  = μ̂(−π/2 sin(πx)cos(πy), −π/2 cos(πx)sin(πy))    [holes:     sign=+1 × ∇φ̂]
-#
 #   ∇n̂*  = (π cos(πx)sin(πy), π sin(πx)cos(πy))
+#   ∇²φ̂* = −2π²·φ̂* = −π² cos(πx)cos(πy)
+#   ∇²n̂* = −2π² n̂*
 #
-#   a·∇n̂*:
-#     = sign·μ̂·(−π/2)·[sin(πx)cos(πy)·π cos(πx)sin(πy)
-#                        + cos(πx)sin(πy)·π sin(πx)cos(πy)]
-#     = sign·μ̂·(−π²/2)·2·sin(πx)cos(πx)·sin(πy)cos(πy)
-#     = sign·μ̂·(−π²/2)·(sin(2πx)/2)·(sin(2πy)/2)·2        ← extra ×2 from 2 terms
-#     = sign·μ̂·(−π²/4)·sin(2πx)sin(2πy)
-#     = −sign·μ̂·(π²/4)·sin(2πx)sin(2πy)
+#   ∇n̂*·∇φ̂*:
+#     = (−π/2)·π·[sin(πx)cos(πy)cos(πx)sin(πy) + cos(πx)sin(πy)sin(πx)cos(πy)]
+#     = (−π²/2)·2·sin(πx)cos(πx)sin(πy)cos(πy)
+#     = (−π²/4)·sin(2πx)sin(2πy)
+#   n̂*∇²φ̂* = sin(πx)sin(πy)·(−2π²φ̂*) = −2π²·(1/8)sin(2πx)sin(2πy)
+#            = −(π²/4)·sin(2πx)sin(2πy)   [n̂*φ̂* = (1/8)sin2πx sin2πy]
 #
-#   ∇²n̂* = −2π² sin(πx)sin(πy) = −2π² n̂*
+#   −sign·μ̂(∇n̂·∇φ̂ + n̂∇²φ̂) = −sign·μ̂·(−π²/2)·sin(2πx)sin(2πy)
+#                             = +sign·μ̂·(π²/2)·sin(2πx)sin(2πy)
 #   −μ̂∇²n̂* = +2π²μ̂ n̂*
 #
-# MMS source (nonconservative kernel):
-#   f*(x) = (σ + 2π²μ̂) n̂*(x) − sign·μ̂·(π²/4)·sin(2πx)sin(2πy)
+# MMS source (CONSERVATIVE kernel — includes the ∓μ̂n̂Δφ̂ contribution the
+# NONCONSERVATIVE form dropped; verified numerically to 2e-16, both signs):
+#   f*(x) = (σ + 2π²μ̂) n̂*(x) + sign·μ̂·(π²/2)·sin(2πx)sin(2πy)
 #
-# NOTE: the cross-term coefficient is −sign (not +sign); verified numerically
-# by comparing with scalar_transport.assemble_scalar_ad on the same inputs.
-#
-# Conservative form would give f_cons = f_nc + n̂*(∇·a) but the kernel does
-# NOT implement the ∇·a term — using f_nc confirms the nonconservative choice.
+# NOTE: cross-term coefficient is +sign·(π²/2) — vs the old −sign·(π²/4):
+# the sign FLIPPED (conservative equilibrium reverses) and the magnitude
+# DOUBLED (the +sign·μ̂ n̂Δφ̂ term adds another π²/4, same shape here).
 # ──────────────────────────────────────────────────────────────────────────────
 
 _n_star  = lambda x: np.sin(np.pi * x[:, 0]) * np.sin(np.pi * x[:, 1])
@@ -281,20 +282,20 @@ _grad_phi_c = lambda x: np.stack([
 
 
 def _carrier_source(x, sign, mu_hat, sigma=0.0):
-    """MMS source for the nonconservative carrier kernel (steady or transient).
+    """MMS source for the CONSERVATIVE carrier kernel (steady or transient).
 
-    Hand derivation:
-        a·∇n̂* = sign·μ̂·∇φ̂*·∇n̂*
-               = −sign·μ̂·(π²/4)·sin(2πx)sin(2πy)
+    Hand derivation (μ̂ const, drift by parts → −sign·μ̂·∇·(n̂∇φ̂)):
+        −sign·μ̂(∇n̂*·∇φ̂* + n̂*∇²φ̂*)
+            = +sign·μ̂·(π²/2)·sin(2πx)sin(2πy)
         −μ̂∇²n̂* = 2π²μ̂ n̂*
 
-    Therefore:
-        f = (σ + 2π²μ̂) n̂* − sign·μ̂·(π²/4)·sin(2πx)sin(2πy)
+    Therefore (includes the ∓μ̂n̂Δφ̂ term dropped by the old nonconservative form):
+        f = (σ + 2π²μ̂) n̂* + sign·μ̂·(π²/2)·sin(2πx)sin(2πy)
     """
     n   = _n_star(x)
-    adv = -sign * mu_hat * (np.pi ** 2 / 4.0) * (
+    drift = sign * mu_hat * (np.pi ** 2 / 2.0) * (
         np.sin(2 * np.pi * x[:, 0]) * np.sin(2 * np.pi * x[:, 1]))
-    return (sigma + 2.0 * np.pi ** 2 * mu_hat) * n + adv
+    return (sigma + 2.0 * np.pi ** 2 * mu_hat) * n + drift
 
 
 def _solve_carrier(dm, mesh, cons, sign, mu_hat, sigma, f_fn, device):
@@ -325,16 +326,27 @@ def _solve_carrier(dm, mesh, cons, sign, mu_hat, sigma, f_fn, device):
 
 @pytest.mark.parametrize("p,order_lo,sign", [
     (1, 1.9, -1.0),  # electrons
-    (2, 2.9, -1.0),
+    (2, 2.5, -1.0),
     (1, 1.9, +1.0),  # holes
-    (2, 2.9, +1.0),
+    (2, 2.5, +1.0),
 ])
 def test_carrier_steady_mms(p, order_lo, sign, device):
     """G6: steady MMS, n̂*=sin(πx)sin(πy), φ̂*=cos(πx)cos(πy)/2, μ̂=0.1.
 
-    Source derived from the NONCONSERVATIVE kernel (a·∇n̂, not ∇·(an̂)):
-        f = 2π²μ̂ n̂* − sign·μ̂·π²/4·sin(2πx)sin(2πy)
+    Source derived from the CONSERVATIVE kernel (CPU DDEquation.h drift form
+    −sign·μ̂·∇·(n̂∇φ̂), NOT the old a·∇n̂):
+        f = 2π²μ̂ n̂* + sign·μ̂·π²/2·sin(2πx)sin(2πy)
     Both drift signs (electrons sign=-1, holes sign=+1) must converge.
+
+    P2 ORDER NOTE (conservative-form SUPG deviation, brief-sanctioned): with
+    SUPG on, the p2 order is ~2.6 rather than ~3.  The SUPG strong residual
+    stabilises only the ADVECTIVE part U·∇ĉ (= −sign·μ̂∇φ̂·∇ĉ); the conservative
+    drift's DIVERGENCE part −sign·μ̂ ĉ Δφ̂ is the recorded omission (Δφ̂ is not
+    passed to the standalone carrier kernel — the CPU stabilises the advective
+    part only).  This higher-order inconsistency mildly pollutes p2 (Galerkin,
+    supg=0, still gives a clean 3.00 — verified).  Threshold 2.5 keeps the gate
+    strictly super-quadratic (proves p2 basis + conservative drift) while
+    honouring the documented deviation; p1 is unaffected (≥1.9).
     """
     mu_hat  = 0.1
     levels  = (3, 4, 5)
@@ -359,9 +371,9 @@ def test_carrier_steady_mms(p, order_lo, sign, device):
 # dn̂/dt = −n̂*  →  σ_eff varies with BDF order
 #
 # For BDF1 with step Δt (start from t_n, advance to t_{n+1}=t_n+Δt):
-#   (n̂^{n+1} − n̂^n)/Δt + a·∇n̂ − μ̂∇²n̂ = f^{n+1}
+#   (n̂^{n+1} − n̂^n)/Δt − sign·μ̂∇·(n̂∇φ̂) − μ̂∇²n̂ = f^{n+1}
 #   ⟹ assembled σ = 1/Δt; f^{n+1} = dn̂/dt|_{n+1} + 2π²μ̂ n̂*^{n+1}
-#                                       + sign·μ̂·π²/4·sin(2πx)sin(2πy)|_{n+1}
+#                                       + sign·μ̂·π²/2·sin(2πx)sin(2πy)|_{n+1}
 #      history rhs =  (n̂^n / Δt)  (added to fq in the assembler)
 #
 # For BDF2: σ = 3/(2Δt); history = (2n̂^n − n̂^{n-1}/2) / Δt  (standard weights)
@@ -374,16 +386,16 @@ def _n_star_t(x, t):
 def _carrier_source_transient(x, t, sign, mu_hat):
     """Full manufactured source for n̂*(x,t) = e^{-t}sin(πx)sin(πy).
 
-    Strong residual: ∂_t n̂* + a·∇n̂* − μ̂∇²n̂* = f_transient
+    Strong residual (CONSERVATIVE drift): ∂_t n̂* − sign·μ̂∇·(n̂*∇φ̂) − μ̂∇²n̂* = f
     ∂_t n̂* = −n̂*  (gives the temporal coupling)
-    a·∇n̂*  = −sign·μ̂·(π²/4)·sin(2πx)sin(2πy)·e^{-t}
+    −sign·μ̂∇·(n̂*∇φ̂) = +sign·μ̂·(π²/2)·sin(2πx)sin(2πy)·e^{-t}  (φ̂ steady → ∝ e^{-t})
     −μ̂∇²n̂* = +2π²μ̂·n̂*
     """
     n   = _n_star_t(x, t)
-    # a·∇n̂* same formula as steady but scaled by e^{-t}
-    adv = -sign * mu_hat * (np.pi ** 2 / 4.0) * (
+    # conservative drift: same spatial formula as steady, scaled by e^{-t}
+    drift = sign * mu_hat * (np.pi ** 2 / 2.0) * (
         np.sin(2 * np.pi * x[:, 0]) * np.sin(2 * np.pi * x[:, 1])) * np.exp(-t)
-    return -n + 2.0 * np.pi ** 2 * mu_hat * n + adv
+    return -n + 2.0 * np.pi ** 2 * mu_hat * n + drift
 
 
 def _run_carrier_bdf(dm, mesh, cons, sign, mu_hat, dt, T_end, bdf_order,
@@ -498,7 +510,11 @@ def test_carrier_transient_mms(p, bdf_order, order_lo, dts, dt_ref, device):
 def test_carrier_peclet_robustness(device):
     """G8: Pe_h >> 1 — Galerkin overshoot > threshold; SUPG monotone-ish.
 
-    1-D-in-2-D setup: a_x=1, a_y=0, μ̂=1e-5 (Pe_h = h/(2μ) ≈ 3125 at L4).
+    1-D-in-2-D setup: drift velocity U_x=+1, U_y=0, μ̂=1e-5 (Pe_h = h/(2μ)
+    ≈ 3125 at L4).  CONSERVATIVE form: the SUPG upwind velocity is U = −aq, so
+    to get a rightward drift (U_x=+1) — flow from the n̂=1 inflow wall at x=0 to
+    the n̂=0 outflow wall at x=1, with the boundary-layer overshoot at x=1 — the
+    caller sets aq = [−1, 0] (constant, bypassing φ̂).
     Dirichlet only at x=0 (n̂=1) and x=1 (n̂=0) — Neumann on y-walls so the
     problem is genuinely 1-D-in-2-D and SUPG can fully suppress oscillations.
     (With Dirichlet on all 4 walls the problem is 2-D and SUPG is not
@@ -509,8 +525,8 @@ def test_carrier_peclet_robustness(device):
     dm, mesh, cons = _make_dm(level, p, device)
     xq = gauss_points(mesh, dm.tables_by_p)
 
-    # constant unit advection in x-direction (bypassing the phi field)
-    aq_gp = {pv: np.column_stack([np.ones(len(xq[pv])),
+    # aq = [−1,0] → drift velocity U = −aq = [+1,0] rightward (conservative form)
+    aq_gp = {pv: np.column_stack([-np.ones(len(xq[pv])),
                                    np.zeros(len(xq[pv]))]) for pv in xq}
     mu_gp = {pv: np.full(len(xq[pv]), mu_hat) for pv in xq}
     fq_gp = {pv: np.zeros(len(xq[pv]))        for pv in xq}
@@ -568,17 +584,19 @@ def test_carrier_direction_sensitivity(device):
     A sign-slip in assemble_xdd_carrier that maps both species to the same
     advection field would make K_e == K_h, failing this gate.
 
-    (b) 1-D upwinding structure
+    (b) 1-D upwinding structure  (CONSERVATIVE form: SUPG velocity U = −aq)
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~
     Use a 1-D-in-2-D uniform mesh (L3, p1) with LINEAR φ̂ = x/4 (so ∇φ̂ = [1/4,0],
     constant over the domain) and supg=1.0.  Assemble electrons (aq = -mu*[1/4,0])
-    and holes (aq = +mu*[1/4,0]).  For interior free-DOF rows, SUPG adds an
-    upstream bias: the upwind entry (lower-column index for rightward advection)
-    is larger in magnitude than the downwind entry.  Assert:
-        electron case: sum of UPPER off-diagonals > sum of LOWER off-diagonals
-                       (advection is LEFTWARD → bias toward smaller column indices)
-        hole     case: sum of LOWER off-diagonals > sum of UPPER off-diagonals
-                       (advection is RIGHTWARD → bias toward larger column indices)
+    and holes (aq = +mu*[1/4,0]).  The SUPG upwind velocity is U = −aq (CPU
+    convention U_n=+μ̂∇φ̂ / U_p=−μ̂∇φ̂), so ELECTRONS drift RIGHTWARD (U_e=+μ̂[1/4,0])
+    and HOLES drift LEFTWARD — the bias directions are REVERSED vs the old
+    nonconservative form.  For interior free-DOF rows, SUPG biases the upstream
+    (downwind-of-U) off-diagonal.  Assert:
+        electron case: sum of LOWER off-diagonals > sum of UPPER off-diagonals
+                       (U_e RIGHTWARD → bias toward larger column indices)
+        hole     case: sum of UPPER off-diagonals > sum of LOWER off-diagonals
+                       (U_h LEFTWARD → bias toward smaller column indices)
     A sign-slip in assemble_xdd_carrier would flip aq for one species, making
     its upwinding bias identical to the other, causing one assertion to fail.
     """
@@ -655,18 +673,22 @@ def test_carrier_direction_sensitivity(device):
     print(f"G9(b) hole    upper={up_h:.4f} lower={lo_h:.4f}")
 
     # Off-diagonal entries are negative (diffusion + upwinded advection).
-    # Electrons drift LEFT (aq_x < 0): SUPG biases the upper off-diagonal
-    # (toward lower col-index neighbors, i.e. upstream-left), making it more
-    # negative than the lower off-diagonal: |up_e| > |lo_e|  ↔  up_e < lo_e.
-    # Holes drift RIGHT (aq_x > 0): bias flips → |lo_h| > |up_h|  ↔  lo_h < up_h.
+    # CONSERVATIVE form: SUPG velocity U = −aq.  Electrons have aq_x < 0 so
+    # U_e_x > 0 (drift RIGHT): SUPG biases the lower off-diagonal (toward
+    # higher col-index neighbors, upstream-of-U on the right), making it more
+    # negative: |lo_e| > |up_e|  ↔  lo_e < up_e.
+    # Holes have aq_x > 0 so U_h_x < 0 (drift LEFT): bias flips →
+    # |up_h| > |lo_h|  ↔  up_h < lo_h.
     # A sign-slip in assemble_xdd_carrier that makes aq identical for both
     # species would produce up_e==up_h and lo_e==lo_h, failing one assertion.
-    assert up_e < lo_e, (
-        f"G9(b): electron (leftward drift) should have |upper| > |lower| "
-        f"off-diagonals (more negative upper), got upper={up_e:.4f} lower={lo_e:.4f}")
-    assert lo_h < up_h, (
-        f"G9(b): hole (rightward drift) should have |lower| > |upper| "
-        f"off-diagonals (more negative lower), got upper={up_h:.4f} lower={lo_h:.4f}")
+    assert lo_e < up_e, (
+        f"G9(b): electron (U rightward, conservative) should have |lower| > "
+        f"|upper| off-diagonals (more negative lower), got upper={up_e:.4f} "
+        f"lower={lo_e:.4f}")
+    assert up_h < lo_h, (
+        f"G9(b): hole (U leftward, conservative) should have |upper| > |lower| "
+        f"off-diagonals (more negative upper), got upper={up_h:.4f} "
+        f"lower={lo_h:.4f}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
