@@ -162,7 +162,7 @@ def test_onsager_braun_derivative_fd(p):
         analytic_d = float(dk_dgrad_d[0])
 
         rel_err = abs(fd_d - analytic_d) / (abs(analytic_d) + 1e-300)
-        assert rel_err < 1e-5, (
+        assert rel_err < 1e-6, (
             f"FD derivative check failed at E={grad*phi0/x0:.2e} V/m: "
             f"fd={fd_d:.6e}, analytic={analytic_d:.6e}, rel_err={rel_err:.2e}"
         )
