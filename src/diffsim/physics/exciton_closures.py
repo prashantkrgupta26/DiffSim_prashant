@@ -152,6 +152,12 @@ class LangevinRecombination:
     spatial: str = "uniform"    # "disabled" | "uniform" | "interface"
     width: float = 1e-9         # interface width [m] for "interface" spatial
 
+    def __post_init__(self) -> None:
+        if not (0 < self.zeta <= 1):
+            raise ValueError(
+                f"LangevinRecombination.zeta must satisfy 0 < zeta <= 1, got {self.zeta!r}"
+            )
+
     def __call__(
         self,
         n_hat: np.ndarray,
@@ -268,7 +274,10 @@ class Generation:
         if self.profile == "constant":
             G_d_dim = p.Gx_donor    * w_donor
             G_a_dim = p.Gx_acceptor * w_acceptor
-            # RET: Förster transfer from donor to acceptor at the interface
+            # RET: CPU parity — DDFields.h: `Gx_a += ret_factor * G_donor` uses
+            # the RAW (unweighted) donor profile value `Gx_donor`.  Using the
+            # region-weighted G_d_dim would zero RET in the sharp-mask limit
+            # (w_donor→0 at interface) — wrong behaviour.
             G_a_dim = G_a_dim + (
                 p.ret_factor * p.Gx_donor
                 * interface_mask(dist, p.interface_thk / 2.0)
@@ -281,9 +290,12 @@ class Generation:
             G_dim = self.alpha0 * self.Gamma0 * np.exp(-self.alpha0 * x0 * (1.0 - h_hat))
             G_d_dim = 0.5 * G_dim * w_donor
             G_a_dim = 0.5 * G_dim * w_acceptor
-            # RET (using donor contribution)
+            # RET: CPU parity — DDFields.h uses the raw (unweighted) donor profile
+            # value `Gx_donor` (constant) / `0.5*G_dim` (beer_lambert) before
+            # region weighting.  Using the region-weighted G_d_dim would zero RET
+            # in the sharp-mask limit (w_donor→0 at interface) — wrong behaviour.
             G_a_dim = G_a_dim + (
-                p.ret_factor * G_d_dim
+                p.ret_factor * (0.5 * G_dim)
                 * interface_mask(dist, p.interface_thk / 2.0)
                 * w_acceptor
             )

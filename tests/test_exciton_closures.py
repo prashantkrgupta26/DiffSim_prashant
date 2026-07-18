@@ -108,10 +108,10 @@ def test_onsager_braun_hand_value(p, s):
     dist_arr = np.array([0.0])
     k_hat_d, k_hat_a, (dk_dgrad_d, dk_dgrad_a) = ob(grad_phi_hat, dist_arr)
 
-    assert abs(float(k_hat_d[0]) - k_hat_expected) / k_hat_expected < 1e-8, (
+    assert abs(float(k_hat_d[0]) - k_hat_expected) / k_hat_expected < 1e-10, (
         f"k_hat_d={float(k_hat_d[0]):.10e}, expected={k_hat_expected:.10e}"
     )
-    assert abs(float(k_hat_a[0]) - k_hat_expected) / k_hat_expected < 1e-8, (
+    assert abs(float(k_hat_a[0]) - k_hat_expected) / k_hat_expected < 1e-10, (
         f"k_hat_a={float(k_hat_a[0]):.10e}, expected={k_hat_expected:.10e}"
     )
 
@@ -120,18 +120,63 @@ def test_onsager_braun_hand_value(p, s):
 
 
 def test_onsager_braun_b0_limit(p):
-    """Phi(b=0) == 1 exactly — zero-field limit."""
-    # At E=0, grad_phi_hat=0, b=0, Phi=1
-    # k_dim = (3*gamma0/(4*pi*a^3)) * exp(-E_B/kT) * 1
-    # Just verify k_hat_d > 0 and consistent with E>0 result (k increases with E)
+    """Phi(b=0) == 1 exactly — zero-field limit with full hand-computed check."""
+    # At E=0, grad_phi_hat=0, b=0, Phi(0)=1.
+    # Hand-computed (all literals):
+    #   eps_r_at0 = 3.0 + (3.9-3.0)*0.5 = 3.45
+    #   eps       = 8.8541878128e-12 * 3.45 = 3.0546947954e-11 F/m
+    #   E_B       = Q^2/(4*pi*eps*a)  [a=1.8e-9]
+    #             = (1.602176634e-19)^2 / (4*pi*3.0546947954e-11*1.8e-9)
+    #             = 3.7151007284e-20 J
+    #   kT        = 1.380649e-23 * 300 = 4.14194700e-21 J
+    #   exp(-E_B/kT) = exp(-8.9694550133) = 1.2723751601e-04
+    #   gamma0    = 2*(2e-7+1.5e-7)*1.602176634e-19 / (8.8541878128e-12*(3.9+3.0))
+    #             = 1.8357376414e-15 m^3/s
+    #   prefactor = 3*gamma0/(4*pi*a^3) = 3*1.8357376414e-15/(4*pi*(1.8e-9)^3)
+    #             = 7.5145761279e+10 1/s/m^3 * m^3 = 7.5145761279e+10 s^-1
+    #   k_dim(b=0) = prefactor * exp(-E_B/kT) * Phi(0) = 7.5145761279e+10 * 1.2723751601e-04 * 1.0
+    #             = 9.5613600041e+06 s^-1
+    #   phi0      = 1.380649e-23*300/1.602176634e-19 = 2.5851999786e-02 V
+    #   x0        = 100e-9 m, mu0 = 2e-7 m^2/Vs
+    #   t0        = x0^2/(mu0*phi0) = (100e-9)^2/(2e-7*2.5851999786e-02) = 1.9340863536e-06 s
+    #   k_hat_no_mask = k_dim * t0 = 9.5613600041e+06 * 1.9340863536e-06 = 1.8492495906e+01
+    #   interface_mask(0, 1e-9): half_thk=1e-9, val=0.5*(tanh((1e-9-0)/(0.25*1e-9))+1)
+    #             = 0.5*(tanh(4)+1) = 9.9966464987e-01
+    #   k_hat_d(b=0) = k_hat_no_mask * mask * ex_diss_d_scaling * 1.0
+    #             = 1.8492495906e+01 * 9.9966464987e-01 = 1.8486294445e+01
+    T    = 300.0
+    a    = 1.8e-9
+    eps_r_at0 = 3.0 + (3.9 - 3.0) * 0.5   # = 3.45 (tanh_mask(0,w)=0.5)
+    eps  = _EPS0 * eps_r_at0
+    E_B  = _Q**2 / (4 * math.pi * eps * a)
+    kT   = _KB * T
+    gam0 = 2 * (2e-7 + 1.5e-7) * _Q / (_EPS0 * (3.9 + 3.0))
+    prefactor = 3 * gam0 / (4 * math.pi * a**3)
+    k_dim_b0 = prefactor * math.exp(-E_B / kT) * 1.0   # Phi(0)=1
+    phi0 = kT / _Q
+    x0   = 100e-9
+    mu0  = 2e-7
+    t0   = x0**2 / (mu0 * phi0)
+    half_thk = 1e-9   # interface_thk/2 = 2e-9/2
+    mask = 0.5 * (math.tanh((half_thk - 0.0) / (0.25 * half_thk)) + 1.0)
+    # k_hat_d expected (literal, rel 1e-10):
+    k_hat_d_expected_b0 = k_dim_b0 * t0 * mask * 1.0  # ex_diss_d_scaling=1.0
+    #                    ≈ 1.8486294445e+01
+
     width = 1e-9
     ob = OnsagerBraunDissociation(params=p, width=width)
     dist_arr = np.array([0.0])
 
     k0_d, k0_a, _ = ob(0.0, dist_arr)
-    k7_d, k7_a, _ = ob(38.68, dist_arr)  # E≈1e7 V/m
 
-    assert float(k0_d[0]) > 0.0, "k_hat_d(E=0) must be positive"
+    # (a) Phi(0)=1: k(E=0) must match hand-computed literal, rel 1e-10
+    np.testing.assert_allclose(
+        float(k0_d[0]), k_hat_d_expected_b0, rtol=1e-10,
+        err_msg=f"k_hat_d(b=0) mismatch: got {float(k0_d[0]):.10e}, expected {k_hat_d_expected_b0:.10e}"
+    )
+
+    # (b) Monotonicity: k must increase with field
+    k7_d, _, _ = ob(38.68, dist_arr)  # E≈1e7 V/m
     assert float(k7_d[0]) > float(k0_d[0]), "k_hat_d must increase with field"
 
 
@@ -277,6 +322,21 @@ def test_generation_regions(p, s):
         "G_hat_a should be larger at interface than deep donor due to RET"
     )
 
+    # Independent nondim check: G_hat_d deep in donor = Gx_donor / U0_literal
+    # U0 = mu0*phi0*C0/x0^2 = 2e-7 * 0.025851999786... * 2.5e25 / (1e-7)^2
+    #    = 2e-7 * 0.025851999786 * 2.5e25 / 1e-14
+    #    = 2e-7 * 6.4629999893e23
+    #    = 1.2925999893e31
+    # (arithmetic: 2e-7 * 2.5e25 = 5e18; 5e18 * 0.025851999786 = 1.29259998930e17;
+    #              /1e-14 = 1.29259998930e31)
+    U0_literal = 1.2925999893e31  # [m^-3 s^-1]  — never references scales().U0
+    G_hat_d_dd_nondim = p.Gx_donor / U0_literal  # = 1e28 / 1.2925999893e31 ≈ 7.7363454e-4
+    np.testing.assert_allclose(
+        float(G_hat_d[deep_donor_idx]), G_hat_d_dd_nondim, rtol=1e-9,
+        err_msg=f"G_hat_d deep donor nondim: got {float(G_hat_d[deep_donor_idx]):.10e}, "
+                f"expected {G_hat_d_dd_nondim:.10e} (= Gx_donor/{U0_literal:.4e})"
+    )
+
     # beer_lambert profile: check ratio G(h=1)/G(h=0) = exp(alpha0*x0)
     alpha0 = 1e7
     gen_bl = Generation(params=p, profile="beer_lambert", alpha0=alpha0,
@@ -409,3 +469,76 @@ def test_c0_over_u0_is_t0():
     assert abs(s.C0 / s.U0 - s.t0) / s.t0 < 1e-12, (
         f"C0/U0={s.C0/s.U0:.10e} != t0={s.t0:.10e}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Gate 8 — Sharp-limit RET: RET survives near-sharp interface mask
+# ---------------------------------------------------------------------------
+
+def test_ret_sharp_limit(p):
+    """RET contribution is nonzero (> 0.5*ret_factor*Gx_donor/U0) in acceptor
+    shell just inside interface_thk/2, even for near-sharp mask (width=1e-12).
+
+    This guards the controller adjudication: RET uses the *unweighted* donor
+    profile (Gx_donor for constant; 0.5*G_dim for beer_lambert).  If the
+    region-weighted G_d_dim were used instead, w_donor→0 near the interface
+    would zero out RET — wrong behaviour in the sharp limit.
+    """
+    from diffsim.xdd.morphology import interface_mask as _imask
+
+    # Near-sharp mask: tanh_mask(dist, 1e-12) ≈ step function
+    width_sharp = 1e-12
+    gen = Generation(params=p, profile="constant", waveform="cw", width=width_sharp)
+
+    # U0 hand-computed (same literal as gate 4 — never references scales().U0)
+    # U0 = mu0*phi0*C0/x0^2 = 2e-7 * 0.025851999786 * 2.5e25 / (1e-7)^2
+    #    = 1.2925999893e31 m^-3 s^-1
+    U0_literal = 1.2925999893e31
+
+    # A dist array spanning the acceptor shell 0 < dist < interface_thk/2
+    # (acceptor side, inside the interface mask support)
+    # Use a handful of points in (0, 0.5*interface_thk)
+    half_thk = p.interface_thk / 2.0   # 1e-9 m
+    dist_shell = np.linspace(0.05 * half_thk, 0.9 * half_thk, 10)
+    h_hat_shell = np.full_like(dist_shell, 0.5)
+
+    _, G_hat_a = gen(dist_shell, h_hat_shell, 0.0)
+
+    # Minimum expected RET contribution (lower bound):
+    # G_a_RET = ret_factor * Gx_donor * interface_mask * w_acceptor / U0
+    # In the acceptor shell, interface_mask > 0 and w_acceptor > 0 for dist > 0.
+    # With near-sharp mask (width=1e-12), w_acceptor ≈ 1 everywhere dist > 0.
+    # So RET per point >= ret_factor * Gx_donor * min(interface_mask) / U0 * min(w_acceptor)
+    # We use a conservative threshold of 0.5 * ret_factor * Gx_donor / U0
+    ret_lower_bound = 0.5 * p.ret_factor * p.Gx_donor / U0_literal
+
+    # Every point in the shell must have G_hat_a > lower_bound (RET survives sharp mask)
+    for i, g in enumerate(G_hat_a):
+        assert float(g) > ret_lower_bound, (
+            f"RET killed at dist={dist_shell[i]:.3e} m with near-sharp mask: "
+            f"G_hat_a={float(g):.6e} <= ret_lower_bound={ret_lower_bound:.6e}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gate 9 — LangevinRecombination zeta validation
+# ---------------------------------------------------------------------------
+
+def test_langevin_zeta_validation(p):
+    """LangevinRecombination raises ValueError for zeta outside (0, 1]."""
+    import pytest
+
+    # Valid boundary values
+    LangevinRecombination(params=p, zeta=1.0)   # exactly 1.0 — allowed
+    LangevinRecombination(params=p, zeta=0.01)  # small positive — allowed
+
+    # Invalid: zeta <= 0
+    with pytest.raises(ValueError, match="zeta"):
+        LangevinRecombination(params=p, zeta=0.0)
+
+    with pytest.raises(ValueError, match="zeta"):
+        LangevinRecombination(params=p, zeta=-0.5)
+
+    # Invalid: zeta > 1
+    with pytest.raises(ValueError, match="zeta"):
+        LangevinRecombination(params=p, zeta=1.1)
