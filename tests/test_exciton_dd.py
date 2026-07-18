@@ -13,7 +13,8 @@ B2 gate summary
 G6  Steady MMS: p1 → ≥2, p2 → ≥3; both drift signs (electrons + holes)
 G7  Transient MMS cross-matrix: BDF1/BDF2 × p1/p2 temporal orders
 G8  Peclet robustness: Galerkin oscillates; SUPG monotone-ish (overshoot gate)
-G9  Sign symmetry: electron(sign=-1, φ̂) == hole(sign=+1, -φ̂) to 1e-14
+G9  Direction-sensitivity + upwinding: electron/hole stiffness matrices differ
+    (not vacuously equal); 1-D interior row asymmetry flips between carriers
 """
 import numpy as np
 import pytest
@@ -332,7 +333,7 @@ def test_carrier_steady_mms(p, order_lo, sign, device):
     """G6: steady MMS, n̂*=sin(πx)sin(πy), φ̂*=cos(πx)cos(πy)/2, μ̂=0.1.
 
     Source derived from the NONCONSERVATIVE kernel (a·∇n̂, not ∇·(an̂)):
-        f = 2π²μ̂ n̂* + sign·μ̂·π²/4·sin(2πx)sin(2πy)
+        f = 2π²μ̂ n̂* − sign·μ̂·π²/4·sin(2πx)sin(2πy)
     Both drift signs (electrons sign=-1, holes sign=+1) must converge.
     """
     mu_hat  = 0.1
@@ -412,23 +413,16 @@ def _run_carrier_bdf(dm, mesh, cons, sign, mu_hat, dt, T_end, bdf_order,
 
     # Initial condition
     u_prev = _n_star_t(mesh.node_coords, t)
-    u_prev_free = np.asarray(cons.T.T @ u_prev)
-
-    u_prev2 = None  # only used by BDF2 from step 2+
 
     for step in range(n_steps):
         t_new = t + dt
 
         if bdf_order == 1 or (bdf_order == 2 and step == 0):
             # BDF1 step: σ=1/Δt, history = u_prev/Δt
+            # History uses the exact solution at each step (isolates temporal
+            # error; B4 will accumulate the numerical solution instead).
             sigma   = 1.0 / dt
             sig2tau = (2.0 * sigma) ** 2
-            history_gp = {pv: np.interp(
-                np.zeros(1), [0], [0])[0] * 0  # dummy; compute properly below
-                for pv in xq}
-            # History: (n̂^n / Δt) at all GPs
-            # We need n̂^n at GPs: interpolate from u_prev (nodal)
-            # For this test, use the exact solution at t (avoids interpolation)
             history_gp = {pv: _n_star_t(xq[pv], t) / dt for pv in xq}
             fq_total   = {pv: _fq(t_new)[pv] + history_gp[pv] for pv in xq}
             A, b       = assemble_xdd_carrier(
@@ -456,7 +450,6 @@ def _run_carrier_bdf(dm, mesh, cons, sign, mu_hat, dt, T_end, bdf_order,
         u_free  = splu(A.tocsr().tocsc()).solve(b)
         u_all   = np.asarray(cons.T @ u_free)
 
-        u_prev2 = u_prev
         u_prev  = u_all
         t       = t_new
 
@@ -558,39 +551,119 @@ def test_carrier_peclet_robustness(device):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# G9 — Sign symmetry: electron(sign=-1, φ̂) == hole(sign=+1, -φ̂) to 1e-14
+# G9 — Direction-sensitivity + 1-D upwinding asymmetry
 # ──────────────────────────────────────────────────────────────────────────────
 
-def test_carrier_sign_symmetry(device):
-    """G9: K_electron(sign=-1, ∇φ̂) == K_hole(sign=+1, −∇φ̂) entry-by-entry.
+def test_carrier_direction_sensitivity(device):
+    """G9: electron and hole stiffness matrices are genuinely different (not
+    vacuously equal), and 1-D upwinding bias flips between the two species.
 
-    The ONE factory pair is parameterized by a sign kernel arg; swapping sign
-    and negating the advection field must produce the identical matrix (up to
-    fp round-off).  This catches a sign-convention slip that MMS with symmetric
-    solutions misses.
+    (a) Direction-sensitivity gate
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    From the SAME nonconstant φ̂* (= cos(πx)cos(πy)/2), build:
+        electron aq = -mu * grad_phi   (sign=-1)
+        hole     aq = +mu * grad_phi   (sign=+1)
+    These are genuinely opposite vectors, so the advection-weighted stiffness
+    matrices must differ.  Gate: norm(K_e - K_h) / norm(K_e) > 1e-3.
+    A sign-slip in assemble_xdd_carrier that maps both species to the same
+    advection field would make K_e == K_h, failing this gate.
+
+    (b) 1-D upwinding structure
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    Use a 1-D-in-2-D uniform mesh (L3, p1) with LINEAR φ̂ = x/4 (so ∇φ̂ = [1/4,0],
+    constant over the domain) and supg=1.0.  Assemble electrons (aq = -mu*[1/4,0])
+    and holes (aq = +mu*[1/4,0]).  For interior free-DOF rows, SUPG adds an
+    upstream bias: the upwind entry (lower-column index for rightward advection)
+    is larger in magnitude than the downwind entry.  Assert:
+        electron case: sum of UPPER off-diagonals > sum of LOWER off-diagonals
+                       (advection is LEFTWARD → bias toward smaller column indices)
+        hole     case: sum of LOWER off-diagonals > sum of UPPER off-diagonals
+                       (advection is RIGHTWARD → bias toward larger column indices)
+    A sign-slip in assemble_xdd_carrier would flip aq for one species, making
+    its upwinding bias identical to the other, causing one assertion to fail.
     """
     mu_hat = 0.1
+
+    # ── (a) Direction-sensitivity ──────────────────────────────────────────
     level, p = 4, 1
     dm, mesh, cons = _make_dm(level, p, device)
     xq = gauss_points(mesh, dm.tables_by_p)
 
-    # φ̂* gradient at GPs
-    gph = {pv: _grad_phi_c(xq[pv]) for pv in xq}
+    gph = {pv: _grad_phi_c(xq[pv]) for pv in xq}   # ∇(cos(πx)cos(πy)/2)
 
-    # Electron: sign=-1, drift a_n = -mu * grad_phi
-    aq_e = {pv: -mu_hat * gph[pv] for pv in xq}
+    aq_e = {pv: -mu_hat * gph[pv] for pv in xq}    # electron: sign=-1
+    aq_h = {pv:  mu_hat * gph[pv] for pv in xq}    # hole:     sign=+1
     mu_g = {pv: np.full(len(xq[pv]), mu_hat) for pv in xq}
     fq_z = {pv: np.zeros(len(xq[pv]))        for pv in xq}
-    A_e, _ = assemble_xdd_carrier(dm, aq_e, mu_g, fq_z, sigma=0.0)
 
-    # Hole: sign=+1, drift a_p = +mu * grad(-phi) = -mu * grad_phi
-    # => SAME aq_gp, SAME matrix
-    aq_h = {pv: mu_hat * (-gph[pv]) for pv in xq}
-    A_h, _ = assemble_xdd_carrier(dm, aq_h, mu_g, fq_z, sigma=0.0)
+    K_e, _ = assemble_xdd_carrier(dm, aq_e, mu_g, fq_z, sigma=0.0)
+    K_h, _ = assemble_xdd_carrier(dm, aq_h, mu_g, fq_z, sigma=0.0)
 
-    diff = abs(A_e - A_h).max()
-    ref  = abs(A_e).max()
-    rel  = diff / max(ref, 1e-30)
-    print(f"G9 sign-symmetry rel={rel:.2e}, diff={diff:.2e}")
-    assert rel < 1e-14, (
-        f"G9 sign-symmetry broken: rel={rel:.2e}, diff={diff:.2e}")
+    diff_rel = (np.linalg.norm((K_e - K_h).toarray())
+                / np.linalg.norm(K_e.toarray()))
+    print(f"G9(a) direction-sensitivity: norm(K_e-K_h)/norm(K_e) = {diff_rel:.4f}")
+    assert diff_rel > 1e-3, (
+        f"G9(a): electron and hole stiffness matrices are too similar "
+        f"(rel={diff_rel:.2e}); a sign-slip may have made aq identical")
+
+    # ── (b) 1-D upwinding asymmetry ────────────────────────────────────────
+    # Linear φ̂=x/4: ∇φ̂=[1/4,0] everywhere → constant aq along x.
+    level1d, p1d = 3, 1
+    dm1, mesh1, cons1 = _make_dm(level1d, p1d, device)
+    xq1 = gauss_points(mesh1, dm1.tables_by_p)
+
+    # Constant advection: electrons LEFT (-mu*[1/4,0]), holes RIGHT (+mu*[1/4,0])
+    def _const_aq(sign_):
+        return {pv: np.column_stack([
+            np.full(len(xq1[pv]), sign_ * mu_hat * 0.25),
+            np.zeros(len(xq1[pv])),
+        ]) for pv in xq1}
+
+    mu_g1 = {pv: np.full(len(xq1[pv]), mu_hat) for pv in xq1}
+    fq_z1 = {pv: np.zeros(len(xq1[pv]))        for pv in xq1}
+
+    Ke1, _ = assemble_xdd_carrier(dm1, _const_aq(-1.0), mu_g1, fq_z1,
+                                   sigma=0.0, supg=1.0)
+    Kh1, _ = assemble_xdd_carrier(dm1, _const_aq(+1.0), mu_g1, fq_z1,
+                                   sigma=0.0, supg=1.0)
+
+    # Identify interior free-DOF rows (not on any boundary)
+    coords1 = mesh1.node_coords[cons1.free_nodes]
+    interior = np.ones(len(coords1), bool)
+    for c in range(2):
+        interior &= (coords1[:, c] > 1e-10) & (coords1[:, c] < 1.0 - 1e-10)
+    int_rows = np.where(interior)[0]
+    assert len(int_rows) > 0, "G9(b): no interior rows found"
+
+    def _offdiag_asymmetry(K, rows):
+        """Sum upper vs lower off-diagonal entries over the given rows."""
+        K_csr = K.tocsr()
+        upper = 0.0
+        lower = 0.0
+        for i in rows:
+            row_start = K_csr.indptr[i]
+            row_end   = K_csr.indptr[i + 1]
+            cols_r    = K_csr.indices[row_start:row_end]
+            data_r    = K_csr.data[row_start:row_end]
+            upper += float(np.sum(data_r[cols_r > i]))
+            lower += float(np.sum(data_r[cols_r < i]))
+        return upper, lower
+
+    up_e, lo_e = _offdiag_asymmetry(Ke1, int_rows)
+    up_h, lo_h = _offdiag_asymmetry(Kh1, int_rows)
+    print(f"G9(b) electron upper={up_e:.4f} lower={lo_e:.4f}")
+    print(f"G9(b) hole    upper={up_h:.4f} lower={lo_h:.4f}")
+
+    # Off-diagonal entries are negative (diffusion + upwinded advection).
+    # Electrons drift LEFT (aq_x < 0): SUPG biases the upper off-diagonal
+    # (toward lower col-index neighbors, i.e. upstream-left), making it more
+    # negative than the lower off-diagonal: |up_e| > |lo_e|  ↔  up_e < lo_e.
+    # Holes drift RIGHT (aq_x > 0): bias flips → |lo_h| > |up_h|  ↔  lo_h < up_h.
+    # A sign-slip in assemble_xdd_carrier that makes aq identical for both
+    # species would produce up_e==up_h and lo_e==lo_h, failing one assertion.
+    assert up_e < lo_e, (
+        f"G9(b): electron (leftward drift) should have |upper| > |lower| "
+        f"off-diagonals (more negative upper), got upper={up_e:.4f} lower={lo_e:.4f}")
+    assert lo_h < up_h, (
+        f"G9(b): hole (rightward drift) should have |lower| > |upper| "
+        f"off-diagonals (more negative lower), got upper={up_h:.4f} lower={lo_h:.4f}")

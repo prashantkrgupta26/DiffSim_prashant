@@ -316,7 +316,6 @@ def make_xdd_carrier_Ae(nbf: int, nqp: int, dim: int):
     if key in _kernel_cache:
         return _kernel_cache[key]
 
-    dim_pow = float(dim)
     dim_f   = float(dim)
 
     @wp.kernel(module="unique", enable_backward=False,
@@ -411,7 +410,6 @@ def make_xdd_carrier_be(nbf: int, nqp: int, dim: int):
     if key in _kernel_cache:
         return _kernel_cache[key]
 
-    dim_pow = float(dim)
     dim_f   = float(dim)
 
     @wp.kernel(module="unique", enable_backward=False,
