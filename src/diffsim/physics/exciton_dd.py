@@ -1,6 +1,6 @@
-"""SP-1 B1: XDD Poisson brick — λ²-form quasi-static electrostatics.
+"""SP-1 B1+B2: XDD Poisson brick and carrier drift-diffusion bricks.
 
-WEAK FORMS (SP-1 brick family — keep in sync as B2/B4 add terms)
+WEAK FORMS (SP-1 brick family — keep in sync as B3/B4 add terms)
 -----------------------------------------------------------------
 B1  Poisson (this brick):
     Strong (nondim): −∇·(λ² ε̂(x) ∇φ̂) − (p̂ − n̂) = 0
@@ -12,23 +12,63 @@ B1  Poisson (this brick):
     ε̂(x) = ε_r(x) / max(ε_A, ε_D)  — supplied as a GP field by the caller
     (same GP-field contract as kappa in scalar_transport.py).
 
+B2  Carrier drift-diffusion (n̂ electrons / p̂ holes) — NONCONSERVATIVE form:
+    Strong:  ∂_t n̂  + a·∇n̂  − μ̂∇²n̂  = f
+    with advection velocity  a = sign · μ̂(x) · ∇φ̂  (frozen at GPs from the
+    M2 one-way-coupler contract).
+      sign = −1  for electrons: a_n = −μ̂_n ∇φ̂
+      sign = +1  for holes:     a_p = +μ̂_p ∇φ̂  (holes drift DOWN potential)
+
+    FORM CHOICE — NONCONSERVATIVE  (matching scalar_transport.py's convention):
+    The kernel accumulates (a·∇n̂, w) + μ̂(∇n̂, ∇w), NOT ∇·(an̂).
+    The difference is n̂(∇·a); for the MMS tests (σ = BDF coefficient) the
+    source must match this convention — see _carrier_source() in
+    tests/test_exciton_dd.py for the explicit hand derivation.
+
+    Equivalence to the CPU residual convention μ(−n∇φ·∇w + ∇n·∇w):
+    Integrating the conservative flux −μn∇φ + μ∇n by parts gives exactly
+    the Galerkin terms above (boundary terms zero for homogeneous Dirichlet)
+    ONLY when ∇·(μ∇φ) = 0.  For a manufactured φ̂ this does not hold in
+    general, so the source differs between conservative/nonconservative forms
+    by n̂·∇·a.  The kernel implements nonconservative, matching scalar_transport.
+
+    Galerkin weak form (σ = BDF coefficient, f includes history term):
+      σ(n̂, w) + (a·∇n̂, w) + μ̂(∇n̂, ∇w) + SUPG = (f, w) + SUPG_rhs
+
+    SUPG: Tezduyar-class τ_M via tau_m_metric(|a|, h, μ̂, sig²τ, dim) exactly
+    as scalar_transport.py.  Complete VMS residual (-μ̂ lapN) for p2 exactness:
+      res_b = σ N_b + a·∇N_b − μ̂ lapN_b      (on the trial function N_b)
+      SUPG contribution: τ_M (a·∇w, res_b)    (test function augmentation)
+
+    ONE factory pair parameterised by the `sign` kernel arg (float).  The
+    caller computes aq_gp = sign * mu_gp * grad_phi_gp and passes it directly;
+    sign is absorbed into aq — the kernel itself is sign-agnostic (aq is used
+    as-is).  See assemble_xdd_carrier for the calling convention.
+
 KERNEL FACTORIES (house idiom — see scalar_transport.py)
 ---------------------------------------------------------
-  make_xdd_poisson_Ae(nbf, nqp, dim)   →  warp kernel (Ke stiffness)
-  make_xdd_poisson_be(nbf, nqp, dim)   →  warp kernel (fe load, rho source)
+  B1:
+    make_xdd_poisson_Ae(nbf, nqp, dim)   →  warp kernel (Ke stiffness)
+    make_xdd_poisson_be(nbf, nqp, dim)   →  warp kernel (fe load, rho source)
+  B2 (sign-parameterized via aq_gp = sign * mu * grad_phi):
+    make_xdd_carrier_Ae(nbf, nqp, dim)   →  warp kernel (carrier stiffness)
+    make_xdd_carrier_be(nbf, nqp, dim)   →  warp kernel (carrier load)
 
 ASSEMBLY
 --------
   assemble_xdd_poisson(dm, eps_gp, rho_gp, *, lam2=None, params=None,
                        f_src_gp=None)
       → (K_constrained: csr_matrix, F_constrained: ndarray)
-  Caller passes lam2 explicitly OR XDDParams (params); at least one must be
-  supplied.  eps_gp and rho_gp are dicts {p: np.ndarray[ngp]} keyed by poly
-  degree (same as tables_by_p).  Optional f_src_gp adds an extra body load
-  (for future B4 use; default None = zeros).
 
-B2/B4 consumers: factories and assembly signature are stable.  Add B2 carrier
-bricks (make_xdd_ndd_Ae etc.) in this file following the same pattern.
+  assemble_xdd_carrier(dm, aq_gp, mu_gp, fq_gp, *, sigma=0.0,
+                       sig2tau=None, supg=None)
+      → (K_constrained: csr_matrix, F_constrained: ndarray)
+      aq_gp   : dict {p: [ngp, dim]}  advection at GPs (= sign*mu*grad_phi)
+      mu_gp   : dict {p: [ngp]}       μ̂(x) at GPs  (diffusivity)
+      fq_gp   : dict {p: [ngp]}       source f (= D̂−R̂ + BDF-history for B4)
+      sigma   : BDF time coefficient (1/Δt for BDF1, 3/(2Δt) for BDF2)
+      sig2tau : (2σ)² for tau_m_metric (derived from sigma if None)
+      supg    : SUPG scale (1.0 default; pass 0.0 to disable = Galerkin)
 """
 import numpy as np
 import scipy.sparse as sp
@@ -36,6 +76,7 @@ import warp as wp
 
 from ..assembly.femelm import FEMElm, fe_dN_s, fe_detJxW_s, fe_N
 from ..assembly.operators import _kernel_cache
+from ..api.ns_bricks import tau_m_metric
 
 wp.set_module_options({"enable_backward": False})
 
@@ -219,6 +260,280 @@ def assemble_xdd_poisson(dm, eps_gp, rho_gp, *, lam2=None, params=None,
         wp.launch(kb, dim=ne,
                   inputs=[b["conn"], b["h"], b["N"], b["w"],
                           rho_d, fsrc_d, be],
+                  device=d)
+
+        Aeh = Ae.numpy()
+        beh = be.numpy()
+
+        rows.append(np.repeat(conn_np, nbf, axis=1).ravel())
+        cols.append(np.tile(conn_np, (1, nbf)).ravel())
+        vals.append(Aeh.ravel())
+        np.add.at(F_full, conn_np.ravel(), beh.ravel())
+
+    K = sp.coo_matrix(
+        (np.concatenate(vals),
+         (np.concatenate(rows), np.concatenate(cols))),
+        shape=(dm.n_nodes, dm.n_nodes),
+    ).tocsr()
+    T = dm.constraints.T.tocsr()
+    return (T.T @ K @ T).tocsr(), np.asarray(T.T @ F_full)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# B2 — carrier drift-diffusion stiffness kernel
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Kernel signature mirrors scalar_transport.make_scalar_ad_Ae exactly:
+#   conn   [ne, nbf]     int32  — local→global DOF map
+#   h      [ne]          f64    — element size
+#   Ntab   [nqp, nbf]    f64    — basis values (for mass term)
+#   dNtab  [nqp, nbf, d] f64    — reference basis gradients
+#   lapNtab[nqp, nbf]    f64    — reference basis Laplacians (for VMS p2)
+#   wtab   [nqp]         f64    — quadrature weights
+#   aq     [ne*nqp, dim] f64    — advection field at GPs (sign*mu*grad_phi)
+#   kq     [ne*nqp]      f64    — μ̂(x) diffusivity at GPs
+#   sigma                f64    — BDF coefficient (0 for steady)
+#   sig2tau              f64    — (2σ)² for tau_m_metric
+#   supg                 f64    — SUPG scale (1.0 or 0.0)
+#   Ae     [ne,nbf,nbf]  f64    — output (pre-zeroed)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_xdd_carrier_Ae(nbf: int, nqp: int, dim: int):
+    """Element stiffness for the XDD carrier brick (SUPG, nonconservative form).
+
+    Implements:
+        σ(N_b, N_a) + (a·∇N_b, N_a) + μ̂(∇N_b, ∇N_a) + τ_M(a·∇N_a, res_b)
+    where res_b = σ N_b + a·∇N_b − μ̂ lapN_b  (VMS-complete strong residual).
+
+    Sign of advection is baked into aq_gp by the caller:
+        electrons:  aq_gp = −μ̂ ∇φ̂
+        holes:      aq_gp = +μ̂ ∇φ̂
+
+    This is ONE factory — sign is not a kernel arg; the caller varies aq_gp.
+    Cache key: ("xdd_carrier_Ae", nbf, nqp, dim).
+    """
+    key = ("xdd_carrier_Ae", nbf, nqp, dim)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    dim_pow = float(dim)
+    dim_f   = float(dim)
+
+    @wp.kernel(module="unique", enable_backward=False,
+               module_options=({"max_unroll": 0} if dim >= 3 else {}))
+    def xdd_carrier_Ae(
+        conn:     wp.array2d(dtype=wp.int32),
+        h:        wp.array(dtype=wp.float64),
+        Ntab:     wp.array2d(dtype=wp.float64),
+        dNtab:    wp.array3d(dtype=wp.float64),
+        lapNtab:  wp.array2d(dtype=wp.float64),
+        wtab:     wp.array(dtype=wp.float64),
+        aq:       wp.array2d(dtype=wp.float64),   # [ne*nqp, dim]
+        kq:       wp.array(dtype=wp.float64),     # [ne*nqp]  μ̂ at GPs
+        sigma:    wp.float64,
+        sig2tau:  wp.float64,
+        supg:     wp.float64,
+        Ae:       wp.array3d(dtype=wp.float64),
+    ):
+        e = wp.tid()
+        he = h[e]
+        half = he * wp.float64(0.5)
+        # jac = (he/2)^dim — power loop (house idiom, see operators.py)
+        jac = wp.float64(1.0)
+        for _ in range(dim):
+            jac = jac * half
+        dscale = wp.float64(2.0) / he
+
+        for q in range(nqp):
+            dJxW = wtab[q] * jac
+            gp   = e * nqp + q
+            kap  = kq[gp]       # μ̂ at this Gauss point
+
+            # |a| for tau_m_metric
+            amag = wp.float64(0.0)
+            for d in range(dim):
+                amag += aq[gp, d] * aq[gp, d]
+            amag = wp.sqrt(amag)
+            tauM = supg * tau_m_metric(amag, he, kap, sig2tau,
+                                       wp.float64(dim_f))
+
+            for a in range(nbf):
+                Na = Ntab[q, a]
+                # a·∇N_a  (test function augmentation for SUPG)
+                agw = wp.float64(0.0)
+                for d in range(dim):
+                    agw += aq[gp, d] * dNtab[q, a, d] * dscale
+
+                for b in range(nbf):
+                    Nb = Ntab[q, b]
+                    # a·∇N_b  (advection on trial function)
+                    agu = wp.float64(0.0)
+                    # ∇N_a·∇N_b (diffusion)
+                    lap = wp.float64(0.0)
+                    for d in range(dim):
+                        agu += aq[gp, d] * dNtab[q, b, d] * dscale
+                        lap += (dNtab[q, a, d] * dNtab[q, b, d]
+                                * dscale * dscale)
+
+                    # VMS-complete strong residual on trial N_b:
+                    #   res_b = σ N_b + a·∇N_b − μ̂ lapN_b
+                    # The lapN term is zero at p1 (Q1 Laplacians = 0) but
+                    # required at p2 for third-order L2 convergence (same
+                    # finding as scalar_transport.py — see its PROVENANCE note).
+                    resu = (sigma * Nb + agu
+                            - kap * lapNtab[q, b] * dscale * dscale)
+
+                    # Galerkin: σ(N_b N_a) + (a·∇N_b) N_a + μ̂(∇N_b·∇N_a)
+                    # SUPG:     τ_M (a·∇N_a) res_b
+                    wp.atomic_add(
+                        Ae, e, a, b,
+                        (sigma * Na * Nb + Na * agu + kap * lap
+                         + tauM * agw * resu) * dJxW)
+
+    _kernel_cache[key] = xdd_carrier_Ae
+    return xdd_carrier_Ae
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# B2 — carrier load kernel
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_xdd_carrier_be(nbf: int, nqp: int, dim: int):
+    """Element load for the XDD carrier brick.
+
+    Implements: (f, N_a) + τ_M (a·∇N_a, f)
+    where f is the full source (D̂ − R̂ + BDF-history for B4;
+    the manufactured source for MMS tests).
+
+    Cache key: ("xdd_carrier_be", nbf, nqp, dim).
+    """
+    key = ("xdd_carrier_be", nbf, nqp, dim)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    dim_pow = float(dim)
+    dim_f   = float(dim)
+
+    @wp.kernel(module="unique", enable_backward=False,
+               module_options=({"max_unroll": 0} if dim >= 3 else {}))
+    def xdd_carrier_be(
+        conn:    wp.array2d(dtype=wp.int32),
+        h:       wp.array(dtype=wp.float64),
+        Ntab:    wp.array2d(dtype=wp.float64),
+        dNtab:   wp.array3d(dtype=wp.float64),
+        wtab:    wp.array(dtype=wp.float64),
+        aq:      wp.array2d(dtype=wp.float64),   # [ne*nqp, dim]
+        kq:      wp.array(dtype=wp.float64),     # [ne*nqp]  μ̂ at GPs
+        fq:      wp.array(dtype=wp.float64),     # [ne*nqp]  source
+        sig2tau: wp.float64,
+        supg:    wp.float64,
+        be:      wp.array2d(dtype=wp.float64),
+    ):
+        e = wp.tid()
+        he = h[e]
+        half = he * wp.float64(0.5)
+        jac = wp.float64(1.0)
+        for _ in range(dim):
+            jac = jac * half
+        dscale = wp.float64(2.0) / he
+
+        for q in range(nqp):
+            dJxW = wtab[q] * jac
+            gp   = e * nqp + q
+            kap  = kq[gp]
+            fv   = fq[gp]
+
+            amag = wp.float64(0.0)
+            for d in range(dim):
+                amag += aq[gp, d] * aq[gp, d]
+            amag = wp.sqrt(amag)
+            tauM = supg * tau_m_metric(amag, he, kap, sig2tau,
+                                       wp.float64(dim_f))
+
+            for a in range(nbf):
+                agw = wp.float64(0.0)
+                for d in range(dim):
+                    agw += aq[gp, d] * dNtab[q, a, d] * dscale
+                # (f, N_a) + τ_M (a·∇N_a, f)  — same structure as scalar_be
+                wp.atomic_add(be, e, a,
+                              (Ntab[q, a] + tauM * agw) * fv * dJxW)
+
+    _kernel_cache[key] = xdd_carrier_be
+    return xdd_carrier_be
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# B2 — assembly helper
+# ══════════════════════════════════════════════════════════════════════════════
+
+def assemble_xdd_carrier(dm, aq_gp, mu_gp, fq_gp, *, sigma=0.0,
+                          sig2tau=None, supg=None):
+    """Assemble the constrained XDD carrier system T^T K T, T^T F.
+
+    Parameters
+    ----------
+    dm : DeviceMesh
+    aq_gp : dict {p: np.ndarray[ngp, dim]}
+        Advection field at Gauss points.  Caller builds this as
+        ``sign * mu_gp * grad_phi_gp``:
+          electrons → sign=-1  →  aq = −μ̂ ∇φ̂
+          holes     → sign=+1  →  aq = +μ̂ ∇φ̂
+        The sign convention is fully absorbed by the caller; this assembly
+        helper and the kernel are sign-agnostic.
+    mu_gp : dict {p: np.ndarray[ngp]}
+        Mobility μ̂(x) at GPs (diffusivity in the drift-diffusion PDE).
+    fq_gp : dict {p: np.ndarray[ngp]}
+        Source f at GPs.  For standalone MMS: manufactured source.
+        For B4 coupled solve: D̂ − R̂ + BDF-history terms.
+    sigma : float
+        BDF time coefficient: 0 (steady), 1/Δt (BDF1), 3/(2Δt) (BDF2).
+    sig2tau : float or None
+        (2σ)² passed to tau_m_metric.  Derived as (2σ)² if None.
+    supg : float or None
+        SUPG scale.  1.0 (on, default) or 0.0 (off = Galerkin).
+
+    Returns
+    -------
+    K : scipy.sparse.csr_matrix  (constrained, n_free × n_free)
+    F : np.ndarray               (constrained, length n_free)
+    """
+    if sig2tau is None:
+        sig2tau = (2.0 * sigma) ** 2
+    supg_val = 1.0 if supg is None else float(supg)
+
+    d = dm.device
+    rows, cols, vals = [], [], []
+    F_full = np.zeros(dm.n_nodes)
+
+    for pv, b in dm.bins.items():
+        conn_np = dm.mesh.conn_of[pv].astype(np.int64)
+        ne, nbf = conn_np.shape
+        nqp     = b["nqp"]
+
+        aq_np  = np.ascontiguousarray(aq_gp[pv],  dtype=np.float64)
+        mu_np  = np.ascontiguousarray(mu_gp[pv],  dtype=np.float64)
+        fq_np  = np.ascontiguousarray(fq_gp[pv],  dtype=np.float64)
+
+        aq_d  = wp.array(aq_np,  dtype=wp.float64, device=d)
+        kq_d  = wp.array(mu_np,  dtype=wp.float64, device=d)
+        fq_d  = wp.array(fq_np,  dtype=wp.float64, device=d)
+
+        Ae = wp.zeros((ne, nbf, nbf), dtype=wp.float64, device=d)
+        be = wp.zeros((ne, nbf),      dtype=wp.float64, device=d)
+
+        kA = make_xdd_carrier_Ae(nbf, nqp, dm.dim)
+        kb = make_xdd_carrier_be(nbf, nqp, dm.dim)
+        sg = wp.float64(supg_val)
+
+        wp.launch(kA, dim=ne,
+                  inputs=[b["conn"], b["h"], b["N"], b["dN"], b["lapN"],
+                          b["w"], aq_d, kq_d,
+                          wp.float64(sigma), wp.float64(sig2tau), sg, Ae],
+                  device=d)
+        wp.launch(kb, dim=ne,
+                  inputs=[b["conn"], b["h"], b["N"], b["dN"],
+                          b["w"], aq_d, kq_d, fq_d,
+                          wp.float64(sig2tau), sg, be],
                   device=d)
 
         Aeh = Ae.numpy()
