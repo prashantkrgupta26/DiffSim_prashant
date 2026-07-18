@@ -23,6 +23,12 @@ This quantity of interest is the reduced functional
 where u(kappa) is implicitly defined by the PDE.  The adjoint gives
 dJ_hat/dkappa in O(1) solves regardless of how many parameters kappa has.
 
+Information-flow view (Farrell): forward solves propagate data FROM the
+parameter field kappa THROUGH the PDE TO the output functional J.  The
+adjoint reverses this flow — it carries sensitivity FROM the scalar output
+J BACKWARD through the PDE TO every parameter at once, achieving O(1)
+gradient cost independent of parameter count N.
+
 Attribution:
   - P.E. Farrell, mathematical background for dolfin-adjoint/pyadjoint.
   - Farrell, Ham, Funke & Rognes (2013). Automated Derivation of the
@@ -108,7 +114,12 @@ PROBES = 0.5 + 0.10 * np.array(
 #   Differentiate R(u,m) = 0 w.r.t. m_i:
 #     A du_i/dm_i = -dA/dm_i * u        (one forward-mode solve per i)
 #     dJ/dm_i = (dJ/du) * du_i/dm_i
-#   Cost: N FORWARD SOLVES.  Exact (to machine precision). Same cost as FD.
+#   Cost: N FORWARD SOLVES — same order O(N), but 2× cheaper than central
+#   differences (which need 2N).
+#
+#   Note: even when R(u, κ) = 0 is nonlinear in u, the adjoint equation
+#   (dR/du)^T λ = (dJ/du)^T is always LINEAR in λ — one linear solve, always,
+#   at the converged state.
 #
 # METHOD 3 — Adjoint
 #   Differentiate the Lagrangian L = J - lambda^T R:
@@ -348,12 +359,16 @@ r_probe   = W @ u_all - u_obs_vals                           # residual at probe
 dJdu_all  = np.asarray(W.T @ r_probe)                       # [n_nodes]
 
 # Adjoint solve (reuse the SAME factorization as the forward solve via A.T)
-# Zero out boundary entries: those rows of A are identity, kappa-independent.
+# STEP 1 — seed zeroing: boundary rows of A_eff are identity (Dirichlet
+# elimination), so (dR/du)^T at boundary dofs is already identity; zeroing
+# dJdu_adj[bdry] forces the adjoint solve to return lam[bdry]=0 directly
+# from those rows — no extra work needed.
 dJdu_adj  = dJdu_all.copy()
 dJdu_adj[bdry_mask] = 0.0                                    # zero boundary rows
 lam       = splu(A_csc.T.tocsc()).solve(dJdu_adj)            # A^T lam = dJ/du
 
-# Zero lam at boundary nodes — their rows of A_eff are kappa-independent
+# STEP 2 — belt-and-suspenders: lam[bdry] should already be 0 from STEP 1,
+# but we zero explicitly as a safeguard before the gradient contraction below.
 lam_int   = lam.copy()
 lam_int[bdry_mask] = 0.0
 
@@ -608,11 +623,11 @@ print()
 # Sanity gates (fail loudly; CI smoke will catch regressions)
 assert np.abs(grad_kappa_tape - grad_kappa_exact).max() < 1e-14, \
     "toy tape check failed"
-assert rel_adj_fd.max()   < 1e-5, \
+assert rel_adj_fd.max()   < 1e-6, \
     f"adj vs FD rel err too large: {rel_adj_fd.max():.2e}"
-assert rel_tape_fd.max()  < 1e-5, \
+assert rel_tape_fd.max()  < 1e-6, \
     f"tape vs FD rel err too large: {rel_tape_fd.max():.2e}"
-assert rel_adj_tape.max() < 1e-7, \
+assert rel_adj_tape.max() < 1e-9, \
     f"adj vs tape rel err too large: {rel_adj_tape.max():.2e}"
 print("All checks passed.")
 print()
