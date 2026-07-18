@@ -1150,3 +1150,26 @@ def test_exciton_source_coupling(device):
     print(f"G14: b_acc_top={b_acc_top:.4e}, b_don_bot={b_don_bot:.4e}")
     assert b_acc_top  > 0, "G14: acceptor generation not reaching top half"
     assert b_don_bot  > 0, "G14: donor generation not reaching bottom half"
+
+    # ── Brief-specified array check: assembled RHS ≈ M @ g_nodal ────────────
+    # Build the mass matrix M via the exciton Ae with the σ_tot=1, μ̂_X=0 trick
+    # (assemble_xdd_exciton with sigma_gp=1, mu_gp=0 → pure Galerkin mass M).
+    # For a CONSTANT Ĝ, the load (Ĝ, N_a)dV = M @ Ĝ_nodal exactly (Ĝ_nodal is
+    # the constant sampled at nodes).  Documented choice: exciton-Ae mass M.
+    from diffsim.physics.exciton_dd import assemble_xdd_exciton as _asm_x
+    Gc = 3.7  # arbitrary constant generation
+    mu0_gp   = {pv: np.zeros(len(xq[pv])) for pv in xq}   # μ̂_X=0 → pure mass M
+    mu1_gp   = {pv: np.ones(len(xq[pv]))  for pv in xq}   # μ̂_X=1 (load path only)
+    sig1_gp  = {pv: np.ones(len(xq[pv]))  for pv in xq}   # σ_tot=1 → mass M
+    fq_const = {pv: np.full(len(xq[pv]), Gc) for pv in xq}
+    # M via the σ_tot=1, μ̂_X=0 trick: the returned stiffness IS the Galerkin
+    # mass matrix M (no diffusion, unit mass coefficient).  The load `b` is
+    # taken from the μ̂_X=1 call: with aq=0 and supg=0 the exciton load reduces
+    # to (Ĝ, N_a)dV independent of μ̂_X (μ̂ enters only the SUPG-disabled path).
+    M_free, _        = _asm_x(dm, mu0_gp, sig1_gp, fq_const)  # pure mass M
+    _,      b_const  = _asm_x(dm, mu1_gp, sig1_gp, fq_const)  # clean load
+    g_nodal_free = np.full(cons.T.shape[1], Gc)             # constant on free dofs
+    Mg = M_free @ g_nodal_free
+    rel = np.linalg.norm(b_const - Mg) / max(np.linalg.norm(Mg), 1e-30)
+    print(f"G14 array check: ||b - M@g_nodal||/||M@g_nodal|| = {rel:.2e}")
+    assert rel < 1e-12, f"G14: assembled RHS != M @ g_nodal (rel={rel:.2e})"
