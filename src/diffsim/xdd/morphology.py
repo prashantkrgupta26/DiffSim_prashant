@@ -4,7 +4,7 @@ Provides:
 - Morphology dataclass — structured Cartesian grid morphology
 - read_cpu_cloud()    — parse the CPU legacy .txt cloud format
 - write_cpu_cloud()   — inverse writer for round-trip support
-- signed_distance()   — scipy EDT-based signed distance utility
+- signed_distance()   — scipy EDT-based signed distance utility with mid-plane correction
 - from_film_npz()     — reader for DiffSim film-output npz files
 - tanh_mask()         — relaxed phase indicator (→1 in acceptor)
 - region_weights()    — (w_donor, w_acceptor, w_interface) weights
@@ -18,16 +18,22 @@ Sign convention (CPU ground truth):
   dist < 0 : donor side
   dist = 0 : at the interface
 
-signed_distance() formula:
-  dist = edt(morph >= 0.5, sampling) - edt(morph < 0.5, sampling)
-  This gives +distance in acceptor, -distance in donor — matching the CPU
-  convention.  No flip required (verified against morph_bilayer_2D.txt).
+signed_distance() formula and mid-plane correction:
+  EDT is voxel-center-to-voxel-center, so the raw field
+      raw = edt(morph >= 0.5, sampling) - edt(morph < 0.5, sampling)
+  places the zero-crossing half a voxel into the acceptor region rather than
+  at the physical interface mid-plane.  signed_distance() applies the correction
+      dist = raw - 0.5 * max(spacing) * sign(raw)
+  shifting every non-zero value half a voxel toward zero.  After correction,
+  deviations from the CPU ground-truth file (morph_bilayer_2D.txt) are
+  symmetric ±0.5 voxel on both donor and acceptor sides.
 
-Half-voxel bias note:
-  EDT measures distance from voxel *center* to nearest opposite-phase voxel
-  center.  The D/A interface sits between voxel centers, so all EDT distances
-  carry a half-voxel bias (~half a spacing).  This is accepted and documented;
-  the bilayer gate asserts agreement within 0.51 * max(spacing).
+CPU file convention and parity:
+  The CPU files (morph_bilayer_2D.txt) anchor dist=0 at the last acceptor
+  node rather than the geometric mid-plane.  Against that convention, our
+  utility deviates by up to ±0.5 * max(spacing) symmetrically.
+  The CPU-parity path (read_cpu_cloud) uses the file-provided dist field
+  directly and is unaffected by this utility.
 """
 from __future__ import annotations
 
@@ -229,21 +235,31 @@ def signed_distance(
 ) -> np.ndarray:
     """Compute a signed distance field from a binary morphology label array.
 
-    Uses scipy.ndimage.distance_transform_edt with per-axis sampling=spacing.
+    Uses scipy.ndimage.distance_transform_edt with per-axis sampling=spacing,
+    then applies a half-voxel mid-plane correction so the zero-crossing sits
+    at the physical interface mid-plane between donor and acceptor voxel centres.
 
-    Formula:
-        dist = edt(morph >= 0.5, sampling) - edt(morph < 0.5, sampling)
+    Formula (raw EDT, then mid-plane correction):
+        raw  = edt(morph >= 0.5, sampling) - edt(morph < 0.5, sampling)
+        dist = raw - 0.5 * max(spacing) * sign(raw)
+
+    EDT is voxel-centre-to-voxel-centre; the correction shifts each non-zero
+    value half the maximum voxel spacing toward zero.  np.sign(0)=0, so exact
+    zeros are untouched.  The raw field has no values in (-s, s) minus {0} by EDT
+    construction, so the correction never flips signs.
 
     Sign convention (matches CPU ground truth):
         dist > 0 : acceptor side (morph=1 region)
         dist < 0 : donor side (morph=0 region)
         dist ~ 0 : near the D/A interface
 
-    Half-voxel bias:
-        EDT distances are measured from voxel *centre* to nearest opposite-phase
-        voxel centre.  The true interface sits between voxel centres, so all
-        values carry a half-voxel bias (~half a spacing).  Agreement with the
-        CPU file is asserted within 0.51 * max(spacing) in Gate 2.
+    Parity with CPU files:
+        The CPU files (e.g. morph_bilayer_2D.txt) anchor dist=0 at the last
+        acceptor node rather than the geometric mid-plane.  After the mid-plane
+        correction, deviations vs that convention are symmetric ±0.5*max(spacing)
+        on both donor and acceptor sides (Gate 2 tolerance: 0.51*max(spacing)).
+        The CPU-parity path (read_cpu_cloud) uses file-provided dist directly
+        and is unaffected.
 
     Parameters
     ----------
@@ -265,8 +281,19 @@ def signed_distance(
     d_from_donor    = distance_transform_edt(acceptor_mask, sampling=sampling)
     d_from_acceptor = distance_transform_edt(donor_mask,    sampling=sampling)
 
-    # Positive in acceptor, negative in donor
-    dist = d_from_donor - d_from_acceptor
+    # Positive in acceptor, negative in donor (raw: voxel-center-to-voxel-center)
+    raw = d_from_donor - d_from_acceptor
+
+    # Half-voxel mid-plane correction:
+    # EDT measures from voxel *centre* to nearest opposite-phase voxel centre, so
+    # every non-zero value is shifted by +0.5*spacing relative to the physical
+    # interface mid-plane.  Subtract half the max-spacing in the direction of the
+    # current sign so that the zero-crossing sits at the true mid-plane.
+    # np.sign(0)=0, so exact zeros are untouched.
+    # The raw field has no values in (-s, 0) or (0, s) by EDT construction,
+    # so this shift cannot flip any sign.
+    s = float(max(spacing))
+    dist = raw - 0.5 * s * np.sign(raw)
     return dist
 
 
@@ -474,7 +501,8 @@ def descriptors(m: Morphology) -> dict:
             interface_edges × (face area per edge) / domain_volume  [m^-1].
             Face area for each edge is the product of spacings of all axes
             EXCEPT the axis along which the pair is measured.
-            Domain volume is the product of (n[d] * spacing[d]) for all d.
+            Domain volume is the physical extent: product of (n[d]-1)*spacing[d]
+            for all d (consistent with spacing = L/(n-1) in read_cpu_cloud).
     """
     morph   = m.morph
     spacing = m.spacing
@@ -501,7 +529,7 @@ def descriptors(m: Morphology) -> dict:
     # Interface area per volume
     # Face area for edges along axis `ax` = product of spacings for all OTHER axes
     # Domain volume = product of (n[d] * spacing[d]) for all d
-    domain_volume = float(np.prod([shape[d] * spacing[d] for d in range(ndim)]))
+    domain_volume = float(np.prod([(shape[d] - 1) * spacing[d] for d in range(ndim)]))
 
     total_face_area = 0.0
     label = acceptor_mask.astype(np.int8)

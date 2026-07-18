@@ -110,18 +110,16 @@ class TestSignedDistanceBilayer:
         spacing = (0.25e-7, 0.25e-7)
         morph = self._make_bilayer_morph()
         dist = signed_distance(morph, spacing)
-        # Reference: file values
+        # Reference: file values (CPU file anchors dist=0 at the last acceptor node iy=2)
         ref = np.zeros((5, 5))
         ref[:, 0] = 0.5e-7
         ref[:, 1] = 0.25e-7
         ref[:, 2] = 0.0
         ref[:, 3] = -0.25e-7
         ref[:, 4] = -0.5e-7
-        # The EDT measures center-to-center distances; the CPU file places dist=0
-        # at the last acceptor node (iy=2) rather than the mid-interface.  This
-        # causes a systematic 1-voxel bias on the acceptor side.  Tolerance is
-        # 1.01 * max(spacing) to accommodate the full inter-voxel-center offset.
-        tol = 1.01 * max(spacing)
+        # After the half-voxel mid-plane correction in signed_distance(), the
+        # deviation vs the CPU file is symmetric ±0.5 voxel on both sides.
+        tol = 0.51 * max(spacing)
         assert np.all(np.abs(dist - ref) <= tol), (
             f"Max deviation {np.max(np.abs(dist-ref)):.3e} exceeds {tol:.3e}"
         )
@@ -221,11 +219,12 @@ class TestDescriptorsBilayer:
         # interface_area_per_volume:
         # Each edge corresponds to a face area = dx * 1 (2D: dx in x, thickness 1 voxel)
         # Face area for y-axis neighbor pair = dx (the x-dimension face)
-        # Domain volume (2D area) = nx*dx * ny*dy = 5*dx * 5*dy where dx=dy=0.25e-7
+        # Domain volume (2D physical extent) = (nx-1)*dx * (ny-1)*dy
+        # consistent with spacing = L/(n-1) in read_cpu_cloud
         spacing = m.spacing
         dx, dy = spacing[0], spacing[1]
         face_area = dx        # 2D: each interface "edge" is a 1D line of length dx
-        domain_vol = (5 * dx) * (5 * dy)
+        domain_vol = ((5 - 1) * dx) * ((5 - 1) * dy)
         expected_iapv = 5 * face_area / domain_vol
         assert abs(d["interface_area_per_volume"] - expected_iapv) < 1e-3 * expected_iapv
 
