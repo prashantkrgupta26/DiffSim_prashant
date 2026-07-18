@@ -3,8 +3,9 @@
 LEARNING OUTCOME. You can open any DiffSim kernel, identify what ``wp.Tape``
 records, and reason about which parts to differentiate vs. what to compute
 once and store.  You have run the dot-product test for the Poisson operator
-and seen a two-blob conductivity field recover from noise in ~40 gradient-
-descent steps.
+and seen gradient descent reduce the probe misfit by >100× — and understood
+why that does NOT imply the κ field was recovered (5 probes cannot determine
+64 unknowns).
 
 BACKGROUND. Adapted from the mathematical background developed for
 dolfin-adjoint/pyadjoint by Patrick E. Farrell; Farrell, Ham, Funke & Rognes
@@ -26,9 +27,11 @@ Attribution:
 EXPECTED RESULTS (CPU, level-3 grid, 5 probes, FP64):
     Dot-product test rel err          < 1e-12   (symmetric A: ~1e-17)
     Factorization reuse ratio           > 1.5 x  (one LU for fwd+adj)
-    kappa recovery J_init (misfit)    5e-3 – 5e-2
-    kappa recovery J_final (misfit)     < 5e-4
-    kappa recovery misfit drop (J)      > 100 x  (printed table)
+    misfit J_init                     5e-3 – 5e-2
+    misfit J_final                      < 5e-4
+    misfit drop (J)                     > 100 x  (printed table)
+    param error ratio (||kappa_final-kappa_true||/||kappa_init-kappa_true||)
+                                        0.5 – 1.5  (barely moved — underdetermined)
 
 Run:  python tutorials/E_differentiable/E0b_anatomy_of_a_taped_brick.py
 """
@@ -343,7 +346,7 @@ print("-" * 65)
 #
 # NEVER unroll the Newton loop through a tape — you would differentiate through
 # ~20 linear solves and their convergence checks, accumulating catastrophic
-# rounding.  The IFT derivative is cleaner AND cheaper.
+# cost and unnecessary complexity.  The IFT derivative is cleaner AND cheaper.
 #
 # DiffSim: the SBM Poisson uses bicgstab (nonsymmetric operator); for the
 # kappa-gradient, diffsim.sbm.adjoint constructs (dR/du)^T = A^T and solves
@@ -585,10 +588,10 @@ print()
 # ──────────────────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────────
-# §6  PAYOFF: κ(x)-FIELD RECOVERY
+# §6  PAYOFF — GRADIENT DESCENT ON AN UNDERDETERMINED INVERSE (misfit minimization)
 # ─────────────────────────────────────────────────────────────────────────────
 
-print("§6  PAYOFF — κ(x)-FIELD RECOVERY (gradient descent, ~40 steps)")
+print("§6  PAYOFF — GRADIENT DESCENT ON AN UNDERDETERMINED INVERSE (misfit minimization)")
 print("=" * 65)
 print()
 
@@ -688,10 +691,24 @@ for step in range(N_STEPS):
 
 J_final  = J_vals[-1]
 err_drop = J_init / max(J_final, 1e-20)
+
+# Parameter-space error ratio — underdetermination diagnostic
+# The misfit dropped >100×, but does the kappa field actually move toward the truth?
+# ||kappa_final - kappa_true|| / ||kappa_init - kappa_true||:
+#   ratio ~ 1.0 means the parameter ERROR barely moved — classic underdetermined behaviour.
+#   5 probes cannot determine 64 unknowns; the low-frequency misfit was minimised
+#   but high-frequency kappa components are unconstrained.
+#   See E0c for Tikhonov regularisation and the aside in §6 above.
+param_err_init  = np.linalg.norm(kappa_init - kappa_true)
+param_err_final = np.linalg.norm(kappa - kappa_true)
+param_err_ratio = param_err_final / max(param_err_init, 1e-30)  # parameter error barely moved — underdetermined; see the aside and E0c
+
 print()
 print(f"  J_init  (misfit)  : {J_init:.4e}")
 print(f"  J_final (misfit)  : {J_final:.4e}")
 print(f"  Misfit drop (J)   : {err_drop:.1f}x  (require >= 100x)")
+print(f"  ||kappa_final - kappa_true|| / ||kappa_init - kappa_true||"
+      f" : {param_err_ratio:.3f}  (expect ~1.0 — parameter error barely moved)")
 print()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -702,9 +719,10 @@ print("EXPECTED RESULTS")
 print("=" * 65)
 print(f"  Dot-product rel err       : {dp_rel:.2e}  (expect < 1e-12)")
 print(f"  Factorization reuse ratio : {ratio:.2f}x   (expect > 1.5x)")
-print(f"  kappa recovery J_init     : {J_init:.4e}  (expect 5e-3 – 5e-2)")
-print(f"  kappa recovery J_final    : {J_final:.4e}  (expect < 5e-4)")
-print(f"  kappa recovery J drop     : {err_drop:.1f}x   (expect >= 100x)")
+print(f"  misfit J_init             : {J_init:.4e}  (expect 5e-3 – 5e-2)")
+print(f"  misfit J_final            : {J_final:.4e}  (expect < 5e-4)")
+print(f"  misfit drop               : {err_drop:.1f}x   (expect >= 100x)")
+print(f"  param error ratio         : {param_err_ratio:.3f}  (expect 0.5 – 1.5)")
 print()
 
 # Sanity gates — asserts match PRINTED thresholds with ≥2× headroom
@@ -713,12 +731,14 @@ assert dp_rel < 1e-12, \
     f"Dot-product test FAILED: {dp_rel:.2e} >= 1e-12"
 assert ratio > 1.5, \
     f"Factorization reuse ratio too small: {ratio:.2f} < 1.5"
-assert J_init > 5e-4, \
-    f"J_init too small (initial guess too close to truth): {J_init:.4e}"
+assert 5e-3 <= J_init <= 5e-2, \
+    f"J_init out of expected range 5e-3–5e-2: {J_init:.4e}"
 assert J_final < 5e-4, \
     f"J_final too large (recovery stalled): {J_final:.4e} >= 5e-4"
 assert err_drop >= 100.0, \
     f"Misfit drop insufficient: {err_drop:.1f}x < 100x"
+assert 0.5 <= param_err_ratio <= 1.5, \
+    f"Param error ratio out of expected band: {param_err_ratio:.3f} (expect 0.5–1.5)"
 print("All checks passed.")
 print()
 

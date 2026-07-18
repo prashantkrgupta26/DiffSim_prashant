@@ -39,7 +39,7 @@ Attribution:
   - "Learning reaction rates" example lineage: dolfin-adjoint tutorial.
 
 EXPECTED RESULTS (CPU, level-3 grid, 5 probes, FP64):
-    J at eval kappa (kappa_true two-blob, kappa_eval=1.3)  ~ 1.17e-01
+    J at eval kappa (kappa_true two-blob, kappa_eval=1.3)  ~ 8.35e-03
     Adjoint time                                           < 0.05 s
     FD time (64 params, central differences)               < 1.5  s
     adj  vs FD  max rel err                                < 1e-6
@@ -47,7 +47,9 @@ EXPECTED RESULTS (CPU, level-3 grid, 5 probes, FP64):
     adj  vs tape max rel err                               < 1e-9
     FD cost / adjoint cost                                 ~ 30-80 x
       (n_params=64 elements; first-run tape includes kernel compilation;
-       subsequent runs show the steady-state ratio of ~32x)
+       subsequent runs show the steady-state ratio of ~35x)
+    kappa_true range                                       [1.0, ~2.5]
+      (two-blob field; centroids from anchors()/2^31 + 0.5*h, NOT Morton integers)
 
 Run:  python tutorials/E_differentiable/E0a_thinking_differentiable.py
 """
@@ -259,6 +261,8 @@ def solve_poisson(kappa_vec: np.ndarray):
     Returns
     -------
     A_csc     : assembled constrained stiffness (scipy CSC, for adjoint reuse)
+    lu        : SuperLU factorization — reuse for adjoint via lu.solve(rhs, trans='T')
+                (one factorization serves both — see E0b §4)
     u_free    : free-node solution (= u_all since T=I for this mesh)
     u_all     : full-node solution
     bdry_dofs : indices of Dirichlet-constrained dofs
@@ -294,9 +298,10 @@ def solve_poisson(kappa_vec: np.ndarray):
         bvec[i] = u_star(coords[i:i + 1])[0]
 
     A_csc  = A_lil.tocsr().tocsc()                           # for splu
-    u_free = splu(A_csc).solve(bvec)                         # THE SOLVE
+    lu     = splu(A_csc)                                     # ← THE LU FACTORIZATION (used twice)
+    u_free = lu.solve(bvec)                                  # forward solve
     u_all  = np.asarray(cons.T @ u_free)                     # scatter to all nodes
-    return A_csc, u_free, u_all, bdry
+    return A_csc, lu, u_free, u_all, bdry
 
 # ─────────────────────────────────────────────────────────────────────────────
 # §4  POISSON dJ/dkappa — THREE-WAY CHECK
@@ -304,12 +309,20 @@ def solve_poisson(kappa_vec: np.ndarray):
 
 # ── Setup: fixed observation data from a "true" kappa field ───────────────
 # Two-blob kappa field as the ground truth (range ~ 1.0 to 2.5).
-xc    = dm.mesh.tree.anchors() * 2.0 ** (-LEVEL) + 0.5 * dm.mesh.tree.h()[:, None]
+# Element centroids from Gauss-point coordinates (same approach as E0b):
+#   anchors() returns Morton integers in [0, 2^31); dividing by 2^31 maps
+#   them to [0,1).  Adding half the cell width gives the centroid in [0,1]^2.
+# NOTE: the old formula  anchors() * 2^{-LEVEL}  produced Morton-integer
+# garbage (coordinates ~1e9), making kappa_true essentially flat.  Fixed here.
+xc    = dm.mesh.tree.anchors() / 2**31 + 0.5 * dm.mesh.tree.h()[:, None]
+print(f"  kappa_true centroid range check: x in [{xc[:,0].min():.3f},{xc[:,0].max():.3f}]"
+      f", y in [{xc[:,1].min():.3f},{xc[:,1].max():.3f}]  (expect [0,1])")
 kappa_true = (1.0
               + 1.5 * np.exp(-40 * ((xc[:, 0] - 0.3)**2 + (xc[:, 1] - 0.3)**2))
               + 1.0 * np.exp(-40 * ((xc[:, 0] - 0.7)**2 + (xc[:, 1] - 0.7)**2)))
+print(f"  kappa_true range: [{kappa_true.min():.3f}, {kappa_true.max():.3f}]  (expect [1.0, ~2.5])")
 
-_, _, u_true_all, _ = solve_poisson(kappa_true)
+_, _, _, u_true_all, _ = solve_poisson(kappa_true)
 u_obs_vals = W @ u_true_all           # "measurements" at five probes
 
 # Evaluation point: uniform kappa away from the truth
@@ -317,7 +330,7 @@ kappa_eval = np.ones(n_elem) * 1.3   # where we compute the gradient
 
 def J_func(kv: np.ndarray) -> float:
     """Scalar loss: (1/2) sum_i (u(x_i) - u_obs_i)^2."""
-    _, _, ua, _ = solve_poisson(kv)
+    _, _, _, ua, _ = solve_poisson(kv)
     r = W @ ua - u_obs_vals
     return 0.5 * float(r @ r)
 
@@ -352,7 +365,7 @@ def J_func(kv: np.ndarray) -> float:
 # ──────────────────────────────────────────────────────────────────────────
 
 t_a0 = time.time()
-A_csc, u_free, u_all, bdry = solve_poisson(kappa_eval)
+A_csc, lu_fwd, u_free, u_all, bdry = solve_poisson(kappa_eval)
 
 # Gradient of J w.r.t. solution at probe points, scattered to all nodes
 r_probe   = W @ u_all - u_obs_vals                           # residual at probes
@@ -365,7 +378,9 @@ dJdu_all  = np.asarray(W.T @ r_probe)                       # [n_nodes]
 # from those rows — no extra work needed.
 dJdu_adj  = dJdu_all.copy()
 dJdu_adj[bdry_mask] = 0.0                                    # zero boundary rows
-lam       = splu(A_csc.T.tocsc()).solve(dJdu_adj)            # A^T lam = dJ/du
+# Reuse the forward LU factor via trans='T' — one factorization serves both.
+# (one factorization serves both — see E0b §4)
+lam       = lu_fwd.solve(dJdu_adj, trans='T')               # A^T lam = dJ/du
 
 # STEP 2 — belt-and-suspenders: lam[bdry] should already be 0 from STEP 1,
 # but we zero explicitly as a safeguard before the gradient contraction below.
@@ -611,7 +626,7 @@ print()
 print("=" * 65)
 print("EXPECTED RESULTS")
 print("=" * 65)
-print(f"  J at eval kappa        : {J0:.3e}  (expect ~1.17e-01)")
+print(f"  J at eval kappa        : {J0:.3e}  (expect ~8.35e-03)")
 print(f"  adj  vs FD  max rel err: {rel_adj_fd.max():.2e}  (expect < 1e-6)")
 print(f"  tape vs FD  max rel err: {rel_tape_fd.max():.2e}  (expect < 1e-6)")
 print(f"  adj  vs tape rel err   : {rel_adj_tape.max():.2e}  (expect < 1e-9)")
