@@ -106,9 +106,10 @@ def _solve(dm, mesh, cons, eps_fn, f_fn, lam2, device):
 
 @pytest.mark.parametrize("p,order_lo", [(1, 1.9), (2, 2.9)])
 def test_mms_const_eps(p, order_lo, device):
-    """G1: constant ε̂=1, λ²=1 — p1 → ≥2, p2 → ≥3 (last-interval order)."""
+    """G1: constant ε̂=1, λ²=1 — p1 → ≥2, p2 → ≥3 (least-squares order)."""
     lam2 = 1.0
     levels = (3, 4, 5)
+    hs = [2.0 ** (-lv) for lv in levels]
     errs = []
     for lv in levels:
         dm, mesh, cons = _make_dm(lv, p, device)
@@ -116,9 +117,9 @@ def test_mms_const_eps(p, order_lo, device):
                            lambda x: np.ones(len(x)),
                            lambda x: _source_const_eps(x, lam2),
                            lam2, device))
-    orders = [np.log2(errs[i] / errs[i + 1]) for i in range(len(errs) - 1)]
-    print(f"G1 p{p}: errs {[f'{e:.2e}' for e in errs]} orders {[f'{o:.2f}' for o in orders]}")
-    assert orders[-1] >= order_lo, (orders, errs)
+    order = observed_order(hs, errs)
+    print(f"G1 p{p}: errs {[f'{e:.2e}' for e in errs]} order {order:.2f}")
+    assert order >= order_lo, (order, errs)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -130,6 +131,7 @@ def test_mms_var_eps(p, order_lo, device):
     """G2: ε̂(x)=1+0.3·tanh((x-0.5)/0.1), manufactured source — orders hold."""
     lam2 = 1.0
     levels = (3, 4, 5)
+    hs = [2.0 ** (-lv) for lv in levels]
     errs = []
     for lv in levels:
         dm, mesh, cons = _make_dm(lv, p, device)
@@ -137,9 +139,9 @@ def test_mms_var_eps(p, order_lo, device):
                            _eps_var,
                            lambda x: _source_var_eps(x, lam2),
                            lam2, device))
-    orders = [np.log2(errs[i] / errs[i + 1]) for i in range(len(errs) - 1)]
-    print(f"G2 p{p}: errs {[f'{e:.2e}' for e in errs]} orders {[f'{o:.2f}' for o in orders]}")
-    assert orders[-1] >= order_lo, (orders, errs)
+    order = observed_order(hs, errs)
+    print(f"G2 p{p}: errs {[f'{e:.2e}' for e in errs]} order {order:.2f}")
+    assert order >= order_lo, (order, errs)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -147,57 +149,28 @@ def test_mms_var_eps(p, order_lo, device):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def test_source_coupling(device):
-    """G3: non-zero ρ=(p̂−n̂) coupled source term; error consistent with p1.
+    """G3: exercises the rho_gp (p̂−n̂) branch of the load kernel with ε̂=1.
 
-    Manufactured: φ̂ = sin(πx)sin(πy), ρ = sin(πx)sin(πy) (arbitrary).
-    Source: f = -λ²ε̂ Δφ̂ - ρ  (the full RHS so (p̂-n̂,w) is exercised).
+    The full manufactured source −λ²Δφ̂ is routed entirely through rho_gp
+    (f_src_gp=None), so the (p̂−n̂, w) accumulation path is what drives the
+    solve.  Checks the solved field against φ̂=sin(πx)sin(πy), exercising the
+    coupling term B4 will later drive with carrier densities.
     """
     lam2, level, p = 1.0, 5, 1
     dm, mesh, cons = _make_dm(level, p, device)
 
-    # manufactured charge density (same shape as φ̂)
-    rho_fn = _phi_star
-
-    def f_fn(x):
-        # RHS of weak form: λ²ε̂(∇φ̂,∇w) = (f + ρ, w)
-        # so kernel source = −λ² Δφ̂ − ρ  (the sign convention: b adds rho_gp)
-        return _source_const_eps(x, lam2) - rho_fn(x)
-
     xq = gauss_points(mesh, dm.tables_by_p)
-    # eps_gp = 1, rho_gp = rho_fn(xq)
+    # Route the full manufactured source through rho_gp; no extra body load.
+    rho_gp = {pv: _source_const_eps(xq[pv], lam2) for pv in xq}
     eps_gp = {pv: np.ones(len(xq[pv])) for pv in xq}
-    rho_gp = {pv: rho_fn(xq[pv]) for pv in xq}
-
-    # The RHS load is: (f_total, w) = (−λ²Δφ̂, w) which the assembly covers
-    # via the manufactured source.  But we want to test the (ρ, w) branch
-    # specifically: pass rho_gp and set the external load to just the
-    # Laplacian part (no density): so f_body = -λ²Δφ̂ is the "load" and
-    # rho = rho_fn adds the coupling contribution separately.
-    # Actually: assemble_xdd_poisson builds RHS as load(f_src) + rho.
-    # Here f_src = 0 (no external forcing beyond density coupling).
-    # The Poisson source is: -λ²ε̂ Δφ̂ = manufactured_rhs.
-    # The coupling adds: rho = p̂-n̂ = rho_fn
-    # So full source = -λ²ε̂ Δφ̂ - rho_fn. We pass rho_gp = rho_fn and
-    # f_src = -λ²Δφ̂ - rho_fn so total RHS = f_src + rho = -λ²Δφ̂.
-    # That's the same as the pure-Laplacian gate. Instead: let rho carry all
-    # of it. f_src = 0, rho_gp = -λ²Δφ̂ - rho_fn → no, that conflates.
-    #
-    # Clean split: f_src = 0 (no additional load), rho_gp = -(−λ²Δφ̂) = λ²Δφ̂
-    # is WRONG sign convention. Let the assembly do:
-    #    b = load_kernel(f_src) + load_kernel(rho_gp)
-    # and we manufacture: rho = -(- λ²Δφ̂) = the source for the Poisson eq.
-    # when f_src = 0.  This DOES exercise the rho branch.
-    rho_gp2 = {pv: _source_const_eps(xq[pv], lam2) for pv in xq}
-    eps_gp2 = {pv: np.ones(len(xq[pv])) for pv in xq}
-    A, b = assemble_xdd_poisson(dm, eps_gp2, rho_gp2, lam2=lam2,
-                                 f_src_gp=None)
+    A, b = assemble_xdd_poisson(dm, eps_gp, rho_gp, lam2=lam2, f_src_gp=None)
     coords = mesh.node_coords[cons.free_nodes]
     A, b = _apply_dirichlet(A, b, coords, _phi_star)
     x = splu(A.tocsc()).solve(b)
     u_all = np.asarray(cons.T @ x)
     err = l2_error(dm, u_all, _phi_star)
-    # Should be well below p1 L5 ballpark (~2e-3 for sin/sin at L5)
-    assert err < 5e-3, f"G3 coupling error too large: {err:.2e}"
+    # Measured ~4e-4 at L5 p1; bound is 1e-3 (2.5× headroom).
+    assert err < 1e-3, f"G3 coupling error too large: {err:.2e}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────

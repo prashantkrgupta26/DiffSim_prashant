@@ -63,8 +63,6 @@ def make_xdd_poisson_Ae(nbf: int, nqp: int, dim: int):
     if key in _kernel_cache:
         return _kernel_cache[key]
 
-    dim_pow = float(dim)
-
     @wp.kernel(module="unique", enable_backward=False)
     def xdd_poisson_Ae(
         conn:   wp.array2d(dtype=wp.int32),
@@ -77,7 +75,11 @@ def make_xdd_poisson_Ae(nbf: int, nqp: int, dim: int):
     ):
         e = wp.tid()
         he = h[e]
-        jac = wp.pow(he * wp.float64(0.5), wp.float64(dim_pow))
+        half = he * wp.float64(0.5)
+        # jac = (he/2)^dim — power loop (house idiom, see operators.py)
+        jac = wp.float64(1.0)
+        for _ in range(dim):
+            jac = jac * half
         dscale = wp.float64(2.0) / he
         fe = FEMElm()
         fe.e = e
@@ -120,8 +122,6 @@ def make_xdd_poisson_be(nbf: int, nqp: int, dim: int):
     if key in _kernel_cache:
         return _kernel_cache[key]
 
-    dim_pow = float(dim)
-
     @wp.kernel(module="unique", enable_backward=False)
     def xdd_poisson_be(
         conn:   wp.array2d(dtype=wp.int32),
@@ -134,7 +134,11 @@ def make_xdd_poisson_be(nbf: int, nqp: int, dim: int):
     ):
         e = wp.tid()
         he = h[e]
-        jac = wp.pow(he * wp.float64(0.5), wp.float64(dim_pow))
+        half = he * wp.float64(0.5)
+        # jac = (he/2)^dim — power loop (house idiom, see operators.py)
+        jac = wp.float64(1.0)
+        for _ in range(dim):
+            jac = jac * half
         fe = FEMElm()
         fe.e = e
         fe.he = he
