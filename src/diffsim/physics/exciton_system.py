@@ -937,7 +937,13 @@ class XDDSystem:
             if rn_new < self.atol or rn_new < rtol * r0:
                 converged = True
                 break
-            if (dnorm <= self.newton_tol * max(unorm, 1e-30)
+            # NOTE: in log mode dnorm carries LOG-space carrier increments while
+            # unorm is primal — mixing units would allow false convergence at
+            # depletion (an O(1) log step is a negligible primal change). The
+            # increment criterion is therefore primal-mode only; log mode
+            # converges on the residual criterion alone. (B5 review, Important #2.)
+            if (not self._log_carriers
+                    and dnorm <= self.newton_tol * max(unorm, 1e-30)
                     and step > 1e-6):
                 converged = True
                 break

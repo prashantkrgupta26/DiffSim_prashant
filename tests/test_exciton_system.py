@@ -1108,6 +1108,10 @@ def test_log_bilayer_e60_reporting(device):
     assert not info_l["converged"], (
         "G_B5_2: log UNEXPECTEDLY converged — promote to a quadratic gate and "
         "update the B5 report (the BLOCKED finding would be stale)")
+    assert not info_p["converged"], (
+        "G_B5_2: primal UNEXPECTEDLY converged — the both-modes-fail finding is "
+        "stale; a log-mode-specific regression could now hide. Update the B5 "
+        "report and re-scope this gate. (B5 review, Important #1.)")
     assert abs(info_p["rnorms"][0] - info_l["rnorms"][0]) < 1e-6, (
         "G_B5_2: primal and log it-1 residuals diverge — the two modes should "
         "track on this config (same discrete residual, different carrier coord)")
