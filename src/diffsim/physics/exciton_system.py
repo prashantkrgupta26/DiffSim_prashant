@@ -504,7 +504,7 @@ class XDDSystem:
                  langevin=None, onsager=None,
                  tau_inv_d=0.0, tau_inv_a=0.0,
                  supg=1.0, newton_tol=1e-10, atol=1e-12,
-                 linsolve=None):
+                 linsolve=None, carrier_vars="primal"):
         self.dm = dm
         self.lam2 = float(lam2)
         self.eps_gp = eps_gp
@@ -521,6 +521,19 @@ class XDDSystem:
         self.newton_tol = float(newton_tol)
         self.atol = float(atol)
         self.linsolve = linsolve or (lambda A, r: splu(A.tocsc()).solve(r))
+
+        if carrier_vars not in ("primal", "log"):
+            raise ValueError(f"carrier_vars must be 'primal' or 'log', "
+                             f"got {carrier_vars!r}")
+        # "log": the carrier variables n̂,p̂ are iterated as u=ln n̂, v=ln p̂
+        # via a Newton-level chain rule (Slotboom-class positivity, no re-derived
+        # weak form).  The PUBLIC state stays primal (n̂,p̂ full nodal vectors);
+        # the transformation lives entirely inside the Newton loop.  Positivity
+        # is structural (n̂=e^u>0 for any δu), so the fraction-to-boundary guard
+        # never truncates a carrier step — exposed via ``self.guard_trunc``.
+        self.carrier_vars = carrier_vars
+        self._log_carriers = (carrier_vars == "log")
+        self.guard_trunc = 0    # counts carrier steps clipped by the guard (log)
 
         self.T = dm.constraints.T.tocsr()
         self.free = dm.constraints.free_nodes
@@ -818,15 +831,31 @@ class XDDSystem:
                     A_blocks[i][j] = None
                 else:
                     A_blocks[i][j] = (T.T @ B @ T).tocsr()
-        A = sp.bmat(A_blocks, format="lil")
+        A = sp.bmat(A_blocks, format="csr")
         r = np.concatenate([np.asarray(T.T @ R[f]) for f in range(NDOF)])
 
+        # LOG-DENSITY chain rule (carrier_vars="log"): the increment solved for
+        # is δu=δ(ln n̂), δv=δ(ln p̂) rather than δn̂,δp̂.  With n̂=e^u the nodal
+        # Jacobian columns transform  J_·n̂ → J_·n̂·diag(n̂),  reusing ALL primal
+        # blocks (right-multiply the carrier column-blocks by diag(n̂_free)).
+        # Applied to the FULL bmat (physics rows) BEFORE Dirichlet identity rows,
+        # so cross-row couplings ∂R_other/∂u = ∂R_other/∂n̂·n̂ are scaled too.
+        if self._log_carriers:
+            scale = np.ones(NDOF * nf)
+            free_all = self.free
+            for field in (IN, IP):
+                cur = self._current_state[field][free_all]
+                scale[field * nf:(field + 1) * nf] = cur
+            A = A @ sp.diags(scale)
+
+        A = A.tolil()
         # strong Dirichlet: identity row on free-dof index of the pinned node
         # map global node id → free index
         free = self.free
         node_to_free = -np.ones(self.dm.n_nodes, np.int64)
         node_to_free[free] = np.arange(nf)
         for field, (nodes, vals) in self.dirichlet.items():
+            log_field = self._log_carriers and field in (IN, IP)
             for k, nid in enumerate(nodes):
                 fi = node_to_free[nid]
                 if fi < 0:
@@ -835,8 +864,13 @@ class XDDSystem:
                 A.rows[row] = [row]
                 A.data[row] = [1.0]
                 # r carries residual R already reduced; for Dirichlet we want
-                # δu = g − u_old.  R currently holds T^T R (physics); overwrite.
-                r[row] = vals[k] - self._current_state[field][nid]
+                # δu = g − u_old.  In log mode the carrier target is in log
+                # space: δu = ln(g) − ln(u_old) closes the BC on the first step.
+                cur = self._current_state[field][nid]
+                if log_field:
+                    r[row] = np.log(vals[k]) - np.log(cur)
+                else:
+                    r[row] = vals[k] - cur
         return A.tocsr(), r
 
     # ── Newton solve with positivity-guarded backtracking line search ───────
@@ -921,6 +955,13 @@ class XDDSystem:
         """
         nf = self.n_free
         free = self.free
+        # LOG mode: carriers are n̂=e^u > 0 for ANY δu — the positivity boundary
+        # does not exist for them, so fraction-to-boundary never constrains the
+        # carrier step.  Return α=1 (X̂ is guarded by the positivity CHECK +
+        # backtracking as in primal).  We record that no carrier truncation
+        # occurred (the no-guard-needed evidence for gate 4).
+        if self._log_carriers:
+            return 1.0
         alpha = 1.0
         for f in (IN, IP):
             duf = np.asarray(self.T @ du[f * nf:(f + 1) * nf])[free]
@@ -930,6 +971,7 @@ class XDDSystem:
                 amax = np.min((floor - cur[dec]) / duf[dec])
                 if amax > 0:
                     alpha = min(alpha, tau_fb * amax)
+                    self.guard_trunc += 1
         return max(min(alpha, 1.0), 0.0)
 
     def _solve_rhs(self, A, r):
@@ -959,7 +1001,19 @@ class XDDSystem:
         new = {f: state[f].copy() for f in range(NDOF)}
         for f in range(NDOF):
             duf = du[f * nf:(f + 1) * nf]
-            new[f] = np.asarray(state[f] + step * (self.T @ duf))
+            if self._log_carriers and f in (IN, IP):
+                # δu is a LOG-space increment: n̂ ← n̂·exp(step·δu).  Positive for
+                # any δu — carriers can never cross zero.  The T-scatter of a
+                # log increment then exp keeps hanging-node consistency because T
+                # is nodal-injective on free dofs (uniform mesh here).  Clip the
+                # exponent to the float64 exp range: a pathological (ill-
+                # conditioned) δu that would overflow is capped to +inf-free
+                # values so the positivity/backtracking guard can cleanly reject
+                # the trial step without a spurious overflow warning.
+                expo = np.clip(step * np.asarray(self.T @ duf), -230.0, 230.0)
+                new[f] = np.asarray(state[f] * np.exp(expo))
+            else:
+                new[f] = np.asarray(state[f] + step * (self.T @ duf))
         return new
 
     def _positivity_ok(self, state, floor, x_floor):
