@@ -47,15 +47,15 @@ import sys
 import time
 
 
-def _film_cmd(cfg, outdir, res, max_steps, extra_sets):
-    """Build the film front-end argv for one probe size.
+def _film_argv(cfg, outdir, res, max_steps, extra_sets):
+    """Build the film front-end argv (sans the python -m prefix).
 
     Mirrors cluster/wodo_campaign/a100_wodo3d_hero.sbatch's 3-D
     extension of the fig6_n5 config verbatim, parametrised on resolution.
     """
     nx, ny, nz = res
     argv = [
-        sys.executable, "-m", "diffsim.film", cfg,
+        cfg,
         "--outdir", outdir,
         "--set", "domain.dim=3",
         "--set", "domain.Lx=3.3",
@@ -73,6 +73,40 @@ def _film_cmd(cfg, outdir, res, max_steps, extra_sets):
     for s in extra_sets:
         argv += ["--set", s]
     return argv
+
+
+def _film_cmd(cfg, outdir, res, max_steps, extra_sets):
+    """Subprocess argv: default (mempool/default warp allocator) path."""
+    return [sys.executable, "-m", "diffsim.film"] + \
+        _film_argv(cfg, outdir, res, max_steps, extra_sets)
+
+
+def _install_managed_allocator(device="cuda:0"):
+    """OVERSUBSCRIPTION MECHANISM (M1d item 2), zero solver change.
+
+    Warp 1.15 instantiates ``CudaManagedAllocator`` (cudaMallocManaged)
+    but never wires it to ``current_allocator`` -- the built-in choice is
+    mempool-or-default, both HBM-bound. The PUBLIC hook
+    ``wp.set_device_allocator(dev, wp.CudaManagedAllocator(dev))`` routes
+    every subsequent ``wp.zeros``/``wp.array`` device allocation through
+    managed memory, which on GH200's NVLink-C2C coherent fabric spills
+    transparently into the 480 GB Grace LPDDR5X pool past the 96 GB HBM3.
+    The dominant film buffers (``vals_d`` nnz x f64, slot/offset arrays)
+    are all warp-owned, so this swap makes the WHOLE device-resident march
+    oversubscribable without touching diffsim. Called in-process before
+    the film run allocates anything.
+    """
+    import warp as wp
+    wp.init()
+    dev = wp.get_device(device)
+    if not dev.is_managed_memory_supported:
+        raise RuntimeError(
+            f"device {dev} reports is_managed_memory_supported=False -- "
+            "managed oversubscription unavailable")
+    wp.set_device_allocator(dev, wp.CudaManagedAllocator(dev))
+    print(f"PROBE_MANAGED installed CudaManagedAllocator on {dev} "
+          f"(concurrent_managed_access="
+          f"{dev.is_concurrent_managed_access_supported})", flush=True)
 
 
 def _distil(outdir):
@@ -171,6 +205,12 @@ def main(argv=None):
                     help="extra film --set overrides (repeatable)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the film argv and exit")
+    ap.add_argument("--managed", action="store_true",
+                    help="OVERSUBSCRIPTION mode: install warp's "
+                         "CudaManagedAllocator (cudaMallocManaged) BEFORE "
+                         "the film run and drive it in-process, so device "
+                         "arrays spill into the Grace pool past HBM. No "
+                         "solver change.")
     args = ap.parse_args(argv)
 
     cfg = args.config
@@ -181,17 +221,31 @@ def main(argv=None):
         cfg = os.path.normpath(cfg)
 
     os.makedirs(args.outdir, exist_ok=True)
-    cmd = _film_cmd(cfg, args.outdir, args.res, args.max_steps, args.sets)
-    print("PROBE_CMD " + " ".join(cmd), flush=True)
+    film_argv = _film_argv(cfg, args.outdir, args.res, args.max_steps,
+                           args.sets)
+    print("PROBE_CMD python -m diffsim.film " + " ".join(film_argv)
+          + (" [MANAGED in-process]" if args.managed else ""), flush=True)
     if args.dry_run:
         return 0
 
     t0 = time.time()
-    proc = subprocess.run(cmd)
+    if args.managed:
+        # in-process: install the managed allocator, then call the film
+        # front-end main() so allocations route through managed memory.
+        _install_managed_allocator(device="cuda:0")
+        from diffsim.film.__main__ import main as film_main
+        try:
+            rc = film_main(film_argv)
+        except Exception as e:                       # OOM / alloc failures
+            print(f"PROBE_MANAGED_EXC {e!r}", flush=True)
+            rc = 1
+    else:
+        rc = subprocess.run(_film_cmd(
+            cfg, args.outdir, args.res, args.max_steps, args.sets)).returncode
     wall = time.time() - t0
 
     row = {"res": args.res, "wall_total_s": round(wall, 1),
-           "film_rc": proc.returncode}
+           "film_rc": rc, "managed": args.managed}
     try:
         row.update(_distil(args.outdir))
     except (FileNotFoundError, ValueError) as e:
@@ -199,9 +253,9 @@ def main(argv=None):
 
     # verdict: physical if it finished max_steps and mass_drift is small
     md = row.get("mass_drift")
-    if proc.returncode == 0 and md is not None and md < 1e-10:
+    if rc == 0 and md is not None and md < 1e-10:
         row["verdict"] = "PHYSICAL"
-    elif proc.returncode == 0:
+    elif rc == 0:
         row["verdict"] = "COMPLETED-CHECK-DRIFT"
     else:
         row["verdict"] = "FAILED"
@@ -212,8 +266,8 @@ def main(argv=None):
         f"res={args.res} dofs={row.get('dofs')} nnz={row.get('nnz')} "
         f"gpu_gb={row.get('gpu_gb_peak')} s/step={row.get('s_per_step')} "
         f"idx={row.get('index_width')} drift={row.get('mass_drift')} "
-        f"verdict={row.get('verdict')}", flush=True)
-    return 0 if proc.returncode == 0 else 1
+        f"managed={args.managed} verdict={row.get('verdict')}", flush=True)
+    return 0 if rc == 0 else 1
 
 
 if __name__ == "__main__":
