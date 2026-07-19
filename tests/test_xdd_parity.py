@@ -181,3 +181,54 @@ def test_e2_simsalabim_crosscheck():
         exp = e2[ref_key]
         assert abs(got - exp) <= rtol * abs(exp), (
             f"G_E2_1: {key} {got} vs locked reference {exp} (rtol {rtol})")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# E5 — Nirmal J(t) perf gate (LEDGER-LOCKED, not CI-reasserted)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_E5_BASELINE_PATH = os.path.join(os.path.dirname(__file__), "baselines",
+                                 "xdd_e5_perf.json")
+
+
+def _e5_baseline() -> dict:
+    with open(_E5_BASELINE_PATH) as fh:
+        return json.load(fh)
+
+
+def test_e5_perf_baseline_parses_and_speedup_consistent():
+    """G_E5: the perf baseline file parses and its recorded speedup IS what the
+    file's own s/step + steps + CPU-baseline arithmetic says.
+
+    House pattern for perf: measured numbers are LEDGER-LOCKED on the box
+    (benchmarks/xdd/e5_perf_nirmal.py), NOT re-run in CI (a 330k-DOF GPU march
+    is not a unit test).  This test guards against silent corruption of the
+    locked ledger by re-deriving the speedup from the recorded primitives and
+    asserting internal consistency.
+    """
+    b = _e5_baseline()
+    m = b["measured"]
+    g = b["gate"]
+
+    # 1) primitives present and physical
+    assert m["nodes"] > 0 and m["dofs"] > 0
+    assert m["s_per_step_median"] > 0.0
+    assert m["steps_for_window"] > 0
+    assert "splu" in m["solver"].lower(), (
+        "G_E5: solver provenance must record the host splu path")
+
+    # 2) end-to-end = s/step × steps (the recorded projection)
+    e2e = m["s_per_step_median"] * m["steps_for_window"]
+    assert abs(e2e - g["end_to_end_s"]) <= 1e-6 * max(e2e, 1.0), (
+        f"G_E5: end-to-end {g['end_to_end_s']} != s/step*steps {e2e}")
+
+    # 3) speedup = CPU baseline / end-to-end (both baseline-band ends)
+    for hours, key in ((g["baseline_hours_lo"], "speedup_vs_10h"),
+                       (g["baseline_hours_hi"], "speedup_vs_30h")):
+        exp = (hours * 3600.0) / g["end_to_end_s"]
+        assert abs(exp - g[key]) <= 1e-6 * max(exp, 1.0), (
+            f"G_E5: {key} {g[key]} != baseline/e2e {exp}")
+
+    # 4) the recorded verdict matches the 100x target arithmetic
+    assert g["pass_vs_10h"] == (g["speedup_vs_10h"] >= g["target"])
+    assert g["pass_vs_30h"] == (g["speedup_vs_30h"] >= g["target"])
