@@ -211,6 +211,20 @@ def main(argv=None):
                          "the film run and drive it in-process, so device "
                          "arrays spill into the Grace pool past HBM. No "
                          "solver change.")
+    ap.add_argument("--balloon-gb", type=float, default=0.0,
+                    help="pin this many GB of HBM with a plain (non-"
+                         "managed) torch CUDA allocation before the film "
+                         "run, shrinking effective HBM so a managed run of "
+                         "known working set spills a controlled fraction "
+                         "into the Grace pool (oversubscription-"
+                         "degradation experiment at fixed problem size)")
+    ap.add_argument("--force-narrow", action="store_true",
+                    help="force index_width='narrow' via a probe-side "
+                         "WodoFilmStepper class attribute (legal below "
+                         "2^31 nnz). Needed in the 90-100%% of 2^31 band "
+                         "where 'auto' picks wide but warp's int32 array-"
+                         "shape ceiling (types.py check_array_shape) "
+                         "rejects >2^31-element nnz buffers.")
     args = ap.parse_args(argv)
 
     cfg = args.config
@@ -223,33 +237,60 @@ def main(argv=None):
     os.makedirs(args.outdir, exist_ok=True)
     film_argv = _film_argv(cfg, args.outdir, args.res, args.max_steps,
                            args.sets)
+    in_process = args.managed or args.force_narrow or args.balloon_gb > 0
     print("PROBE_CMD python -m diffsim.film " + " ".join(film_argv)
-          + (" [MANAGED in-process]" if args.managed else ""), flush=True)
+          + (" [in-process:"
+             + ("managed" if args.managed else "")
+             + (f" balloon={args.balloon_gb}GB" if args.balloon_gb else "")
+             + (" force-narrow" if args.force_narrow else "") + "]"
+             if in_process else ""), flush=True)
     if args.dry_run:
         return 0
 
     t0 = time.time()
-    if args.managed:
-        # in-process: install the managed allocator, then call the film
-        # front-end main() so allocations route through managed memory.
-        _install_managed_allocator(device="cuda:0")
+    if in_process:
+        balloon = None
+        if args.balloon_gb > 0:
+            # plain torch cudaMalloc -> HBM-resident, NOT spillable:
+            # shrinks the HBM the managed working set can occupy.
+            import torch
+            balloon = torch.empty(int(args.balloon_gb * 2 ** 30),
+                                  dtype=torch.uint8, device="cuda:0")
+            free_b, tot_b = torch.cuda.mem_get_info("cuda:0")
+            print(f"PROBE_BALLOON {args.balloon_gb} GB pinned; HBM free "
+                  f"{free_b / 2**30:.1f} / {tot_b / 2**30:.1f} GB",
+                  flush=True)
+        if args.managed:
+            _install_managed_allocator(device="cuda:0")
+        if args.force_narrow:
+            from diffsim.physics.wodo_film import WodoFilmStepper
+            WodoFilmStepper._index_width = "narrow"
+            print("PROBE_FORCE_NARROW WodoFilmStepper._index_width="
+                  "'narrow' (probe-side class attr)", flush=True)
         from diffsim.film.__main__ import main as film_main
         try:
             rc = film_main(film_argv)
         except Exception as e:                       # OOM / alloc failures
-            print(f"PROBE_MANAGED_EXC {e!r}", flush=True)
+            print(f"PROBE_INPROC_EXC {e!r}", flush=True)
             rc = 1
+        del balloon
     else:
         rc = subprocess.run(_film_cmd(
             cfg, args.outdir, args.res, args.max_steps, args.sets)).returncode
     wall = time.time() - t0
 
     row = {"res": args.res, "wall_total_s": round(wall, 1),
-           "film_rc": rc, "managed": args.managed}
+           "film_rc": rc, "managed": args.managed,
+           "balloon_gb": args.balloon_gb,
+           "force_narrow": args.force_narrow}
     try:
         row.update(_distil(args.outdir))
     except (FileNotFoundError, ValueError) as e:
         row["distil_error"] = repr(e)
+    if args.force_narrow:
+        # preflight reads params (config-level 'auto'), not the probe's
+        # stepper-class override -- report what actually ran
+        row["index_width"] = "narrow-forced(probe)"
 
     # verdict: physical if it finished max_steps and mass_drift is small
     md = row.get("mass_drift")
