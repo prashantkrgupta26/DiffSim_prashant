@@ -27,6 +27,29 @@ from diffsim.physics.exciton_system import (
 )
 
 
+def _infer_level(mesh) -> Optional[int]:
+    """Best-effort uniform-octree level from a square mesh's node count.
+
+    For a uniform p1 mesh, n_nodes = (2^level + 1)^2.  Returns the integer level
+    if the node count matches that form, else None (preflight is skipped rather
+    than reporting a wrong h_hat)."""
+    try:
+        n = mesh.node_coords.shape[0]
+        p = int(mesh.p)
+    except Exception:
+        return None
+    edge = round(math.sqrt(n))
+    if edge * edge != n or edge <= 1:
+        return None
+    cells = (edge - 1) / max(p, 1)          # cells per edge = p·2^level / p
+    if cells < 1 or cells != int(cells):
+        return None
+    lvl = round(math.log2(cells))
+    if (2 ** lvl) == int(cells):
+        return lvl
+    return None
+
+
 # ── Log-linear IC builder (the B5 "continuation-free" starting state) ────────
 
 def log_linear_ic(mesh, Eg_hat: float, minority_ln: float,
@@ -697,6 +720,9 @@ class XDDRun:
         outdir: Optional[str] = None,
         newton_kw: Optional[dict] = None,
         eg_ramp_levels: Optional[List[float]] = None,
+        level: Optional[int] = None,
+        preflight_strict: bool = False,
+        run_preflight: bool = True,
     ):
         self.sysm = sysm
         self.mesh = mesh
@@ -721,7 +747,37 @@ class XDDRun:
         self.outdir = outdir
         self.newton_kw = newton_kw or {}
         self.eg_ramp_levels = eg_ramp_levels  # None → auto ladder from Eg_hat
+        self.level = level
+        self.preflight_strict = preflight_strict
+        self.run_preflight = run_preflight
+        self.preflight_report = None
         self.log = _XDDRunLog(outdir=outdir)
+
+    # ── preflight (Block E lesson, wired) ────────────────────────────────────
+
+    def preflight(self, *, strict: Optional[bool] = None, verbose: bool = True):
+        """Run the XDD preflight checks (scales report + Debye/interface/dt0/
+        memory feasibility) for this run's config.  Returns a PreflightReport;
+        stores it on self.preflight_report.
+
+        Requires self.params (for scales) and either self.level or an inferable
+        uniform-octree level from the mesh node count.  The λ² actually used by
+        the run is read from self.sysm.lam2 (may be the reduced marchable value),
+        so the Debye check reports the run's ACTUAL drive.
+        """
+        from diffsim.xdd.preflight import preflight as _preflight
+        if self.params is None:
+            return None
+        level = self.level if self.level is not None else _infer_level(self.mesh)
+        if level is None:
+            return None
+        lam2 = getattr(self.sysm, "lam2", None)
+        st = self.preflight_strict if strict is None else strict
+        rep = _preflight(
+            self.params, level=level, lam2=lam2,
+            dt0_hat=self.dt0_hat, strict=st, verbose=verbose)
+        self.preflight_report = rep
+        return rep
 
     def _march_kw(self):
         return dict(
@@ -1081,6 +1137,17 @@ class XDDRun:
         dict with keys: strategy, dark_eq_info, histories, final_state, log
         """
         result = {"strategy": self.strategy}
+
+        # Preflight: scales report + Debye/interface/dt0/memory feasibility.
+        # Printed + returned; strict=True raises on FAIL (the Block-E lesson).
+        if self.run_preflight and self.params is not None:
+            try:
+                rep = self.preflight(verbose=True)
+                if rep is not None:
+                    result["preflight"] = rep
+            except RuntimeError:
+                # strict FAIL — propagate (the run is not feasible as configured)
+                raise
 
         if self.strategy == STEADY_STATE_JV:
             # dark_eq → G_ramp (if generation) → V_sweep with continuation

@@ -1,0 +1,78 @@
+{
+  "_provenance": "SP-1 R0 E4 framework-table bilayer Jsc anchors (REDUCED SCOPE, honest). Measured on gpubox (WSL2, NVIDIA RTX 6000 Ada 48GB sm_89, driver 13.2, Warp 1.14 / CUDA 12.9, .venv/bin/python; nvmath-python[cu12] 0.9.0). Driver: benchmarks/xdd/e4_anchors.py --device cuda:0 --linsolver cudss --level 6 (65x65 = 21125 dofs; reduced-drive marchable regime lam2=1e-1, Eg_hat=4, symmetric mu=0.5, eps_hat=1, zeta=1e-6, dist_scale=8nm). GPU run REQUIRES LD_LIBRARY_PATH=/usr/lib/wsl/lib (WSL libcuda shadowing). Locked 2026-07-19. Perf/values LEDGER-LOCKED (a level-6 GPU continuation march is not a CI unit test); the gate test re-derives the ratios + asserts convergence + the honest delta class.",
+
+  "_scope": "Full Table-1 parity (8 morphologies x 2 systems x full J-V) is a CAMPAIGN, not an R0 gate (~8h/physical case at 14 s/step). E4's R0 anchor is bilayer Jsc-only (V_hat=0, light) for BOTH material systems, on the box with cuDSS.",
+
+  "_regime": "REDUCED-DRIVE PROXY. The physical drive of either system hits the documented Debye/mesh wall (E1(ii)/E2/E5; test_xdd_run._resolvable_bilayer): physical lam2~2.2e-5 -> Debye << h -> the march blows phi_hat up and never fires the steady criterion on any feasible uniform-octree mesh. E4 therefore marches in the SAME marchable regime E1/E5 use (lam2=1e-1, Eg_hat=4, symmetric mu=0.5, eps_hat=1, weak Langevin zeta=1e-6 -- the E1 stripe knobs). The per-system material knobs that SURVIVE this regime are tau_x (via tau_inv), the Onsager separation a, and the donor:acceptor generation ratio; mu_hat, lam2, eps_hat, Eg_hat are all reduced/symmetrized.",
+
+  "_delta_class": "REDUCED-DRIVE PROXY -- the physical Table-1 mA/cm2 anchor is NOT reproduced and is NOT expected to be. Both systems march to a CONVERGED lit steady state (criterion fired, flux self-consistency < 1e-2). The nondim |J| is the meaningful comparable quantity. The re-dimensionalised mA/cm2 OVERSHOOTS the anchor (p3ht_pcbm ratio 1343x = delta class 10^3; pm6_y6 ratio 6.12x = delta class 10^0-10^1) because the marchable regime decouples the current from the physical mobility scale: |J| is computed with symmetric mu_hat=0.5, then multiplied by the PHYSICAL J0 (= U0*x0*q, which carries the physical mobility), which double-counts the physical mobility. The honest verdict per the plan ('record the honest delta class, NOT a fake match'): physical mA/cm2 Jsc is UNREACHABLE on a uniform CPU/GPU mesh -- it is a Scharfetter-Gummel / boundary-refined-mesh R1 item (the same Debye wall). Mechanism = mesh + drive + symmetrized transport, NOT a solver defect.",
+
+  "TABLE1_BILAYER_ANCHOR": {
+    "p3ht_pcbm": 0.746,
+    "pm6_y6": 2.422,
+    "_note": "Framework-paper Table-1 bilayer Jsc (mA/cm2, V=0, light)."
+  },
+
+  "results": {
+    "p3ht_pcbm": {
+      "system": "p3ht_pcbm",
+      "_params": "mu_n=2.3e-6, mu_p=7.3e-7, eps 3.0/3.9, tau_x=8e-9, a=1e-8, G=6.5e27, Eg=1.15, height=100nm (framework-paper P3HT:PCBM values).",
+      "level": 6,
+      "device": "cuda:0",
+      "linsolver": "cudss",
+      "jny_nondim": -0.004183227816949464,
+      "jpy_nondim": -0.004207196431542867,
+      "J_nondim": 0.004207196431542867,
+      "Jmin_nondim": 0.004183227816949464,
+      "flux_imbalance": 0.005697051464890448,
+      "J0": 2381619.5250000004,
+      "U0": 1.4864899877200434e+32,
+      "t0": 1.6818142205145043e-07,
+      "Eg_hat": 4.0,
+      "lam2": 0.1,
+      "G_max_hat": 0.01,
+      "jsc_mA_per_cm2": 1001.9941166872821,
+      "carrier_src": 0.005388646613393432,
+      "criterion_fired": true,
+      "anchor": {
+        "measured_mA_per_cm2": 1001.9941166872821,
+        "anchor_mA_per_cm2": 0.746,
+        "ratio": 1343.1556523958207
+      }
+    },
+    "pm6_y6": {
+      "system": "pm6_y6",
+      "_params": "A1 canonical PM6:Y6 defaults + G=1.0e28, Eg=1.35, a=1e-7 (framework-paper PM6:Y6 values).",
+      "level": 6,
+      "device": "cuda:0",
+      "linsolver": "cudss",
+      "jny_nondim": 0.0007162191437785487,
+      "jpy_nondim": 0.0007162142026375107,
+      "J_nondim": 0.0007162191437785487,
+      "Jmin_nondim": 0.0007162142026375107,
+      "flux_imbalance": 6.898923438330937e-06,
+      "J0": 207097.35000000003,
+      "U0": 1.292599989321777e+31,
+      "t0": 1.9340863535916802e-06,
+      "Eg_hat": 4.0,
+      "lam2": 0.1,
+      "G_max_hat": 0.01,
+      "jsc_mA_per_cm2": 14.832708669580644,
+      "carrier_src": 1.7263585938186816e-06,
+      "criterion_fired": true,
+      "anchor": {
+        "measured_mA_per_cm2": 14.832708669580644,
+        "anchor_mA_per_cm2": 2.422,
+        "ratio": 6.124157171585732
+      }
+    }
+  },
+
+  "cross_system_ordering": {
+    "_note": "In the reduced-drive regime the physical PM6>P3HT ordering does NOT hold: p3ht_pcbm's tiny Onsager separation a=1e-8 gives far higher dissociation/current than pm6_y6's a=1e-7. This is a regime artifact (the surviving knobs, not the physical device), recorded honestly -- like E1's horizontal>vertical deviation. The robust E4 anchor is the per-system convergence + honest delta class, not the cross-system ordering.",
+    "pm6_y6_jsc": 14.832708669580644,
+    "p3ht_pcbm_jsc": 1001.9941166872821,
+    "pm6_gt_p3ht_measured": false,
+    "pm6_gt_p3ht_anchor": true
+  }
+}

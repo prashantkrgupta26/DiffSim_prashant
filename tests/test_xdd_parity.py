@@ -250,3 +250,54 @@ def test_e5_perf_baseline_parses_and_speedup_consistent():
         f"G_E5: speedup_vs_history_splu_median {g['speedup_vs_history_splu_median']}"
         f" != splu/cudss s/step {sp}")
     assert sp > 1.0, "G_E5: the cuDSS fix must be faster than the host-splu history"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# E4 — framework-table bilayer Jsc anchors (LEDGER-LOCKED, box+cuDSS)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_E4_BASELINE_PATH = os.path.join(os.path.dirname(__file__), "baselines",
+                                 "xdd_e4_anchors.json")
+
+
+def _e4_baseline() -> dict:
+    with open(_E4_BASELINE_PATH) as fh:
+        return json.load(fh)
+
+
+def test_e4_anchors_baseline_parses_and_ratios_consistent():
+    """G_E4: the E4 bilayer-Jsc anchor baseline parses; the recorded ratio equals
+    measured/anchor for BOTH systems; the honest reduced-drive delta class is
+    recorded (NOT a fake physical match).
+
+    E4 is a reduced-drive PROXY (marchable regime — the Debye-wall reduction):
+    both systems march to a converged lit steady state, the nondim |J| is the
+    comparable quantity, and the physical Table-1 mA/cm² anchor is NOT reproduced
+    (the ratio overshoots ~10^2-10^4x because the marchable regime decouples the
+    current from the physical mobility scale).  This test guards the locked ledger
+    against silent corruption by re-deriving the ratio and asserting the caveat is
+    present — it does NOT assert a physical match (which would be dishonest here).
+
+    House pattern (cf. E5): measured on the box (benchmarks/xdd/e4_anchors.py,
+    linsolver='cudss'), ledger-locked, not CI-re-run.
+    """
+    b = _e4_baseline()
+    for system in ("p3ht_pcbm", "pm6_y6"):
+        r = b["results"][system]
+        # 1) the run converged (fired) and is flux self-consistent
+        assert r["criterion_fired"] is True, (
+            f"G_E4: {system} must reach a lit steady state (criterion fired)")
+        assert r["flux_imbalance"] < 0.05, (
+            f"G_E4: {system} flux self-consistency (imbalance {r['flux_imbalance']})")
+        # 2) the recorded anchor ratio = measured/anchor
+        a = r["anchor"]
+        exp_ratio = a["measured_mA_per_cm2"] / a["anchor_mA_per_cm2"]
+        assert abs(exp_ratio - a["ratio"]) <= 1e-6 * max(abs(exp_ratio), 1.0), (
+            f"G_E4: {system} ratio {a['ratio']} != measured/anchor {exp_ratio}")
+        # 3) the anchor is the framework-paper Table-1 bilayer value
+        assert a["anchor_mA_per_cm2"] > 0
+    # 4) the honest delta class is recorded (proxy, not a physical match)
+    assert "proxy" in b["_delta_class"].lower(), (
+        "G_E4: the reduced-drive delta class must be recorded honestly")
+    # 5) the run used cuDSS on the box (the brief's requirement)
+    assert b["results"]["pm6_y6"]["linsolver"] == "cudss"
