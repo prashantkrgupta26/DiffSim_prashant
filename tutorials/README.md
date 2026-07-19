@@ -39,7 +39,7 @@ website is generated from them (`python tutorials/build_site.py`, then
 
 **E. Differentiable simulation**
 | E0a | `E_differentiable/E0a_thinking_differentiable.py` | three paths to a gradient (FD / tangent-linear / adjoint), naked `wp.Tape` toy, Poisson dJ/dκ verified to three-way 1e-9 |
-| E0b | `E_differentiable/E0b_anatomy_of_a_taped_brick.py` | open a real DiffSim kernel, do-not-differentiate list, compute-once patterns, dot-product test, κ-field recovery |
+| E0b | `E_differentiable/E0b_anatomy_of_a_taped_brick.py` | open a real DiffSim kernel, do-not-differentiate list, compute-once patterns, dot-product test, probe-misfit drop >100× + the underdetermination lesson (5 probes ≠ 64 unknowns) |
 | E0c | `E_differentiable/E0c_recipe_new_pde.py` | the adjoint-readiness checklist applied end-to-end: transient heat chain, store-vs-recompute, choosing J, mini Allen-Cahn phase-field gradient |
 | E1 | `E_differentiable/E1_shape_optimization.py` | the adjoint loop: recover a hidden shape from probe data |
 
