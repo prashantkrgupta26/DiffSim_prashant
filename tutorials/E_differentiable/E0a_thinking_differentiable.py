@@ -6,7 +6,7 @@ the tangent-linear method, and the adjoint — and you can see exactly WHY the
 adjoint wins for large parameter counts. You have run a naked ``wp.Tape``
 example to see what automatic differentiation records, and you have verified
 the adjoint for a Poisson conductivity-field problem at three-way agreement
-of 1e-9 or better.
+at the 1e-6/1e-9 class (adjoint-vs-tape at 1e-9; vs FD at 1e-6).
 
 BACKGROUND. Adapted from the mathematical background developed for
 dolfin-adjoint/pyadjoint by Patrick E. Farrell; examples and the three-way

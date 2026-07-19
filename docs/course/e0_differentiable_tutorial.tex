@@ -395,7 +395,7 @@ forward solve (\texttt{lu.solve(b)}) and the adjoint solve
 
 \begin{measured}
 Level-3 Poisson, 50 trials.  One LU (two solve calls): $\approx t$~ms.
-Two separate LU factorizations: $\approx 1.7t$~ms.  Ratio $> 1.5\times$
+Two separate LU factorizations: $\approx 1.7t$~ms.  Ratio $> 1.2\times$
 (measured; the factorization cost dominates at this size; the ratio
 grows toward $2\times$ at scale because factorization is
 $O(n^{1.5})$ in 2-D while each solve is $O(n\log n)$).
@@ -754,8 +754,8 @@ E0a & adj vs tape max rel err         & $< 10^{-9}$  & $< 10^{-9}$ \\
 E0a & FD / adjoint cost ratio         & 30--80$\times$ & $\sim$35$\times$ \\
 \midrule
 E0b & dot-product test rel err        & $< 10^{-12}$ & $\sim 10^{-17}$ \\
-E0b & factorization reuse ratio       & $> 1.5\times$  & $> 1.5\times$ \\
-E0b & misfit drop (100 GD steps)      & $> 100\times$  & $> 100\times$ \\
+E0b & factorization reuse ratio       & $> 1.2\times$  & $> 1.2\times$ \\
+E0b & misfit drop (40 GD steps)       & $> 100\times$  & $> 100\times$ \\
 \midrule
 E0c & heat-chain adj vs FD            & $< 10^{-5}$  & $< 10^{-5}$ \\
 E0c & store vs recompute dJ agreement & $< 10^{-10}$ & $\sim 0$ \\
@@ -808,7 +808,7 @@ observable, gauge identifiability, and composition-coverage conditioning}
 
 \emph{Apply this checklist to any new PDE before writing gradient code.
 The normative, citable version lives on the reference page
-\texttt{docs/site\_src/theory/}\linebreak\texttt{adjoint\_readiness\_checklist.md} (T4).
+\texttt{docs/theory/}\linebreak\texttt{adjoint\_readiness\_checklist.md} (T4).
 This appendix is the derived, annotated form; the reference page owns
 the normative list.}
 

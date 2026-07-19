@@ -28,7 +28,7 @@ adjoint sweeps backward through every stored step.  Everything you need to make
 a new PDE differentiable is on the checklist in section 1 -- whose normative
 twin lives on the reference page:
 
-    NORMATIVE TWIN: docs/site_src/theory/adjoint_readiness_checklist.md (T4).
+    NORMATIVE TWIN: docs/theory/adjoint_readiness_checklist.md (T4).
     That page owns the citable list; this chapter derives and demonstrates it.
 
 Attribution:
@@ -93,7 +93,7 @@ print()
 # THE ADJOINT-READINESS CHECKLIST.  Apply this to ANY new PDE before you write
 # a line of gradient code.  Each item is developed in E0a/E0b or below; the
 # normative, citable statement lives on the reference page (T4):
-#     docs/site_src/theory/adjoint_readiness_checklist.md
+#     docs/theory/adjoint_readiness_checklist.md
 #
 #  1. WHAT TO TAPE.  Only the residual kernels that depend on the parameters
 #     you differentiate w.r.t.  Tape R(u, m) in m (and in u if J or a later
@@ -140,7 +140,7 @@ print("  4. Transpose  : one LU serves A and A^T; build the adjoint solve once."
 print("  5. Verify     : dot-product -> three-way -> transient-chain (climb the ladder).")
 print("  6. Relax      : abs/min/max/threshold/mask -> softabs/logsumexp/sigmoid.")
 print("  7. Cost       : backward march <= ~2.5x forward march (MEASURE it).")
-print("  Normative twin: docs/site_src/theory/adjoint_readiness_checklist.md")
+print("  Normative twin: docs/theory/adjoint_readiness_checklist.md")
 print()
 
 # ═════════════════════════════════════════════════════════════════════════════
