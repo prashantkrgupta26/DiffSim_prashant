@@ -266,7 +266,7 @@ def test_gate_d3_nirmal_features_analytic():
       present (even sum = 0 → odd/even ratio = +∞-class huge).
 
     FOURIER-PARTIAL square y = sin + (1/3)sin(3·) + (1/5)sin(5·):
-      THD = √((1/3)²+(1/5)²) = 0.388730… ;  harmonic_decay_slope ≈ −3.03
+      THD = √((1/3)²+(1/5)²) = 0.388730… ;  harmonic_decay_slope = −1.0 (amps 1/m ⇒ slope exactly −1)
       (log|H_m| vs log m over m∈{1,3,5} = orders {1,2,3} in the ladder).
     """
     # -- triangle time features --
