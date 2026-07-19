@@ -470,9 +470,16 @@ def _march_to_steady(sysm, state, *,
         if log is not None:
             log.log_step(step_rec)
 
-        # Update BDF history
+        # Update BDF history.  BDF1 advances u^{n+1} from history σ·u^n, so
+        # the NEXT step's `prev` (u^n) must be the state we just reached
+        # (new_state), NOT the pre-step `state` (which would be u^{n-1} — an
+        # off-by-one that makes the history σ·u^{n-1} while advancing u^n, so
+        # every other Newton solve is a no-op fixed point and the effective
+        # integrated dt doubles → decay/transient rates come out HALVED; the
+        # D3 PL-decay analytic gate catches exactly this).  prev2 (for BDF2)
+        # keeps the older u^{n-1} = the pre-step `state`.
         prev2_state = {f: prev_state[f].copy() for f in range(NDOF)}
-        prev_state  = {f: state[f].copy()      for f in range(NDOF)}
+        prev_state  = {f: new_state[f].copy()  for f in range(NDOF)}
         state       = new_state
 
         # Steady criterion
