@@ -6,7 +6,7 @@ Rules (calibration provenance in each function):
   ic-thermodynamics      FH curvature eigs at the IC (b_reg included)
   evaporation-dt-cap     dt0 vs the march's dh_cap/(k_e dphi) clamp
   memory-forecast        G5-ladder linear sizing model vs available
-  int32-slot-ceiling     device-assembly nnz vs the 2^31 slot range
+  index-width     device-assembly nnz vs the 2^31 slot range
 
 The MEMORY MODEL is calibrated on the G5 ladder
 (docs/dev/2026-07-09-blockch-preconditioner.md, RTX 6000 Ada 48 GB,
@@ -262,7 +262,7 @@ def run_preflight(params, resolved, query_hardware=True):
                     "adapt=lte with noise=0: deterministic run gets the "
                     "full LTE PI(D) controller.")
 
-    # -- index-width (P0-2: the old int32-slot-ceiling, now an auto-
+    # -- index-width (P0-2: the old index-width, now an auto-
     #    switch report) --------------------------------------------------
     # Device assembly used to hard-FAIL past 2^31 nnz (the int32 slot
     # arithmetic wrapped).  Mixed-width CSR (int64 offsets/slots, int32
