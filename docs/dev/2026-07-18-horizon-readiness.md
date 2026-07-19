@@ -124,3 +124,15 @@ allocation-size conversion from the Frontera request, Deep-Partnership terms
 - Thin-feature gap: `docs/dev/m1-verification-coverage.md` (M7 tier).
 - The roadmap-reconciliation task (pending) should absorb P0/P2 items as
   numbered milestones with Horizon as their deadline.
+
+## 6. P0 status updates
+
+- **P0-1 aarch64/Grace lane: GREEN (2026-07-19).** DiffSim marched on a Nova
+  GH200-480GB (sm_90, CUDA 12.9): cuDSS + device assembly, mass drift 2.9e-16.
+  Findings: Nova ships **no aarch64 Python ≥3.10 module** (worked around by
+  root-less RPM extraction to /work; admin request filed-worthy; verify TACC's
+  ARM Python story at onboarding); the full wheel matrix exists for
+  aarch64+cu12 (torch 2.13, warp 1.15, nvmath/cuDSS — **cuDSS confirmed
+  working on ARM**); Warp kernel cache must be redirected off $HOME on
+  Horizon. Historic failure 11447898 = account GPU-quota + x86 python.
+  Full recipe: session ledger `gh200-findings.md`.
