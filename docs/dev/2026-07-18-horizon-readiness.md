@@ -136,3 +136,12 @@ allocation-size conversion from the Frontera request, Deep-Partnership terms
   working on ARM**); Warp kernel cache must be redirected off $HOME on
   Horizon. Historic failure 11447898 = account GPU-quota + x86 python.
   Full recipe: session ledger `gh200-findings.md`.
+
+- **§1 sizing correction (2026-07-19, A100/GH200 forensics):** a ~61 s/step
+  host-side floor (element assembly + scatter + GP fields) is common to Ada,
+  A100, and GH200 — an Amdahl ceiling on bandwidth scaling (measured
+  efficiencies: A100 75%, GH200 55% of BW-predicted). The §1 B200 step-time
+  projections are therefore ~3× optimistic as written (≈83 s/step realistic,
+  not ~30) **unless the film-stack host fraction is device-ported** — now the
+  named prerequisite for the full B200 speedup, alongside 8j fp32-storage.
+  Full analysis: session ledger `a100-forensics-findings.md`.
