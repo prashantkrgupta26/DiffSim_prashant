@@ -274,3 +274,15 @@ comparison, deferred with mechanism.
 (`.superpowers/sdd/sp1-e-a-report.md`, `sp1-e-b-report.md`, `sp1-e5fix-report.md`,
 `sp1-e-c-report.md`) and the locked baselines. Every gate value is reproducible
 from the named driver.*
+
+## Post-review addenda (whole-branch review, 2026-07-19)
+
+- **E5 batched-multi-waveform demo: explicitly DEFERRED to R1/#35.** The plan
+  listed it as an E5 deliverable; it was not run. The cuDSS plan-once /
+  reset_operands machinery already supports it — a demo-not-run, not a
+  capability gap. (The whole-branch review's only silent-reduction finding.)
+- **E4 itemization:** the dropped anchors are specifically BHJ3 P3HT:PCBM
+  8.303 and PM6:Y6 19.810 mA/cm² (full J–V campaign class, with the physical
+  drive behind the §3 Debye wall — the R1 SG/boundary-refined-mesh item).
+- Companion note: `docs/dev/2026-07-18-sp1-r0-e5-e3-findings.md` (the E-b
+  measurement detail) is part of this record.
