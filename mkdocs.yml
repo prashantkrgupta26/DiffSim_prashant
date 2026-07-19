@@ -29,11 +29,15 @@ nav:
     - "Differentiable Design": projects/differentiable.md
     - "Adaptivity — Spatial & Temporal": projects/adaptivity.md
   - Theory:
+    - "Adjoint-Readiness Checklist for Differentiable PDE Simulation": theory/adjoint_readiness_checklist.md
+    - "P1 — Coupled Multi-CH x Multi-AC": theory/crystallization_formulation_p1.md
     - "Adjoint-Readiness Requirements for cuFEM Device Adaptivity": theory/cufem_adjoint_readiness_memo.md
+    - "P2 — Realism Pack + Diffuse Film-Air Interface + Flow": theory/flow_film_formulation_p2.md
     - "Relaxed Classification for Differentiable Immersed Optimization": theory/n6_relaxed_classification_brief.md
     - "Local p-Refinement Bands for the Shifted Boundary Method": theory/p2_band_problem_statement.md
     - "The p2 Band Around a Shifted Boundary": theory/p2_band_study_for_students.md
     - "P0 — Ternary Phase-Field with Evaporation and Crystallization": theory/phasefield_formulation_p0.md
+    - "P3 — Structure-to-Property": theory/structure_property_p3.md
   - Curriculum:
     - A. Foundations:
       - A1_mms_convergence: A1_mms_convergence.md
@@ -53,6 +57,9 @@ nav:
       - D2_lid_driven_cavity: D2_lid_driven_cavity.md
       - D3_cylinder: D3_cylinder.md
     - E. Differentiable:
+      - E0a_thinking_differentiable: E0a_thinking_differentiable.md
+      - E0b_anatomy_of_a_taped_brick: E0b_anatomy_of_a_taped_brick.md
+      - E0c_recipe_new_pde: E0c_recipe_new_pde.md
       - E1_shape_optimization: E1_shape_optimization.md
       - E2_genie_diffsbm: E2_genie_diffsbm.md
     - F. Phase field:

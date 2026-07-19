@@ -54,6 +54,36 @@ jobs:
       - name: Course common/ tests (config, checker, provenance)
         run: pytest tests/test_course_common.py -q
 
+  e0-cpu-smoke:
+    name: e0-cpu-smoke (E0 adjoint tutorial smoke — CPU Warp)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install (with Warp, CPU only — no GPU extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . --no-deps
+          pip install "warp-lang>=1.7,<2" numpy scipy
+
+      - name: E0a — thinking differentiable (three-way gradient, Poisson dJ/dkappa)
+        run: python tutorials/E_differentiable/E0a_thinking_differentiable.py
+
+      - name: E0b — anatomy of a taped brick (dot-product test, kappa recovery)
+        run: python tutorials/E_differentiable/E0b_anatomy_of_a_taped_brick.py
+
+      - name: E0c — the recipe (transient chain, store-vs-recompute, AC phase-field)
+        run: python tutorials/E_differentiable/E0c_recipe_new_pde.py
+
   gpu-tutorials:
     name: gpu-tutorials (self-hosted — GATED)
     # Same gate as ci.yml's gpu-smoke: needs a registered self-hosted NVIDIA
