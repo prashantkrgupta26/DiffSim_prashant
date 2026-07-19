@@ -88,4 +88,5 @@ markers = [
   "tier5: SBM solves, MMS orders, backend cross-verification",
   "ad: adjoint/gradient checks (Tier AD)",
   "geometry: geometry-oracle / trimesh tests",
+  "slow: long-running marching/continuation tests (SP-1 Block C)",
 ]
