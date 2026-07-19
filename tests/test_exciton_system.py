@@ -83,7 +83,7 @@ def _dist_bilayer(x):
 
 
 def _make_system_for_jac(level=3, p=1, device="cpu", with_closures=True,
-                         zeta=1e-3):
+                         zeta=1e-3, _linsolver="splu", _linsolve=None):
     """Build an XDDSystem with real A3 closures and a bilayer dist field.
 
     zeta tames the physical Langevin γ̂ (~1e5) to a well-conditioned scale for
@@ -116,7 +116,8 @@ def _make_system_for_jac(level=3, p=1, device="cpu", with_closures=True,
         dm, lam2=1.0, eps_gp=one, mu_n_gp=mu_n, mu_p_gp=mu_p,
         mu_xd_gp=mu_xd, mu_xa_gp=mu_xa, dist_gp=dist_gp,
         langevin=langevin, onsager=onsager,
-        tau_inv_d=1.0, tau_inv_a=1.0, supg=1.0)
+        tau_inv_d=1.0, tau_inv_a=1.0, supg=1.0,
+        linsolver=_linsolver, linsolve=_linsolve)
     return sysm, dm, mesh, cons, xq
 
 
@@ -1213,3 +1214,70 @@ def test_log_lighton_smoke(device):
     # G_B5_4 (no-guard) folded in: carriers are e^u>0 → guard never fires.
     assert sysm.guard_trunc == 0, (
         f"G_B5_5/G_B5_4: log guard truncated a carrier step ({sysm.guard_trunc})")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# E5 fix — cuDSS linsolver option plumbing (Mac/CPU: no CUDA — plumbing only)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# SP-1 R0 E5: the host-splu Newton solve was GPU-idle at 330k DOF (0% util,
+# 97.75 s/step).  XDDSystem now takes linsolver="splu"|"cudss"; the cudss path
+# routes the assembled Jacobian through the in-tree cuDSS GPU sparse direct LU
+# (nvmath, plan-once + refactorize per Newton iterate).  These tests assert the
+# OPTION plumbing on CPU (the actual GPU solve is measured on the box); they do
+# NOT require nvmath/CUDA.
+
+
+def test_e5_linsolver_default_splu_unchanged():
+    """G_E5_fix: default linsolver='splu' — parity/CPU mode is the pre-fix
+    behaviour verbatim (host scipy splu callable, _cudss plan untouched)."""
+    sysm, dm, mesh, cons, xq = _make_system_for_jac(level=2, with_closures=False)
+    assert sysm.linsolver == "splu"
+    assert sysm._cudss is None
+    # a real small solve still works through the splu path
+    state = _random_state(dm, seed=1)
+    sysm.sigma = 0.0
+    st, info = sysm.solve_newton(state, max_iter=3)
+    assert all(np.all(np.isfinite(st[f])) for f in range(NDOF))
+
+
+def test_e5_linsolver_rejects_unknown():
+    """G_E5_fix: an unknown linsolver name is a clear ValueError at construction
+    (not a late/obscure failure mid-Newton)."""
+    with pytest.raises(ValueError, match="linsolver must be"):
+        _make_system_for_jac(level=2, with_closures=False, _linsolver="bogus")
+
+
+def test_e5_linsolver_cudss_selected_and_degrades():
+    """G_E5_fix: linsolver='cudss' wires XDDSystem.linsolve to the cuDSS path,
+    and on a CUDA-less host it degrades with a CLEAR BackendError (nvmath
+    absent) rather than a cryptic import trace — the Mac graceful-degradation
+    requirement.  (On the box with nvmath this same seam runs the GPU solve.)"""
+    from diffsim.errors import BackendError
+    sysm, dm, mesh, cons, xq = _make_system_for_jac(
+        level=2, with_closures=False, _linsolver="cudss")
+    assert sysm.linsolver == "cudss"
+    assert sysm.linsolve == sysm._cudss_linsolve
+    import scipy.sparse as sp
+    A = sp.eye(4, format="csr")
+    b = np.ones(4)
+    try:
+        import nvmath.sparse.advanced  # noqa: F401
+        have_nvmath = True
+    except Exception:
+        have_nvmath = False
+    if have_nvmath:
+        pytest.skip("nvmath present — GPU solve path is measured on the box, "
+                    "not asserted as a CPU unit test")
+    with pytest.raises(BackendError, match="cudss"):
+        sysm._cudss_linsolve(A, b)
+
+
+def test_e5_explicit_linsolve_overrides_linsolver():
+    """G_E5_fix: an explicit `linsolve` callable still overrides `linsolver`
+    (the bespoke-driver / test hook contract is preserved)."""
+    from scipy.sparse.linalg import splu as _splu
+    hook = lambda A, r: _splu(A.tocsc()).solve(r)
+    sysm, dm, mesh, cons, xq = _make_system_for_jac(
+        level=2, with_closures=False, _linsolve=hook, _linsolver="cudss")
+    assert sysm.linsolve is hook

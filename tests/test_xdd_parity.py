@@ -200,6 +200,11 @@ def test_e5_perf_baseline_parses_and_speedup_consistent():
     """G_E5: the perf baseline file parses and its recorded speedup IS what the
     file's own s/step + steps + CPU-baseline arithmetic says.
 
+    E5 FIX (2026-07-18): the gate now targets the cuDSS 'measured' row
+    (XDDSystem(linsolver='cudss') wired the GPU sparse direct LU into the Newton
+    solve).  The pre-fix host-splu measurement is kept in 'history' as provenance
+    and its arithmetic is validated too.
+
     House pattern for perf: measured numbers are LEDGER-LOCKED on the box
     (benchmarks/xdd/e5_perf_nirmal.py), NOT re-run in CI (a 330k-DOF GPU march
     is not a unit test).  This test guards against silent corruption of the
@@ -209,13 +214,19 @@ def test_e5_perf_baseline_parses_and_speedup_consistent():
     b = _e5_baseline()
     m = b["measured"]
     g = b["gate"]
+    h = b["history"]
 
     # 1) primitives present and physical
     assert m["nodes"] > 0 and m["dofs"] > 0
     assert m["s_per_step_median"] > 0.0
     assert m["steps_for_window"] > 0
-    assert "splu" in m["solver"].lower(), (
-        "G_E5: solver provenance must record the host splu path")
+    # the GATE now targets the cuDSS solve (the E5 fix)
+    assert m["linsolver"] == "cudss"
+    assert "cudss" in m["solver"].lower(), (
+        "G_E5: the gated 'measured' row must record the cuDSS path (the E5 fix)")
+    # history preserves the pre-fix host-splu provenance
+    assert "splu" in h["solver"].lower(), (
+        "G_E5: 'history' must preserve the pre-fix host-splu provenance")
 
     # 2) end-to-end = s/step × steps (the recorded projection)
     e2e = m["s_per_step_median"] * m["steps_for_window"]
@@ -232,3 +243,10 @@ def test_e5_perf_baseline_parses_and_speedup_consistent():
     # 4) the recorded verdict matches the 100x target arithmetic
     assert g["pass_vs_10h"] == (g["speedup_vs_10h"] >= g["target"])
     assert g["pass_vs_30h"] == (g["speedup_vs_30h"] >= g["target"])
+
+    # 5) the cuDSS-vs-splu speedup is internally consistent with the two rows
+    sp = h["s_per_step_median"] / m["s_per_step_median"]
+    assert abs(sp - g["speedup_vs_history_splu_median"]) <= 1e-4 * sp, (
+        f"G_E5: speedup_vs_history_splu_median {g['speedup_vs_history_splu_median']}"
+        f" != splu/cudss s/step {sp}")
+    assert sp > 1.0, "G_E5: the cuDSS fix must be faster than the host-splu history"

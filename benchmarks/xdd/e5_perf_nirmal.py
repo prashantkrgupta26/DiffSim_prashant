@@ -21,14 +21,18 @@ device size on a single GPU, and computes the speedup vs the CPU baseline
   - morphology: analytic bilayer via A2 signed_distance.
 
 ## What "GPU" means here (recorded, honest — the deferred-brainstorm input)
-  Element assembly runs through Warp kernels on `cuda:N`.  BUT the global 5-field
-  Jacobian is a scipy CSR built on HOST, and the Newton linear solve is HOST
-  scipy `splu` (nonsymmetric sparse LU); the A3 closures are HOST numpy.  cuDSS is
-  NOT wired into XDDSystem.linsolve (default `splu(A.tocsc()).solve`).  So the
-  per-step cost is dominated by host-side sparse LU + host closure eval, with GPU
-  used only for element matrix assembly.  This is the measured configuration; the
-  s/step number and this solver-config detail are the input to the A100-speedup /
-  cuDSS brainstorm if the gate misses.
+  Element assembly runs through Warp kernels on `cuda:N`.  The global 5-field
+  Jacobian is a scipy CSR built on HOST.  The Newton linear solve backend is
+  chosen with --linsolver:
+    splu  (default) — HOST scipy `splu` (nonsymmetric sparse LU): the E-b
+           baseline; GPU idle during the solve (0% util, host-LU bound at
+           330k DOF — the documented E5 gate MISS).
+    cudss — the E5 FIX: XDDSystem(linsolver="cudss") routes the assembled
+           Jacobian through the in-tree cuDSS GPU sparse direct LU (nvmath,
+           plan-once + refactorize per Newton iterate on the fixed sparsity).
+           The factorization AND triangular solves run on the device.
+  (The A3 closures remain HOST numpy either way — recorded; if transfer/closure
+  eval dominates after the cudss fix, that is the next bottleneck to profile.)
 
 ## The march (per-step waveform, capturing J(t))
   The stock XDDRun PULSE/STEADY_PULSE paths use SQUARE-wave phases, not a
@@ -88,7 +92,8 @@ def bilayer_dist_gp(xq, height, h_axis=1):
 
 
 def build_system(level: int, device: str, params: XDDParams,
-                 *, h_axis: int = 1, regime: str = "marchable"):
+                 *, h_axis: int = 1, regime: str = "marchable",
+                 linsolver: str = "splu"):
     """Build the XDDSystem at the given uniform level on `device`.
 
     regime:
@@ -145,42 +150,29 @@ def build_system(level: int, device: str, params: XDDParams,
     tau_inv_a = s.t0 / params.tau_x_acceptor
     lam2 = 1e-1 if regime == "marchable" else s.lambda2
 
-    linsolve = _try_cudss(device)
+    # E5 fix (2026-07-18): linsolver="cudss" routes the assembled 5-field
+    # Jacobian through the in-tree cuDSS GPU sparse direct LU (plan-once +
+    # refactorize per Newton iterate; see XDDSystem._cudss_linsolve).  The
+    # host-splu default is GPU-idle at 330k DOF — the measured E-b bottleneck.
     sysm = XDDSystem(
         dm, lam2=lam2, eps_gp=eps, mu_n_gp=mu_n, mu_p_gp=mu_p,
         mu_xd_gp=mu_xd, mu_xa_gp=mu_xa, dist_gp=dist_gp,
         langevin=lang, onsager=ons, tau_inv_d=tau_inv_d, tau_inv_a=tau_inv_a,
-        supg=1.0, carrier_vars="log",
-        **({"linsolve": linsolve} if linsolve is not None else {}))
+        supg=1.0, carrier_vars="log", linsolver=linsolver)
     return sysm, mesh, cons, dm, xq, dist_gp
-
-
-def _try_cudss(device: str):
-    """Attempt a cuDSS-backed linsolve for the nonsymmetric 2-D system.
-
-    Returns a callable (A, b)->x on success, else None (→ host splu default).
-    cuDSS is the natural GPU LU for the 2-D nonsymmetric Jacobian; if no python
-    binding is importable we record that and fall back — the honest measured
-    config is then host splu."""
-    if not device.startswith("cuda"):
-        return None
-    try:
-        from cudss import CudssSolver  # noqa
-    except Exception:
-        return None
-    # Only reached if a cudss python binding exists (it does not on this box —
-    # recorded).  Kept as a hook so the brainstorm can wire it without a driver
-    # rewrite.
-    return None
 
 
 def measure(level: int, device: str, n_steps: int, dt_hat: float,
             params: XDDParams, *, h_axis: int = 1, verbose: bool = True,
-            regime: str = "marchable"):
+            regime: str = "marchable", linsolver: str = "splu"):
     """March `n_steps` fixed-dt BDF1 steps of the 10 GHz rect-sin drive,
-    capturing J(t) and per-step wall time.  Returns a results dict."""
+    capturing J(t) and per-step wall time.  Returns a results dict.
+
+    linsolver: "splu" (host scipy SuperLU, the E-b baseline) | "cudss" (the
+    E5-fix GPU sparse direct LU — wired via XDDSystem(linsolver="cudss"))."""
     sysm, mesh, cons, dm, xq, dist_gp = build_system(
-        level, device, params, h_axis=h_axis, regime=regime)
+        level, device, params, h_axis=h_axis, regime=regime,
+        linsolver=linsolver)
     s = params.scales()
     n_nodes = dm.n_nodes
     if verbose:
@@ -281,7 +273,11 @@ def measure(level: int, device: str, n_steps: int, dt_hat: float,
         steps_for_window=steps_for_window,
         end_to_end_projected_s=end_to_end_proj,
         jt_trace=jt,
-        solver="host_scipy_splu (cuDSS not wired; warp assembly on GPU)",
+        linsolver=linsolver,
+        solver=("cudss GPU sparse direct LU (nvmath, plan-once + "
+                "refactorize per Newton iterate; warp assembly on GPU)"
+                if linsolver == "cudss" else
+                "host_scipy_splu (cuDSS not wired; warp assembly on GPU)"),
     )
 
 
@@ -312,6 +308,10 @@ def main():
                     help="fixed step in picoseconds (5 ps → 20 steps/cycle at 10 GHz)")
     ap.add_argument("--regime", default="marchable",
                     choices=("marchable", "physical"))
+    ap.add_argument("--linsolver", default="splu",
+                    choices=("splu", "cudss"),
+                    help="linear-solve backend: splu (host, E-b baseline) | "
+                         "cudss (GPU sparse direct LU, the E5 perf fix)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -324,7 +324,7 @@ def main():
           f"1ns window = {NIRMAL_WINDOW/(args.dt_ps*1e-12):.0f} steps", flush=True)
 
     res = measure(args.level, args.device, args.n_steps, dt_hat, params,
-                  regime=args.regime)
+                  regime=args.regime, linsolver=args.linsolver)
     gate = gate_arithmetic(res)
     res_out = {k: v for k, v in res.items() if k != "jt_trace"}
     res_out["jt_trace_len"] = len(res["jt_trace"])

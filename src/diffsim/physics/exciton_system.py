@@ -522,7 +522,7 @@ class XDDSystem:
                  langevin=None, onsager=None,
                  tau_inv_d=0.0, tau_inv_a=0.0,
                  supg=1.0, newton_tol=1e-10, atol=1e-12,
-                 linsolve=None, carrier_vars="primal"):
+                 linsolve=None, linsolver="splu", carrier_vars="primal"):
         self.dm = dm
         self.lam2 = float(lam2)
         self.eps_gp = eps_gp
@@ -538,7 +538,37 @@ class XDDSystem:
         self.supg = float(supg)
         self.newton_tol = float(newton_tol)
         self.atol = float(atol)
-        self.linsolve = linsolve or (lambda A, r: splu(A.tocsc()).solve(r))
+
+        # Linear-solve backend.  `linsolve` (an explicit (A, b)->x callable)
+        # overrides everything (test hook / bespoke driver).  Otherwise
+        # `linsolver` selects a stock backend:
+        #   "splu"  — host scipy SuperLU (prototype default; PARITY/CPU mode
+        #             unchanged — this is the pre-E5-fix behaviour verbatim).
+        #   "cudss" — NVIDIA cuDSS (GPU sparse direct LU) via nvmath-python,
+        #             the GPU analogue of splu for this 2-D NONSYMMETRIC 5-field
+        #             Jacobian.  Plan ONCE on the first Newton iterate, then
+        #             reset_operands + refactorize per iterate (the Jacobian
+        #             sparsity is FIXED across Newton iters — same mesh, same
+        #             5-field coupling), the M1d refactorization-loop case.
+        #             Uses the PLAIN DirectSolverOptions(blocking=True) path
+        #             (multiphase's lesson: the mtlayer_gomp planning layer
+        #             leaks a gomp thread-team per call; these 2-D systems plan
+        #             fast single-threaded).  Discarded plans are EXPLICITLY
+        #             .free()'d (double-free guard).  nvmath/CUDA absent ->
+        #             clear BackendError at first solve (Mac/CPU parity mode
+        #             never trips it).
+        if linsolver not in ("splu", "cudss"):
+            raise ValueError(f"linsolver must be 'splu' or 'cudss', "
+                             f"got {linsolver!r}")
+        self.linsolver = linsolver
+        self._cudss = None          # nvmath DirectSolver plan (per fixed pattern)
+        self._cudss_nnz = -1        # sparsity fingerprint of the planned matrix
+        if linsolve is not None:
+            self.linsolve = linsolve
+        elif linsolver == "cudss":
+            self.linsolve = self._cudss_linsolve
+        else:
+            self.linsolve = lambda A, r: splu(A.tocsc()).solve(r)
 
         if carrier_vars not in ("primal", "log"):
             raise ValueError(f"carrier_vars must be 'primal' or 'log', "
@@ -1029,6 +1059,60 @@ class XDDSystem:
                 row = field * nf + fi
                 b[row] = -b[row]   # flip back to +(g−u)
         return self.linsolve(A, b)
+
+    def _cudss_linsolve(self, A, b):
+        """cuDSS (GPU sparse direct LU) solve of A x = b for the 5-field
+        Jacobian — the E5 perf-fix path (host splu was GPU-idle at 330k DOF).
+
+        Follows the in-tree multiphase/wodo lifecycle: PLAN ONCE on the first
+        Newton iterate, then reset_operands + refactorize per iterate (the
+        Jacobian pattern is fixed across a Newton solve — same mesh, same
+        coupling).  The plan is rebuilt (old one EXPLICITLY .free()'d — the
+        double-free guard) if the nnz pattern ever changes.  PLAIN
+        DirectSolverOptions(blocking=True): no mtlayer_gomp (its per-call
+        gomp-thread-team leak killed multiphase marches; the 2-D system plans
+        fast single-threaded).  nvmath/CUDA absent -> BackendError (Mac/CPU
+        parity mode uses linsolver="splu" and never reaches here)."""
+        A = A.tocsr()
+        b = np.ascontiguousarray(b, np.float64)
+        try:
+            from nvmath.sparse.advanced import (DirectSolver,
+                                                DirectSolverOptions)
+        except Exception as exc:                       # nvmath / CUDA absent
+            from ..errors import BackendError
+            raise BackendError(
+                "linsolver='cudss' requires nvmath-python[cu12] on a CUDA "
+                f"device (import failed: {exc}). Use linsolver='splu' on "
+                "CPU/Mac.") from exc
+        if self._cudss is not None and self._cudss_nnz != A.nnz:
+            # sparsity changed -> the cached plan is stale; release it
+            # EXPLICITLY (GC finalizer double-frees device buffers under
+            # pattern flapping — the multiphase 2026-07-10 lesson).
+            try:
+                self._cudss.free()
+            except Exception:
+                pass
+            self._cudss = None
+        try:
+            if self._cudss is None:
+                self._cudss = DirectSolver(
+                    A, b, options=DirectSolverOptions(blocking=True))
+                self._cudss.plan()
+                self._cudss_nnz = A.nnz
+            else:
+                self._cudss.reset_operands(a=A, b=b)
+            self._cudss.factorize()
+            return np.asarray(self._cudss.solve())
+        except Exception:
+            # release the (possibly half-built) plan so the next attempt
+            # re-plans cleanly rather than double-freeing on GC
+            try:
+                self._cudss.free()
+            except Exception:
+                pass
+            self._cudss = None
+            self._cudss_nnz = -1
+            raise
 
     def _apply_increment(self, state, du, step):
         nf = self.n_free
