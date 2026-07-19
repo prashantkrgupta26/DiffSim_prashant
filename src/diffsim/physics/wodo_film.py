@@ -808,7 +808,8 @@ class WodoFilmStepper(TernaryCHStepper):
         # builds; None = the assembler's size-based auto switch)
         self._asm = DeviceNSAssembler(
             self.dm, ndof=4,
-            node_pattern=getattr(self, "_node_pattern", None))
+            node_pattern=getattr(self, "_node_pattern", None),
+            index_width=getattr(self, "_index_width", "auto"))
         d = self.dm.device
         ntf, nfn = self.top_faces.shape
         rows, cols, gdofs = [], [], []
@@ -819,8 +820,11 @@ class WodoFilmStepper(TernaryCHStepper):
             gdofs.append(gd.ravel())
         slots = self._asm.csr_slots(np.concatenate(rows),
                                     np.concatenate(cols))
-        self._flux_slots_d = wp.array(slots.astype(np.int32),
-                                      dtype=wp.int32, device=d)
+        # flux slots index nnz-space -> cast to the assembler's CSR
+        # index width (add_matrix_values contract; P0-2).
+        self._flux_slots_d = wp.array(
+            slots.astype(self._asm._idx_np),
+            dtype=self._asm._idx_dtype, device=d)
         self._flux_gdof_d = wp.array(
             np.concatenate(gdofs).astype(np.int32), dtype=wp.int32,
             device=d)

@@ -34,6 +34,7 @@ XI_ELEMS_RULE = 4.0            # the >=4-elements interface rule (PASS)
 # precedent. Measured anchor, not an invented tolerance.
 XI_ELEMS_FLOOR = 2.5
 INT32_CEIL = 2 ** 31           # device-assembly slot arithmetic
+WIDE_THRESHOLD = int(0.9 * 2 ** 31)   # auto-switch to mixed-width CSR
 CUDSS_NNZ_WALL = 228e6         # measured ALLOC wall, 48 GB card (3-D)
 
 
@@ -261,15 +262,30 @@ def run_preflight(params, resolved, query_hardware=True):
                     "adapt=lte with noise=0: deterministic run gets the "
                     "full LTE PI(D) controller.")
 
-    # -- int32-slot-ceiling ---------------------------------------------
+    # -- index-width (P0-2: the old int32-slot-ceiling, now an auto-
+    #    switch report) --------------------------------------------------
+    # Device assembly used to hard-FAIL past 2^31 nnz (the int32 slot
+    # arithmetic wrapped).  Mixed-width CSR (int64 offsets/slots, int32
+    # columns) removes that ceiling: "auto" flips to the wide path once
+    # nnz crosses ~90% of 2^31.  A user who FORCES narrow past the
+    # ceiling still FAILs loudly here (no silent wrap).
     if p.device_assembly:
         pct = 100.0 * r.nnz / INT32_CEIL
-        if r.nnz >= INT32_CEIL:
-            rep.add("int32-slot-ceiling", FAIL,
-                    f"nnz={r.nnz} >= 2^31: device-assembly int32 slot "
-                    f"arithmetic overflows ({pct:.0f}% of range) -- "
-                    "reduce resolution")
+        iw = getattr(p, "index_width", "auto")
+        if iw == "narrow" and r.nnz >= INT32_CEIL:
+            rep.add("index-width", FAIL,
+                    f"nnz={r.nnz} >= 2^31 ({pct:.0f}% of range) but "
+                    "index_width='narrow' forced: the int32 slot "
+                    "arithmetic would WRAP -- use 'auto' or 'wide'")
+        elif iw == "wide" or (iw == "auto" and r.nnz >= WIDE_THRESHOLD):
+            mode = "wide (forced)" if iw == "wide" else "wide (auto)"
+            rep.add("index-width", PASS,
+                    f"nnz={r.nnz} = {pct:.0f}% of int32 range -> {mode}: "
+                    "mixed-width CSR (int64 offsets/slots, int32 columns) "
+                    "-- past the int32 nnz ceiling, near-zero mem tax")
         else:
-            rep.add("int32-slot-ceiling", PASS,
-                    f"nnz={r.nnz} = {pct:.0f}% of the int32 slot range")
+            rep.add("index-width", PASS,
+                    f"nnz={r.nnz} = {pct:.0f}% of int32 range -> narrow "
+                    "(int32 offsets/slots; auto-switch to wide at "
+                    f"{100.0 * WIDE_THRESHOLD / INT32_CEIL:.0f}%)")
     return rep
