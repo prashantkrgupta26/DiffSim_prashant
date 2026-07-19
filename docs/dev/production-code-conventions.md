@@ -309,3 +309,24 @@ DMAX=19), element-parallel flat kernels throughout. Verdicts for us:
    anti-pattern at scale; coloring/matrix-free stays our plan.
 6. Solver = AMGX aggregation-CG only; geometry = STL ray-cast cut-cell
    (no SBM, no differentiability, no VMS) — no overlap with our edge.
+
+## Scaling-pathway declaration (standing rule, ratified 2026-07-19)
+
+Every new physics development (NS, NS-SBM, thin-shell-NS, NS-PNP, PNP, XDD,
+AM, and successors) must declare its 100M+-DOF pathway AT THE SPEC STAGE:
+
+1. **Stage residency table** — assembly / solve / closures / marching /
+   observables, each marked `host | device | either`. "Mixed" requires an
+   explicit Amdahl budget ("stage X is host at Y s/step; acceptable at target
+   scale because Z") — never mixed-by-default. Motivation: the 2026-07-19
+   forensics found a ~61 s/step host floor (assembly/scatter/GP fields)
+   common to Ada/A100/GH200 — a silent Amdahl ceiling inside a nominally
+   device-resident stack (efficiencies capped at 55–75% of bandwidth-predicted).
+2. **100M-DOF budget line** — bytes/dof, nnz/dof, index width (mixed-width
+   CSR per the P0-2 templating), multi-GPU comms pattern if any stage halos.
+3. **Deployment tiers** — workstation single-GPU (2-D production) · single
+   big node (GH200 / Horizon NVL4 hero runs) · multi-node (Horizon gb-large /
+   AWS on-demand clusters).
+
+CPU-only code = tooling and parity references only; production compute
+remains GPU-only per the standing program rule.
