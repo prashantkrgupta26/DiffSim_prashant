@@ -1,0 +1,28 @@
+{
+  "_provenance": "SP-1 R0 Block E — E1 reduction gates + E2 SimSalabim cross-check. Locked 2026-07-18 on warp-CPU (arm64 Mac). Regenerate: benchmarks/xdd/e1_reduction.py (E1) and benchmarks/xdd/e2_simsalabim.py (E2, needs SIMSS_BIN). Tests: tests/test_xdd_parity.py E1/E2 sections.",
+
+  "e1_stripe_ordering": {
+    "_config": "Reduced-drive marchable regime (lam2=1e-1, Eg_hat=4, symmetric mu=0.5, zeta=1e-6) — the config test_xdd_run._resolvable_bilayer documents. Device PARAMETERS are physical Kodali PPV:PCBM Table-2 (height=120nm, eps_r=3.4, N_C=2.5e25, mu_n=2.5e-7, mu_p=3e-8, E_g=1.34, a=2.5nm); only Poisson drive strength (lam2) + built-in (Eg_hat) relaxed for mesh resolvability. Level=3, p=1, 33x33 stripe morphology via signed_distance().",
+    "_observable": "carrier_src = int(k_hat_D*X_D) + int(k_hat_A*X_A) — the free-carrier generation content (transport-only carrier source; the CMAME-2012 transport-only model current tracks this). Assert ORDERING not absolute (per plan).",
+    "vertical_2":   {"carrier_src": 1.425855750234923e-04, "n_sites": 64.00, "J": 1.9391611043169665e-02},
+    "vertical_6":   {"carrier_src": 5.255108087881609e-04, "n_sites": 232.72, "J": 1.9551493153605132e-02},
+    "horizontal_2": {"carrier_src": 1.381097170230076e-04, "n_sites": 64.00, "J": 1.9400248720892452e-02},
+    "horizontal_6": {"carrier_src": 5.231506682724593e-04, "n_sites": 232.72, "J": 1.9566533564675680e-02},
+    "_ordering_asserted": "6-stripe carrier_src > 2-stripe carrier_src (both orientations): 2x interface sites -> more dissociation -> more free-carrier generation. J also higher for 6-stripe.",
+    "rtol": 0.15,
+    "_rtol_note": "15% relative headroom on the locked absolute values (>2x measured run-to-run drift, which is ~0 — deterministic solve). The HARD gate is the ordering (6>2), which holds by a 3.7x margin.",
+    "_horiz_vs_vert_note": "The plan's 'horizontal > vertical total current' claim requires asymmetric conduction pathways not resolved in the symmetric reduced-drive config: measured vertical_6 csrc (5.255e-4) ~ horizontal_6 (5.232e-4), a 0.5% difference (device is transport-symmetric). Recorded as an honest deviation; the site-count ordering (6>2) is the robust reduction anchor."
+  },
+
+  "e2_simsalabim": {
+    "_status": "INSTALLED + RUNNING. pySIMsalabim (PyPI) installs on arm64 Mac; SimSS binary built from github.com/kostergroup/SIMsalabim with fpc 3.2.2 (brew). Reference locked from the physical 120nm Kodali-class device.",
+    "_device": "Matched 1-D homogeneous: L=120nm, eps_r=3.4, N_c=2.5e25, mu_n=2.5e-7, mu_p=3e-8, E_g=1.34 (E_c=3.9,E_v=5.24), T=300, uniform G_ehp=2.7e27, Langevin (useLangevin=1, preLangevin=1), ohmic contacts (W_L=E_c,W_R=E_v), no traps, no ions, NP=400. See benchmarks/xdd/e2_simsalabim.py for the full parameter-mapping dictionary.",
+    "Jsc_A_per_m2": -44.8378,
+    "Voc_V": 0.8316,
+    "FF": 0.5506,
+    "rtol": 0.05,
+    "_rtol_note": "5% relative headroom on the SimSS reference (SimSS is deterministic; run-to-run identical). This locks the community-standard 1-D anchor.",
+    "_kodali_band": "Kodali PPV:PCBM Jsc ~ -30 A/m2 class. Documented band: +/-50% => [-45, -15] A/m2. SimSS -44.8378 A/m2 lands at the band edge (larger |Jsc| than -30 from the 120nm absorption volume + full internal-QE Langevin-only device); the same device at 100nm gives -37.76 A/m2, comfortably inside. Anchor CONFIRMED: the physical device parametrisation is Kodali-class.",
+    "_xdd_headtohead_blocked": "The XDD FORWARD solver cannot march the PHYSICAL device on a CPU mesh (Eg_hat~52, Debye~0.44nm << any feasible CPU element; probe: dark-eq march gives 1 accepted / 47 rejected steps, phi blows to +/-26, criterion NOT fired). This is the documented mesh-resolution wall (test_xdd_run._resolvable_bilayer) — a Block-D/E Scharfetter-Gummel / GPU-mesh item, NOT an R0-CPU gate. E2 therefore locks the SimSS physical reference as the anchor; the absolute XDD-vs-SimSS |dJsc|/|dVoc| head-to-head is deferred with this recorded mechanism."
+  }
+}
