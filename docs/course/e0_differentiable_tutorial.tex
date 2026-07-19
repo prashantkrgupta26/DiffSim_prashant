@@ -1,0 +1,891 @@
+% E0 track: the adjoint on-ramp course document.
+% Companion to tutorials/E_differentiable/{E0a,E0b,E0c}. Self-contained:
+% only amsmath/amssymb/booktabs/hyperref. Compile: tectonic (x1 sufficient).
+\documentclass[11pt]{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\setlength{\parskip}{0.4em}
+\setlength{\parindent}{0pt}
+
+% ---- lightweight remark boxes (no external packages) --------------------
+\newcounter{remark}
+\newenvironment{remark}[1]{%
+  \refstepcounter{remark}\par\medskip
+  \noindent\begin{minipage}{\linewidth}
+  \hrule height 0.8pt \smallskip
+  \textbf{Remark \theremark\ (#1).}\ }{%
+  \smallskip\hrule height 0.8pt \end{minipage}\par\medskip}
+
+\newenvironment{measured}{%
+  \par\medskip\noindent\begin{minipage}{\linewidth}
+  \hrule height 0.8pt \smallskip
+  \textbf{Measured.}\ }{%
+  \smallskip\hrule height 0.8pt \end{minipage}\par\medskip}
+
+% ---- math shorthands ----------------------------------------------------
+\newcommand{\diff}[2]{\frac{\partial #1}{\partial #2}}
+\newcommand{\vd}[2]{\frac{\delta #1}{\delta #2}}
+\newcommand{\ip}[2]{\left(#1,\,#2\right)}
+\newcommand{\dR}{\,\mathrm{d}}
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\nn}{\mathbf{n}}
+
+\title{Differentiable Simulation on DiffSim:\\
+  Three Ways to a Gradient, the Discrete Adjoint, and the Recipe\\
+  \large The E0 course document (Track E, adjoint on-ramp)}
+\author{The DiffSim curriculum}
+\date{July 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document is the theory companion to the three runnable E0 tutorials
+(\texttt{tutorials/E\_differentiable/E0a--E0c}).  It develops the
+mathematics of differentiable simulation in DiffSim notation, consolidates
+the theory of the three chapters, and closes with the Adjoint-Readiness
+Checklist as an appendix.  Structure and example lineage are adapted from
+the mathematical background of \textbf{dolfin-adjoint/pyadjoint} by Patrick
+E.~Farrell; the mother problem, three-way comparison device, and
+``learning reaction rates'' examples follow Farrell, Ham, Funke \& Rognes
+\cite{farrell2013} and Mitusch, Funke \& Dokken \cite{mitusch2019}.
+DiffSim-native content --- the discrete-adjoint stance, taping rules, the
+beyond-FH gauge story, the H4 signal-scale protocol --- is developed in
+the E-track specs and dev notes.  House rule: \emph{theory predicts a
+number, then we print the measured number next to it.}  All numbers quoted
+here are from the gate batteries of tutorials E0a--E0c,
+reproducible on CPU in under three minutes each.
+\end{abstract}
+
+\tableofcontents
+
+%=======================================================================
+\section*{Part I: The Reduced Functional and Three Paths to Its Gradient}
+\addcontentsline{toc}{section}{Part I: The Reduced Functional}
+
+\section{The reduced functional}
+\label{sec:reduced}
+
+Let $m \in \RR^N$ be a vector of simulation parameters (a conductivity
+field per element, material coefficients, boundary data, \ldots).  The
+forward model maps $m$ to a state $u(m) \in \RR^n$ by solving a residual
+equation
+\begin{equation}
+  R\bigl(u(m),\, m\bigr) \;=\; 0 .
+  \label{eq:residual}
+\end{equation}
+A scalar quantity of interest $J(u, m)$ defines the \emph{reduced
+functional}
+\begin{equation}
+  \hat{J}(m) \;=\; J\!\bigl(u(m),\, m\bigr),
+  \label{eq:Jhat}
+\end{equation}
+where $u(m)$ is understood as the implicit solution of \eqref{eq:residual}.
+The optimisation problem is $\min_m \hat{J}(m)$; gradient-based methods
+require $\nabla_m \hat{J}$.
+
+\textbf{The mother problem (Farrell/pyadjoint).}  Throughout Part~I we
+use the Poisson conductivity problem as a concrete instance:
+$-\nabla\cdot(\kappa(x)\nabla u) = f$ on $\Omega = [0,1]^2$ with
+$u|_{\partial\Omega} = g$.  The conductivity field $\kappa(x)$ is our
+parameter, discretized as a per-element constant $m = (\kappa_1,\ldots,
+\kappa_N)$ on a uniform $Q_1$ mesh.  Someone hands us probe measurements
+$u_{\mathrm{obs}}(x_i)$ at $P$ interior locations; the objective is
+\begin{equation}
+  J = \tfrac12 \sum_{i=1}^P \bigl(u(x_i) - u_{\mathrm{obs},i}\bigr)^2 .
+  \label{eq:Jprobe}
+\end{equation}
+For $N = 64$ elements (level-3 grid) the tutorial measures
+$\hat{J}(\kappa_{\mathrm{eval}}) \approx 8.35 \times 10^{-3}$ at a
+uniform evaluation point $\kappa_{\mathrm{eval}} = 1.3$, with a two-blob
+true field $\kappa_{\mathrm{true}} \in [1.0,\, 2.5]$.
+
+\section{Three ways to $\nabla_m \hat{J}$}
+\label{sec:threeways}
+
+Differentiating the residual constraint \eqref{eq:residual}
+implicitly links $\nabla_m \hat{J}$ to $u$ and $R$.  Three methods
+exploit this link at radically different cost.
+
+\subsection{Finite differences (FD)}
+
+For each parameter index $i = 1,\ldots,N$:
+\begin{equation}
+  \frac{\partial \hat{J}}{\partial m_i}
+  \;\approx\;
+  \frac{\hat{J}(m + \epsilon e_i) - \hat{J}(m - \epsilon e_i)}{2\epsilon}.
+  \label{eq:fd}
+\end{equation}
+Cost: \textbf{$2N$ forward solves} (central differences).  Accuracy:
+limited by floating-point cancellation for $\epsilon \lesssim
+\sqrt{\varepsilon_{\mathrm{machine}}}$.  At $N = 64$ this requires 128
+forward solves.
+
+\subsection{Tangent-linear method (TLM, forward-mode AD)}
+
+Differentiate \eqref{eq:residual} with respect to $m_i$:
+\begin{equation}
+  \frac{\partial R}{\partial u} \,\dot{u}_i + \frac{\partial R}{\partial m_i}
+  = 0
+  \quad\Rightarrow\quad
+  \dot{u}_i = -\!\left(\frac{\partial R}{\partial u}\right)^{\!-1}
+              \frac{\partial R}{\partial m_i} .
+  \label{eq:tlm}
+\end{equation}
+Each $\dot{u}_i$ is obtained by one \emph{forward-mode} linear solve, then
+$\partial \hat{J}/\partial m_i = (\partial J/\partial u)\,\dot{u}_i$.
+Cost: \textbf{$N$ forward-mode solves} --- half the FD cost, same
+$O(N)$ scaling.
+
+\subsection{Adjoint (reverse-mode)}
+\label{sec:adjoint}
+
+Form the Lagrangian by appending the residual constraint with a multiplier
+$\lambda$:
+\begin{equation}
+  \mathcal{L}(u, m, \lambda)
+  \;=\; J(u, m) \;-\; \lambda^\top R(u, m) .
+  \label{eq:lagrangian}
+\end{equation}
+Stationarity with respect to $u$ gives the \textbf{adjoint equation}:
+\begin{equation}
+  \frac{\partial \mathcal{L}}{\partial u} = 0
+  \quad\Longrightarrow\quad
+  \left(\frac{\partial R}{\partial u}\right)^{\!\top} \lambda
+  = \left(\frac{\partial J}{\partial u}\right)^{\!\top} .
+  \label{eq:adj}
+\end{equation}
+This is \emph{one linear system for $\lambda$, independent of $N$}.
+Once $\lambda$ is known, the gradient with respect to every parameter
+follows from $\partial \mathcal{L}/\partial m = 0$:
+\begin{equation}
+  \frac{\partial \hat{J}}{\partial m}
+  = \frac{\partial J}{\partial m}
+  - \lambda^\top \frac{\partial R}{\partial m} .
+  \label{eq:adjgrad}
+\end{equation}
+Cost: \textbf{1 forward solve $+$ 1 adjoint solve}, regardless of $N$.
+
+\begin{remark}{adjoint linearity}
+Even when $R(u,m) = 0$ is nonlinear in $u$, the adjoint equation
+\eqref{eq:adj} is \emph{always linear} in $\lambda$ --- it is the
+transposed Jacobian of $R$ evaluated at the converged state $u^*(m)$.
+There is no iteration, only one linear solve.
+\end{remark}
+
+\begin{table}[h]
+\centering
+\caption{Three paths to $\nabla_m \hat{J}$, cost in forward-solve units.
+At $N = 64$ the tutorial measures an FD/adjoint wall-time ratio of
+approximately 30--80$\times$ (kernel compilation dominates the first run;
+steady-state ratio $\approx 35\times$).}
+\label{tab:threeways}
+\begin{tabular}{lccc}
+\toprule
+Method & Solve cost & Exact? & Scales with $N$? \\
+\midrule
+Finite differences (central) & $2N$ forward & No ($\epsilon$-limited) & Yes \\
+Tangent-linear                & $N$ forward  & Yes                    & Yes \\
+Adjoint                       & $1 + 1$      & Yes                    & \textbf{No} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For the Poisson mother problem with $N = 64$ the adjoint equation is
+$A^\top \lambda = (\partial J/\partial u)^\top$, where $A(\kappa)$ is
+the assembled constrained stiffness.  Since $A$ is symmetric
+($A^\top = A$), the forward-solve LU factorization can be reused
+directly for the adjoint solve at no additional cost.
+
+\begin{measured}
+Level-3 grid, 64 elements, 5 probes, FP64.  Adjoint vs central FD:
+max relative error $< 10^{-6}$.  Adjoint vs \texttt{wp.Tape} (taped
+in $\kappa$): max relative error $< 10^{-9}$.  FD wall time / adjoint
+wall time: 30--80$\times$ (first run); $\approx 35\times$ steady-state.
+(\texttt{tutorials/E\_differentiable/E0a\_thinking\_differentiable.py}.)
+\end{measured}
+
+\section{Information-flow reversal}
+\label{sec:infoflow}
+
+The forward solve propagates information \emph{from} the parameter field
+$m$ \emph{through} the PDE \emph{to} the output functional $J$.  The
+adjoint reverses this flow: it carries sensitivity \emph{from} the scalar
+$J$ \emph{backward through} the PDE \emph{to} every parameter at once.
+This is why the adjoint cost is $O(1)$ in $N$: instead of differentiating
+$N$ forward paths, it differentiates one backward path.
+
+The information-flow picture is due to Farrell~\cite{farrell2013} and is
+the central image of the E0a tutorial.
+
+%=======================================================================
+\section*{Part II: Discretize-Then-Differentiate}
+\addcontentsline{toc}{section}{Part II: Discretize-Then-Differentiate}
+
+\section{The discrete-adjoint stance}
+\label{sec:dtd}
+
+Two philosophies exist for adjoints of PDE-constrained problems.
+
+\emph{Differentiate-then-discretize} derives the adjoint PDE in the
+continuous setting (a second boundary-value problem) and then discretizes
+it.  The resulting discrete adjoint is not the exact transpose of the
+primal discretization; it introduces an additional error term of the same
+order as the spatial discretization.
+
+\emph{Discretize-then-differentiate} first commits to a discrete residual
+$R_h(u_h, m) = 0$ and then differentiates the discrete system.  The
+resulting discrete adjoint satisfies
+$({\partial R_h}/{\partial u_h})^\top \lambda = ({\partial J_h}/
+{\partial u_h})^\top$ \emph{exactly}---there is no extra approximation
+beyond the chosen discretization.
+
+\textbf{DiffSim's stance is discretize-then-differentiate} (spec S4.3).
+Every formula in these notes applies to the discrete system; the word
+``adjoint equation'' always refers to the discrete transpose.
+
+\begin{remark}{IFT / relation vs.\ algorithm}
+The Implicit Function Theorem (IFT) underlies the entire approach.
+Given a smooth residual $R(u, m) = 0$ with $\partial R/\partial u$
+invertible at a solution $(u^*, m)$, the IFT guarantees a locally smooth
+map $m \mapsto u^*(m)$ whose derivative is
+\begin{equation}
+  \frac{\partial u^*}{\partial m}
+  = -\!\left(\frac{\partial R}{\partial u}\right)^{\!-1}
+    \frac{\partial R}{\partial m}\biggr|_{(u^*,m)} .
+  \label{eq:ift}
+\end{equation}
+We differentiate the \emph{relation} $R = 0$, not the \emph{algorithm}
+used to solve it.  A Newton iteration, a Krylov method, or an LU
+factorization is an algorithm for inverting $R$; none of these need to
+be differentiated.  Only the assembled matrix $\partial R/\partial u$
+evaluated at convergence enters the adjoint equation.
+\end{remark}
+
+\section{The Lagrangian derivation of the discrete adjoint}
+\label{sec:lagrangian}
+
+Let $R_h : \RR^n \times \RR^N \to \RR^n$ be the discrete residual and
+$J_h : \RR^n \times \RR^N \to \RR$ the discrete objective.
+The Lagrangian is
+\begin{equation}
+  \mathcal{L}(u_h, m, \lambda) = J_h(u_h, m) - \lambda^\top R_h(u_h, m) .
+\end{equation}
+Stationarity conditions:
+\begin{align}
+  \frac{\partial \mathcal{L}}{\partial \lambda} &= 0
+  \quad\Longrightarrow\quad R_h(u_h^*, m) = 0
+  \quad\text{(forward problem)}, \label{eq:stat_lam}\\
+  \frac{\partial \mathcal{L}}{\partial u_h} &= 0
+  \quad\Longrightarrow\quad
+  \underbrace{\left(\frac{\partial R_h}{\partial u_h}\right)^{\!\top}}_{A^\top}
+  \lambda
+  = \underbrace{\left(\frac{\partial J_h}{\partial u_h}\right)^{\!\top}}_{\text{RHS}}
+  \quad\text{(adjoint equation)}, \label{eq:stat_u}\\
+  \frac{\partial \mathcal{L}}{\partial m} &= 0
+  \quad\Longrightarrow\quad
+  \frac{\partial \hat{J}}{\partial m}
+  = \frac{\partial J_h}{\partial m}
+  - \lambda^\top \frac{\partial R_h}{\partial m}
+  \quad\text{(gradient formula)}. \label{eq:stat_m}
+\end{align}
+For the Poisson problem, $\partial R_h/\partial u_h = A(\kappa)$ and
+$\partial R_h/\partial \kappa_e = A_e$ (the element stiffness at
+$\kappa = 1$), so \eqref{eq:stat_m} reduces to
+\begin{equation}
+  \frac{\partial \hat{J}}{\partial \kappa_e}
+  = -\lambda_{\mathrm{int}}^\top A_e\, u_h^*,
+  \label{eq:poissongrad}
+\end{equation}
+where $\lambda_{\mathrm{int}}$ is $\lambda$ with boundary-node
+entries zeroed (because the Dirichlet-eliminated rows of $A$ do not
+depend on $\kappa_e$).
+
+\begin{remark}{symmetry and factorization reuse}
+For the Poisson operator $A = A^\top$, so the adjoint equation
+$A^\top \lambda = \partial J_h/\partial u_h$ is solved with the
+\emph{same LU factorization} as the forward solve.  In
+\texttt{scipy.sparse.linalg.splu}, the call
+\texttt{lu.solve(rhs,~trans=`T')} triggers the transposed
+forward-backward substitution using the stored triangular factors.
+For non-symmetric operators (SBM, convection-diffusion, Navier-Stokes)
+the same principle holds: one factorization, two solve directions.
+\end{remark}
+
+%=======================================================================
+\section*{Part III: Anatomy of a Taped Brick}
+\addcontentsline{toc}{section}{Part III: Anatomy of a Taped Brick}
+
+\section{What \texttt{wp.Tape} records}
+\label{sec:tape}
+
+A Warp \texttt{wp.Tape} is a \emph{launch graph}: a list of
+\[
+  (\text{kernel\_ref},\; \text{dim},\; \text{input arrays},\;
+   \text{output arrays})
+\]
+tuples appended during the \texttt{with tape:} scope.  On
+\texttt{tape.backward()}, the list is replayed in reverse; for each entry
+the backward kernel propagates cotangents
+\[
+  \mathrm{adj}\_x \mathrel{+}= \frac{\partial f}{\partial x}\,
+  \mathrm{adj}\_y,
+\]
+where $\mathrm{adj}\_y = \texttt{tape.gradients}[y]$ is the incoming seed.
+Arrays with \texttt{requires\_grad=False} are \emph{frozen}: the tape
+skips cotangent accumulation for them.
+
+\textbf{Custom VJP vs.\ unrolled tape.}  When a kernel has
+\texttt{enable\_backward=False} (e.g.\ the Poisson assembly kernel in
+\texttt{diffsim/assembly/}\allowbreak\texttt{operators.py}), the tape
+does \emph{not} generate an automatic backward kernel.  The gradient path
+is instead supplied as a \emph{custom VJP} --- in DiffSim's case, the
+transposed solve $A^\top \lambda = \partial J/\partial u$.  This is
+intentional: letting the tape unroll an LU factorization would be
+catastrophically expensive and unnecessary, given the IFT.
+
+\section{The do-not-differentiate list}
+\label{sec:dontdiff}
+
+Each item below is an \emph{algorithm} implementing a mathematical
+\emph{relation}.  The relation has a clean adjoint; the algorithm's
+code graph does not.
+
+\begin{enumerate}
+\item \textbf{Linear solvers (splu, bicgstab, GMRES, cuDSS, \ldots).}
+  Relation: $A(m)\,u = b$.  Adjoint: $A^\top \lambda = \partial J/
+  \partial u$ (one solve, same LU factors).  Never unroll the
+  LU/Krylov steps through a tape.
+
+\item \textbf{Newton / nonlinear iterations.}
+  Relation: $R(u^*, m) = 0$ defines $u^*(m)$ implicitly (IFT).
+  Adjoint: $(\partial R/\partial u)^\top \lambda = \partial J/\partial u$
+  evaluated at the \emph{converged} state.  Never tape through the
+  iteration loop.
+
+\item \textbf{Mesh build, octree carve, element classification,
+  preflight checks.}
+  These produce combinatorial objects (connectivity tables, sorted
+  element lists) that are piecewise constant in the geometric parameters;
+  their derivative is zero almost everywhere and undefined at transitions.
+  The correct approach: \emph{freeze} the mesh before opening the tape.
+  Geometric sensitivities live in the boundary parametrization (shape
+  derivatives), not the mesh arrays.  E1
+  (\texttt{E1\_shape\_optimization.py}) is the worked instance.
+
+\item \textbf{RNG seeds and tabulated basis functions.}
+  Basis tables (\texttt{N}, \texttt{dN}, \texttt{w}) are computed once by
+  \texttt{basis\_tables(p,~dim)} and treated as frozen inputs with
+  \texttt{requires\_grad=False}.  Random seeds are inputs in the
+  reparametrization sense; they are never inside the tape scope.
+\end{enumerate}
+
+\section{Compute-once-and-store patterns}
+\label{sec:computeonce}
+
+Three canonical patterns avoid redundant computation.
+
+\textbf{(i) One LU factorization for $A$ and $A^\top$ solves.}
+\texttt{scipy\-.sparse\-.linalg\-.splu} stores both triangular factors; the
+forward solve (\texttt{lu.solve(b)}) and the adjoint solve
+(\texttt{lu.solve(c,~trans=`T')}) share the same factorization.
+
+\begin{measured}
+Level-3 Poisson, 50 trials.  One LU (two solve calls): $\approx t$~ms.
+Two separate LU factorizations: $\approx 1.7t$~ms.  Ratio $> 1.5\times$
+(measured; the factorization cost dominates at this size; the ratio
+grows toward $2\times$ at scale because factorization is
+$O(n^{1.5})$ in 2-D while each solve is $O(n\log n)$).
+(\texttt{E0b}, \S4.)
+\end{measured}
+
+\textbf{(ii) Tabulated basis reuse.}  \texttt{dm.bins[p][`dN']} is
+computed once; every kernel launch takes a reference to the same device
+array.  Its shape is \texttt{(nqp, nbf, dim)} --- at $Q_1$ on a 2-D
+level-3 grid this is \texttt{(4, 4, 2)}.
+
+\textbf{(iii) GP-field precomputation (\emph{frozen at GPs}).}  A
+closure field $\kappa_\theta(x)$ is evaluated at all Gauss points
+\emph{before} the tape scope, stored in an array with
+\mbox{\texttt{requires\_grad=False}}, and passed as a frozen input
+to the assembly kernel.  The tape tracks only the PDE residual's
+dependence on the tabulated values, not the internals of
+$\kappa_\theta$.  This is the M2 ``one-way coupler'' convention:
+the closure changes in the outer optimisation loop; the PDE adjoint
+needs only $\partial R/\partial \kappa$ at the quadrature points.
+
+\section{The dot-product test}
+\label{sec:dotproduct}
+
+For any operator $A$ and vectors $v$, $w$:
+\begin{equation}
+  \langle A v,\, w \rangle \;=\; \langle v,\, A^\top w \rangle .
+  \label{eq:dottest}
+\end{equation}
+This is the cheapest possible sanity check for a new operator and its
+adjoint.  The test does not require an explicit matrix: only the
+forward action $v \mapsto Av$ and the adjoint action $w \mapsto A^\top w$
+are needed (it is valid for matrix-free operators).  A failure means the
+adjoint is wrong; a pass to machine precision gives strong evidence it
+is correct.
+
+The verification protocol for every new DiffSim operator: pick random
+$v, w$; compute $Av$ and $A^\top w$; check
+\[
+  \frac{|\langle Av,w\rangle - \langle v,A^\top w\rangle|}
+  {\|Av\|\,\|w\| + 10^{-100}}
+  \;<\; 10^{-12} .
+\]
+
+\begin{measured}
+Level-3 Poisson assembled CSR.  Relative error of dot-product test:
+$\sim 10^{-17}$ (Poisson is symmetric, $A = A^\top$, so the test is
+algebraically exact up to floating-point rounding).
+(\texttt{E0b}, \S5.)
+\end{measured}
+
+%=======================================================================
+\section*{Part IV: Transient Chains and Compute-vs-Memory}
+\addcontentsline{toc}{section}{Part IV: Transient Chains}
+
+\section{The transient adjoint}
+\label{sec:transient}
+
+A time-marching scheme produces a sequence of states
+$u^0, u^1, \ldots, u^N$.  Each step is a residual
+\begin{equation}
+  F^n(u^n, u^{n-1}, m) = 0 , \qquad n = 1, \ldots, N .
+\end{equation}
+For BDF1 heat: $F^n = A\,u^n - (M/\Delta t)\,u^{n-1} = 0$, with
+$A = M/\Delta t + K(\kappa)$.  The Lagrangian appends one multiplier
+$\lambda^n$ per step:
+\begin{equation}
+  \mathcal{L} = J_h(u^N, m)
+  - \sum_{n=1}^N (\lambda^n)^\top F^n(u^n, u^{n-1}, m).
+\end{equation}
+Stationarity at $u^n$ for $n < N$:
+\begin{align}
+  \left(\frac{\partial F^n}{\partial u^n}\right)^\top \lambda^n
+  &= -\left(\frac{\partial F^{n+1}}{\partial u^n}\right)^\top \lambda^{n+1}
+  \nonumber\\
+  A^\top \lambda^n &= P^\top \lambda^{n+1},
+  \qquad P = M/\Delta t , \label{eq:adjrec}
+\end{align}
+with terminal condition at $n = N$:
+\begin{equation}
+  A^\top \lambda^N = \left(\frac{\partial J_h}{\partial u^N}\right)^\top
+  = W^\top(W u^N - u_{\mathrm{obs}}) .
+  \label{eq:adjterm}
+\end{equation}
+This is the \emph{adjoint recurrence}: solve backward in time, one
+transposed solve per step.  The gradient contribution from step $n$ is
+\begin{equation}
+  \Delta\!\left(\frac{\partial \hat{J}}{\partial \kappa}\right)_e
+  \mathrel{+}=
+  -(\lambda^n_{\mathrm{int}})^\top A_e\, u^n,
+  \label{eq:trangrad}
+\end{equation}
+where $u^n$ is the \emph{primal state stored from the forward march}
+(checklist item~3 in Appendix~\ref{app:checklist}).
+
+\begin{remark}{one factorization, all steps}
+When $\kappa$ is constant in time, $A = M/\Delta t + K(\kappa)$ does
+not change between steps.  A \emph{single LU factorization} serves every
+forward solve and every adjoint solve --- forward via \texttt{lu.solve(rhs)}
+and backward via \texttt{lu.solve(seed,~trans=`T')}.  Both directions
+reuse the same stored triangular factors.
+\end{remark}
+
+\begin{measured}
+BDF1 heat, level-3 grid, 30 steps, $\Delta t = 0.01$.  Transient-chain
+check (discrete adjoint vs central FD, end-to-end): max relative error
+$< 10^{-5}$.  (\texttt{E0c}, \S2.)
+\end{measured}
+
+\section{Compute-vs-memory: full-store and recompute}
+\label{sec:cvm}
+
+The backward sweep \eqref{eq:trangrad} requires $u^n$ at each step.  Two
+strategies supply it.
+
+\textbf{Full-store.} Keep $u^0, u^1, \ldots, u^N$ in memory.  Memory:
+$(N+1) \times n_{\mathrm{nodes}} \times 8$~bytes (FP64).  Backward cost:
+$N$ transposed solves.  At $10^6$ dofs and $10^3$ steps this is 8~GB
+--- a regime where full-store exceeds GPU memory.
+
+\textbf{Recompute from checkpoints.}  Store $n_c$ checkpoints at
+intervals of $\Delta n = N/n_c$ steps.  When the backward sweep needs
+$u^n$, re-march forward from the nearest earlier checkpoint.  Memory:
+$n_c \times n_{\mathrm{nodes}} \times 8$~bytes.  Backward cost: $N$
+transposed solves plus $O(n_c \cdot \Delta n)$ extra forward solves.
+
+The optimal checkpoint schedule is \emph{revolve} (Griewank \& Walther
+\cite{griewank2000}): $O(\log N)$ checkpoints achieve $O(N \log N)$
+recompute at $O(\log N)$ memory, provably optimal.  Binomial scheduling
+libraries (\texttt{pyrevolve}, \texttt{checkpoint\_schedules}) implement
+this and wire directly into the backward loop above.
+
+\textbf{The $2.5\times$ cost contract.}  A correct reverse-mode adjoint
+adds at most one transposed solve plus one gradient contraction per forward
+step.  The backward march should cost $\leq 2.5\times$ the forward march.
+If backward $\gg$ forward, something is being unrolled that should not be.
+
+\begin{measured}
+BDF1 heat, level-3, 30 steps.  Full-store backward / forward wall-time
+ratio $\leq 2.5\times$ (measured).  Primal-storage inventory: 31 states
+$\times$ 81 nodes $\times$ 8 bytes = 20~KiB.  Full-store vs recompute-
+from-6-checkpoints gradient agreement: $< 10^{-10}$ (same discrete
+adjoint, bit-for-bit identical $u^n$ from re-march).
+(\texttt{E0c}, \S3.)
+\end{measured}
+
+%=======================================================================
+\section*{Part V: Choosing a Good $J$}
+\addcontentsline{toc}{section}{Part V: Choosing a Good $J$}
+
+\section{Smoothness: nonsmooth $J$ and its relaxation}
+\label{sec:smoothness}
+
+Functionals built on $\max$, $\min$, $|\cdot|$, or hard thresholds are
+nonsmooth: the gradient jumps when the active branch switches, and is
+zero almost everywhere for a threshold.  An optimiser fed a jumpy
+gradient stalls or oscillates.
+
+The standard cure is a \emph{relaxed surrogate}.  For
+$J = \max_i g_i(p)$, the logsumexp (softmax) upper bound
+\begin{equation}
+  J_\beta(p) = \frac{1}{\beta}\log\sum_i \exp\!\bigl(\beta\, g_i(p)\bigr)
+  \;\xrightarrow{\beta\to\infty}\; \max_i g_i(p)
+  \label{eq:lse}
+\end{equation}
+has a smooth softmax-weighted gradient at any finite $\beta$.
+
+\begin{measured}
+Sweeping a scalar $p$ over $[0,3]$: max-J discrete gradient maximum jump
+$\approx 0.55$; logsumexp ($\beta = 40$) maximum jump $\approx 0.17$;
+ratio $\approx 0.31 < 0.5$ (smoother by $1.8\times$).
+(\texttt{E0c}, \S4(i).)
+\end{measured}
+
+\section{Signal scale: the H4 protocol}
+\label{sec:signalscale}
+
+Before launching any optimiser, verify that $|\partial \hat{J}/\partial m|$
+clears the finite-difference noise floor.  The \emph{H4 protocol}
+(DiffSim-native): compute central FD across a range of $\epsilon$ values
+and take the minimum FD spread as the noise-floor estimate.  If the adjoint
+signal does not exceed the floor by orders of magnitude, the objective
+barely responds to the parameters --- rescale $m$ or $J$, or choose a
+more informative observable, before spending a single optimiser iteration.
+
+\begin{measured}
+Heat chain, level-3.  Adjoint signal $|\partial \hat{J}/\partial \kappa|_\infty
+\approx 10^{-3}$; FD noise floor (min spread across $\epsilon \in
+[10^{-3}, 10^{-8}]$) $\approx 10^{-7}$; signal-to-floor ratio
+$\approx 10^4 \gg 10^3$ (required).
+(\texttt{E0c}, \S4(ii).)
+\end{measured}
+
+\section{Flat-$J$ geometry and informative probe placement}
+\label{sec:flatJ}
+
+A probe placed where the solution field has negligible amplitude sees
+$\partial u/\partial m \approx 0$: the gradient is near zero regardless of
+how good the adjoint is.  The observable placement is part of the
+experiment design, not the solver.
+
+\begin{measured}
+Heat chain, sharp bump at $(0.25, 0.25)$.  Probe on the active bump:
+$\|\partial \hat{J}/\partial\kappa\|_\infty \approx 2 \times 10^{-3}$.
+Probe in the far corner $(0.84, 0.84)$: $\approx 2 \times 10^{-5}$.
+Contrast $\approx 100\times \gg 10\times$ (required).
+(\texttt{E0c}, \S4(iii).)
+\end{measured}
+
+\section{Identifiability, gauge freedom, and regularisation as science}
+\label{sec:identifiability}
+
+A gradient can be correct, large, and smooth while the inverse problem
+remains ill-posed: the parameterisation may have \emph{unidentifiable
+directions} --- parameter combinations that produce zero observable change.
+The diagnostic is the spectrum of the observation Jacobian (the Gramian
+$G = J_m^\top J_m$ where $J_m = \partial \mathbf{d}/\partial m$ maps
+parameters to data), not the gradient of $J$ itself.
+
+\textbf{Case study: the beyond-FH gauge story (M4, rung~2).}
+Learning a free-energy correction $f'_\theta(c)$ on top of Flory-Huggins
+has two structurally invisible modes.  A constant in $f'$ shifts the
+chemical potential $\mu$ by a constant, which is invisible to conserved-$c$
+dynamics.  The linear mode proportional to $(1 - 2c)$ is \emph{exactly
+aliased} with the FH chi term: the trajectory difference along this
+direction was measured at $5 \times 10^{-15}$.  These are \emph{gauge
+freedoms}; they must be removed from the parameterisation before fitting.
+
+Quantitatively (numbers quoted from the beyond-FH dev note
+\cite{beyondfh2026}):
+\begin{itemize}
+\item Un-anchored basis $\{\chi, P_1, P_2, P_3\}$:
+  observation-Jacobian condition number $\approx 1.4 \times 10^{16}$
+  ($\chi$ and $P_1$ aliased --- effectively singular).
+\item Anchored basis $\{\chi, P_2, P_3\}$ (Legendre modes orthogonal
+  to $\{1, c\}$, removing the gauge by construction):
+  condition number $\approx 18$ (well-posed).  Recovery of coefficients
+  from a single interior trajectory: relative error $\approx 5.6 \times
+  10^{-8}$.
+\item Conditioning improvement: $\approx 7.6 \times 10^{14}$.
+\end{itemize}
+Even with a gauge-anchored parameterisation, a \emph{single narrow
+trajectory} (visited composition range $0.46$--$0.56$) leaves higher
+modes weakly constrained (condition number $\approx 2 \times 10^2$--$5
+\times 10^2$).  A \emph{composition-diverse} protocol (range
+$0.21$--$0.85$) reduces the condition number to $\approx 14$--$18$
+($15$--$30\times$ improvement) and recovers $\{P_2, \ldots, P_5\}$ to
+coefficient error $\approx 4 \times 10^{-5}$, while the single narrow fit
+fails (coefficient error $\approx 0.9$--$1.0$, a $> 2 \times 10^4\times$
+recovery gap).
+
+\textbf{Tikhonov regularisation as a prior, not a hack.}  A penalty
+$\varepsilon \|\theta\|^2$ encodes the hypothesis that the correction is
+small.  In the beyond-FH fit it does not merely stabilise: it pulls the
+ill-conditioned single-trajectory fit to a definite (wrong) answer rather
+than to NaN, making the failure legible.  Regularisation states a
+scientific hypothesis; the condition number of the observation Jacobian
+tells you whether the data can test it.
+
+\begin{remark}{the rule taught three times}
+E2 (the recovery plateau), M2--M3 (the observability ladder), and the
+beyond-FH study all arrive at the same principle: \emph{mechanism before
+optimiser}.  When a fit stalls, measure identifiability before tuning
+the descent.
+\end{remark}
+
+\section{Multi-observable $J$ and the SP-1 bridge}
+\label{sec:multiobs}
+
+A single scalar probe misfit is often flat or aliased (\S\S\ref{sec:flatJ}
+and \ref{sec:identifiability}).  The cure is a richer,
+\emph{instrument-space} observable --- or several:
+\begin{equation}
+  J = \sum_k w_k \| \mathcal{O}_k(u) - d_k \|^2 ,
+  \label{eq:multiJ}
+\end{equation}
+where $\mathcal{O}_k$ are diverse operators (probe values, a structure
+factor $S(q,t)$, a film height $h(t)$, a PSF-convolved image).  Diverse
+protocols illuminate different directions of parameter space, turning the
+underdetermined inverse of E0b (5 probes for 64 unknowns) into a
+well-posed one.  The beyond-FH instrument-space $S(q)$ misfit backpropagates
+to the closure coefficients matching FD to $1.8 \times 10^{-11}$
+(structure factor computed as a differentiable Warp kernel).  SP-1 (R3)
+builds the multi-observable, multi-protocol inversion on the production
+stack.
+
+%=======================================================================
+\section*{Part VI: The Mini Phase-Field Payoff}
+\addcontentsline{toc}{section}{Part VI: Mini Phase-Field Payoff}
+
+\section{Allen-Cahn: learning mobility and gradient-energy coefficient}
+\label{sec:acpayoff}
+
+The Allen-Cahn equation
+\begin{equation}
+  \partial_t c = -M \bigl[ f'(c) - \kappa\,\Delta c \bigr],
+  \qquad f(c) = \tfrac14(c^2-1)^2 ,
+  \label{eq:ac}
+\end{equation}
+is the group's own physics (F-track, M4) and serves as the payoff example
+for the E0c recipe.  The ``learning reaction rates'' framing is the
+dolfin-adjoint tutorial of that name \cite{mitusch2019}; we adapt it to
+the Warp discrete-adjoint stack.
+
+We differentiate $J = \tfrac12 \|W c^N - c_{\mathrm{obs}}\|^2$ with
+respect to the scalar mobility $M$ and the gradient-energy coefficient
+$\kappa$ through a 25-step semi-implicit BDF1 march.  The adjoint
+recurrence \eqref{eq:adjrec} takes the form
+\begin{align}
+  A^\top \lambda^n &= \mathrm{seed}^n, \label{eq:acadjrec}\\
+  \mathrm{seed}^{n-1} &= -\frac{\partial F^n}{\partial c^{n-1}}\,\lambda^n
+  = \left[\frac{m_\ell}{\Delta t} - M\, m_\ell\,(3(c^{n-1})^2 - 1)\right]\lambda^n,
+  \label{eq:acseed}
+\end{align}
+where $m_\ell$ is the lumped mass diagonal.
+
+The three-way gradient check uses central FD as one leg and
+\emph{complex-step differentiation} as the second exact leg: for a
+holomorphic extension $\hat{J}(m + i\,h)$ with $h = 10^{-30}$,
+\begin{equation}
+  \frac{\partial \hat{J}}{\partial m} = \frac{\operatorname{Im}
+  \hat{J}(m + ih)}{h} + O(h^2) ,
+  \label{eq:cstep}
+\end{equation}
+with no subtraction error.  Agreement of all three legs to
+$< 10^{-6}$ relative error provides strong evidence of correctness
+independent of any single computational path.
+
+\begin{measured}
+Allen-Cahn, level-3, 25 steps, $\Delta t = 0.005$.  Three-way check:
+adjoint vs complex-step vs FD, max relative error (worst of $\partial
+\hat{J}/\partial M$ and $\partial \hat{J}/\partial \kappa$) $< 10^{-6}$.
+(\texttt{E0c}, \S5.)
+\end{measured}
+
+%=======================================================================
+\section*{Part VII: Numerical Results Summary}
+\addcontentsline{toc}{section}{Part VII: Numerical Results Summary}
+
+\section{Measured gates}
+\label{sec:gates}
+
+\begin{table}[h]
+\centering
+\caption{Measured gate results from tutorials E0a--E0c (CPU, FP64,
+level-3 grid unless otherwise noted).  All reproducible with
+\texttt{python tutorials/E\_differentiable/E0\{a,b,c\}*.py}.}
+\label{tab:gates}
+\begin{tabular}{llll}
+\toprule
+Chapter & Gate & Required & Measured \\
+\midrule
+E0a & adj vs FD max rel err           & $< 10^{-6}$  & $< 10^{-6}$ \\
+E0a & tape vs FD max rel err          & $< 10^{-6}$  & $< 10^{-6}$ \\
+E0a & adj vs tape max rel err         & $< 10^{-9}$  & $< 10^{-9}$ \\
+E0a & FD / adjoint cost ratio         & 30--80$\times$ & $\sim$35$\times$ \\
+\midrule
+E0b & dot-product test rel err        & $< 10^{-12}$ & $\sim 10^{-17}$ \\
+E0b & factorization reuse ratio       & $> 1.5\times$  & $> 1.5\times$ \\
+E0b & misfit drop (100 GD steps)      & $> 100\times$  & $> 100\times$ \\
+\midrule
+E0c & heat-chain adj vs FD            & $< 10^{-5}$  & $< 10^{-5}$ \\
+E0c & store vs recompute dJ agreement & $< 10^{-10}$ & $\sim 0$ \\
+E0c & backward/forward wall ratio     & $< 2.5\times$  & $< 2.5\times$ \\
+E0c & logsumexp/max gradient-jump ratio & $< 0.5$    & $\approx 0.31$ \\
+E0c & signal / FD-floor ratio         & $> 10^3$     & $\approx 10^4$ \\
+E0c & flat-J probe contrast           & $> 10\times$   & $\approx 100\times$ \\
+E0c & AC three-way (adj/cstep/FD)     & $< 10^{-6}$  & $< 10^{-6}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=======================================================================
+\begin{thebibliography}{9}
+
+\bibitem{farrell2013}
+P.~E.~Farrell, D.~A.~Ham, S.~W.~Funke, and M.~E.~Rognes,
+\emph{Automated Derivation of the Adjoint of High-Level Mathematical
+Programs},
+SIAM Journal on Scientific Computing \textbf{35} (2013) C369--C393.
+\url{https://doi.org/10.1137/120873558}
+
+\bibitem{mitusch2019}
+S.~K.~Mitusch, S.~W.~Funke, and J.~S.~Dokken,
+\emph{dolfin-adjoint 2018.1: automated adjoints for FEniCS and Firedrake},
+Journal of Open Source Software \textbf{4} (2019) 1292.
+\url{https://doi.org/10.21105/joss.01292}
+
+\bibitem{griewank2000}
+A.~Griewank and A.~Walther,
+\emph{Algorithm 799: Revolve: An Implementation of Checkpointing for the
+Reverse or Adjoint Mode of Computational Differentiation},
+ACM Transactions on Mathematical Software \textbf{26} (2000) 19--45.
+\url{https://doi.org/10.1145/347837.347846}
+
+\bibitem{beyondfh2026}
+DiffSim group,
+\emph{Beyond Flory-Huggins: differentiable $S(q)$ instrument-space
+observable, gauge identifiability, and composition-coverage conditioning}
+(internal dev note, 2026-07-14).
+\texttt{docs/dev/2026-07-14-beyond-fh-learned-thermo.md}.
+
+\end{thebibliography}
+
+%=======================================================================
+\appendix
+
+\section{The Adjoint-Readiness Checklist}
+\label{app:checklist}
+
+\emph{Apply this checklist to any new PDE before writing gradient code.
+The normative, citable version lives on the reference page
+\texttt{docs/site\_src/theory/}\linebreak\texttt{adjoint\_readiness\_checklist.md} (T4).
+This appendix is the derived, annotated form; the reference page owns
+the normative list.}
+
+\medskip
+
+\noindent\textbf{1. What to tape.}
+Tape only the residual kernels that depend on the parameters you
+differentiate with respect to.  Record $R(u, m)$ in $m$ (and in $u$ if
+a later step or $J$ needs $\partial J/\partial u$).  Everything
+algebraic-and-parameter-dependent is taped; the linear solver is not
+(item~4).
+
+\noindent\textbf{2. What to freeze.}
+\begin{itemize}
+\item Mesh, octree, element classification, preflight checks --- piecewise-constant
+  in parameters (\S\ref{sec:dontdiff}, item~3).
+\item Basis and quadrature tables: frozen inputs (\S\ref{sec:dontdiff}, item~4).
+\item RNG seeds: reparametrize.
+\item Any GP-field precomputed outside the tape: the M2 ``frozen at GPs''
+  convention (\S\ref{sec:computeonce}, item~iii).
+\end{itemize}
+
+\noindent\textbf{3. What to store across steps.}
+A transient adjoint sweeps backward and contracts with the primal state
+$u^n$ at each step (\S\ref{sec:transient}).  Store the whole trajectory
+(full-store, $O(N \times n)$ memory) or store checkpoints and recompute
+segments (revolve, $O(\log N)$ memory at $O(N \log N)$ recompute cost).
+Print the storage inventory before committing to a strategy.
+
+\noindent\textbf{4. Transposed-solve infrastructure.}
+The gradient path through any solver is the transposed solve at the
+converged state (\S\S\ref{sec:lagrangian},\,\ref{sec:dontdiff}).  One LU
+factorization serves both $A$ and $A^\top$ solves
+(\S\ref{sec:computeonce}).  Build and test the adjoint solve before
+writing the optimisation loop.
+
+\noindent\textbf{5. The verification ladder.}
+\begin{enumerate}
+\item[(a)] Dot-product test $\langle Av,w\rangle = \langle v,A^\top w\rangle$
+  per operator (\S\ref{sec:dotproduct}).
+\item[(b)] Three-way gradient check: hand adjoint vs tape (or complex-step)
+  vs central FD, for a small problem.  Agreement $< 10^{-6}$ relative
+  error is the house standard.
+\item[(c)] Transient-chain check: the full backward sweep vs FD end-to-end
+  (\S\ref{sec:transient}).
+\end{enumerate}
+Climb the ladder before trusting a gradient in an optimiser.
+
+\noindent\textbf{6. Nondifferentiability hazards.}
+Replace $\mathrm{abs}$, $\min$, $\max$, threshold, and mask operations
+with relaxed forms (\S\ref{sec:smoothness}): \texttt{softabs} ($\sqrt{x^2
++ \varepsilon^2}$), logsumexp \eqref{eq:lse}, sigmoid gates.  Do this
+\emph{before} optimising.
+
+\noindent\textbf{7. The $2.5\times$ cost contract.}
+A correct reverse-mode adjoint adds $O(1)$ solves per forward step.
+Measure the backward/forward wall-time ratio (\S\ref{sec:cvm}) before
+scaling up.  If backward $\gg$ forward, something is being unrolled that
+should not be.
+
+\bigskip
+
+\noindent\textbf{J-design addendum.}  Once the adjoint is verified:
+\begin{itemize}
+\item \emph{Signal scale first} (H4 protocol, \S\ref{sec:signalscale}):
+  confirm $|\partial \hat{J}/\partial m|$ clears the FD noise floor by
+  $\geq 10^3$ before any optimisation.
+\item \emph{Probe placement matters} (\S\ref{sec:flatJ}): an observable
+  blind to the active region gives a vanishing gradient; design the
+  measurement to see the physics.
+\item \emph{Identifiability first} (\S\ref{sec:identifiability}): compute
+  the observation-Jacobian condition number before fitting.  Remove gauge
+  freedoms from the parameterisation by construction.  Add Tikhonov
+  regularisation as a scientific prior, not as a solver fix.
+\item \emph{Diverse observables} (\S\ref{sec:multiobs}): combine
+  probe misfits, structure-factor misfits, and integral observables to
+  illuminate different directions of parameter space.
+\end{itemize}
+
+\end{document}
