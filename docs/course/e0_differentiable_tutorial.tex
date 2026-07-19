@@ -33,9 +33,9 @@
 \newcommand{\RR}{\mathbb{R}}
 \newcommand{\nn}{\mathbf{n}}
 
-\title{Differentiable Simulation on DiffSim:\\
-  Three Ways to a Gradient, the Discrete Adjoint, and the Recipe\\
-  \large The E0 course document (Track E, adjoint on-ramp)}
+\title{The Differentiable Simulation Track (E0--E2):\\
+  Mathematical Companion\\
+  \large E0 = the adjoint on-ramp; E1/E2 = the payoff chapters}
 \author{The DiffSim curriculum}
 \date{July 2026}
 
@@ -43,21 +43,33 @@
 \maketitle
 
 \begin{abstract}
-This document is the theory companion to the three runnable E0 tutorials
-(\texttt{tutorials/E\_differentiable/E0a--E0c}).  It develops the
-mathematics of differentiable simulation in DiffSim notation, consolidates
-the theory of the three chapters, and closes with the Adjoint-Readiness
-Checklist as an appendix.  Structure and example lineage are adapted from
-the mathematical background of \textbf{dolfin-adjoint/pyadjoint} by Patrick
-E.~Farrell; the mother problem, three-way comparison device, and
-``learning reaction rates'' examples follow Farrell, Ham, Funke \& Rognes
-\cite{farrell2013} and Mitusch, Funke \& Dokken \cite{mitusch2019}.
-DiffSim-native content --- the discrete-adjoint stance, taping rules, the
-beyond-FH gauge story, the H4 signal-scale protocol --- is developed in
-the E-track specs and dev notes.  House rule: \emph{theory predicts a
-number, then we print the measured number next to it.}  All numbers quoted
-here are from the gate batteries of tutorials E0a--E0c,
-reproducible on CPU in under three minutes each.
+This document is the theory companion to the full E-track of differentiable
+simulation tutorials (\texttt{tutorials/E\_differentiable/E0a--E2}).
+\textbf{E0} (Parts I--VII, the on-ramp) develops the mathematics of
+differentiable simulation in DiffSim notation: three paths to a gradient,
+the discrete-adjoint stance, taping rules, transient chains, and $J$-design
+principles.  Structure and example lineage are adapted from the mathematical
+background of \textbf{dolfin-adjoint/pyadjoint} by Patrick E.~Farrell; the
+mother problem, three-way comparison device, and ``learning reaction rates''
+examples follow Farrell, Ham, Funke \& Rognes \cite{farrell2013} and
+Mitusch, Funke \& Dokken \cite{mitusch2019}.  DiffSim-native content ---
+the discrete-adjoint stance, taping rules, the beyond-FH gauge story, the
+H4 signal-scale protocol --- is developed in the E-track specs and dev
+notes.
+
+\textbf{E1 and E2} (Part VIII, the payoff chapters) apply the on-ramp
+machinery to geometric inverse problems: E1 recovers a hidden disk from
+sparse Poisson probes by differentiating through the Shifted-Boundary
+Method (SBM) face residuals and the implicit-function-theorem
+closest-point projection; E2 connects a GENIE implicit neural
+representation (INR) as the geometry oracle and recovers a hidden
+last-layer edit from probe data alone, closing the differentiable
+simulation $\times$ neural geometry loop.
+
+House rule: \emph{theory predicts a number, then we print the measured
+number next to it.}  All E0 numbers quoted here are from the gate batteries
+of tutorials E0a--E0c, reproducible on CPU in under three minutes each.
+E1/E2 numbers are from the respective chapters at the grid levels noted.
 \end{abstract}
 
 \tableofcontents
@@ -769,6 +781,383 @@ E0c & AC three-way (adj/cstep/FD)     & $< 10^{-6}$  & $< 10^{-6}$ \\
 \end{table}
 
 %=======================================================================
+\section*{Part VIII: The Payoff Chapters — E1 and E2}
+\addcontentsline{toc}{section}{Part VIII: The Payoff Chapters (E1 and E2)}
+
+%-----------------------------------------------------------------------
+\section{E1: Shape Optimization --- Finding the Hidden Circle}
+\label{sec:e1}
+
+E1 (\texttt{tutorials/E\_differentiable/\allowbreak E1\_shape\_optimization.py})
+is the smallest closed instance of the loop that motivates all of DiffSim:
+a quantity of interest $J$ defined on simulation output, differentiated with
+respect to \emph{geometry} (not material fields), driving gradient descent
+with the mesh re-carved from scratch every iteration.  The on-ramp (E0)
+taught the adjoint for material parameters; E1 shows it working in the wild
+for shape.
+
+\subsection{The inverse problem}
+\label{sec:e1problem}
+
+A Poisson problem with conductivity $\kappa = 1.3$ is solved on a 2-D
+square $[0,1]^2$ whose interior boundary is a disk of center
+$(\theta_x^*, \theta_y^*)$ and radius $r^*$ (unknown).  Nine probe
+values $u(x_i)$ measured on a small ring inside the disk are handed to the
+recovery algorithm; the task is to find $\theta = (\theta_x, \theta_y, r)$
+from these observations.
+
+The objective is the standard probe least-squares misfit:
+\begin{equation}
+  J(\theta) \;=\; \tfrac{1}{2}
+  \sum_{i=1}^{9} \bigl(u_\theta(x_i) - u^*_{\mathrm{obs},i}\bigr)^2,
+  \label{eq:e1J}
+\end{equation}
+where $u_\theta$ is the FEM solution on the SBM mesh carved to the disk
+parametrized by $\theta$.
+
+\subsection{The gradient chain}
+\label{sec:e1chain}
+
+The full chain, as stated in the E1 docstring, is:
+\begin{equation}
+  J
+  \;\xrightarrow{\partial J/\partial u}\;
+  \lambda \;=\; (A^\top)^{-1}\!\left(\frac{\partial J}{\partial u}\right)^\top
+  \;\xrightarrow{-\lambda^\top \partial R/\partial \theta}\;
+  \theta .
+  \label{eq:e1chain}
+\end{equation}
+Each arrow is one of the three payoff mechanisms; we expand them in order.
+
+\subsubsection{Step 1: probe Jacobian $\partial J/\partial u$}
+
+From \eqref{eq:e1J}, the right-hand side of the adjoint equation is
+\begin{equation}
+  \left(\frac{\partial J}{\partial u}\right)^\top
+  \;=\; \sum_{i=1}^{9} \bigl(u_\theta(x_i) - u^*_{\mathrm{obs},i}\bigr)\,
+  w_i,
+  \label{eq:e1rhs}
+\end{equation}
+where $w_i$ are the point-evaluation weight vectors (sparse finite-element
+interpolation weights) returned by \texttt{point\_eval\_weights}.
+This is the same probe-misfit seed as in the E0 conductivity tutorial,
+now assembled in the SBM geometry.
+
+\subsubsection{Step 2: adjoint solve $A^\top \lambda = \partial J/\partial u$}
+
+Nothing new relative to E0: one transposed LU solve.  Cost is one forward
+solve, independent of the number of shape parameters (here 3, but the cost
+is the same for 3000 GridSDF voxels --- the whole point of adjoints).  The
+system matrix $A(\theta)$ is the SBM Nitsche-augmented stiffness for the
+current geometry; it is assembled in the forward pass and its LU
+factorization is reused for the adjoint (\S\ref{sec:computeonce}, item~i).
+
+\subsubsection{Step 3: SBM face cotangents $-\lambda^\top \partial R/\partial \theta$}
+\label{sec:e1sbmtape}
+
+This is the step E0's do-not-differentiate list (\S\ref{sec:dontdiff},
+item~3) pointed to as ``the worked instance.''  The SBM residual
+$R(u, \theta) = 0$ depends on $\theta$ through:
+\begin{itemize}
+  \item the signed-distance vectors $\mathbf{d}(\theta)$ from each cut-face
+    foot to the boundary (computed by the Newton closest-point projection),
+  \item the mapped Dirichlet data $g(x + \mathbf{d}(\theta))$ evaluated at
+    the projected boundary point.
+\end{itemize}
+A \texttt{wp.Tape} scope records the SBM face-residual kernels as
+functions of these geometric quantities.  On \texttt{tape.backward()},
+the tape propagates cotangents through the Nitsche face integrals back to
+$\mathbf{d}$ and to $g(x + \mathbf{d})$:
+\begin{equation}
+  \frac{\partial R}{\partial \theta}
+  \;=\; \frac{\partial R}{\partial \mathbf{d}}\,
+  \frac{\partial \mathbf{d}}{\partial \theta}
+  \;+\; \frac{\partial R}{\partial (g \circ p_\theta)}\,
+  \frac{\partial (g \circ p_\theta)}{\partial \theta},
+  \label{eq:e1dRdtheta}
+\end{equation}
+where $p_\theta(x)$ is the boundary projection map.  The tape delivers
+the left-multiplied cotangent $-\lambda^\top (\partial R/\partial \mathbf{d})$
+and $-\lambda^\top (\partial R/\partial g)$ as gradients on the intermediate
+arrays.  These are exactly the ``tape cotangents for distance vectors +
+mapped boundary data'' mentioned in the E1 docstring.
+
+\subsubsection{Step 4: IFT through the Newton projection}
+\label{sec:e1ift}
+
+The distance vector $\mathbf{d}(\theta)$ is itself the output of a Newton
+closest-point projection (a nonlinear iteration in \texttt{torch}) applied
+to the oracle's signed-distance function $\psi(\cdot\,;\theta)$.
+By the Implicit Function Theorem applied to the projection stationarity
+condition,
+\begin{equation}
+  \frac{\partial \mathbf{d}}{\partial \theta}
+  \;=\; -\!\left(\frac{\partial^2 \psi}{\partial x^2}\right)^{\!-1}
+  \frac{\partial^2 \psi}{\partial x\, \partial \theta}\biggr|_{x = p(\theta)},
+  \label{eq:e1ift}
+\end{equation}
+where $x = p(\theta)$ is the converged foot point.
+\emph{We differentiate the projection relation, not the Newton
+algorithm}---exactly the IFT stance of \S\ref{sec:dtd}, Remark~2.
+In practice, \texttt{torch.autograd} differentiates through the oracle's
+\texttt{psi(x; theta)} computation (a smooth CSG formula or a SIREN
+network), and the Newton iteration is not unrolled.
+
+This step closes the chain: the tape cotangent at $\mathbf{d}$ is
+multiplied by $\partial \mathbf{d}/\partial \theta$ (via \texttt{torch}'s
+backward) to deliver the final gradient $\partial J/\partial \theta$ on the
+\texttt{torch} tensor \texttt{theta}.
+
+\subsection{Why classification freezing makes the gradient well-defined}
+\label{sec:e1freeze}
+
+The E0 do-not-differentiate list (\S\ref{sec:dontdiff}, item~3) establishes
+that mesh build, octree carve, and element classification are
+\emph{piecewise constant} in geometric parameters: the classify step assigns
+each cell a binary inside/outside label that does not change as $\theta$
+moves smoothly within a classification epoch.  Therefore
+\[
+  \frac{\partial (\text{element classification})}{\partial \theta} = 0
+  \quad\text{(almost everywhere in } \theta\text{).}
+\]
+E1 asserts this by tests.  The gradient is well-defined \emph{within} an
+epoch because only the continuous geometric quantities ($\mathbf{d}$,
+$g \circ p_\theta$) depend on $\theta$, not the combinatorial mesh
+topology.  Between iterations the world is rebuilt: new retained set, new
+surrogate, new constraints.  Gradients survive because they never depended
+on mesh topology, only on the smooth geometric quantities.  This is the
+``freeze-classify, differentiate-geometry'' principle that makes
+shape-adjoint codes on cut meshes tractable.
+
+\subsection{Connection to E0 concepts}
+\label{sec:e1e0connect}
+
+\begin{itemize}
+  \item \textbf{IFT / relation vs.\ algorithm} (\S\ref{sec:dtd}): the Newton
+    projection is an algorithm; only the converged foot-point relation
+    enters \eqref{eq:e1ift}.
+  \item \textbf{Do-not-differentiate list, item~3} (\S\ref{sec:dontdiff}):
+    mesh build and classification are frozen before the tape opens.
+  \item \textbf{Custom VJP for the linear solve} (\S\ref{sec:tape}): the
+    adjoint solve $A^\top \lambda = \partial J/\partial u$ is a custom
+    backward rule; the LU iteration is not unrolled.
+  \item \textbf{Dot-product test} (\S\ref{sec:dotproduct}): the SBM
+    Nitsche operator's adjoint is verified with the dot-product test before
+    any shape optimization.
+  \item \textbf{Signal scale / H4} (\S\ref{sec:signalscale}): the probe
+    ring is placed inside the disk (not in the far field) to ensure
+    $|\partial J/\partial \theta|$ clears the FD noise floor.
+\end{itemize}
+
+%-----------------------------------------------------------------------
+\section{E2: GENIE/DiffSBM --- Neural Geometry Meets the Adjoint}
+\label{sec:e2}
+
+E2 (\texttt{tutorials/E\_differentiable/\allowbreak E2\_genie\_diffsbm.py})
+extends E1's shape-gradient machinery to a provided implicit neural
+representation (INR) as the geometry oracle.  The physical problem is
+3-D SBM Poisson on a sphere-like surface; the design variables are the
+INR's last-layer edit coefficients $\alpha \in \RR^k$.
+
+\subsection{The provided-INR contract}
+\label{sec:e2inr}
+
+DiffSim does \emph{not} train INRs
+(\texttt{docs/dev/specs/2026-07-06-neuralsdf.md}, \S N0).
+A trained checkpoint is a \emph{provided input}: a SIREN-family network
+with a linear last layer,
+\begin{equation}
+  \psi(x;\theta_L) \;=\; h_\phi(x)^\top \theta_L,
+  \label{eq:inrpsi}
+\end{equation}
+where $h_\phi$ is the frozen feature extractor and $\theta_L$ is the
+editable linear head.  DiffSim loads the checkpoint via
+\texttt{ProvidedINROracle} and uses $\psi$ purely as an SDF oracle
+(sign for classification, Newton+IFT for distance vectors).
+
+\subsection{GENIE edit modes}
+\label{sec:e2genie}
+
+Following Karki et al.\ (GENIE) \cite{karki2025}, for linear-last-layer
+INRs any last-layer edit $\Delta\theta_L$ changes the field by
+$\Delta\psi(x) = h_\phi(x)^\top \Delta\theta_L$ --- the geometry is
+\emph{affine} in the edit parameters.  The Gram operator over a
+thick-band sampling distribution $\mu$ on a shell near the surface is
+\begin{equation}
+  G \;=\; \mathbb{E}_{x \sim \mu}\!\bigl[h_\phi(x)\, h_\phi(x)^\top\bigr],
+  \label{eq:gram}
+\end{equation}
+and its top-$k$ eigenvectors $\{v_j\}_{j=1}^k$ define the \emph{design
+space}: $\theta_L(\alpha) = \theta_L^0 + \sum_{j=1}^k \alpha_j v_j$.
+Sampling on a \emph{thick} band (width $\approx \pm 0.05$ times the
+surface radius, versus a thin shell of $\pm 0.005$) is essential for
+stable modes: the GENIE paper's Fig.~4a finding is directly adopted as
+DiffSim's sampling rule.  The mode stability is measured as the
+subspace angle between two independent thick-band draws; at the sphere
+checkpoint with $k=4$ modes, stability $= 1.000$ is measured.
+
+\begin{remark}{DiffSim does not train INRs}
+The program rule is: DiffSim consumes trained checkpoints but never
+initiates a training run.  This boundary is an explicit design choice
+(\texttt{docs/dev/specs/2026-07-06-neuralsdf.md}, \S N0): training INRs
+is a different optimization problem (minimizing a neural rendering loss),
+with different infrastructure, data pipelines, and convergence criteria.
+The E2 chapter uses an analytical sphere checkpoint as the canonical test
+double; real GENIE checkpoints drop in via \texttt{from\_genie\_json}.
+\end{remark}
+
+\subsection{Differentiating through the SDF query into the SBM machinery}
+\label{sec:e2diffchain}
+
+The INR gradient chain is structurally identical to E1's
+(\S\ref{sec:e1chain}), with $\alpha$ replacing $\theta$:
+\begin{equation}
+  J
+  \;\xrightarrow{\partial J/\partial u}\;
+  \lambda \;=\; (A^\top)^{-1}(\partial J/\partial u)^\top
+  \;\xrightarrow{-\lambda^\top \partial R/\partial \alpha}\;
+  \alpha .
+  \label{eq:e2chain}
+\end{equation}
+
+The new ingredient is the $\partial R/\partial \alpha$ path through the INR.
+Because $\psi$ is affine in $\alpha$:
+\begin{equation}
+  \frac{\partial \psi}{\partial \alpha_j}(x)
+  \;=\; h_\phi(x)^\top v_j,
+  \label{eq:e2dpsi}
+\end{equation}
+which is smooth and closed-form (or inexpensive via \texttt{torch.autograd}
+on the network forward).  The distance vector $\mathbf{d}(\alpha)$ is again
+the output of the Newton closest-point projection applied to $\psi(\cdot;
+\alpha)$, differentiated by the IFT (\S\ref{sec:e1ift} with $\psi$ now an
+INR).  The tape cotangents through the SBM face residuals then deliver
+$-\lambda^\top \partial R/\partial \alpha$ via \texttt{shape\_gradient},
+and \texttt{torch.autograd} propagates through \eqref{eq:e2dpsi} to give
+the final $\partial J/\partial \alpha$ on the \texttt{alpha} tensor.
+
+\subsection{Epoch management: the trust-region contract}
+\label{sec:e2epoch}
+
+Because classification is frozen within an epoch (\S\ref{sec:e1freeze}),
+the SBM stiffness $A(\alpha)$ is smooth in $\alpha$ only while the surface
+stays within the frozen surrogate's trust region.  E2 defines the epoch
+trust radius as
+\begin{equation}
+  \text{DRIFT} \;=\; 0.35\, h_{\min}, \qquad h_{\min} = 2^{-\text{LEVEL}},
+  \label{eq:e2drift}
+\end{equation}
+where $h_{\min}$ is the finest-level cell size.  When
+$\|\mathbf{d}(\alpha)\|_\infty > \text{DRIFT}$, a new classification epoch
+is triggered at the current $\alpha$.  This \emph{epoch continuation}
+strategy (also used in the M3 bunny hero, \texttt{docs/dev/roadmap.md})
+gives smooth-within, valid-across: gradient descent can cross epoch
+boundaries, with the objective continuous but the mesh topology changing
+at each epoch transition.
+
+\begin{remark}{branch stability and the FD check}
+The three measured INR facts baked into the framework
+(\texttt{docs/dev/specs/2026-07-06-neuralsdf.md}): the computational
+WINDOW contract (feature spans $\geq 8$ cells at the chosen level), domain-
+BOUNDED projections (sine INRs have spurious far zero sheets, so Newton is
+initialized within the windowed sub-box), and the BRANCH-STABILITY rule:
+at a bistable closest-point the projection selects different branches for
+$\alpha + \epsilon$ and $\alpha - \epsilon$, making $J$ genuinely
+non-smooth at isolated knife-edge points.  The FD check at L5 accordingly
+shows relative error $\sim 10^{-2}$ (branch-switching noise) while the
+same check at L4 with a gentler surface structure measures $10^{-6}$--$10^{-8}$
+(the pipeline itself is exact).
+\end{remark}
+
+\subsection{Gauss-Newton recovery and the open research question}
+\label{sec:e2recovery}
+
+With the gradient $\partial J/\partial \alpha$ in hand, a Levenberg-Marquardt
+Gauss-Newton step recovers the mode coefficients $\alpha^*$ from probe data.
+The expected results at the sphere checkpoint ($k=4$ modes, L5):
+\begin{itemize}
+  \item Objective consistency: $J(\alpha^*) = O(10^{-30})$ (the sentinel ---
+    the solution is represented exactly in the mode span).
+  \item Recovery: $J$ drops $\sim 1000\times$ but \emph{plateaus} at a local
+    minimum near $\alpha = 0$.  This is an honest, measured limitation: the
+    objective has steep local structure at scales below $|\alpha^*|$
+    (sensitivity at $0$ is $\sim 100\times$ the mean slope to the target),
+    so descent methods stall.
+\end{itemize}
+The NS (Navier-Stokes) version of the same story (hero demo H1, steady
+sphere) \emph{does} converge: advective transport enriches the measurement,
+yielding recovery error $1.77 \times 10^{-3}$.  The M3 bunny headline
+(\texttt{docs/dev/roadmap.md}) achieves recovery error $1.23 \times 10^{-3}$
+via $h$/epoch continuation, confirming that Gauss-Newton alone loses to
+landscape structure, while continuation across resolution and epoch beats it.
+
+\subsection{Connection to E0 concepts}
+\label{sec:e2e0connect}
+
+\begin{itemize}
+  \item \textbf{Do-not-differentiate list, item~3} (\S\ref{sec:dontdiff}):
+    classification is frozen; the mesh arrays have zero derivative in $\alpha$.
+  \item \textbf{IFT through the projection} (\S\ref{sec:dtd} and \S\ref{sec:e1ift}):
+    the Newton projector is a relation, not an algorithm; the IFT closes the
+    chain through the INR.
+  \item \textbf{Identifiability / Gramian} (\S\ref{sec:identifiability}):
+    rank-2 force aliasing (Gramian condition $\sim 80$) means two mode
+    directions move the observable identically; the thick-band extraction and
+    the Gramian check before any gradient run are the E2 equivalents of the
+    beyond-FH gauge analysis.
+  \item \textbf{Signal scale / probe placement} (\S\S\ref{sec:signalscale},
+    \ref{sec:flatJ}): E2's 26-point shell at $r \approx 0.42$ is placed
+    outside the wobble+edit envelope but well inside the Poisson decay radius,
+    fixing the observability that corner probes (measured $J_0 \sim 4 \times
+    10^{-4}$, wild Gauss-Newton) cannot provide.
+  \item \textbf{The $2.5\times$ cost contract} (\S\ref{sec:cvm}): the
+    adjoint for $k = 4$ mode coefficients costs one forward solve plus one
+    transposed solve, regardless of $k$ --- the same $O(1)$ scaling as E0's
+    material-parameter adjoint.
+\end{itemize}
+
+%-----------------------------------------------------------------------
+\section{The Arc: E0 to E1/E2 and Beyond}
+\label{sec:arc}
+
+The E-track teaches a single idea in three registers of complexity.
+
+\textbf{E0 (the on-ramp).} Build intuition for information-flow reversal
+(\S\ref{sec:infoflow}), derive the discrete adjoint from the Lagrangian
+(\S\ref{sec:lagrangian}), learn the taping rules (\S\S\ref{sec:tape},
+\ref{sec:dontdiff}), handle transient chains (\S\ref{sec:transient}), and
+design a good $J$ (Parts V--VI).  The payoff is the Allen-Cahn three-way
+gradient check (\S\ref{sec:acpayoff}) and the beyond-FH gauge story
+(\S\ref{sec:identifiability}).
+
+\textbf{E1 (shape adjoint).} The same adjoint formula now acts on geometry:
+the do-not-differentiate list items appear in the wild (classification
+freeze), the custom VJP for the linear solver governs the adjoint solve,
+and the IFT through the Newton projection closes the chain.  The gradient
+cost is still one forward solve plus one transposed solve, regardless of
+whether the shape is described by 3 parameters (disk) or 3000 (GridSDF
+voxels).
+
+\textbf{E2 (neural geometry).} GENIE's affine-in-$\alpha$ edit space turns
+a neural SDF into a smooth, differentiable geometry oracle.  The framework
+is unchanged: the tape collects SBM face cotangents, \texttt{torch.autograd}
+propagates through the feature extractor, and the same adjoint solve closes
+the loop.  The new content is the epoch-trust-region contract and the open
+research question of landscape nonconvexity.
+
+\textbf{Where the program goes.} The M3 bunny ladder
+(\texttt{docs/dev/roadmap.md}) confirms that $h$/epoch continuation
+converts an open research question (E2) into a headline result (recovery
+error $1.23 \times 10^{-3}$): the machinery is complete; the open frontier
+is richer observables and continuation strategies.  SP-1 (R3,
+\texttt{docs/theory/\allowbreak structure\_property\_p3.md} and
+\texttt{docs/dev/\allowbreak 2026-07-18-horizon-readiness.md}) builds the multi-protocol
+inversion --- instrument-space $S(q,t)$, film height $h(t)$, PSF-convolved
+images --- on the production stack, scaling to $60$--$140$~M dofs on Horizon
+GB nodes.  The E-track is the on-ramp; the production inverse program is
+the destination.
+
+%=======================================================================
 \begin{thebibliography}{9}
 
 \bibitem{farrell2013}
@@ -797,6 +1186,19 @@ DiffSim group,
 observable, gauge identifiability, and composition-coverage conditioning}
 (internal dev note, 2026-07-14).
 \texttt{docs/dev/2026-07-14-beyond-fh-learned-thermo.md}.
+
+\bibitem{karki2025}
+R.~Karki, V.~Krishnamurthy, and B.~Ganapathysubramanian,
+\emph{GENIE: Editing Implicit Neural Representations via Last-Layer Edit
+Space},
+arXiv preprint arXiv:2603.29860 (2025).
+\url{https://arxiv.org/abs/2603.29860}
+
+\bibitem{neuralsdf2026}
+DiffSim group,
+\emph{NeuralSDF (Provided-INR) Oracle --- Implementation Spec (M1c/M2)}
+(internal spec, 2026-07-06).
+\texttt{docs/dev/specs/2026-07-06-neuralsdf.md}.
 
 \end{thebibliography}
 
