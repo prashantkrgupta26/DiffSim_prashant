@@ -848,15 +848,23 @@ class DeviceNSAssembler:
         return self._diag_d.numpy()
 
     def device_csr(self):
-        """Zero-copy torch CSR over vals_d + device rhs (dlpack)."""
+        """Zero-copy torch CSR over vals_d + device rhs (dlpack).
+
+        Task #37 fix: the indptr/indices tensors were hardcoded to
+        torch device "cuda" (= cuda:0) while the dlpack'd values ride
+        the assembler's ACTUAL warp device — on cuda:1 the mixed-device
+        CSR made every cuDSS solve fail (swallowed as a numerical NaN
+        -> instant dt-underflow ladder; measured on the film front-end,
+        runs/t37-g3-dev).  The torch device now follows dm.device."""
         import torch
         vals_t = torch.from_dlpack(self.vals_d.__dlpack__())
         if not hasattr(self, "_indptr_t"):
+            tdev = str(self.dm.device)
             self._indptr_t = torch.tensor(self.indptr, dtype=torch.int64,
-                                          device="cuda")
+                                          device=tdev)
             self._indices_t = torch.tensor(self.indices,
                                            dtype=torch.int64,
-                                           device="cuda")
+                                           device=tdev)
         A_t = torch.sparse_csr_tensor(
             self._indptr_t, self._indices_t, vals_t,
             size=(self.Nfull, self.Nfull))
