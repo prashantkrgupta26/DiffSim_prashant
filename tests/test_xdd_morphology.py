@@ -26,6 +26,12 @@ _CPU_TEST = pathlib.Path(
 )
 _BILAYER_2D = _CPU_TEST / "morph_bilayer_2D.txt"
 
+# The CPU reference tree is a Mac-side checkout (absolute path above);
+# on remote runners (gpubox/Nova) it cannot exist — skip, not fail.
+pytestmark = pytest.mark.skipif(
+    not _CPU_TEST.is_dir(),
+    reason="CPU reference tree not present (Mac-only parity tests)")
+
 # bilayer physical size: spacing=0.25e-7 in y; 5 nodes → Ly=4*0.25e-7=1e-7
 # same spacing assumed in x (not given by dist, so use same 0.25e-7)
 _BILAYER_PHYS = (4 * 0.25e-7, 4 * 0.25e-7)   # (Lx, Ly) in m

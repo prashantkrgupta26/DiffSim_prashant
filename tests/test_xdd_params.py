@@ -29,6 +29,14 @@ _PL_P3HT   = f"{_CPU_TEST}/donor_pl_p3ht.spec"
 _BLEND_PM6Y6 = f"{_CPU_TEST}/blend_pm6-y6.spec"
 
 
+# The CPU reference tree is a Mac-side checkout (absolute path above);
+# on remote runners (gpubox/Nova) it cannot exist — skip, not fail.
+pytestmark = pytest.mark.skipif(
+    not __import__("os").path.isdir(_CPU_TEST),
+    reason="CPU reference tree not present (Mac-only parity tests)")
+
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants (same as implementation — written here for independent check)
 # ──────────────────────────────────────────────────────────────────────────────
