@@ -35,6 +35,11 @@ XI_ELEMS_RULE = 4.0            # the >=4-elements interface rule (PASS)
 XI_ELEMS_FLOOR = 2.5
 INT32_CEIL = 2 ** 31           # device-assembly slot arithmetic
 WIDE_THRESHOLD = int(0.9 * 2 ** 31)   # auto-switch to mixed-width CSR
+# Task #38 block-row ChunkedCSR: per-chunk element capacity (mirrors
+# device_assembly.CHUNK_CAP_DEFAULT — kept local so the warp-free
+# preflight tier never imports the assembly stack); chunking
+# auto-activates at WIDE_THRESHOLD alongside the wide index switch.
+CHUNK_CAP = int(0.9 * 2 ** 31) // 8
 CUDSS_NNZ_WALL = 228e6         # measured ALLOC wall, 48 GB card (3-D)
 
 
@@ -272,20 +277,38 @@ def run_preflight(params, resolved, query_hardware=True):
     if p.device_assembly:
         pct = 100.0 * r.nnz / INT32_CEIL
         iw = getattr(p, "index_width", "auto")
+        ch = getattr(p, "chunking", "auto")
+        # Task #38: warp's array_t ABI (int32 shapes/byte-strides)
+        # rejects ANY >= 2^31-ELEMENT array at construction — past the
+        # ceiling the wide index arithmetic alone cannot allocate its
+        # buffers; block-row ChunkedCSR must be active too.
+        chunk_on = ch == "force" or (ch == "auto"
+                                     and r.nnz >= WIDE_THRESHOLD)
+        nch = -(-r.nnz // CHUNK_CAP) if chunk_on else 0
+        ch_txt = (f" + block-row chunked CSR (C={nch} chunks, "
+                  f"{'forced' if ch == 'force' else 'auto'} -- warp "
+                  "2^31-element array ceiling)") if chunk_on else ""
         if iw == "narrow" and r.nnz >= INT32_CEIL:
             rep.add("index-width", FAIL,
                     f"nnz={r.nnz} >= 2^31 ({pct:.0f}% of range) but "
                     "index_width='narrow' forced: the int32 slot "
                     "arithmetic would WRAP -- use 'auto' or 'wide'")
+        elif ch == "off" and r.nnz >= INT32_CEIL:
+            rep.add("index-width", FAIL,
+                    f"nnz={r.nnz} >= 2^31 ({pct:.0f}% of range) but "
+                    "chunking='off' forced: warp's array_t ABI (int32 "
+                    "shapes/byte-strides) cannot construct any "
+                    ">=2^31-element buffer -- use chunking='auto'")
         elif iw == "wide" or (iw == "auto" and r.nnz >= WIDE_THRESHOLD):
             mode = "wide (forced)" if iw == "wide" else "wide (auto)"
             rep.add("index-width", PASS,
                     f"nnz={r.nnz} = {pct:.0f}% of int32 range -> {mode}: "
-                    "mixed-width CSR (int64 offsets/slots, int32 columns) "
-                    "-- past the int32 nnz ceiling, near-zero mem tax")
+                    "mixed-width CSR (int64 offsets/slots, int32 columns)"
+                    f"{ch_txt}")
         else:
             rep.add("index-width", PASS,
                     f"nnz={r.nnz} = {pct:.0f}% of int32 range -> narrow "
-                    "(int32 offsets/slots; auto-switch to wide at "
-                    f"{100.0 * WIDE_THRESHOLD / INT32_CEIL:.0f}%)")
+                    "(int32 offsets/slots; auto-switch to wide+chunked "
+                    f"at {100.0 * WIDE_THRESHOLD / INT32_CEIL:.0f}%)"
+                    f"{ch_txt}")
     return rep

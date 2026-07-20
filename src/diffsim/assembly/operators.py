@@ -48,6 +48,66 @@ def csr_spmv(
 _kernel_cache: dict = {}
 
 
+# ---------------------------------------------------------------------
+# Task #38 ChunkedCSR: warp's array_t ABI carries int32 shapes AND int32
+# byte-strides, so NO single array dimension may reach 2^31 elements
+# (types.py check_array_shape) — any nnz-length buffer dies at
+# construction past 2.15B nnz regardless of index dtype (#33 widened the
+# arithmetic, not the arrays).  Fix: block-ROW chunked storage — one 2-D
+# [nchunks, cap] array whose per-chunk byte stride stays < 2^31; the
+# int64 global slot is located with a small binary search over the
+# chunk-base table and addressed [c, int32(slot - bases[c])].
+# ---------------------------------------------------------------------
+@wp.func
+def _chunk_of(bases: wp.array(dtype=wp.int64), nc: wp.int32,
+              slot: wp.int64) -> wp.int32:
+    """Largest c in [0, nc) with bases[c] <= slot (bases ascending,
+    length nc+1) — the chunk holding nnz-space position `slot`."""
+    lo = wp.int32(0)
+    hi = nc - wp.int32(1)
+    while lo < hi:
+        mid = (lo + hi + wp.int32(1)) / wp.int32(2)
+        if bases[mid] <= slot:
+            lo = mid
+        else:
+            hi = mid - wp.int32(1)
+    return lo
+
+
+def make_csr_spmv_chunked():
+    """CSR SpMV over CHUNKED (block-row 2-D) data/column arrays: row
+    offsets int64, columns int32.  Chunk boundaries are row-aligned
+    (ChunkTable contract), so one chunk lookup per row suffices and the
+    inner walk is int32 within-chunk."""
+    key = ("csr_spmv_chunked",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique")
+    def spmv_ch(
+        indptr: wp.array(dtype=wp.int64),
+        indices: wp.array2d(dtype=wp.int32),
+        data: wp.array2d(dtype=wp.float64),
+        bases: wp.array(dtype=wp.int64),
+        nc: wp.int32,
+        x: wp.array(dtype=wp.float64),
+        y: wp.array(dtype=wp.float64),
+    ):
+        row = wp.tid()
+        j0 = indptr[row]
+        cnt = wp.int32(indptr[row + 1] - j0)
+        acc = wp.float64(0.0)
+        if cnt > 0:
+            c = _chunk_of(bases, nc, j0)
+            lj = wp.int32(j0 - bases[c])
+            for k in range(cnt):
+                acc += data[c, lj + k] * x[indices[c, lj + k]]
+        y[row] = acc
+
+    _kernel_cache[key] = spmv_ch
+    return spmv_ch
+
+
 def make_csr_spmv(idx_dtype=wp.int32):
     """CSR SpMV specialized on the OFFSET (row-pointer) dtype — the P0-2
     mixed-width path.  Narrow (int32) returns the module-level csr_spmv
@@ -428,12 +488,23 @@ class CSROperator:
         columns, float64 data) without any host round-trip — the G5
         device-resident blockch setup consumes assembler-owned value
         buffers directly.  The SpMV specializes on the offset dtype so a
-        wide (int64-offset) full-A operator never wraps."""
+        wide (int64-offset) full-A operator never wraps.
+
+        Task #38: indices_d/data_d may be ChunkedArray (block-row 2-D
+        past warp's 2^31-element array ceiling) — the chunked SpMV then
+        rides the shared chunk table; matvec() is unchanged because the
+        _dev tuple mirrors the chunked kernel's argument order."""
         op = cls.__new__(cls)
         op.device = device
         op.n_free = n
-        op._dev = (indptr_d, indices_d, data_d)
-        op._spmv = make_csr_spmv(indptr_d.dtype)
+        if not isinstance(data_d, wp.array):        # ChunkedArray pair
+            t = data_d.table
+            op._dev = (indptr_d, indices_d.data, data_d.data,
+                       t.bases_d, wp.int32(t.nchunks))
+            op._spmv = make_csr_spmv_chunked()
+        else:
+            op._dev = (indptr_d, indices_d, data_d)
+            op._spmv = make_csr_spmv(indptr_d.dtype)
         return op
 
     def matvec(self, x: wp.array, y: wp.array):

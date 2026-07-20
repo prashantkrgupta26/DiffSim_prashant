@@ -21,7 +21,7 @@ import warp as wp
 
 from ..errors import BackendError, ConfigError
 
-from .operators import _kernel_cache
+from .operators import _kernel_cache, _chunk_of
 
 
 # ---------------------------------------------------------------------
@@ -70,6 +70,156 @@ def _resolve_idx_width(index_width, nnz_estimate):
     return wp.int32
 
 
+# ---------------------------------------------------------------------
+# Task #38: block-row ChunkedCSR — past warp's 2^31-ELEMENT array
+# ceiling.  The #34 probe measured that warp 1.15 rejects ANY array
+# dimension >= 2^31 at construction (types.py check_array_shape; the
+# array_t ABI carries int32 shapes AND int32 BYTE-strides), so the #33
+# wide slot arithmetic is correct but the nnz-length buffers it indexes
+# (vals_d f64, column indices i32) cannot exist past 2.15B nnz —
+# measured wall: 265x265x75 film, 2.29B nnz, FAILED on a 96 GB GH200
+# with HBM half empty (gh200-capacity-findings.md §2).
+#
+# Fix: every nnz-space buffer becomes ONE 2-D [nchunks, cap] array whose
+# per-chunk byte stride stays < 2^31; chunk boundaries sit at CSR ROW
+# starts (no row straddles a chunk), carried by a device-agnostic
+# ChunkTable (int64 bases) that doubles as the later multi-GPU row
+# decomposition (Horizon gb-large — do NOT map chunks to devices here).
+# Kernels keep the int64 global-slot arithmetic (#33) and only at the
+# memory access locate the chunk (binary search over bases, <= 6 steps)
+# and address [c, int32(slot - bases[c])].  Chunking OFF (the default
+# below ~90% of 2^31 nnz) leaves the #33 paths bit-for-bit untouched.
+# ---------------------------------------------------------------------
+CHUNK_NNZ_THRESHOLD = IDX_WIDE_THRESHOLD    # auto-chunk at >= 90% of 2^31
+# Elements per chunk: the largest power-of-nothing round count whose f64
+# byte stride keeps 10% margin under 2^31 (int64 buffers share it; int32
+# buffers are even safer).  241,591,910 elements = 1.93 GB f64 rows.
+CHUNK_CAP_DEFAULT = int(0.9 * 2 ** 31) // 8
+
+
+def _resolve_chunking(chunking, nnz_estimate):
+    """Map the chunking knob + an nnz estimate to a bool.
+
+    chunking: "auto" (default) | "off" | "force".  "auto" activates
+    block-row chunking once the estimate crosses ~90% of 2^31 (the same
+    threshold as the wide index auto-switch, so wide+chunked fire
+    together); "off"/"force" force the choice.  An "off" past 2^31 is
+    REFUSED loudly — warp cannot construct the buffers at all."""
+    if chunking not in ("auto", "off", "force"):
+        raise ConfigError(
+            f"chunking must be 'auto'|'off'|'force', got {chunking!r}")
+    if chunking == "force":
+        return True
+    if chunking == "off":
+        if nnz_estimate is not None and nnz_estimate >= 2 ** 31:
+            raise BackendError(
+                f"chunking='off' forced but nnz {nnz_estimate} >= 2^31: "
+                f"warp's array_t ABI (int32 shapes/byte-strides) cannot "
+                f"construct any array of >= 2^31 elements — use "
+                f"chunking='auto'")
+        return False
+    return (nnz_estimate is not None
+            and nnz_estimate >= CHUNK_NNZ_THRESHOLD)
+
+
+class ChunkTable:
+    """Block-row partition of a CSR's nnz space.
+
+    Chunk c covers rows [row_start[c], row_start[c+1]) and nnz-space
+    positions [bases[c], bases[c+1]); bases[c] = indptr[row_start[c]]
+    (int64), so rows NEVER straddle chunks and every chunk holds at most
+    `cap` entries.  The table is deliberately storage-agnostic — it is
+    the row decomposition a later multi-GPU task maps to devices; today
+    ChunkedArray realizes it as one 2-D device array."""
+
+    def __init__(self, indptr, cap=None, device=None):
+        cap = CHUNK_CAP_DEFAULT if cap is None else int(cap)
+        if cap * 8 >= 2 ** 31:          # f64/int64 row byte-stride bound
+            raise ConfigError(
+                f"chunk_cap {cap} overflows warp's int32 BYTE-stride "
+                f"ABI for 8-byte dtypes (cap*8 must stay < 2^31)")
+        indptr = np.asarray(indptr, np.int64)
+        nnz = int(indptr[-1])
+        nrow = len(indptr) - 1
+        bases = [0]
+        row_start = [0]
+        while bases[-1] < nnz:
+            # last row whose START lies within cap of the current base
+            r = int(np.searchsorted(indptr, bases[-1] + cap,
+                                    side="right") - 1)
+            r = min(r, nrow)
+            if r <= row_start[-1]:
+                raise BackendError(
+                    f"ChunkTable: row {row_start[-1]} alone carries "
+                    f"{int(indptr[row_start[-1] + 1] - bases[-1])} nnz "
+                    f"> chunk capacity {cap}")
+            row_start.append(r)
+            bases.append(int(indptr[r]))
+        if len(bases) == 1:                     # degenerate empty CSR
+            row_start.append(nrow)
+            bases.append(0)
+        self.nnz = nnz
+        self.cap = cap
+        self.bases = np.asarray(bases, np.int64)
+        self.row_start = np.asarray(row_start, np.int64)
+        self.nchunks = len(bases) - 1
+        self.device = device
+        self.bases_d = wp.array(self.bases, dtype=wp.int64, device=device)
+
+    def counts(self):
+        """Per-chunk entry counts (host int64)."""
+        return np.diff(self.bases)
+
+
+class ChunkedArray:
+    """One nnz-space device buffer in block-row chunked storage: a
+    single 2-D warp array [nchunks, cap] (each dimension and each byte
+    stride < 2^31 — warp's array_t ABI is respected per dimension while
+    the TOTAL element count passes 2^31 freely).  Chunk c's valid span
+    is [0, bases[c+1]-bases[c]); the tail of each row is zeroed padding,
+    never addressed by any kernel."""
+
+    def __init__(self, table, dtype, device):
+        self.table = table
+        self.dtype = dtype
+        self.device = device
+        self.data = wp.zeros((table.nchunks, table.cap), dtype=dtype,
+                             device=device)
+
+    @property
+    def size(self):
+        return self.table.nnz
+
+    def __len__(self):
+        return self.table.nnz
+
+    def zero_(self):
+        self.data.zero_()
+
+    def numpy(self):
+        """Valid spans concatenated to ONE host 1-D array (per-chunk
+        pulls — the padded whole-array copy never exists on host)."""
+        t = self.table
+        cnt = t.counts()
+        if t.nnz == 0:
+            return np.empty(0, dtype=self.data.numpy().dtype)
+        return np.concatenate(
+            [self.data[c].numpy()[:cnt[c]] for c in range(t.nchunks)])
+
+    def upload(self, host_1d):
+        """Host 1-D nnz-length array -> per-chunk device copies (no
+        padded host mirror is ever built)."""
+        t = self.table
+        host_1d = np.ascontiguousarray(host_1d)
+        for c in range(t.nchunks):
+            b0, b1 = int(t.bases[c]), int(t.bases[c + 1])
+            if b1 == b0:
+                continue
+            src = wp.array(host_1d[b0:b1], dtype=self.dtype,
+                           device="cpu", copy=False)
+            wp.copy(self.data[c], src, count=b1 - b0)
+
+
 # Auto-switch threshold for the node-graph pattern build (G5 rung c):
 # above this many dof-pair entries (sum over bins of ne*(nbf*ndof)^2)
 # the old host COO/slot build becomes the memory binder (measured
@@ -85,7 +235,7 @@ class DeviceNSAssembler:
 
     def __init__(self, dm, sigma_like=1.0, coloring=False, ndof=None,
                  node_pattern=None, blockmask=None, matvec_only=False,
-                 index_width="auto"):
+                 index_width="auto", chunking="auto", chunk_cap=None):
         # ndof: dofs per node (default dim+1 = the NS layout; 4 for the
         # ternary CH film system, 2 for binary CH — M4 device-bound)
         # blockmask (B5): bool [ndof, ndof] compile-time dof-pair block
@@ -105,6 +255,15 @@ class DeviceNSAssembler:
         self._index_width = index_width
         self._idx_dtype = wp.int32          # provisional; finalized below
         self._idx_np = np.int32
+        # Task #38 block-row chunking config: resolved with the index
+        # width once nnz is known; OFF below ~90% of 2^31 keeps every
+        # buffer/kernel bit-for-bit the pre-#38 path.  chunk_cap
+        # overrides the per-chunk element capacity (tests force small
+        # caps so multi-chunk paths run at toy sizes).
+        self._chunking = chunking
+        self._chunk_cap = chunk_cap
+        self._chunked = False               # provisional; finalized below
+        self._ctab = None
         ndof = (dm.dim + 1) if ndof is None else int(ndof)
         self.ndof = ndof
         if blockmask is not None:
@@ -240,6 +399,19 @@ class DeviceNSAssembler:
         # P0-2: resolve the CSR index width from the realized nnz.
         idx_dt = self._finalize_idx_width(self.nnz)
         inp = self._idx_np
+        # Task #38: block-row chunk table over the realized pattern.
+        # COO-path chunking supports the identity-T non-colored scatter
+        # (the only COO configuration that can meet these sizes; the
+        # weighted/colored scatters index vals_d through paths kept
+        # narrow-only by scope).
+        if self._chunked:
+            if coloring or not identity_T:
+                raise BackendError(
+                    "chunking supports the identity-constraint, "
+                    "non-colored scatter paths only (COO or node-graph "
+                    "pattern)")
+            self._ctab = ChunkTable(self.indptr, cap=self._chunk_cap,
+                                    device=dm.device)
         # slot index per (element-pair entry): position in the CSR
         # values array. FULLY VECTORIZED via sparse fancy indexing: give
         # the pattern matrix data = arange(nnz), then K2[rr, cc] returns
@@ -277,8 +449,10 @@ class DeviceNSAssembler:
         self._src_d = [None if s2 is None else wp.array(
             np.ascontiguousarray(s2.astype(np.int32)), dtype=wp.int32,
             device=dm.device) for s2 in self._src_bins]
-        self.vals_d = wp.zeros(self.nnz, dtype=wp.float64,
-                               device=dm.device)
+        self.vals_d = (ChunkedArray(self._ctab, wp.float64, dm.device)
+                       if self._chunked
+                       else wp.zeros(self.nnz, dtype=wp.float64,
+                                     device=dm.device))
         self.F_d = wp.zeros(self.Nfull, dtype=wp.float64,
                             device=dm.device)
         gdof_bins = []
@@ -330,8 +504,22 @@ class DeviceNSAssembler:
         realized pattern nnz.  Sets self._idx_dtype (wp) / self._idx_np
         (numpy).  Also asserts dofs (Nfull) fit int32 — always true at
         our scales but checked so a wide-mode column-index assumption
-        can never silently break.  Returns the chosen wp dtype."""
+        can never silently break.  Returns the chosen wp dtype.
+
+        Task #38: also resolves the chunking knob (block-row ChunkedCSR
+        past warp's 2^31-element array ceiling).  Chunked storage
+        carries int64 global slots by construction, so chunking forces
+        the WIDE index dtype; an explicit index_width='narrow' conflicts
+        and is refused."""
         self._idx_dtype = _resolve_idx_width(self._index_width, nnz)
+        self._chunked = _resolve_chunking(self._chunking, nnz)
+        if self._chunked:
+            if self._index_width == "narrow":
+                raise ConfigError(
+                    "chunking is active but index_width='narrow' forced: "
+                    "chunked kernels carry int64 global slots — use "
+                    "index_width='auto' or 'wide'")
+            self._idx_dtype = wp.int64
         self._idx_np = (np.int64 if self._idx_dtype is wp.int64
                         else np.int32)
         if self.Nfull >= 2 ** 31:
@@ -421,28 +609,57 @@ class DeviceNSAssembler:
                                  * rowcnt[None, :]).ravel()))
             ).astype(np.int64)
         assert self.indptr[-1] == self.nnz
+        # Task #38: block-row chunk table over the closed-form indptr —
+        # built BEFORE any nnz-length allocation (the whole point: warp
+        # cannot construct a 1-D >2^31-element buffer at all).
+        if self._chunked:
+            self._ctab = ChunkTable(self.indptr, cap=self._chunk_cap,
+                                    device=d)
+            # in-kernel int64 reads of Gind assume node-pair nnz < 2^31
+            # (nnz/ndof^2 — holds to ~34B dof-level nnz)
+            assert gnnz < 2 ** 31
         # dof-level indices by device kernel (one thread per dof row);
         # int32 mirror kept on host (blockch symbolic setup, csr_slots).
         # Gptr indexes into nnz-space (via g0) -> uploaded at the CSR
-        # index width; the COLUMN indices (ind_d) stay int32.
+        # index width; the COLUMN indices (ind_d) stay int32 and go
+        # CHUNKED past the ceiling (a dof row never straddles chunks —
+        # ChunkTable is row-aligned — so the write kernel locates its
+        # chunk once).
         self._Gptr_d = wp.array(Gptr.astype(inp), dtype=idx_dt, device=d)
         Gind_d = wp.array(Gind, dtype=wp.int32, device=d)
-        ind_d = wp.zeros(self.nnz, dtype=wp.int32, device=d)
+        ind_d = (ChunkedArray(self._ctab, wp.int32, d) if self._chunked
+                 else wp.zeros(self.nnz, dtype=wp.int32, device=d))
         if mask is None:
             self._mask_d = None
-            wp.launch(_dof_indices_kernel(idx_dt), dim=self.Nfull,
-                      inputs=[self._Gptr_d, Gind_d, wp.int32(ndof),
-                              ind_d], device=d)
+            if self._chunked:
+                wp.launch(_dof_indices_kernel_chunked(), dim=self.Nfull,
+                          inputs=[self._Gptr_d, Gind_d, wp.int32(ndof),
+                                  ind_d.data, self._ctab.bases_d,
+                                  wp.int32(self._ctab.nchunks)], device=d)
+            else:
+                wp.launch(_dof_indices_kernel(idx_dt), dim=self.Nfull,
+                          inputs=[self._Gptr_d, Gind_d, wp.int32(ndof),
+                                  ind_d], device=d)
         else:
             i32 = lambda a_: wp.array(a_.astype(np.int32),
                                       dtype=wp.int32, device=d)
             self._mask_d = dict(rowoff=i32(rowoff), lcols=i32(lcols),
                                 colpos=i32(colpos),
                                 blocknnz=int(rowcnt.sum()))
-            wp.launch(_dof_indices_masked_kernel(idx_dt), dim=self.Nfull,
-                      inputs=[self._Gptr_d, Gind_d, wp.int32(ndof),
-                              self._mask_d["rowoff"],
-                              self._mask_d["lcols"], ind_d], device=d)
+            if self._chunked:
+                wp.launch(_dof_indices_masked_kernel_chunked(),
+                          dim=self.Nfull,
+                          inputs=[self._Gptr_d, Gind_d, wp.int32(ndof),
+                                  self._mask_d["rowoff"],
+                                  self._mask_d["lcols"], ind_d.data,
+                                  self._ctab.bases_d,
+                                  wp.int32(self._ctab.nchunks)], device=d)
+            else:
+                wp.launch(_dof_indices_masked_kernel(idx_dt),
+                          dim=self.Nfull,
+                          inputs=[self._Gptr_d, Gind_d, wp.int32(ndof),
+                                  self._mask_d["rowoff"],
+                                  self._mask_d["lcols"], ind_d], device=d)
         self.indices = ind_d.numpy()
         del ind_d, Gind_d
         # per-element node-pair slot in G via keyed searchsorted
@@ -459,7 +676,10 @@ class DeviceNSAssembler:
                                           dtype=wp.int32, device=d))
             del key, slot
         del Gkey, Gind, rows_all, cols_all
-        self.vals_d = wp.zeros(self.nnz, dtype=wp.float64, device=d)
+        self.vals_d = (ChunkedArray(self._ctab, wp.float64, d)
+                       if self._chunked
+                       else wp.zeros(self.nnz, dtype=wp.float64,
+                                     device=d))
         self.F_d = wp.zeros(self.Nfull, dtype=wp.float64, device=d)
 
     def set_strong_rows(self, rows, diag_vals=None):
@@ -549,7 +769,6 @@ class DeviceNSAssembler:
                               aq, fq, wp.float64(nu), wp.float64(sig2tau),
                               be], device=d)
             npair = (nbf * ndof) ** 2
-            scat = _scatter_kernel(self._idx_dtype)
             if self.node_mode:
                 self.scatter_bin(k_bin, Ae, be)   # A and b together
                 continue
@@ -560,9 +779,8 @@ class DeviceNSAssembler:
                                   self._w_d[k_bin], self._slots_d[k_bin],
                                   self.vals_d], device=d)
             elif not self.coloring:
-                wp.launch(scat, dim=ne * npair,
-                          inputs=[Ae.reshape((-1,)), self._slots_d[k_bin],
-                                  self.vals_d], device=d)
+                self._scatter_A(Ae.reshape((-1,)), self._slots_d[k_bin],
+                                ne * npair)
             else:
                 order, bounds = self._colors[k_bin]
                 order_d = wp.array(order, dtype=wp.int32, device=d)
@@ -634,6 +852,21 @@ class DeviceNSAssembler:
         self.vals_d.zero_()
         self.F_d.zero_()
 
+    def _scatter_A(self, vals_e, slots_d, n):
+        """Atomic-add vals_e into the device CSR values at nnz-space
+        slots — the ONE dispatch point between the flat (pre-#38,
+        bit-for-bit) and chunked scatter kernels."""
+        if self._chunked:
+            wp.launch(_scatter_kernel_chunked(), dim=n,
+                      inputs=[vals_e, slots_d, self.vals_d.data,
+                              self._ctab.bases_d,
+                              wp.int32(self._ctab.nchunks)],
+                      device=self.dm.device)
+        else:
+            wp.launch(_scatter_kernel(self._idx_dtype), dim=n,
+                      inputs=[vals_e, slots_d, self.vals_d],
+                      device=self.dm.device)
+
     def scatter_batch(self, k_bin, e0, Ae_d, be_d, nb):
         """Scatter BATCH-LOCAL device element blocks for the nb elements
         [e0, e0 + nb) of bin k_bin (Ae_d flat or [>=nb, nl, nl], be_d
@@ -648,25 +881,53 @@ class DeviceNSAssembler:
         npair = nl * nl
         if self.node_mode:
             if self._blockmask is not None:
-                wp.launch(_scatter_node_masked_kernel(self._idx_dtype),
-                          dim=nb * npair,
-                          inputs=[Ae_d.reshape((-1,)),
-                                  self._gslot_d[k_bin],
-                                  self._conn_d[k_bin], self._Gptr_d,
-                                  wp.int32(e0), wp.int32(nbf),
-                                  wp.int32(ndof),
-                                  self._mask_d["rowoff"],
-                                  self._mask_d["colpos"],
-                                  self.vals_d], device=d)
+                if self._chunked:
+                    wp.launch(_scatter_node_masked_kernel_chunked(),
+                              dim=nb * npair,
+                              inputs=[Ae_d.reshape((-1,)),
+                                      self._gslot_d[k_bin],
+                                      self._conn_d[k_bin], self._Gptr_d,
+                                      wp.int32(e0), wp.int32(nbf),
+                                      wp.int32(ndof),
+                                      self._mask_d["rowoff"],
+                                      self._mask_d["colpos"],
+                                      self.vals_d.data,
+                                      self._ctab.bases_d,
+                                      wp.int32(self._ctab.nchunks)],
+                              device=d)
+                else:
+                    wp.launch(_scatter_node_masked_kernel(
+                                  self._idx_dtype),
+                              dim=nb * npair,
+                              inputs=[Ae_d.reshape((-1,)),
+                                      self._gslot_d[k_bin],
+                                      self._conn_d[k_bin], self._Gptr_d,
+                                      wp.int32(e0), wp.int32(nbf),
+                                      wp.int32(ndof),
+                                      self._mask_d["rowoff"],
+                                      self._mask_d["colpos"],
+                                      self.vals_d], device=d)
             else:
-                wp.launch(_scatter_node_kernel(self._idx_dtype),
-                          dim=nb * npair,
-                          inputs=[Ae_d.reshape((-1,)),
-                                  self._gslot_d[k_bin],
-                                  self._conn_d[k_bin], self._Gptr_d,
-                                  wp.int32(e0), wp.int32(nbf),
-                                  wp.int32(ndof), self.vals_d],
-                          device=d)
+                if self._chunked:
+                    wp.launch(_scatter_node_kernel_chunked(),
+                              dim=nb * npair,
+                              inputs=[Ae_d.reshape((-1,)),
+                                      self._gslot_d[k_bin],
+                                      self._conn_d[k_bin], self._Gptr_d,
+                                      wp.int32(e0), wp.int32(nbf),
+                                      wp.int32(ndof), self.vals_d.data,
+                                      self._ctab.bases_d,
+                                      wp.int32(self._ctab.nchunks)],
+                              device=d)
+                else:
+                    wp.launch(_scatter_node_kernel(self._idx_dtype),
+                              dim=nb * npair,
+                              inputs=[Ae_d.reshape((-1,)),
+                                      self._gslot_d[k_bin],
+                                      self._conn_d[k_bin], self._Gptr_d,
+                                      wp.int32(e0), wp.int32(nbf),
+                                      wp.int32(ndof), self.vals_d],
+                              device=d)
             wp.launch(_scatter_node_vec_kernel(), dim=nb * nl,
                       inputs=[be_d.reshape((-1,)), self._conn_d[k_bin],
                               wp.int32(e0), wp.int32(nbf),
@@ -676,9 +937,7 @@ class DeviceNSAssembler:
             raise BackendError(
                 "scatter_batch: constraint-aware path is whole-bin only")
         slots_v = self._slots_d[k_bin][e0 * npair:(e0 + nb) * npair]
-        wp.launch(_scatter_kernel(self._idx_dtype), dim=nb * npair,
-                  inputs=[Ae_d.reshape((-1,)), slots_v, self.vals_d],
-                  device=d)
+        self._scatter_A(Ae_d.reshape((-1,)), slots_v, nb * npair)
         gdof_v = self._gdof_d[k_bin][e0 * nl:(e0 + nb) * nl]
         wp.launch(_scatter_vec_kernel(), dim=nb * nl,
                   inputs=[be_d.reshape((-1,)), gdof_v, self.F_d],
@@ -735,9 +994,8 @@ class DeviceNSAssembler:
                               self._bw_d[k_bin], self._gdof_d[k_bin],
                               self.F_d], device=d)
         else:
-            wp.launch(_scatter_kernel(self._idx_dtype), dim=ne * npair,
-                      inputs=[Ae_d.reshape((-1,)), self._slots_d[k_bin],
-                              self.vals_d], device=d)
+            self._scatter_A(Ae_d.reshape((-1,)), self._slots_d[k_bin],
+                            ne * npair)
             wp.launch(_scatter_vec_kernel(), dim=ne * nbf * self.ndof,
                       inputs=[be_d.reshape((-1,)), self._gdof_d[k_bin],
                               self.F_d], device=d)
@@ -752,13 +1010,25 @@ class DeviceNSAssembler:
         (the M5 multiphase Newton) realize the same strong-row
         semantics as assemble()."""
         st = self._strong
-        wp.launch(_zero_slots_kernel(self._idx_dtype), dim=st["n_spans"],
-                  inputs=[st["spans_d"], self.vals_d],
-                  device=self.dm.device)
         bv = wp.array(np.ascontiguousarray(
             b_vals if b_vals is not None
             else np.zeros(st["n_rows"])), dtype=wp.float64,
             device=self.dm.device)
+        if self._chunked:
+            ct = self._ctab
+            wp.launch(_zero_slots_kernel_chunked(), dim=st["n_spans"],
+                      inputs=[st["spans_d"], self.vals_d.data,
+                              ct.bases_d, wp.int32(ct.nchunks)],
+                      device=self.dm.device)
+            wp.launch(_diag_one_kernel_chunked(), dim=st["n_rows"],
+                      inputs=[st["diag_d"], st["rows_d"], bv,
+                              self.vals_d.data, ct.bases_d,
+                              wp.int32(ct.nchunks), self.F_d],
+                      device=self.dm.device)
+            return
+        wp.launch(_zero_slots_kernel(self._idx_dtype), dim=st["n_spans"],
+                  inputs=[st["spans_d"], self.vals_d],
+                  device=self.dm.device)
         wp.launch(_diag_one_kernel(self._idx_dtype), dim=st["n_rows"],
                   inputs=[st["diag_d"], st["rows_d"], bv,
                           self.vals_d, self.F_d],
@@ -784,11 +1054,10 @@ class DeviceNSAssembler:
     def add_matrix_values(self, slots_d, vals_d):
         """Atomic-add values (device array) at CSR slots (device).
         slots_d must carry the assembler's CSR index dtype
-        (self._idx_dtype: int32 narrow, int64 wide) — csr_slots()
-        returns host int64 slots the caller casts to that width."""
-        wp.launch(_scatter_kernel(self._idx_dtype), dim=len(vals_d),
-                  inputs=[vals_d, slots_d, self.vals_d],
-                  device=self.dm.device)
+        (self._idx_dtype: int32 narrow, int64 wide/chunked) —
+        csr_slots() returns host int64 slots the caller casts to that
+        width."""
+        self._scatter_A(vals_d, slots_d, len(vals_d))
 
     def add_rhs_values(self, dofs_d, vals_d):
         """Atomic-add values (device array) into F_d at dof rows."""
@@ -804,16 +1073,30 @@ class DeviceNSAssembler:
         L6, 1.1M dofs, on a 48 GB card — default AND hybrid memory mode;
         the GH200 capacity question made concrete)."""
         if not hasattr(self, "_op_idx"):
-            from .operators import make_csr_spmv
+            from .operators import make_csr_spmv, make_csr_spmv_chunked
             # indptr (row offsets) indexes nnz-space -> CSR index width;
             # indices are dof-space (int32).  The spmv kernel specializes
             # on the offset dtype so the inner loop bound never wraps.
-            self._op_idx = (
-                wp.array(self.indptr.astype(self._idx_np),
-                         dtype=self._idx_dtype, device=self.dm.device),
-                wp.array(self.indices.astype(np.int32), dtype=wp.int32,
-                         device=self.dm.device))
-            self._op_spmv = make_csr_spmv(self._idx_dtype)
+            # Chunked (#38): the column indices go up as a ChunkedArray
+            # sharing vals_d's chunk table (a >2^31-element 1-D upload
+            # cannot exist) and the chunked SpMV walks within-chunk.
+            if self._chunked:
+                ind_ch = ChunkedArray(self._ctab, wp.int32,
+                                      self.dm.device)
+                ind_ch.upload(np.asarray(self.indices, np.int32))
+                self._op_idx = (
+                    wp.array(self.indptr.astype(np.int64),
+                             dtype=wp.int64, device=self.dm.device),
+                    ind_ch)
+                self._op_spmv = make_csr_spmv_chunked()
+            else:
+                self._op_idx = (
+                    wp.array(self.indptr.astype(self._idx_np),
+                             dtype=self._idx_dtype,
+                             device=self.dm.device),
+                    wp.array(self.indices.astype(np.int32),
+                             dtype=wp.int32, device=self.dm.device))
+                self._op_spmv = make_csr_spmv(self._idx_dtype)
         asm = self
 
         class _Op:
@@ -821,10 +1104,20 @@ class DeviceNSAssembler:
             n_free = asm.Nfull
 
             def matvec(self, x, y):
-                wp.launch(asm._op_spmv, dim=asm.Nfull,
-                          inputs=[asm._op_idx[0], asm._op_idx[1],
-                                  asm.vals_d, x, y],
-                          device=asm.dm.device)
+                if asm._chunked:
+                    wp.launch(asm._op_spmv, dim=asm.Nfull,
+                              inputs=[asm._op_idx[0],
+                                      asm._op_idx[1].data,
+                                      asm.vals_d.data,
+                                      asm._ctab.bases_d,
+                                      wp.int32(asm._ctab.nchunks),
+                                      x, y],
+                              device=asm.dm.device)
+                else:
+                    wp.launch(asm._op_spmv, dim=asm.Nfull,
+                              inputs=[asm._op_idx[0], asm._op_idx[1],
+                                      asm.vals_d, x, y],
+                              device=asm.dm.device)
 
         return _Op()
 
@@ -842,9 +1135,16 @@ class DeviceNSAssembler:
                                           device=self.dm.device)
             self._diag_d = wp.zeros(self.Nfull, dtype=wp.float64,
                                     device=self.dm.device)
-        wp.launch(_gather_kernel(self._idx_dtype), dim=self.Nfull,
-                  inputs=[self.vals_d, self._diag_slots_d, self._diag_d],
-                  device=self.dm.device)
+        if self._chunked:
+            wp.launch(_gather_kernel_chunked(), dim=self.Nfull,
+                      inputs=[self.vals_d.data, self._diag_slots_d,
+                              self._ctab.bases_d,
+                              wp.int32(self._ctab.nchunks),
+                              self._diag_d], device=self.dm.device)
+        else:
+            wp.launch(_gather_kernel(self._idx_dtype), dim=self.Nfull,
+                      inputs=[self.vals_d, self._diag_slots_d,
+                              self._diag_d], device=self.dm.device)
         return self._diag_d.numpy()
 
     def device_csr(self):
@@ -855,9 +1155,16 @@ class DeviceNSAssembler:
         the assembler's ACTUAL warp device — on cuda:1 the mixed-device
         CSR made every cuDSS solve fail (swallowed as a numerical NaN
         -> instant dt-underflow ladder; measured on the film front-end,
-        runs/t37-g3-dev).  The torch device now follows dm.device."""
+        runs/t37-g3-dev).  The torch device now follows dm.device.
+
+        Task #38 chunked mode: cuDSS needs ONE contiguous values
+        tensor, so the chunk rows are CONCATENATED into a torch f64
+        [nnz] tensor (torch sizes are int64 — no 2^31 ceiling).  This
+        COSTS the zero-copy contract: +nnz*8 bytes resident and a
+        device-to-device copy per refresh — callers holding the tensor
+        across fills must call sync_csr_values() before each factorize
+        (the blockch path never materializes this)."""
         import torch
-        vals_t = torch.from_dlpack(self.vals_d.__dlpack__())
         if not hasattr(self, "_indptr_t"):
             tdev = str(self.dm.device)
             self._indptr_t = torch.tensor(self.indptr, dtype=torch.int64,
@@ -865,10 +1172,35 @@ class DeviceNSAssembler:
             self._indices_t = torch.tensor(self.indices,
                                            dtype=torch.int64,
                                            device=tdev)
+        if self._chunked:
+            if not hasattr(self, "_vals_t"):
+                self._vals_t = torch.empty(
+                    self.nnz, dtype=torch.float64,
+                    device=str(self.dm.device))
+            self.sync_csr_values()
+            vals_t = self._vals_t
+        else:
+            vals_t = torch.from_dlpack(self.vals_d.__dlpack__())
         A_t = torch.sparse_csr_tensor(
             self._indptr_t, self._indices_t, vals_t,
             size=(self.Nfull, self.Nfull))
         return A_t, torch.from_dlpack(self.F_d.__dlpack__())
+
+    def sync_csr_values(self):
+        """Chunked mode (#38): refresh the contiguous torch values
+        tensor from the chunked vals_d (device-to-device, per chunk).
+        No-op when unchunked (values are a zero-copy dlpack view) or
+        before device_csr() ever ran."""
+        if not self._chunked or not hasattr(self, "_vals_t"):
+            return
+        import torch
+        ct = self._ctab
+        for c in range(ct.nchunks):
+            b0, b1 = int(ct.bases[c]), int(ct.bases[c + 1])
+            if b1 == b0:
+                continue
+            row = torch.from_dlpack(self.vals_d.data[c].__dlpack__())
+            self._vals_t[b0:b1].copy_(row[:b1 - b0])
 
 
 def _gather_kernel(idx_dtype=wp.int32):
@@ -903,6 +1235,257 @@ def _scatter_kernel(idx_dtype=wp.int32):
 
     _kernel_cache[key] = scat
     return scat
+
+
+# ---------------------------------------------------------------------
+# Task #38 chunked kernel variants: identical arithmetic to the wide
+# (int64) kernels above; ONLY the final memory access changes — the
+# int64 global slot is located in the block-row chunk table (binary
+# search, _chunk_of) and addressed [c, int32(slot - bases[c])] in the
+# 2-D [nchunks, cap] buffer.  Compiled only when chunking is active
+# (own cache keys/modules); the flat narrow/wide kernels are untouched.
+# ---------------------------------------------------------------------
+def _scatter_kernel_chunked():
+    key = ("dev_scatter_ch",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique")
+    def scat(vals_e: wp.array(dtype=wp.float64),
+             slots: wp.array(dtype=wp.int64),
+             out: wp.array2d(dtype=wp.float64),
+             bases: wp.array(dtype=wp.int64),
+             nc: wp.int32):
+        i = wp.tid()
+        s = slots[i]
+        c = _chunk_of(bases, nc, s)
+        wp.atomic_add(out, c, wp.int32(s - bases[c]), vals_e[i])
+
+    _kernel_cache[key] = scat
+    return scat
+
+
+def _gather_kernel_chunked():
+    key = ("dev_gather_ch",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique")
+    def gat(vals: wp.array2d(dtype=wp.float64),
+            slots: wp.array(dtype=wp.int64),
+            bases: wp.array(dtype=wp.int64),
+            nc: wp.int32,
+            out: wp.array(dtype=wp.float64)):
+        i = wp.tid()
+        s = slots[i]
+        c = _chunk_of(bases, nc, s)
+        out[i] = vals[c, wp.int32(s - bases[c])]
+
+    _kernel_cache[key] = gat
+    return gat
+
+
+def _zero_slots_kernel_chunked():
+    key = ("dev_zero_slots_ch",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique")
+    def zk(slots: wp.array(dtype=wp.int64),
+           vals: wp.array2d(dtype=wp.float64),
+           bases: wp.array(dtype=wp.int64),
+           nc: wp.int32):
+        i = wp.tid()
+        s = slots[i]
+        c = _chunk_of(bases, nc, s)
+        vals[c, wp.int32(s - bases[c])] = wp.float64(0.0)
+
+    _kernel_cache[key] = zk
+    return zk
+
+
+def _diag_one_kernel_chunked():
+    key = ("dev_diag_one_ch",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique")
+    def dk(diag: wp.array(dtype=wp.int64),
+           rows: wp.array(dtype=wp.int32),
+           bvals: wp.array(dtype=wp.float64),
+           vals: wp.array2d(dtype=wp.float64),
+           bases: wp.array(dtype=wp.int64),
+           nc: wp.int32,
+           F: wp.array(dtype=wp.float64)):
+        i = wp.tid()
+        s = diag[i]
+        c = _chunk_of(bases, nc, s)
+        vals[c, wp.int32(s - bases[c])] = wp.float64(1.0)
+        F[rows[i]] = bvals[i]
+
+    _kernel_cache[key] = dk
+    return dk
+
+
+def _scatter_node_kernel_chunked():
+    """Chunked variant of _scatter_node_kernel (wide arithmetic): the
+    int64 closed-form slot is chunk-located before the atomic — the
+    ONLY difference from the int64 flat kernel."""
+    key = ("dev_scatter_node_ch",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+    IX = wp.int64
+
+    @wp.kernel(module="unique")
+    def scn(vals_e: wp.array(dtype=wp.float64),
+            gslot: wp.array(dtype=wp.int32),
+            conn: wp.array2d(dtype=wp.int32),
+            Gptr: wp.array(dtype=IX),
+            e0: wp.int32, nbf: wp.int32, ndof: wp.int32,
+            out: wp.array2d(dtype=wp.float64),
+            bases: wp.array(dtype=wp.int64),
+            nc: wp.int32):
+        i = wp.tid()
+        nl = nbf * ndof
+        npair = nl * nl
+        el = i / npair
+        rem = i % npair
+        rl = rem / nl
+        cl = rem % nl
+        a = rl / ndof
+        ca = rl % ndof
+        bb = cl / ndof
+        cb = cl % ndof
+        e = e0 + el
+        s = gslot[e * nbf * nbf + a * nbf + bb]
+        na = conn[e, a]
+        g0 = Gptr[na]                        # nnz-space (int64)
+        dnb = Gptr[na + 1] - g0
+        slot = IX(ndof) * IX(ndof) * g0 + IX(ca) * IX(ndof) * dnb \
+            + IX(ndof) * (IX(s) - g0) + IX(cb)
+        c = _chunk_of(bases, nc, slot)
+        wp.atomic_add(out, c, wp.int32(slot - bases[c]), vals_e[i])
+
+    _kernel_cache[key] = scn
+    return scn
+
+
+def _scatter_node_masked_kernel_chunked():
+    """Chunked variant of _scatter_node_masked_kernel — same masked
+    slot arithmetic (int64), chunk-located atomic."""
+    key = ("dev_scatter_node_masked_ch",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+    IX = wp.int64
+
+    @wp.kernel(module="unique")
+    def scnm(vals_e: wp.array(dtype=wp.float64),
+             gslot: wp.array(dtype=wp.int32),
+             conn: wp.array2d(dtype=wp.int32),
+             Gptr: wp.array(dtype=IX),
+             e0: wp.int32, nbf: wp.int32, ndof: wp.int32,
+             rowoff: wp.array(dtype=wp.int32),
+             colpos: wp.array(dtype=wp.int32),
+             out: wp.array2d(dtype=wp.float64),
+             bases: wp.array(dtype=wp.int64),
+             nc: wp.int32):
+        i = wp.tid()
+        nl = nbf * ndof
+        npair = nl * nl
+        el = i / npair
+        rem = i % npair
+        rl = rem / nl
+        cl = rem % nl
+        a = rl / ndof
+        ca = rl % ndof
+        bb = cl / ndof
+        cb = cl % ndof
+        j = colpos[ca * ndof + cb]
+        if j >= 0:
+            e = e0 + el
+            s = gslot[e * nbf * nbf + a * nbf + bb]
+            na = conn[e, a]
+            g0 = Gptr[na]                    # nnz-space (int64)
+            dnb = Gptr[na + 1] - g0
+            ro = rowoff[ca]
+            rc = rowoff[ca + 1] - ro
+            slot = IX(rowoff[ndof]) * g0 + IX(ro) * dnb \
+                + IX(rc) * (IX(s) - g0) + IX(j)
+            c = _chunk_of(bases, nc, slot)
+            wp.atomic_add(out, c, wp.int32(slot - bases[c]), vals_e[i])
+
+    _kernel_cache[key] = scnm
+    return scnm
+
+
+def _dof_indices_kernel_chunked():
+    """Chunked variant of _dof_indices_kernel: one thread per dof row;
+    the row's whole span lives in ONE chunk (ChunkTable is row-aligned)
+    so the chunk is located once and the writes are int32 within-chunk.
+    Column VALUES stay int32."""
+    key = ("dev_dof_indices_ch",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+    IX = wp.int64
+
+    @wp.kernel(module="unique")
+    def dik(Gptr: wp.array(dtype=IX),
+            Gind: wp.array(dtype=wp.int32),
+            ndof: wp.int32,
+            out: wp.array2d(dtype=wp.int32),
+            bases: wp.array(dtype=wp.int64),
+            nc: wp.int32):
+        r = wp.tid()
+        na = r / ndof
+        ca = r % ndof
+        g0 = Gptr[na]                       # nnz-space (int64)
+        dnb = wp.int32(Gptr[na + 1] - g0)
+        base = IX(ndof) * IX(ndof) * g0 + IX(ca) * IX(ndof) * IX(dnb)
+        c = _chunk_of(bases, nc, base)
+        lb = wp.int32(base - bases[c])
+        for q in range(dnb):
+            col = ndof * Gind[g0 + IX(q)]
+            for cb in range(ndof):
+                out[c, lb + ndof * q + cb] = col + cb
+
+    _kernel_cache[key] = dik
+    return dik
+
+
+def _dof_indices_masked_kernel_chunked():
+    """Chunked variant of _dof_indices_masked_kernel (row-aligned
+    chunks: one lookup per dof row, int32 within-chunk writes)."""
+    key = ("dev_dof_indices_masked_ch",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+    IX = wp.int64
+
+    @wp.kernel(module="unique")
+    def dikm(Gptr: wp.array(dtype=IX),
+             Gind: wp.array(dtype=wp.int32),
+             ndof: wp.int32,
+             rowoff: wp.array(dtype=wp.int32),
+             lcols: wp.array(dtype=wp.int32),
+             out: wp.array2d(dtype=wp.int32),
+             bases: wp.array(dtype=wp.int64),
+             nc: wp.int32):
+        r = wp.tid()
+        na = r / ndof
+        ca = r % ndof
+        g0 = Gptr[na]                       # nnz-space (int64)
+        dnb = wp.int32(Gptr[na + 1] - g0)   # degree fits int32
+        ro = rowoff[ca]
+        rc = rowoff[ca + 1] - ro
+        base = IX(rowoff[ndof]) * g0 + IX(ro) * IX(dnb)
+        c = _chunk_of(bases, nc, base)
+        lb = wp.int32(base - bases[c])
+        for q in range(dnb):
+            col = ndof * Gind[g0 + IX(q)]
+            for j in range(rc):
+                out[c, lb + rc * q + j] = col + lcols[ro + j]
+
+    _kernel_cache[key] = dikm
+    return dikm
 
 
 def _scatter_colored_kernel(idx_dtype=wp.int32):

@@ -419,6 +419,55 @@ def _blockch_pair_fill_kernel():
     return pf
 
 
+def _blockch_pair_fill_kernel_chunked():
+    """Task #38 chunked variant of _blockch_pair_fill_kernel: A's
+    values live in the block-row chunked 2-D buffer, the pos maps carry
+    int64 nnz-space positions; each read locates its chunk (binary
+    search over the int64 base table) — same W1/W2/F recipe."""
+    from ..assembly.operators import _kernel_cache, _chunk_of
+    import warp as wp
+    key = ("blockch_pair_fill_ch",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def pfc(Ad: wp.array2d(dtype=wp.float64),
+            bases: wp.array(dtype=wp.int64),
+            nc: wp.int32,
+            pcc: wp.array(dtype=wp.int64),
+            pcm: wp.array(dtype=wp.int64),
+            pmc: wp.array(dtype=wp.int64),
+            pmm: wp.array(dtype=wp.int64),
+            c_acc: wp.float64, c_acm: wp.float64,
+            c_f_acm: wp.float64, c_w2f: wp.float64,
+            amm: wp.array(dtype=wp.float64),
+            acm: wp.array(dtype=wp.float64),
+            amc: wp.array(dtype=wp.float64),
+            w1: wp.array(dtype=wp.float64),
+            w2: wp.array(dtype=wp.float64)):
+        i = wp.tid()
+        s = pcm[i]
+        c = _chunk_of(bases, nc, s)
+        vcm = Ad[c, wp.int32(s - bases[c])]
+        s = pmc[i]
+        c = _chunk_of(bases, nc, s)
+        vmc = Ad[c, wp.int32(s - bases[c])]
+        s = pmm[i]
+        c = _chunk_of(bases, nc, s)
+        amm[i] = Ad[c, wp.int32(s - bases[c])]
+        s = pcc[i]
+        c = _chunk_of(bases, nc, s)
+        vcc = Ad[c, wp.int32(s - bases[c])]
+        acm[i] = vcm
+        amc[i] = vmc
+        w1i = c_acc * vcc + c_acm * vcm
+        w1[i] = w1i
+        w2[i] = w1i + c_w2f * (-vmc + c_f_acm * vcm)
+
+    _kernel_cache[key] = pfc
+    return pfc
+
+
 def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
                          device="cuda:0", cache=None, cache_key=None,
                          idx_dev=None, jv=None):
@@ -444,21 +493,31 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
     from scipy.sparse.linalg import (LinearOperator, gmres as _gmres,
                                      lgmres as _lgmres)
     from ..assembly.operators import CSROperator
-    from ..assembly.device_assembly import _gather_kernel
+    from ..assembly.device_assembly import (_gather_kernel, ChunkedArray,
+                                            _gather_kernel_chunked)
     from .krylov_dev import cg_dev, bicgstab_dev
     sig = meta["sigma"]
     ndof = meta["ndof"]
     N = len(indptr) - 1
     n = N // ndof
     nnz = len(indices)
+    # Task #38: a ChunkedArray vals_d (block-row 2-D storage past warp's
+    # 2^31-element array ceiling) switches the A-value GATHER/FILL
+    # kernels and the outer full-A SpMV to their chunk-aware variants;
+    # the pair/AC BLOCK machinery (node-space, < 2^31 by construction)
+    # is unchanged either way.
+    chunked = isinstance(vals_d, ChunkedArray)
+    tbl = vals_d.table if chunked else None
     # P0-2: pos maps (positions in A.data) and the full-A row offsets
-    # index nnz-space -> widen the GATHER index dtype past 2^31.  The
-    # pair/AC BLOCK operators are node-space (always int32).  Node cols
-    # (colnodes) and diag are node-space; only the A.data positions
+    # index nnz-space -> widen the GATHER index dtype past 2^31 (and
+    # always in chunked mode: chunked kernels carry int64 positions).
+    # The pair/AC BLOCK operators are node-space (always int32).  Node
+    # cols (colnodes) and diag are node-space; only the A.data positions
     # (pos_d) and the outer full-A indptr widen.
-    idx_np = np.int64 if nnz >= 2 ** 31 else np.int32
-    idx_dt = wp.int64 if nnz >= 2 ** 31 else wp.int32
-    fp = (N, nnz, len(meta["pairs"]), len(meta.get("ac", ())))
+    wide_pos = chunked or nnz >= 2 ** 31
+    idx_np = np.int64 if wide_pos else np.int32
+    idx_dt = wp.int64 if wide_pos else wp.int32
+    fp = (N, nnz, len(meta["pairs"]), len(meta.get("ac", ())), chunked)
     setup = (cache or {}).get(("blockch_dev_setup", cache_key))
     if setup is None or setup["fp"] != fp:
         setup = {"fp": fp, "pairs": [], "ac": []}
@@ -506,13 +565,27 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
         # full-A row offsets index nnz-space (widen); column indices are
         # dof-space (int32).  idx_dev, when provided, already carries the
         # assembler's chosen width (DeviceNSAssembler._op_idx).
-        setup["A_idx_d"] = idx_dev if idx_dev is not None else (
-            wp.array(np.ascontiguousarray(
-                np.asarray(indptr).astype(idx_np)),
-                dtype=idx_dt, device=device),
-            wp.array(np.ascontiguousarray(
-                np.asarray(indices).astype(np.int32)),
-                dtype=wp.int32, device=device))
+        # Chunked (#38): the column indices CANNOT exist as one 1-D
+        # >2^31-element array — they ride a ChunkedArray on vals_d's
+        # chunk table (uploaded once here, cached with the setup).
+        if idx_dev is not None:
+            setup["A_idx_d"] = idx_dev
+        elif chunked:
+            ind_ch = ChunkedArray(tbl, wp.int32, device)
+            ind_ch.upload(np.asarray(indices, np.int32))
+            setup["A_idx_d"] = (
+                wp.array(np.ascontiguousarray(
+                    np.asarray(indptr).astype(np.int64)),
+                    dtype=wp.int64, device=device),
+                ind_ch)
+        else:
+            setup["A_idx_d"] = (
+                wp.array(np.ascontiguousarray(
+                    np.asarray(indptr).astype(idx_np)),
+                    dtype=idx_dt, device=device),
+                wp.array(np.ascontiguousarray(
+                    np.asarray(indices).astype(np.int32)),
+                    dtype=wp.int32, device=device))
         if cache is not None:
             cache[("blockch_dev_setup", cache_key)] = setup
     inner_it = [0]
@@ -528,22 +601,44 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
         inner_it[0] += info.get("iters", 0)
         return x_
 
-    # two gather widths: pos_d index nnz-space (P0-2 wide); diag_d is
-    # node-space (always int32).
-    gat = _gather_kernel(idx_dt)
+    # two gather widths: pos_d index nnz-space (P0-2 wide / #38
+    # chunked); diag_d is node-space (always int32).  _gather_A is the
+    # one dispatch point for A-value gathers at nnz-space positions.
     gat_diag = _gather_kernel(wp.int32)
-    fill = _blockch_pair_fill_kernel()
+    if chunked:
+        gat_ch = _gather_kernel_chunked()
+        fill_ch = _blockch_pair_fill_kernel_chunked()
+
+        def _gather_A(pos, out, n_):
+            wp.launch(gat_ch, dim=n_,
+                      inputs=[vals_d.data, pos, tbl.bases_d,
+                              wp.int32(tbl.nchunks), out], device=device)
+    else:
+        gat = _gather_kernel(idx_dt)
+        fill = _blockch_pair_fill_kernel()
+
+        def _gather_A(pos, out, n_):
+            wp.launch(gat, dim=n_, inputs=[vals_d, pos, out],
+                      device=device)
     pairs = []
     for p, Pd in zip(meta["pairs"], setup["pairs"]):
         mmo, kap = p["m"], p["kappa"]
-        wp.launch(fill, dim=Pd["nnzp"], inputs=[
-            vals_d, Pd["pos_d"]["cc"], Pd["pos_d"]["cm"],
-            Pd["pos_d"]["mc"], Pd["pos_d"]["mm"],
-            wp.float64(np.sqrt(sig) / sig),
-            wp.float64(np.sqrt(mmo * kap) / mmo),
-            wp.float64(-kap / mmo), wp.float64(mmo / np.sqrt(sig)),
-            Pd["amm_d"], Pd["acm_d"], Pd["amc_d"], Pd["w1_d"],
-            Pd["w2_d"]], device=device)
+        coefs = [wp.float64(np.sqrt(sig) / sig),
+                 wp.float64(np.sqrt(mmo * kap) / mmo),
+                 wp.float64(-kap / mmo), wp.float64(mmo / np.sqrt(sig))]
+        outs = [Pd["amm_d"], Pd["acm_d"], Pd["amc_d"], Pd["w1_d"],
+                Pd["w2_d"]]
+        if chunked:
+            wp.launch(fill_ch, dim=Pd["nnzp"], inputs=[
+                vals_d.data, tbl.bases_d, wp.int32(tbl.nchunks),
+                Pd["pos_d"]["cc"], Pd["pos_d"]["cm"],
+                Pd["pos_d"]["mc"], Pd["pos_d"]["mm"],
+                *coefs, *outs], device=device)
+        else:
+            wp.launch(fill, dim=Pd["nnzp"], inputs=[
+                vals_d, Pd["pos_d"]["cc"], Pd["pos_d"]["cm"],
+                Pd["pos_d"]["mc"], Pd["pos_d"]["mm"],
+                *coefs, *outs], device=device)
         dgs = []
         for arr in (Pd["amm_d"], Pd["w1_d"], Pd["w2_d"]):
             wp.launch(gat_diag, dim=n,
@@ -574,9 +669,7 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
                           ("tt", Bd["tt_d"])):
             if buf is None:
                 continue                # masked-out KWC torque block
-            wp.launch(gat, dim=Bd["nnzp"],
-                      inputs=[vals_d, Bd["pos_d"][name], buf],
-                      device=device)
+            _gather_A(Bd["pos_d"][name], buf, Bd["nnzp"])
         dgs = []
         for arr in (Bd["ss_d"], Bd["tt_d"]):
             wp.launch(gat_diag, dim=n, inputs=[arr, Bd["diag_d"],
@@ -638,9 +731,7 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
         def _mk_schur(P):
             Pd = P["Pd"]
             acc_d = wp.zeros(Pd["nnzp"], dtype=wp.float64, device=device)
-            wp.launch(gat, dim=Pd["nnzp"],
-                      inputs=[vals_d, Pd["pos_d"]["cc"], acc_d],
-                      device=device)
+            _gather_A(Pd["pos_d"]["cc"], acc_d, Pd["nnzp"])
             opAcc = CSROperator.from_device_arrays(
                 Pd["rowptr_d"], Pd["colnodes_d"], acc_d, n, device)
             Sc = LinearOperator(
