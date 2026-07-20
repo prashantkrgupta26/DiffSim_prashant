@@ -1,8 +1,7 @@
 {
-  "_provenance": "SP-1 R0 E5 Nirmal J(t) perf gate. TWO measurements on gpubox (WSL2, 2x NVIDIA RTX 6000 Ada 48GB sm_89, driver 13.2, Warp 1.14 / CUDA Toolkit 12.9, .venv/bin/python; nvmath-python[cu12] 0.9.0). Driver: benchmarks/xdd/e5_perf_nirmal.py (level 8 = 257x257 = 66049 nodes = 330245 DOFs, DOF-matched proxy for the 513x129=66177-node Nirmal mesh; marchable regime lam2=1e-1, Eg_hat=4, symmetric mu, 10 GHz rect-sin, dt=5ps, cuda:0). GPU run REQUIRES LD_LIBRARY_PATH=/usr/lib/wsl/lib (WSL libcuda shadowing). 'history' = pre-fix host-splu run (E-b, 2026-07-18). 'measured'/'gate' = the E5 FIX: XDDSystem(linsolver='cudss') wiring cuDSS (GPU sparse direct LU via nvmath) into the Newton solve (2026-07-18). Perf numbers are LEDGER-LOCKED, not CI-reasserted (test asserts the file parses + the recorded speedup matches the recorded arithmetic).",
-
+  "_provenance": "SP-1 R0 E5 Nirmal J(t) perf gate. TWO measurements on gpubox (WSL2, 2x NVIDIA RTX 6000 Ada 48GB sm_89, driver 13.2, Warp 1.14 / CUDA Toolkit 12.9, .venv/bin/python; nvmath-python[cu12] 0.9.0). Driver: benchmarks/xdd/e5_perf_nirmal.py (level 8 = 257x257 = 66049 nodes = 330245 DOFs, DOF-matched proxy for the 513x129=66177-node Nirmal mesh; marchable regime lam2=1e-1, Eg_hat=4, symmetric mu, 10 GHz rect-sin, dt=5ps, cuda:0). GPU run REQUIRES LD_LIBRARY_PATH=/usr/lib/wsl/lib (WSL libcuda shadowing). 'history' = pre-fix host-splu run (E-b, 2026-07-18). 'measured'/'gate' = the E5 FIX: XDDSystem(linsolver='cudss') wiring cuDSS (GPU sparse direct LU via nvmath) into the Newton solve (2026-07-18). Perf numbers are LEDGER-LOCKED, not CI-reasserted (test asserts the file parses + the recorded speedup matches the recorded arithmetic). ROLLED FORWARD 2026-07-20 (#35): 'measured' is now the DEVICE-assembly + cuDSS row (0.379 s/step, warp 1.15); the cuDSS-host-assembly row moved to 'history_cudss'. Supervisor-authored per reviewer advice; gate arithmetic re-derived.",
   "history": {
-    "_note": "PRE-FIX host-splu measurement (E-b, kept for provenance). The GPU was IDLE during the solve (0% util, 642 MiB) — host scipy splu was the bottleneck. This is what the cuDSS fix replaced.",
+    "_note": "PRE-FIX host-splu measurement (E-b, kept for provenance). The GPU was IDLE during the solve (0% util, 642 MiB) \u2014 host scipy splu was the bottleneck. This is what the cuDSS fix replaced.",
     "solver": "host scipy splu (nonsymmetric sparse LU); Warp assembles element matrices on cuda:0 but the global Jacobian CSR is built on HOST and factorized on HOST. cuDSS NOT wired. Closures host numpy.",
     "device": "cuda:0",
     "level": 8,
@@ -10,8 +9,16 @@
     "dofs": 330245,
     "regime": "marchable",
     "n_timed_steps": 3,
-    "step_walls_s": [97.752, 288.494, 95.176],
-    "step_iters": [1, 3, 1],
+    "step_walls_s": [
+      97.752,
+      288.494,
+      95.176
+    ],
+    "step_iters": [
+      1,
+      3,
+      1
+    ],
     "warmup_step_s": 411.025,
     "s_per_step_median": 97.752,
     "s_per_step_mean": 160.474,
@@ -24,8 +31,95 @@
     "gpu_mem_midrun_MiB": 642,
     "verdict": "MISS (off by ~18-55x). Host-splu bound, GPU 0% util. This is the bottleneck the cuDSS fix addresses."
   },
-
   "measured": {
+    "device": "cuda:0",
+    "level": 8,
+    "nodes": 66049,
+    "dofs": 330245,
+    "regime": "marchable",
+    "n_converged": 10,
+    "n_steps_timed": 10,
+    "dt_hat": 2.585199978643553e-06,
+    "dt_seconds": 5e-12,
+    "t0": 1.9340863535916802e-06,
+    "Eg_hat": 4.0,
+    "lam2": 2.2287280458184652e-05,
+    "warmup_wall_s": 4.515103101730347,
+    "s_per_step_median": 0.3794057369232178,
+    "s_per_step_mean": 0.39057762622833253,
+    "s_per_step_min": 0.200577974319458,
+    "s_per_step_max": 0.5955595970153809,
+    "steps_for_window": 201,
+    "end_to_end_projected_s": 76.26055312156677,
+    "linsolver": "cudss",
+    "assembly": "device",
+    "assembly_budget": {
+      "nnz": 12418581,
+      "dofs": 330245,
+      "nnz_per_dof": 37.604145407197684,
+      "bytes_per_dof": 459.24976911081166,
+      "csr_gb": 0.15166494,
+      "index_wide": false
+    },
+    "solver": "cudss GPU sparse direct LU (nvmath, plan-once + refactorize per Newton iterate; warp assembly on GPU)",
+    "jt_trace_len": 10,
+    "jt_trace_head": [
+      [
+        4e-11,
+        0.2222767880225362,
+        0.222276788022496,
+        3,
+        true
+      ],
+      [
+        4.4999999999999993e-11,
+        0.22227678802254722,
+        0.22227678802245185,
+        1,
+        true
+      ],
+      [
+        4.999999999999999e-11,
+        0.49664117064000757,
+        0.49664117064004865,
+        3,
+        true
+      ],
+      [
+        5.4999999999999985e-11,
+        0.49664116534609604,
+        0.49664116534606373,
+        1,
+        true
+      ],
+      [
+        5.999999999999999e-11,
+        0.7041623636075276,
+        0.7041623636075033,
+        3,
+        true
+      ]
+    ],
+    "machine": "gpubox WSL2 RTX 6000 Ada 48GB",
+    "_provenance_35": "#35 device port (2026-07-20, merged 24961cf): warp device Jacobian/residual assembly (exciton_device.py) + device A3 closures; cuDSS plan-once + refactorize per Newton iterate. Same driver/mesh/regime as history_cudss. Timed 10/10 converged steps; J(t) trace head recorded. Profile: cuDSS refactorize 63% is the new top (solver item -> #36); named host stages at 0%."
+  },
+  "gate": {
+    "baseline_hours_lo": 10.0,
+    "baseline_hours_hi": 30.0,
+    "_baseline_note": "Nirmal paper CPU baseline: 10-30 h on 36 CPU cores for one J(t) trace.",
+    "end_to_end_s": 76.26055312156677,
+    "end_to_end_hours": 0.02118348697821299,
+    "_end_to_end_note": "PROJECTION (labeled, honest): s_per_step_median x steps_for_window. Full 1 ns trace NOT run to completion; 10 timed steps + warm-up lock the s/step.",
+    "speedup_vs_10h": 472.06581287985784,
+    "speedup_vs_30h": 1416.1974386395736,
+    "target": 100.0,
+    "pass_vs_10h": true,
+    "pass_vs_30h": true,
+    "verdict": "PASS: >=100x MET on both baseline ends (472x vs 10h, 1416x vs 30h; projection s/step x 201 steps, labeled). Chain: splu 97.75 -> cuDSS 14.12 (LU off critical path) -> #35 device assembly+closures 0.379 s/step. Remaining top cost: cuDSS refactorize 0.134 s/iter (63%) \u2014 further gains are solver-side (fp32-storage+FP64-IR, task #36), not assembly.",
+    "speedup_vs_history_splu_median": 257.64502348519454,
+    "_speedup_vs_history_note": "device+cuDSS 0.379 s/step vs host-splu 97.752 = 257.6x median; vs cuDSS-host-assembly (history_cudss) 14.121 = 37.2x."
+  },
+  "history_cudss": {
     "device": "cuda:0",
     "machine": "gpubox WSL2 RTX 6000 Ada 48GB",
     "level": 8,
@@ -36,9 +130,18 @@
     "regime": "marchable (lam2=1e-1, Eg_hat=4, symmetric mu=0.5). Physical PM6 config hits the documented CPU-mesh drive wall (Eg_hat~42.5, Debye<<h) -> Newton bails at iter 1 (unrepresentative). Marchable runs full Newton; LU size/sparsity (the dominant cost) is IDENTICAL to physical.",
     "n_timed_steps": 8,
     "n_converged": 8,
-    "step_walls_s": [7.826, 21.222, 6.901, 20.887, 6.657, 20.999, 6.657, 21.222],
+    "step_walls_s": [
+      7.826,
+      21.222,
+      6.901,
+      20.887,
+      6.657,
+      20.999,
+      6.657,
+      21.222
+    ],
     "_step_walls_note": "8 timed steps; alternating 1-iter (~6.7-7.8s) and 3-iter (~21s) Newton solves -> ~7s per Newton iteration (vs ~96s/iter host splu). All 8 converged (cuDSS handles the plain nonsymmetric 5-field Jacobian cleanly).",
-    "warmup_step_s": 32.570,
+    "warmup_step_s": 32.57,
     "_warmup_note": "First step incl. Warp JIT compile + 4 Newton iters + cuDSS plan+factorize; one-time, excluded from s/step. Was 411s under host splu -> 12.6x faster warm-up.",
     "s_per_step_median": 14.121465563774109,
     "s_per_step_mean": 14.011052399873734,
@@ -50,28 +153,12 @@
     "steps_for_window": 201,
     "_steps_note": "1 ns window at 5 ps/step = 200 steps + 1 (10 GHz -> 10 optical cycles, 20 steps/cycle).",
     "linsolver": "cudss",
-    "solver": "cudss GPU sparse direct LU (nvmath-python DirectSolver, plain DirectSolverOptions(blocking=True) — no mtlayer_gomp; plan-once + reset_operands+refactorize per Newton iterate on the fixed sparsity; explicit .free() on pattern change/failure). Warp assembles element matrices on cuda:0; the global Jacobian CSR is still built on HOST and the A3 closures are HOST numpy.",
+    "solver": "cudss GPU sparse direct LU (nvmath-python DirectSolver, plain DirectSolverOptions(blocking=True) \u2014 no mtlayer_gomp; plan-once + reset_operands+refactorize per Newton iterate on the fixed sparsity; explicit .free() on pattern change/failure). Warp assembles element matrices on cuda:0; the global Jacobian CSR is still built on HOST and the A3 closures are HOST numpy.",
     "gpu_util_midrun_pct_peak": 100,
     "gpu_util_midrun_pct_typical": 0,
-    "_gpu_util_note": "Bursty: 40-sample burst during the timed march caught 1x 100%, 3x 41%, 36x 0%. Peak 100% during the cuDSS factorize; 0% between solves because the per-step cost is now HOST-bound (Jacobian assembly + closures) — the GPU LU is fast enough to no longer be the bottleneck. Contrast: host-splu was a flat 0% (GPU never used for the solve).",
+    "_gpu_util_note": "Bursty: 40-sample burst during the timed march caught 1x 100%, 3x 41%, 36x 0%. Peak 100% during the cuDSS factorize; 0% between solves because the per-step cost is now HOST-bound (Jacobian assembly + closures) \u2014 the GPU LU is fast enough to no longer be the bottleneck. Contrast: host-splu was a flat 0% (GPU never used for the solve).",
     "gpu_mem_midrun_MiB": 2228,
-    "_bottleneck": "SHIFTED off the GPU LU. cProfile of one representative step (2 steps / 8 Newton iters, 33.1s): _reduce_and_eliminate host Jacobian assembly 12.4s/37% (scipy tolil 8.4s + lil.__init__ 2.05s); jacobian_full host element/closure build 10.5s/32% (einsum 4.2s + numpy tolist 4.17s + _supg/_mass blocks); _cudss_linsolve 5.96s/18% (of which cuDSS plan 4.7s is a one-time re-plan cost in this profile; steady-state _execute factorize+solve is the recurring GPU cost). => The NEXT bottleneck is HOST-side Jacobian assembly + closures (~69%), not the GPU solve. To reach >=100x: move the CSR assembly + A3 closures onto the device (the B4/B5 device-assembly path) and eliminate the host tolil/tolist hotspots."
-  },
-
-  "gate": {
-    "baseline_hours_lo": 10.0,
-    "baseline_hours_hi": 30.0,
-    "_baseline_note": "Nirmal paper CPU baseline: 10-30 h on 36 CPU cores for one J(t) trace.",
-    "end_to_end_s": 2838.414578318596,
-    "end_to_end_hours": 0.7884484939773877,
-    "_end_to_end_note": "PROJECTION (labeled, honest): s_per_step_median x steps_for_window. Full 1 ns trace NOT run to completion; 8 timed steps + warm-up sufficient to lock the s/step (invariant to trace length).",
-    "speedup_vs_10h": 12.683136661919725,
-    "speedup_vs_30h": 38.049409985759176,
-    "target": 100.0,
-    "pass_vs_10h": false,
-    "pass_vs_30h": false,
-    "verdict": "MISS vs 100x, but a REAL ~7x median (11.5x mean) speedup over the host-splu baseline (97.75 -> 14.12 s/step; 5.46 -> 0.79 h end-to-end). cuDSS moved the LU onto the GPU and off the critical path (per-Newton-iter ~96s -> ~7s, ~13x). The gate still misses because the bottleneck SHIFTED to HOST-side Jacobian assembly + closures (~69% of the step; GPU now idle between bursty solves, peaking 100% during factorize). Honest verdict: the cuDSS wiring is the correct, measured first step; the remaining ~8-14x to 100x requires moving the host assembly/closures onto the device (recorded as the next bottleneck).",
-    "speedup_vs_history_splu_median": 6.922544,
-    "_speedup_vs_history_note": "cuDSS s/step 14.121 vs host-splu 97.752 = 6.92x median (160.47/14.01 = 11.45x mean; 95.18/6.66 = 14.3x on the 1-iter min). end-to-end 19648.2/2838.4 = 6.92x."
+    "_bottleneck": "SHIFTED off the GPU LU. cProfile of one representative step (2 steps / 8 Newton iters, 33.1s): _reduce_and_eliminate host Jacobian assembly 12.4s/37% (scipy tolil 8.4s + lil.__init__ 2.05s); jacobian_full host element/closure build 10.5s/32% (einsum 4.2s + numpy tolist 4.17s + _supg/_mass blocks); _cudss_linsolve 5.96s/18% (of which cuDSS plan 4.7s is a one-time re-plan cost in this profile; steady-state _execute factorize+solve is the recurring GPU cost). => The NEXT bottleneck is HOST-side Jacobian assembly + closures (~69%), not the GPU solve. To reach >=100x: move the CSR assembly + A3 closures onto the device (the B4/B5 device-assembly path) and eliminate the host tolil/tolist hotspots.",
+    "_note": "cuDSS-with-HOST-assembly measurement (E5 fix, 2026-07-18; was 'measured' until #35). 14.12 s/step; host tolil assembly 37% + closure einsum 32% were the named next bottleneck \u2014 removed by the #35 device port that superseded this row."
   }
 }
