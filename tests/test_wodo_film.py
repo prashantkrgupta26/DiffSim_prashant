@@ -5,6 +5,7 @@ is conserved EXACTLY per step (machine precision), while the film
 thins and the mapped fractions enrich."""
 import numpy as np
 import pytest
+import warp as wp
 
 from diffsim.octree.build import build_uniform, Octree
 from diffsim.mesh.nodes import build_mesh
@@ -421,6 +422,232 @@ def test_wodo_p2_beats_p1(device):
     print(f"wodo Richardson: L4-p1 {errs[1]:.2e} vs L4-p2 {errs[2]:.2e} "
           f"(ratio {errs[2] / errs[1]:.3f})")
     assert errs[2] < 0.5 * errs[1], errs
+
+
+# ---------------------------------------------------------------------
+# Task #37 (v1.4) G1 stage-parity gates: device-resident GP fields.
+# Solver-free (no nvmath/cuDSS needed), so they run on Mac CPU AND box
+# GPU.  TOLERANCE CONTRACT: the ported stage swaps numpy einsum
+# (vectorized accumulation) for a sequential per-basis-function device
+# loop, so CPU bit-equality is IMPOSSIBLE across the two arithmetics
+# (measured 3.6e-15 abs on random fields) — the gate is the
+# _assert_scatter_equal GPU band (rtol 1e-13 / atol 1e-14) on both
+# devices: an indexing defect would produce O(1) diffs.
+# ---------------------------------------------------------------------
+def _mk_film_dev(device, tstep="bdf1", noise=0.0, p=1):
+    tree0 = build_uniform(5, dim=2)
+    keep = tree0.centers()[:, 0] < 4 / 32
+    tree = Octree(tree0.keys[keep], tree0.levels[keep], dim=2,
+                  periodic=tree0.periodic)
+    mesh = build_mesh(tree, p=p)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(p, dim=2), device)
+    st = WodoFilmStepper(dm, chi=(1.0, 0.3, 0.3), N=(5.0, 5.0, 1.0),
+                         M=(0.225, 0.0, 0.225), kappa=(2e-4, 2e-4),
+                         k_e=1.0, dt=1e-3, var_mob=True, b_reg=1e-3,
+                         noise=noise, tstep=tstep,
+                         use_device_assembly=True)
+    rng = np.random.default_rng(3)
+    st.set_initial(
+        lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)),
+        lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)))
+    return st
+
+
+def _close(a, b, label):
+    a, b = np.asarray(a), np.asarray(b)
+    np.testing.assert_allclose(a, b, rtol=1e-13, atol=1e-14,
+                               err_msg=label)
+
+
+@pytest.mark.parametrize("p", [1, 2])
+def test_wodo_gp_device_parity(device, p):
+    """G1 stage parity: the persistent device GP buffers
+    (_gp_eval_device -> gp_multifield) match the host _gp values and
+    gradients for all 4 fields; the device BDF history (_bdf_time_device
+    -> gp_vals + axpby) matches _bdf_time for BDF1 AND variable-
+    coefficient BDF2; sigma is bit-equal; the identity-Tc elision
+    (_full_of) is bit-equal to the spmv."""
+    st = _mk_film_dev(device, p=p)
+    st._init_device_assembly()
+    rng = np.random.default_rng(11)
+    x = st.x + 1e-3 * rng.standard_normal(len(st.x))
+    st._gp_eval_device(x)
+    fields = [st._gp(x[i::4]) for i in range(4)]
+    for pv in st.dm.bins:
+        vals = st._vals_dev[pv].numpy().copy()
+        grads = st._grads_dev[pv].numpy().copy()
+        for i in range(4):
+            _close(vals[:, i], fields[i][0][pv], f"vals f{i} p{p}")
+            _close(grads[:, i, :], fields[i][1][pv], f"grads f{i} p{p}")
+    # BDF1 history
+    dt = 1e-3
+    sig_d = st._bdf_time_device(dt)
+    sig_h, h1, h2 = st._bdf_time(dt)
+    assert sig_d == sig_h
+    for pv in st.dm.bins:
+        hk = st._hist_dev[pv].numpy().copy()
+        _close(hk[:, 0], h1[pv], "hist1 bdf1")
+        _close(hk[:, 1], h2[pv], "hist2 bdf1")
+    # identity-Tc elision is bit-equal
+    p1n = st.hist[0][0]
+    assert np.array_equal(st._full_of(p1n), np.asarray(st.Tc @ p1n))
+    # variable-coefficient BDF2 (r != 1) with a distinct second level
+    st2 = _mk_film_dev(device, tstep="bdf2", p=p)
+    st2._init_device_assembly()
+    rng = np.random.default_rng(4)
+    st2.hist2 = (st2.hist[0][0] * 0.9
+                 + 1e-3 * rng.standard_normal(len(st2.hist[0][0])),
+                 st2.hist[0][1] * 1.1)
+    st2.dt_prev = 4e-4
+    sig_d = st2._bdf_time_device(dt)
+    sig_h, h1, h2 = st2._bdf_time(dt)
+    assert abs(sig_d - sig_h) < 1e-15 * abs(sig_h)
+    for pv in st2.dm.bins:
+        hk = st2._hist_dev[pv].numpy().copy()
+        _close(hk[:, 0], h1[pv], "hist1 bdf2")
+        _close(hk[:, 1], h2[pv], "hist2 bdf2")
+    # the held-reference cache: a second call with the SAME history
+    # must not re-upload (the #35 reviewer-minor contract)
+    ref = st2._hist_up_ref
+    st2._bdf_time_device(dt)
+    assert st2._hist_up_ref is ref is st2.hist[0]
+
+
+def test_wodo_device_fill_parity(device):
+    """G1 (assembled system): one Newton-iterate fill through
+    _fill_device_system with (a) the device GP path vs (b) the SAME
+    persistent buffers overwritten by host-_gp values (the pre-v1.4
+    data path) — vals_d/F_d agree to the few-ULP band.  Isolates
+    exactly the ported stage; no linear solver involved.  Also checks
+    the noise path: nonzero q buffers uploaded once per attempt enter
+    the fill identically."""
+    st = _mk_film_dev(device, noise=1e-3)
+    st._init_device_assembly()
+    rng = np.random.default_rng(7)
+    x = st.x + 1e-3 * rng.standard_normal(len(st.x))
+    dt = 1e-3
+    K = 0.31
+    sigma = st._bdf_time_device(dt)
+    minv = 1.0 / st.h_curr
+    mlat = 1.0 / st.lat_scale
+    mvert = st.y_comp * minv
+    coef = K * minv * st.y_comp
+    # per-attempt uploads (noise + flux), as _attempt_device does
+    rho = st.noise * np.sqrt(2.0 / dt)
+    for pv, b in st.dm.bins.items():
+        ngp = len(st.mesh.conn_of[pv]) * b["nqp"]
+        st._upload_dev(st._q_dev[pv][0],
+                       rho * st._nrng.standard_normal((ngp, st.dm.dim)))
+        st._upload_dev(st._q_dev[pv][1],
+                       rho * st._nrng.standard_normal((ngp, st.dm.dim)))
+    st._upload_dev(st._flux_vals_dev, -coef * st._flux_base)
+    args = (x, sigma, coef, K, minv, mlat, mvert, -1.0, -1.0, 0)
+
+    # (a) device GP path
+    st._gp_eval_device(x)
+    st._fill_device_system(*args)
+    vals_dev = st._asm.vals_d.numpy().copy()
+    F_dev = st._asm.F_d.numpy().copy()
+
+    # (b) host reference values pushed into the same buffers
+    fields = [st._gp(x[i::4]) for i in range(4)]
+    for pv in st.dm.bins:
+        st._upload_dev(st._vals_dev[pv],
+                       np.stack([fields[i][0][pv] for i in range(4)],
+                                axis=1))
+        st._upload_dev(st._grads_dev[pv],
+                       np.stack([fields[i][1][pv] for i in range(4)],
+                                axis=1))
+    _, h1, h2 = st._bdf_time(dt)
+    for pv in st.dm.bins:
+        st._upload_dev(st._hist_dev[pv],
+                       np.stack([h1[pv], h2[pv]], axis=1))
+    st._fill_device_system(*args)
+    vals_ref = st._asm.vals_d.numpy().copy()
+    F_ref = st._asm.F_d.numpy().copy()
+
+    dv = np.abs(vals_dev - vals_ref).max()
+    df = np.abs(F_dev - F_ref).max()
+    print(f"wodo fill parity: |dA|={dv:.2e} |dF|={df:.2e}")
+    _close(vals_dev, vals_ref, "vals_d")
+    _close(F_dev, F_ref, "F_d")
+
+
+class _SpluDeviceFilm(WodoFilmStepper):
+    """Test double (Task #37 reviewer finding): the FULL v1.4 device
+    path — real per-attempt noise draws/uploads, device GP fields,
+    multi-batch fill, flux adds — with ONLY the linear solve swapped
+    for the same host splu the reference run uses.  Any host/device
+    trajectory difference is then purely the ported DATA path (no
+    solver-tolerance blur, no nvmath/cuDSS dependency; CPU-warp
+    blockch inners were measured at ~7 s/step of pure launch
+    orchestration, so this keeps the test in the seconds class)."""
+
+    def _solve_device_blockch(self, asm):
+        import scipy.sparse as _sp
+        from scipy.sparse.linalg import splu
+        A = _sp.csr_matrix(
+            (asm.vals_d.numpy().copy(), asm.indices, asm.indptr),
+            shape=(asm.Nfull, asm.Nfull))
+        return splu(A.tocsc()).solve(asm.F_d.numpy().copy())
+
+
+def test_wodo_device_noise_trajectory_parity(device):
+    """End-to-end host-vs-device trajectory parity with ACTIVE Langevin
+    noise (Task #37 reviewer finding): the fill-parity test above
+    uploads the q buffers itself, so a q1/q2 swap or a rho error
+    inside _attempt_device would pass every other committed test —
+    this one drives the REAL per-attempt noise path (same host RNG
+    stream on both sides, the noise_seed contract) through 5 fixed-dt
+    steps of the actual film physics (evaporation + top flux +
+    var-mob + b_reg).  The device side is _SpluDeviceFilm (identical
+    splu solve both sides -> the standard 1e-11 parity lock) and is
+    forced MULTI-BATCH: nb_cap = 7 does not divide ne = 128, so a
+    batch-offset defect in the s0/s1 slicing of the persistent
+    GP/noise buffers shifts whole batches and is caught at
+    O(noise)."""
+    tree0 = build_uniform(5, dim=2)
+    keep = tree0.centers()[:, 0] < 4 / 32
+    tree = Octree(tree0.keys[keep], tree0.levels[keep], dim=2,
+                  periodic=tree0.periodic)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+
+    def run(dev_asm):
+        dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2),
+                                  device)
+        cls = _SpluDeviceFilm if dev_asm else WodoFilmStepper
+        st = cls(dm, chi=(1.0, 0.3, 0.3), N=(5.0, 5.0, 1.0),
+                 M=(0.225, 0.0, 0.225), kappa=(2e-4, 2e-4),
+                 k_e=1.0, dt=1e-3, var_mob=True, b_reg=1e-3,
+                 noise=1e-3, noise_seed=5,
+                 linsolver="blockch" if dev_asm else "splu",
+                 use_device_assembly=dev_asm)
+        rng = np.random.default_rng(3)
+        st.set_initial(
+            lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)),
+            lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)))
+        if dev_asm:
+            st._init_device_assembly()
+            for k_bin, (pv, b, ne, nbf, _g) in enumerate(st._asm._bins):
+                assert ne % 7 != 0 and ne > 7   # partial last batch
+                nl = 4 * nbf
+                st._batch_bufs[k_bin] = (
+                    7, wp.zeros((7, nl, nl), dtype=wp.float64,
+                                device=device),
+                    wp.zeros((7, nl), dtype=wp.float64, device=device))
+        return st, _march_fixed_dt(st, 5, 1e-3)
+
+    st_h, xs_h = run(False)
+    st_d, xs_d = run(True)
+    errs = [np.abs(a - b).max() / max(np.abs(a).max(), 1e-30)
+            for a, b in zip(xs_h, xs_d)]
+    print(f"wodo noise trajectory parity (multi-batch): step-wise rel "
+          f"err max {max(errs):.2e}; h {st_h.h_curr:.6f} vs "
+          f"{st_d.h_curr:.6f}")
+    assert max(errs) < 1e-11, errs
+    assert abs(st_h.h_curr - st_d.h_curr) < 1e-13
 
 
 def test_wodo_device_parity_film(device):

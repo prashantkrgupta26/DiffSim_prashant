@@ -43,7 +43,7 @@ rlog "log=$log"
 
 # Poll for the final summary line ("N passed ... in Ns"). The tmux session
 # dying without one means the run crashed -> report the tail and fail.
-for _ in $(seq 1 240); do
+for _ in $(seq 1 360); do
   summary="$(ssh "$GPUBOX_HOST" "tail -3 '$log' 2>/dev/null" | grep -E '(passed|failed|error).* in [0-9.]+s' | tail -1 || true)"
   [ -n "$summary" ] && break
   if ! ssh "$GPUBOX_HOST" 'tmux ls 2>/dev/null | grep -q "^diffsim-"'; then
@@ -59,7 +59,7 @@ for _ in $(seq 1 240); do
   sleep 30
 done
 if [ -z "${summary:-}" ]; then
-  rerr "timed out (2h) waiting for the suite — session left running; poll with gpubox-poll.sh '$log'"
+  rerr "timed out (3h) waiting for the suite — session left running; poll with gpubox-poll.sh '$log'"
   exit 5
 fi
 
