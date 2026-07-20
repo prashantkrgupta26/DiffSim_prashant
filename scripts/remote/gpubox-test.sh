@@ -35,7 +35,7 @@ remote_env='LD_LIBRARY_PATH=/usr/lib/wsl/lib'
 amgx_lib="$(ssh "$GPUBOX_HOST" 'ls "$HOME"/AMGX/build/libamgxsh.so /usr/local/lib/libamgxsh.so 2>/dev/null | head -1' || true)"
 [ -n "$amgx_lib" ] && remote_env="LD_LIBRARY_PATH=/usr/lib/wsl/lib:${amgx_lib%/*}"
 
-cmd="$remote_env .venv/bin/pytest -q -n $JOBS -p no:cacheprovider ${pytest_args[*]}"
+cmd="$remote_env .venv/bin/pytest -q -n $JOBS -p no:cacheprovider ${pytest_args[*]:-}"
 rlog "launch: $cmd"
 out="$("$HERE/gpubox-run.sh" "$cmd" pytest-gate)"
 log="$(printf '%s\n' "$out" | tail -1 | cut -f2)"
