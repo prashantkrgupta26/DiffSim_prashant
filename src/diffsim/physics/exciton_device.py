@@ -577,13 +577,14 @@ class XDDDeviceAssembler:
     fields are scaled by diag(n̂)/diag(p̂).
     """
 
-    def __init__(self, sysm, index_width="auto"):
+    def __init__(self, sysm, index_width="auto", val_dtype="fp64"):
         dm = sysm.dm
         self.sysm = sysm
         self.dm = dm
         self.asm = DeviceNSAssembler(dm, ndof=NDOF, node_pattern=True,
                                      blockmask=XDD_BLOCKMASK,
-                                     index_width=index_width)
+                                     index_width=index_width,
+                                     val_dtype=val_dtype)
         d = dm.device
         self._dev = d
 

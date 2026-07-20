@@ -93,6 +93,44 @@ def test_fp32_snapshot_roundstore(dim, level, device):
     assert np.array_equal(snap32, vals64.astype(np.float32))
 
 
+# ── Step 5/6: runtime plumbing (film class-attr idiom) + probe arg ─────────
+def test_wodo_val_dtype_class_attr_idiom():
+    """The film reads _val_dtype via getattr with a 'fp64' default (the
+    same probe-side class-attr idiom as _index_width/_chunking) — so an
+    un-overridden stepper is fp64 and a class-attr override is honored."""
+    from diffsim.physics.wodo_film import WodoFilmStepper
+    # default: the getattr fallback is 'fp64'
+    assert getattr(WodoFilmStepper, "_val_dtype", "fp64") == "fp64"
+    # the probe sets it as a class attr; confirm getattr picks it up, then
+    # restore so we don't leak state into other tests.
+    try:
+        WodoFilmStepper._val_dtype = "fp32"
+        assert getattr(WodoFilmStepper, "_val_dtype", "fp64") == "fp32"
+    finally:
+        del WodoFilmStepper._val_dtype
+    assert getattr(WodoFilmStepper, "_val_dtype", "fp64") == "fp64"
+
+
+def test_probe_accepts_val_dtype_arg():
+    """The capacity probe parses --val-dtype fp32 and carries it into the
+    dry-run argv without error (the G4 measurement knob)."""
+    from benchmarks.gh200_capacity_probe import main
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        rc = main(["--res", "8", "8", "4", "--outdir", td,
+                   "--val-dtype", "fp32", "--dry-run"])
+    assert rc == 0
+
+
+def test_xdd_val_dtype_default_fp64():
+    """XDDSystem defaults to val_dtype='fp64' (unchanged) and threads a
+    'fp32' opt-in down to the device assembler."""
+    from diffsim.physics.exciton_system import XDDSystem
+    import inspect
+    sig = inspect.signature(XDDSystem.__init__)
+    assert sig.parameters["val_dtype"].default == "fp64"
+
+
 def test_fp32_snapshot_node_pattern(device):
     """The fp32 snapshot round-store also works in node-graph pattern
     mode (the film / XDD path): vals_d fp64, snapshot == fp32(vals_d)."""

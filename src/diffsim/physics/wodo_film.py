@@ -715,7 +715,15 @@ class WodoFilmStepper(TernaryCHStepper):
         asm.vals_d and b a persistent device buffer refreshed from
         asm.F_d — the scatter updates values IN PLACE, so the plan is
         made once (fixed sparsity) and each iterate only refactorizes
-        (nvmath invalidates the plan if operand buffers change)."""
+        (nvmath invalidates the plan if operand buffers change).
+
+        Task #36 (8j): when the assembler carries an fp32 snapshot
+        (val_dtype='fp32'), factor the fp32 CSR and recover FP64 accuracy
+        by iterative refinement — the residual is FP64 (device_operator
+        SpMV against the fp64 vals_d + the fp64 rhs), NEVER the fp32
+        stored values.  The refinement count per solve is logged (§8j)."""
+        if asm._vals_fp32 is not None:
+            return self._solve_device_fp32_ir(asm)
         import torch
         from nvmath.sparse.advanced import DirectSolver
         try:
@@ -739,6 +747,72 @@ class WodoFilmStepper(TernaryCHStepper):
         except Exception as e:
             # expected numerical failure -> NaN divergence signal; surface
             # programming/environment errors instead of swallowing (P0.3)
+            reraise_if_bug(e)
+            self._cudss_dev = None
+            return np.full(asm.Nfull, np.nan)
+
+    def _solve_device_fp32_ir(self, asm):
+        """Task #36: fp32-factor + FP64-iterative-refinement device solve.
+
+        The fp32 cuDSS DirectSolver is planned ONCE over the fp32 snapshot
+        CSR (STABLE fp32 values tensor refreshed in place by
+        device_csr_fp32 -> refresh_fp32_snapshot) and refactorized per
+        iterate.  Each refinement sweep solves the CORRECTION A dx = r in
+        fp32; the residual r = b - A x is computed in FP64 by the
+        assembler's fp64 device SpMV (device_operator, against vals_d) and
+        the fp64 rhs asm.F_d.  Converges to 1e-12 relative residual or 10
+        sweeps; the count is stashed for the flight recorder (§8j).  A
+        non-convergent solve (>10 on a converged-Newton step = FAIL) is
+        surfaced by returning NaN (the Appendix-A reject-ladder signal, as
+        the fp64 path does), with the count recorded for the report."""
+        import torch
+        from nvmath.sparse.advanced import DirectSolver
+        from ..solvers.iterative_refinement import fp64_iterative_refinement
+        try:
+            A32_t, _ = asm.device_csr_fp32()    # refreshes the snapshot
+            b64 = asm.F_d.numpy()
+            op = asm.device_operator()          # fp64 SpMV over vals_d
+
+            def matvec(x):
+                xd = wp.array(np.ascontiguousarray(x, np.float64),
+                              dtype=wp.float64, device=self.dm.device)
+                yd = wp.zeros(asm.Nfull, dtype=wp.float64,
+                              device=self.dm.device)
+                op.matvec(xd, yd)
+                return yd.numpy()
+
+            if self._cudss_dev is None:
+                # plan the fp32 solver once; the rhs operand is a STABLE
+                # fp32 device tensor refreshed per correction solve.
+                self._b_t32 = torch.zeros(asm.Nfull, dtype=torch.float32,
+                                          device=str(self.dm.device))
+                self._cudss_dev = DirectSolver(
+                    A32_t, self._b_t32, options=self._cudss_opts())
+                self._cudss_dev.plan()
+            else:
+                asm.sync_csr_values()           # no-op unchunked
+            self._cudss_dev.factorize()         # refactorize the fp32 A
+
+            def factor_solve(r):
+                # fp32 correction solve: round r to fp32, solve, promote.
+                self._b_t32.copy_(torch.from_numpy(
+                    np.ascontiguousarray(r, np.float32)).to(
+                        self._b_t32.device))
+                self._cudss_dev.reset_operands(b=self._b_t32)
+                return np.asarray(
+                    self._cudss_dev.solve().cpu(), np.float64)
+
+            x, info = fp64_iterative_refinement(
+                matvec, factor_solve, b64, tol=1e-12, max_iter=10)
+            self._last_ir = info                # per-solve §8j datum
+            self._ir_counts = getattr(self, "_ir_counts", [])
+            self._ir_counts.append(info["refinements"])
+            if not info["converged"]:
+                # >10 sweeps unconverged: conditioning FAIL (G2) — signal
+                # divergence to the reject ladder like a hard fp64 failure.
+                return np.full(asm.Nfull, np.nan)
+            return x
+        except Exception as e:
             reraise_if_bug(e)
             self._cudss_dev = None
             return np.full(asm.Nfull, np.nan)
@@ -890,7 +964,8 @@ class WodoFilmStepper(TernaryCHStepper):
             node_pattern=getattr(self, "_node_pattern", None),
             index_width=getattr(self, "_index_width", "auto"),
             chunking=getattr(self, "_chunking", "auto"),
-            chunk_cap=getattr(self, "_chunk_cap", None))
+            chunk_cap=getattr(self, "_chunk_cap", None),
+            val_dtype=getattr(self, "_val_dtype", "fp64"))
         d = self.dm.device
         ntf, nfn = self.top_faces.shape
         rows, cols, gdofs = [], [], []

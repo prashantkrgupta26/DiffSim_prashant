@@ -1259,6 +1259,52 @@ class DeviceNSAssembler:
             size=(self.Nfull, self.Nfull))
         return A_t, torch.from_dlpack(self.F_d.__dlpack__())
 
+    def device_csr_fp32(self):
+        """Task #36: torch fp32 CSR over the round-on-store snapshot, for
+        the cuDSS FP32 factorization.  Refreshes _vals_fp32 from vals_d
+        (a cast — vals_d itself stays fp64), then wraps it as a torch
+        float32 sparse CSR sharing the (int64) indptr/indices tensors.
+
+        The values tensor is STABLE across fills (refreshed in place), so
+        the caller plans the fp32 DirectSolver ONCE and only refactorizes
+        per iterate — the #37 stable-operand contract, in fp32.  The
+        FP64 iterative-refinement residual rides device_operator() (fp64,
+        against vals_d), NOT this fp32 CSR (brief scope 2).  Requires
+        val_dtype='fp32' (else there is no snapshot)."""
+        if self._vals_fp32 is None:
+            raise BackendError(
+                "device_csr_fp32() requires val_dtype='fp32' (no fp32 "
+                "snapshot exists for a fp64 assembler)")
+        import torch
+        self.refresh_fp32_snapshot()
+        tdev = str(self.dm.device)
+        if not hasattr(self, "_indptr_t"):
+            self._indptr_t = torch.tensor(self.indptr, dtype=torch.int64,
+                                          device=tdev)
+            self._indices_t = torch.tensor(self.indices,
+                                           dtype=torch.int64, device=tdev)
+        if self._chunked:
+            # per-chunk concat into a STABLE contiguous fp32 tensor (the
+            # #38 fp64 path's fp32 sibling); cuDSS needs one 1-D buffer.
+            if not hasattr(self, "_vals_t32"):
+                self._vals_t32 = torch.empty(self.nnz, dtype=torch.float32,
+                                             device=tdev)
+            ct = self._ctab
+            for c in range(ct.nchunks):
+                b0, b1 = int(ct.bases[c]), int(ct.bases[c + 1])
+                if b1 == b0:
+                    continue
+                row = torch.from_dlpack(
+                    self._vals_fp32.data[c].__dlpack__())
+                self._vals_t32[b0:b1].copy_(row[:b1 - b0])
+            vals_t = self._vals_t32
+        else:
+            vals_t = torch.from_dlpack(self._vals_fp32.__dlpack__())
+        A_t = torch.sparse_csr_tensor(
+            self._indptr_t, self._indices_t, vals_t,
+            size=(self.Nfull, self.Nfull))
+        return A_t, torch.from_dlpack(self.F_d.__dlpack__())
+
     def sync_csr_values(self):
         """Chunked mode (#38): refresh the contiguous torch values
         tensor from the chunked vals_d (device-to-device, per chunk).
