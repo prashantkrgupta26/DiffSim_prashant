@@ -28,7 +28,7 @@ classifiers = [
   "Operating System :: POSIX :: Linux",
   "Environment :: GPU :: NVIDIA CUDA :: 12",
 ]
-dependencies = ["warp-lang>=1.7,<2", "numpy>=1.26,<3", "scipy>=1.11,<2", "torch>=2.4,<3"]
+dependencies = ["warp-lang>=1.7,<2", "numpy>=1.26,<3", "scipy>=1.11,<2", "torch>=2.4,<3", "pyyaml>=6"]
 
 [project.urls]
 Homepage = "https://github.com/BaskarGS/diffsim"
@@ -37,7 +37,7 @@ Documentation = "https://github.com/BaskarGS/diffsim/tree/master/docs"
 Issues = "https://github.com/BaskarGS/diffsim/issues"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+dev = ["pytest>=8.0", "pytest-xdist>=3.5", "ruff>=0.6"]
 # cuDSS GPU direct solver (measured stepping default at 200k+ dofs)
 cudss = ["nvmath-python[cu12]>=0.2"]
 # AMGX has no PyPI package: build github.com/NVIDIA/AMGX, then

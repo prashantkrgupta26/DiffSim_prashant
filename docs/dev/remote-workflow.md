@@ -28,3 +28,24 @@ or fresh processes run 10–100× slow, retry; a host reboot is the cure if pers
 
 ## Nova
 Scripts are stubbed. Wire `nova-sync-submit.sh` / `nova-poll.sh` on the next kit.
+
+## gpubox-test.sh — the pre-merge suite gate (added 2026-07-20)
+
+`scripts/remote/gpubox-test.sh [pytest-args]` runs the pytest suite on
+gpubox with `pytest -n ${JOBS:-12}` (xdist): FORCE-syncs the CURRENT
+working tree (works from a worktree too — the `.git` exclude covers the
+worktree pointer file), ensures pytest-xdist in the box venv, launches
+under the run-lock, polls to completion, prints the summary + FAILED
+lines, exits nonzero on failure. Full suite ≈ minutes for the parallel
+bulk vs 80+ min single-process on the Mac, and it covers CUDA-only
+behavior the Mac cannot see (GPU atomic scatter is few-ULP, not
+bit-equal — caught 2026-07-19).
+
+Known-environmental: the two `test_stepper_solvers` amgx parity tests
+need `libamgxsh.so` on the loader path; the script probes
+`$HOME/AMGX/build` and `/usr/local/lib` and proceeds without it (tests
+fail-not-skip until AMGX is rebuilt on the box).
+
+Keep the box venv pinned to the repo: `.venv/bin/pip install -e ".[dev]"`
+plus an explicit `warp-lang==<pinned>` when the floor moves (2026-07-20:
+upgraded 1.14→1.15 to match Mac/Nova).
