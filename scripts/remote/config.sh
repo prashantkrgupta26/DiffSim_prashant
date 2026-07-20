@@ -25,7 +25,7 @@ export BOX_MODEL="${BOX_MODEL:-}"   # empty = box default; set to override
 # rsync excludes (Mac -> box): only source syncs; data/artifacts stay put.
 # NOTE: bash cannot export arrays; scripts SOURCE this file so it stays in scope.
 RSYNC_EXCLUDES=(
-  --exclude '.git/'
+  --exclude '.git'
   --exclude '.claude/'
   --exclude '.superpowers/'
   --exclude '.venv/'
