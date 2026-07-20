@@ -87,7 +87,7 @@ def _install_managed_allocator(device="cuda:0"):
     Warp 1.15 instantiates ``CudaManagedAllocator`` (cudaMallocManaged)
     but never wires it to ``current_allocator`` -- the built-in choice is
     mempool-or-default, both HBM-bound. The PUBLIC hook
-    ``wp.set_device_allocator(dev, wp.CudaManagedAllocator(dev))`` routes
+    ``wp.set_device_allocator(dev, wp.CudaManagedAllocator())`` routes
     every subsequent ``wp.zeros``/``wp.array`` device allocation through
     managed memory, which on GH200's NVLink-C2C coherent fabric spills
     transparently into the 480 GB Grace LPDDR5X pool past the 96 GB HBM3.
@@ -103,7 +103,9 @@ def _install_managed_allocator(device="cuda:0"):
         raise RuntimeError(
             f"device {dev} reports is_managed_memory_supported=False -- "
             "managed oversubscription unavailable")
-    wp.set_device_allocator(dev, wp.CudaManagedAllocator(dev))
+    # NB: CudaManagedAllocator() takes no ctor args -- device-agnostic;
+    # warp pushes the target context before each allocate()
+    wp.set_device_allocator(dev, wp.CudaManagedAllocator())
     print(f"PROBE_MANAGED installed CudaManagedAllocator on {dev} "
           f"(concurrent_managed_access="
           f"{dev.is_concurrent_managed_access_supported})", flush=True)
