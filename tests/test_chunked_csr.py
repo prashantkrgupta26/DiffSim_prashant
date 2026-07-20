@@ -355,3 +355,106 @@ def test_chunked_film_blockch_parity(device):
         denom = max(np.abs(x_f).max(), 1e-30)
         assert np.abs(x_f - x_c).max() / denom < 1e-9
 
+
+# ---------------------------------------------------------------------
+# G2: the >2^31 synthetic — chunk table with a base offset past 2^31.
+# ---------------------------------------------------------------------
+def test_chunked_scatter_past_2e31(device):
+    """The generic chunked scatter driven at int64 slots PAST 2^31: the
+    chunk table's second chunk starts above 2^31 and the tiny 2-D buffer
+    receives the atomics at the correct within-chunk positions (an int32
+    kernel would wrap negative; no >2^31-element allocation exists)."""
+    span = 64
+    B = np.int64(2 ** 31) + 4096            # chunk-1 base, past 2^31
+    bases = np.array([0, B, B + span], np.int64)
+    bases_d = wp.array(bases, dtype=wp.int64, device=device)
+    out = wp.zeros((2, span), dtype=wp.float64, device=device)
+    rng = np.random.default_rng(5)
+    loc = rng.integers(0, span, size=200)
+    slots = (B + loc).astype(np.int64)
+    vals = rng.standard_normal(200)
+    wp.launch(_scatter_kernel_chunked(), dim=200,
+              inputs=[wp.array(vals, dtype=wp.float64, device=device),
+                      wp.array(slots, dtype=wp.int64, device=device),
+                      out, bases_d, wp.int32(2)], device=device)
+    ref = np.zeros(span)
+    np.add.at(ref, loc, vals)
+    got = out.numpy()
+    assert np.allclose(got[1], ref, rtol=1e-13, atol=1e-15)
+    assert np.array_equal(got[0], np.zeros(span))   # chunk 0 untouched
+    assert slots.min() > 2 ** 31                    # the point of it
+
+
+def test_chunked_node_scatter_past_2e31(device):
+    """The node-graph chunked scatter with a REAL >2^31 Gptr: the
+    in-kernel int64 closed-form slot (the #33 arithmetic) exceeds 2^31
+    and must land in chunk 1 of the synthetic table at the correct
+    local position — stronger than the #33 synthetic, which had to
+    zero the Gptr because the flat buffer could not exist."""
+    ndof, nbf = 4, 1
+    nl = nbf * ndof
+    npair = nl * nl
+    g0 = (2 ** 31) // (ndof * ndof) + 1000
+    base_nnz = ndof * ndof * g0                     # > 2^31
+    span = 64
+    bases = np.array([0, base_nnz, base_nnz + span], np.int64)
+    Gptr = np.array([g0, g0 + 1], np.int64)         # node 0: deg 1
+    gslot = np.array([g0], np.int32)
+    conn = np.array([[0]], np.int32)
+    Ae = np.arange(1.0, npair + 1.0)
+    out = wp.zeros((2, span), dtype=wp.float64, device=device)
+    wp.launch(_scatter_node_kernel_chunked(), dim=npair,
+              inputs=[wp.array(Ae, dtype=wp.float64, device=device),
+                      wp.array(gslot, dtype=wp.int32, device=device),
+                      wp.array(conn, dtype=wp.int32, device=device),
+                      wp.array(Gptr, dtype=wp.int64, device=device),
+                      wp.int32(0), wp.int32(nbf), wp.int32(ndof),
+                      out,
+                      wp.array(bases, dtype=wp.int64, device=device),
+                      wp.int32(2)], device=device)
+
+    def closed_form(g0v, s):
+        slots = np.empty(npair, np.int64)
+        for k in range(npair):
+            rl, cl = k // nl, k % nl
+            ca, cb = rl % ndof, cl % ndof
+            slots[k] = (ndof * ndof * g0v + ca * ndof * 1
+                        + ndof * (s - g0v) + cb)
+        return slots
+
+    big = closed_form(g0, g0)
+    assert big.min() > 2 ** 31                      # arithmetic past 2^31
+    ref = np.zeros(span)
+    np.add.at(ref, big - base_nnz, Ae)
+    got = out.numpy()
+    assert np.array_equal(got[1], ref)
+    assert np.array_equal(got[0], np.zeros(span))
+
+
+def test_chunked_spmv_past_2e31(device):
+    """The chunked SpMV walking a row whose offsets sit past 2^31 (a
+    synthetic 2-row CSR whose second chunk base is > 2^31; the data
+    buffer stays tiny)."""
+    span = 8
+    B = np.int64(2 ** 31) + 128
+    # row 0: 4 entries in chunk 1 at [B, B+4); row 1: 4 at [B+4, B+8)
+    indptr = np.array([B, B + 4, B + 8], np.int64)
+    bases = np.array([0, B, B + span], np.int64)
+    cols = np.array([0, 1, 2, 3, 0, 1, 2, 3], np.int32)
+    data = np.arange(1.0, span + 1.0)
+    ind2 = wp.zeros((2, span), dtype=wp.int32, device=device)
+    dat2 = wp.zeros((2, span), dtype=wp.float64, device=device)
+    wp.copy(ind2[1], wp.array(cols, dtype=wp.int32, device="cpu",
+                              copy=False), count=span)
+    wp.copy(dat2[1], wp.array(data, dtype=wp.float64, device="cpu",
+                              copy=False), count=span)
+    x = np.array([1.0, 10.0, 100.0, 1000.0])
+    x_d = wp.array(x, dtype=wp.float64, device=device)
+    y_d = wp.zeros(2, dtype=wp.float64, device=device)
+    wp.launch(make_csr_spmv_chunked(), dim=2,
+              inputs=[wp.array(indptr, dtype=wp.int64, device=device),
+                      ind2, dat2,
+                      wp.array(bases, dtype=wp.int64, device=device),
+                      wp.int32(2), x_d, y_d], device=device)
+    ref = np.array([data[:4] @ x, data[4:] @ x])
+    assert np.array_equal(y_d.numpy(), ref)
