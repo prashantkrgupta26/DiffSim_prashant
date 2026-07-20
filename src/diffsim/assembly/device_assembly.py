@@ -43,6 +43,31 @@ from .operators import _kernel_cache, _chunk_of
 IDX_WIDE_THRESHOLD = int(0.9 * 2 ** 31)     # >~90% of 2^31 -> wide path
 
 
+# ---------------------------------------------------------------------
+# Task #36: mixed-precision value storage (8j activation).  The CSR
+# VALUES buffer vals_d ALWAYS accumulates in fp64 (the scatter atomic-adds
+# sum across elements sharing a slot — accumulation must be fp64; "never
+# accumulate fp32").  val_dtype="fp32" opts a SEPARATE round-on-store
+# snapshot buffer (_vals_fp32) into existence; it is refreshed from vals_d
+# per fill and fed ONLY to the cuDSS factorization.  The FP64 iterative
+# refinement residual rides the fp64 device SpMV against vals_d, never the
+# fp32 snapshot.  Default "fp64": no snapshot, no kernels, bit-for-bit the
+# pre-#36 path.  The value dtype joins the kernel-factory cache keys the
+# same way #33 added the index width.
+# ---------------------------------------------------------------------
+def _resolve_val_dtype(val_dtype):
+    """Map the config knob to a warp float dtype for the fp32 snapshot.
+
+    val_dtype: "fp64" (default) | "fp32".  "fp64" -> wp.float64 (no
+    snapshot — the accumulation buffer IS the storage); "fp32" ->
+    wp.float32 (the round-on-store snapshot's element type).  Bogus input
+    is REFUSED loudly."""
+    if val_dtype not in ("fp64", "fp32"):
+        raise ConfigError(
+            f"val_dtype must be 'fp64'|'fp32', got {val_dtype!r}")
+    return wp.float64 if val_dtype == "fp64" else wp.float32
+
+
 def _resolve_idx_width(index_width, nnz_estimate):
     """Map the config knob + an nnz estimate to a warp index dtype.
 
@@ -235,7 +260,8 @@ class DeviceNSAssembler:
 
     def __init__(self, dm, sigma_like=1.0, coloring=False, ndof=None,
                  node_pattern=None, blockmask=None, matvec_only=False,
-                 index_width="auto", chunking="auto", chunk_cap=None):
+                 index_width="auto", chunking="auto", chunk_cap=None,
+                 val_dtype="fp64"):
         # ndof: dofs per node (default dim+1 = the NS layout; 4 for the
         # ternary CH film system, 2 for binary CH — M4 device-bound)
         # blockmask (B5): bool [ndof, ndof] compile-time dof-pair block
@@ -264,6 +290,14 @@ class DeviceNSAssembler:
         self._chunk_cap = chunk_cap
         self._chunked = False               # provisional; finalized below
         self._ctab = None
+        # Task #36 mixed-precision: fp32 round-on-store snapshot config.
+        # vals_d ALWAYS stays fp64 (accumulation contract); _vals_fp32 is
+        # allocated only when val_dtype='fp32' and refreshed from vals_d
+        # per fill (refresh_fp32_snapshot).  Default fp64: _vals_fp32 stays
+        # None and the assembler is bit-for-bit the pre-#36 path.
+        self._val_dtype_cfg = val_dtype
+        self._val_dtype = _resolve_val_dtype(val_dtype)
+        self._vals_fp32 = None              # allocated below iff fp32
         ndof = (dm.dim + 1) if ndof is None else int(ndof)
         self.ndof = ndof
         if blockmask is not None:
@@ -453,6 +487,7 @@ class DeviceNSAssembler:
                        if self._chunked
                        else wp.zeros(self.nnz, dtype=wp.float64,
                                      device=dm.device))
+        self._alloc_fp32_snapshot()
         self.F_d = wp.zeros(self.Nfull, dtype=wp.float64,
                             device=dm.device)
         gdof_bins = []
@@ -680,7 +715,45 @@ class DeviceNSAssembler:
                        if self._chunked
                        else wp.zeros(self.nnz, dtype=wp.float64,
                                      device=d))
+        self._alloc_fp32_snapshot()
         self.F_d = wp.zeros(self.Nfull, dtype=wp.float64, device=d)
+
+    # ------------------------------------------------------------------
+    # Task #36: fp32 round-on-store snapshot of vals_d for cuDSS fp32
+    # factorization.  vals_d stays fp64 (accumulation contract); this is a
+    # SEPARATE buffer rounded from it per fill.  No-op / None for fp64.
+    # ------------------------------------------------------------------
+    def _alloc_fp32_snapshot(self):
+        """Allocate _vals_fp32 mirroring vals_d's storage (flat or #38
+        chunked) when val_dtype='fp32'; leave it None for fp64."""
+        if self._val_dtype is wp.float64:
+            self._vals_fp32 = None
+            return
+        if self._chunked:
+            self._vals_fp32 = ChunkedArray(self._ctab, wp.float32,
+                                           self.dm.device)
+        else:
+            self._vals_fp32 = wp.zeros(self.nnz, dtype=wp.float32,
+                                       device=self.dm.device)
+
+    def refresh_fp32_snapshot(self):
+        """Round-on-store vals_d (fp64) -> _vals_fp32 (fp32).  One cast
+        kernel per nnz; no-op when val_dtype='fp64' (no snapshot).  Call
+        after a fill and before the cuDSS fp32 factorization consumes it
+        (device_csr_fp32)."""
+        if self._vals_fp32 is None:
+            return
+        d = self.dm.device
+        if self._chunked:
+            # per-chunk cast: both buffers share the same 2-D layout, so
+            # a straight element-wise round over each chunk's valid span.
+            wp.launch(_round_store_kernel_chunked(),
+                      dim=(self._ctab.nchunks, self._ctab.cap),
+                      inputs=[self.vals_d.data, self._vals_fp32.data],
+                      device=d)
+        else:
+            wp.launch(_round_store_kernel(), dim=self.nnz,
+                      inputs=[self.vals_d, self._vals_fp32], device=d)
 
     def set_strong_rows(self, rows, diag_vals=None):
         """D1 item 2: per-epoch strong-row plan. rows: global dof ids
@@ -1201,6 +1274,45 @@ class DeviceNSAssembler:
                 continue
             row = torch.from_dlpack(self.vals_d.data[c].__dlpack__())
             self._vals_t[b0:b1].copy_(row[:b1 - b0])
+
+
+# ---------------------------------------------------------------------
+# Task #36: fp32 round-on-store snapshot kernels.  vals_d (fp64) is cast
+# element-wise into _vals_fp32 (fp32) — the ONLY place fp32 values are
+# produced, and it is a pure cast of already-accumulated fp64 sums (never
+# an fp32 accumulation).  Compiled only when val_dtype='fp32'.
+# ---------------------------------------------------------------------
+def _round_store_kernel():
+    key = ("dev_round_store",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def rs(vals64: wp.array(dtype=wp.float64),
+           out32: wp.array(dtype=wp.float32)):
+        i = wp.tid()
+        out32[i] = wp.float32(vals64[i])
+
+    _kernel_cache[key] = rs
+    return rs
+
+
+def _round_store_kernel_chunked():
+    """Chunked (#38) round-store: both buffers share the [nchunks, cap]
+    2-D layout, so a straight element-wise cast over every slot (padding
+    tails are cast 0.0->0.0, never addressed by any consumer)."""
+    key = ("dev_round_store_ch",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def rsc(vals64: wp.array2d(dtype=wp.float64),
+            out32: wp.array2d(dtype=wp.float32)):
+        c, j = wp.tid()
+        out32[c, j] = wp.float32(vals64[c, j])
+
+    _kernel_cache[key] = rsc
+    return rsc
 
 
 def _gather_kernel(idx_dtype=wp.int32):
