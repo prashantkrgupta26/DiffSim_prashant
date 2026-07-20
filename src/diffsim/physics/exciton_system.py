@@ -522,7 +522,8 @@ class XDDSystem:
                  langevin=None, onsager=None,
                  tau_inv_d=0.0, tau_inv_a=0.0,
                  supg=1.0, newton_tol=1e-10, atol=1e-12,
-                 linsolve=None, linsolver="splu", carrier_vars="primal"):
+                 linsolve=None, linsolver="splu", carrier_vars="primal",
+                 assembly="auto", index_width="auto"):
         self.dm = dm
         self.lam2 = float(lam2)
         self.eps_gp = eps_gp
@@ -586,6 +587,40 @@ class XDDSystem:
         self.T = dm.constraints.T.tocsr()
         self.free = dm.constraints.free_nodes
         self.n_free = self.T.shape[1]
+
+        # Task #35: assembly backend.  "host" is the R0 scipy/bmat path (the
+        # parity reference); "device" routes solve_newton's Jacobian+residual
+        # through the warp DeviceNSAssembler path (exciton_device.py — node-
+        # major dofs, blockmasked node-pattern CSR, device closures).  "auto"
+        # (default) picks device on CUDA, host on CPU — CPU behavior is
+        # unchanged, GPU production gets the E5 host-stage fix by default.
+        # Device assembly requires identity constraints (uniform meshes — the
+        # node-pattern scatter contract); "auto" falls back to host otherwise,
+        # a forced "device" raises loudly.
+        if assembly not in ("auto", "host", "device"):
+            raise ValueError(f"assembly must be 'auto'|'host'|'device', "
+                             f"got {assembly!r}")
+        T = self.T
+        identity_T = (T.shape[0] == T.shape[1]) and (
+            T != sp.identity(T.shape[0], format="csr")).nnz == 0
+        if assembly == "device":
+            if not identity_T:
+                from ..errors import BackendError
+                raise BackendError(
+                    "assembly='device' requires identity constraints "
+                    "(uniform mesh); this mesh has hanging-node constraints "
+                    "— use assembly='host'")
+            self._assembly_device = True
+        elif assembly == "host":
+            self._assembly_device = False
+        else:
+            self._assembly_device = (str(dm.device).startswith("cuda")
+                                     and identity_T)
+        self.assembly = "device" if self._assembly_device else "host"
+        self.index_width = index_width
+        self._dev_asm = None        # lazy XDDDeviceAssembler
+        self._cudss_dev = None      # zero-copy device-CSR cuDSS plan
+        self._b_t = None
 
         # dirichlet: per-field dict {field_index: (node_ids, values)}; set via
         # set_dirichlet.  Rows are eliminated with the house identity-row idiom.
@@ -931,6 +966,73 @@ class XDDSystem:
                     r[row] = vals[k] - cur
         return A.tocsr(), r
 
+    # ── Task #35: assembly dispatch (host bmat path | device warp path) ─────
+    def device_assembler(self):
+        """The lazy XDDDeviceAssembler (pattern + static uploads built once)."""
+        if self._dev_asm is None:
+            from .exciton_device import XDDDeviceAssembler
+            self._dev_asm = XDDDeviceAssembler(self, index_width=self.index_width)
+        return self._dev_asm
+
+    def assemble_newton_system(self, state, need_matrix=True):
+        """One Newton system (A, r) at `state`.
+
+        host path: the R0 `residual_full` + `jacobian_full` +
+        `_reduce_and_eliminate` composition (field-major dofs) — verbatim.
+        device path: `XDDDeviceAssembler.assemble` (node-major dofs; Dirichlet
+        and log-mode conventions identical).  need_matrix=False returns
+        (None, r) — the line-search residual probe skips the host CSR pull.
+        With linsolver='cudss' on CUDA the matrix never leaves the device
+        (A is None; `_solve_rhs` consumes the assembler's zero-copy CSR)."""
+        if not self._assembly_device:
+            return self._reduce_and_eliminate(self.jacobian_full(state),
+                                              self.residual_full(state))
+        if not need_matrix:
+            return self.device_assembler().assemble(state, need_matrix=False)
+        dev_solver = (self.linsolver == "cudss"
+                      and str(self.dm.device).startswith("cuda")
+                      and self.linsolve == self._cudss_linsolve)
+        return self.device_assembler().assemble(
+            state, need_matrix=("device" if dev_solver else "host"))
+
+    def _cudss_dev_solve(self, b):
+        """Zero-copy device-CSR cuDSS solve (multiphase `_solve_dev` pattern):
+        DirectSolver planned ONCE over the torch CSR aliasing the assembler's
+        vals_d (fixed pattern — strong rows keep explicit zeros, nnz never
+        flaps); per iterate the fill updates vals_d in place, b is copied into
+        the STABLE b tensor, then factorize + solve.  Explicit .free() on any
+        failure (the double-free guard)."""
+        try:
+            import torch
+            from nvmath.sparse.advanced import (DirectSolver,
+                                                DirectSolverOptions)
+        except Exception as exc:
+            from ..errors import BackendError
+            raise BackendError(
+                "linsolver='cudss' with device assembly requires torch + "
+                f"nvmath-python[cu12] on CUDA (import failed: {exc})") from exc
+        try:
+            if self._cudss_dev is None:
+                A_t, F_t = self.device_assembler().asm.device_csr()
+                self._b_t = torch.empty_like(F_t)
+                self._b_t.copy_(torch.from_numpy(
+                    np.ascontiguousarray(b)).to(self._b_t.device))
+                self._cudss_dev = DirectSolver(
+                    A_t, self._b_t, options=DirectSolverOptions(blocking=True))
+                self._cudss_dev.plan()
+            else:
+                self._b_t.copy_(torch.from_numpy(
+                    np.ascontiguousarray(b)).to(self._b_t.device))
+            self._cudss_dev.factorize()
+            return np.asarray(self._cudss_dev.solve().cpu())
+        except Exception:
+            try:
+                self._cudss_dev.free()
+            except Exception:
+                pass
+            self._cudss_dev = None
+            raise
+
     # ── Newton solve with positivity-guarded backtracking line search ───────
     def solve_newton(self, state, *, max_iter=8, floor=1e-30,
                      x_floor=-1e-12, max_halving=40, rtol=1e-8, verbose=False):
@@ -948,9 +1050,7 @@ class XDDSystem:
         converged = False
         r0 = None
         for it in range(max_iter):
-            R = self.residual_full(state)
-            blocks = self.jacobian_full(state)
-            A, r = self._reduce_and_eliminate(blocks, R)
+            A, r = self.assemble_newton_system(state)
             rnorm = float(np.linalg.norm(r))
             rnorms.append(rnorm)
             if r0 is None:
@@ -970,8 +1070,7 @@ class XDDSystem:
                     step *= 0.5
                     continue
                 self._current_state = cand
-                _, rc = self._reduce_and_eliminate(self.jacobian_full(cand),
-                                                   self.residual_full(cand))
+                _, rc = self.assemble_newton_system(cand, need_matrix=False)
                 rn_new = float(np.linalg.norm(rc))
                 if rn_new < rnorm * (1.0 - 1e-4) or step < 1e-12:
                     ok, trial = True, cand
@@ -1045,6 +1144,12 @@ class XDDSystem:
         physics residual on the rest; A has identity rows for Dirichlet.
         The Newton system is J δ = −R_physics, so we solve A δ = b with
         b = −r on physics rows and +r on Dirichlet rows.
+
+        Device-assembly ordering (Task #35): the device system is NODE-major
+        (row = node·NDOF + field); the Dirichlet flip uses that layout, and
+        the solved increment is permuted back to the host FIELD-major layout
+        so the rest of the Newton loop (increments, line search, log-mode
+        exponentials) is order-agnostic.
         """
         nf = self.n_free
         b = -r.copy()
@@ -1056,9 +1161,17 @@ class XDDSystem:
                 fi = node_to_free[nid]
                 if fi < 0:
                     continue
-                row = field * nf + fi
+                row = (fi * NDOF + field) if self._assembly_device \
+                    else (field * nf + fi)
                 b[row] = -b[row]   # flip back to +(g−u)
-        return self.linsolve(A, b)
+        if self._assembly_device and A is None:
+            du = self._cudss_dev_solve(b)
+        else:
+            du = self.linsolve(A, b)
+        if self._assembly_device:
+            du = np.ascontiguousarray(
+                np.asarray(du).reshape(nf, NDOF).T).reshape(-1)
+        return du
 
     def _cudss_linsolve(self, A, b):
         """cuDSS (GPU sparse direct LU) solve of A x = b for the 5-field
