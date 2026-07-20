@@ -681,6 +681,11 @@ class WodoFilmStepper(TernaryCHStepper):
                 self._cudss_dev.plan()
             else:
                 self._b_t.copy_(self._F_view)
+                # Task #38 chunked CSR: the contiguous cuDSS values
+                # tensor is a per-chunk CONCATENATION, not a zero-copy
+                # view — refresh it from the chunked vals_d before each
+                # refactorize (no-op when unchunked).
+                asm.sync_csr_values()
             self._cudss_dev.factorize()
             return np.asarray(self._cudss_dev.solve().cpu())
         except Exception as e:
@@ -834,7 +839,9 @@ class WodoFilmStepper(TernaryCHStepper):
         self._asm = DeviceNSAssembler(
             self.dm, ndof=4,
             node_pattern=getattr(self, "_node_pattern", None),
-            index_width=getattr(self, "_index_width", "auto"))
+            index_width=getattr(self, "_index_width", "auto"),
+            chunking=getattr(self, "_chunking", "auto"),
+            chunk_cap=getattr(self, "_chunk_cap", None))
         d = self.dm.device
         ntf, nfn = self.top_faces.shape
         rows, cols, gdofs = [], [], []
