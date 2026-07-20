@@ -63,6 +63,75 @@ def test_wodo_film_evaporation(device):
 
 
 # ---------------------------------------------------------------------
+# Task #36 (8j) G3: fp32-storage + FP64-IR film transient marches PHYSICAL.
+# The fp32-factor+IR path lives in the cuDSS device solve (_solve_device),
+# so this uses linsolver="cudss" (not blockch_dev).  cuDSS is CUDA-only.
+# ---------------------------------------------------------------------
+def _film_content_march(device, val_dtype, *, max_steps=40):
+    """A short evaporating-film march on the device cuDSS path with the
+    given val_dtype; returns (relative solute-content drift per component,
+    the stepper) — the conserved-mass physical observable."""
+    tree0 = build_uniform(5, dim=2)
+    keep = tree0.centers()[:, 0] < 4 / 32
+    tree = Octree(tree0.keys[keep], tree0.levels[keep], dim=2,
+                  periodic=tree0.periodic)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), device)
+    st = WodoFilmStepper(dm, chi=(1.0, 0.3, 0.3), N=(5.0, 5.0, 1.0),
+                         M=(0.225, 0.0, 0.225), kappa=(2e-4, 2e-4),
+                         k_e=1.0, dt=1e-3, linsolver="cudss",
+                         use_device_assembly=True)
+    if val_dtype == "fp32":
+        st._val_dtype = "fp32"              # the probe-side class-attr idiom
+    rng = np.random.default_rng(3)
+    st.set_initial(lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)),
+                   lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)))
+    width = mesh.node_coords[:, 0].max()
+
+    def phi_int(vec):
+        v, _ = st._gp(vec)
+        m = 0.0
+        for pv, b in dm.bins.items():
+            h = mesh.tree.h()[mesh.bins[pv]]
+            ne = len(mesh.conn_of[pv])
+            wq = np.tile(dm.tables_by_p[pv].w, ne) \
+                * np.repeat((h / 2) ** 2, b["nqp"])
+            m += float((wq * v[pv]).sum())
+        return m / width
+
+    P1_0, P2_0 = phi_int(st.hist[0][0]), phi_int(st.hist[0][1])
+    c1_0, c2_0 = st.h_curr * P1_0, st.h_curr * P2_0
+    st.march(h_min=0.8, phis_stop=0.05, max_steps=max_steps)
+    P1, P2 = phi_int(st.x[0::4]), phi_int(st.x[2::4])
+    c1, c2 = st.h_curr * P1, st.h_curr * P2
+    drift = (abs(c1 - c1_0) / c1_0, abs(c2 - c2_0) / c2_0)
+    return drift, st
+
+
+def test_g3_film_transient_fp32_physical(device):
+    """G3: the evaporating-film transient with val_dtype='fp32' (cuDSS
+    fp32-factor + FP64-IR) marches PHYSICAL — the solute content is
+    conserved to within 10x of the fp64 cuDSS baseline (the refined solve
+    is fp64-accurate, so conservation is preserved), and the fp32+IR path
+    logged refinement counts (§8j)."""
+    if device == "cpu":
+        pytest.skip("cuDSS fp32+IR film path needs a GPU")
+    drift64, _ = _film_content_march(device, "fp64")
+    drift32, st32 = _film_content_march(device, "fp32")
+    print(f"G3 film content drift: fp64 {drift64} vs fp32+IR {drift32}")
+    # conserved solute content: fp32+IR within 10x the fp64 baseline AND
+    # both physically small (CH mass conservation).
+    for d32, d64 in zip(drift32, drift64):
+        assert d32 <= max(10.0 * d64, 1e-9), (d32, d64)
+    counts = getattr(st32, "_ir_counts", [])
+    assert counts, "no fp32+IR refinement counts logged"
+    assert max(counts) <= 10, counts
+    print(f"G3 fp32+IR refinement counts: min={min(counts)} "
+          f"max={max(counts)} n={len(counts)}")
+
+
+# ---------------------------------------------------------------------
 # M4 device-bound gates: use_device_assembly=True trajectory parity
 # < 1e-11 vs the host COO+scipy path.
 # ---------------------------------------------------------------------

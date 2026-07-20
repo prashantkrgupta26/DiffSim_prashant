@@ -242,6 +242,21 @@ def main(argv=None):
                          "where 'auto' picks wide but warp's int32 array-"
                          "shape ceiling (types.py check_array_shape) "
                          "rejects >2^31-element nnz buffers.")
+    ap.add_argument("--val-dtype", choices=("fp64", "fp32"), default=None,
+                    help="Task #36 (8j) mixed-precision value storage, set "
+                         "via a probe-side WodoFilmStepper class attribute "
+                         "(same idiom as --force-narrow). Default: leave the "
+                         "stepper's 'fp64' (unchanged). 'fp32' stores the "
+                         "CSR values as an fp32 round-on-store snapshot fed "
+                         "to a cuDSS fp32 factorization, recovered to fp64 by "
+                         "iterative refinement (residual in fp64 vs the fp64 "
+                         "vals_d). Measures s/step + peak GB vs fp64 (G4, "
+                         "measurement-only — the §8j Ada net-loss prior "
+                         "stands). NB: the fp32-FACTOR+IR path lives in the "
+                         "cuDSS solve — pair with "
+                         "'--set numerics.linsolver=cudss' to exercise it; "
+                         "the default blockch_dev is ITERATIVE (fp32 storage "
+                         "still halves its vals_d/SpMV bytes, but no factor).")
     args = ap.parse_args(argv)
 
     cfg = args.config
@@ -255,7 +270,8 @@ def main(argv=None):
     film_argv = _film_argv(cfg, args.outdir, args.res, args.max_steps,
                            args.sets)
     in_process = (args.managed or args.force_narrow
-                  or args.balloon_gb > 0 or args.chunking is not None)
+                  or args.balloon_gb > 0 or args.chunking is not None
+                  or args.val_dtype is not None)
     print("PROBE_CMD python -m diffsim.film " + " ".join(film_argv)
           + (" [in-process:"
              + ("managed" if args.managed else "")
@@ -291,6 +307,12 @@ def main(argv=None):
             print(f"PROBE_CHUNKING WodoFilmStepper._chunking="
                   f"{args.chunking!r} (probe-side class attr)",
                   flush=True)
+        if args.val_dtype is not None:
+            from diffsim.physics.wodo_film import WodoFilmStepper
+            WodoFilmStepper._val_dtype = args.val_dtype
+            print(f"PROBE_VAL_DTYPE WodoFilmStepper._val_dtype="
+                  f"{args.val_dtype!r} (probe-side class attr; #36 8j "
+                  f"fp32-storage + FP64-IR)", flush=True)
         from diffsim.film.__main__ import main as film_main
         try:
             rc = film_main(film_argv)
@@ -307,7 +329,8 @@ def main(argv=None):
            "film_rc": rc, "managed": args.managed,
            "balloon_gb": args.balloon_gb,
            "force_narrow": args.force_narrow,
-           "chunking_arg": args.chunking}
+           "chunking_arg": args.chunking,
+           "val_dtype_arg": args.val_dtype}
     try:
         row.update(_distil(args.outdir))
     except (FileNotFoundError, ValueError) as e:
@@ -319,6 +342,10 @@ def main(argv=None):
     if args.chunking is not None and args.chunking != "auto":
         # same params-vs-stepper-attr caveat for the chunking override
         row["chunked"] = f"{args.chunking}(probe)"
+    # #36: the val_dtype override is a probe-side stepper class attr (not a
+    # film param), so record what actually ran.
+    row["val_dtype"] = (f"{args.val_dtype}(probe)"
+                        if args.val_dtype is not None else "fp64")
 
     # verdict: physical if it finished max_steps and mass_drift is small
     md = row.get("mass_drift")
@@ -335,6 +362,7 @@ def main(argv=None):
         f"res={args.res} dofs={row.get('dofs')} nnz={row.get('nnz')} "
         f"gpu_gb={row.get('gpu_gb_peak')} s/step={row.get('s_per_step')} "
         f"idx={row.get('index_width')} chunked={row.get('chunked')} "
+        f"val_dtype={row.get('val_dtype')} "
         f"drift={row.get('mass_drift')} "
         f"managed={args.managed} verdict={row.get('verdict')}", flush=True)
     return 0 if rc == 0 else 1

@@ -523,7 +523,7 @@ class XDDSystem:
                  tau_inv_d=0.0, tau_inv_a=0.0,
                  supg=1.0, newton_tol=1e-10, atol=1e-12,
                  linsolve=None, linsolver="splu", carrier_vars="primal",
-                 assembly="auto", index_width="auto"):
+                 assembly="auto", index_width="auto", val_dtype="fp64"):
         self.dm = dm
         self.lam2 = float(lam2)
         self.eps_gp = eps_gp
@@ -618,9 +618,15 @@ class XDDSystem:
                                      and identity_T)
         self.assembly = "device" if self._assembly_device else "host"
         self.index_width = index_width
+        # Task #36 (8j): fp32-storage + FP64-IR opt-in (default fp64 =
+        # unchanged).  Threaded to the device assembler's val_dtype knob;
+        # the cuDSS solve then factors fp32 + refines in fp64.
+        self.val_dtype = val_dtype
         self._dev_asm = None        # lazy XDDDeviceAssembler
         self._cudss_dev = None      # zero-copy device-CSR cuDSS plan
         self._b_t = None
+        self._b_t32 = None          # stable fp32 rhs (IR correction solve)
+        self._ir_counts = []        # per-solve refinement counts (§8j)
 
         # dirichlet: per-field dict {field_index: (node_ids, values)}; set via
         # set_dirichlet.  Rows are eliminated with the house identity-row idiom.
@@ -971,7 +977,9 @@ class XDDSystem:
         """The lazy XDDDeviceAssembler (pattern + static uploads built once)."""
         if self._dev_asm is None:
             from .exciton_device import XDDDeviceAssembler
-            self._dev_asm = XDDDeviceAssembler(self, index_width=self.index_width)
+            self._dev_asm = XDDDeviceAssembler(
+                self, index_width=self.index_width,
+                val_dtype=self.val_dtype)
         return self._dev_asm
 
     def assemble_newton_system(self, state, need_matrix=True):
@@ -1001,7 +1009,12 @@ class XDDSystem:
         vals_d (fixed pattern — strong rows keep explicit zeros, nnz never
         flaps); per iterate the fill updates vals_d in place, b is copied into
         the STABLE b tensor, then factorize + solve.  Explicit .free() on any
-        failure (the double-free guard)."""
+        failure (the double-free guard).
+
+        Task #36 (8j): val_dtype='fp32' routes to the fp32-factor +
+        FP64-iterative-refinement path — the fp32 snapshot CSR is factored;
+        the residual is FP64 (fp64 device SpMV over vals_d + the fp64 rhs
+        b), NEVER the fp32 stored values; refinement count logged."""
         try:
             import torch
             from nvmath.sparse.advanced import (DirectSolver,
@@ -1011,6 +1024,8 @@ class XDDSystem:
             raise BackendError(
                 "linsolver='cudss' with device assembly requires torch + "
                 f"nvmath-python[cu12] on CUDA (import failed: {exc})") from exc
+        if self.device_assembler().asm._vals_fp32 is not None:
+            return self._cudss_dev_solve_fp32_ir(b)
         try:
             if self._cudss_dev is None:
                 A_t, F_t = self.device_assembler().asm.device_csr()
@@ -1025,6 +1040,67 @@ class XDDSystem:
                     np.ascontiguousarray(b)).to(self._b_t.device))
             self._cudss_dev.factorize()
             return np.asarray(self._cudss_dev.solve().cpu())
+        except Exception:
+            try:
+                self._cudss_dev.free()
+            except Exception:
+                pass
+            self._cudss_dev = None
+            raise
+
+    def _cudss_dev_solve_fp32_ir(self, b):
+        """Task #36: fp32-factor + FP64-iterative-refinement device solve
+        for the XDD Newton system (the #35 cuDSS consumer).  The fp32
+        snapshot CSR is factored once (STABLE fp32 rhs tensor, refactorize
+        per iterate); the correction A dx = r is solved in fp32 while the
+        residual r = b - A x is FP64 (the assembler's fp64 device SpMV over
+        vals_d + the fp64 rhs b).  Refinement count logged (§8j); a
+        >10-sweep non-convergence surfaces as a raised error (the Newton
+        driver's hard-failure path) rather than a silent wrong solve."""
+        import torch
+        from nvmath.sparse.advanced import DirectSolver, DirectSolverOptions
+        from ..solvers.iterative_refinement import fp64_iterative_refinement
+        asm = self.device_assembler().asm
+        b64 = np.ascontiguousarray(b, np.float64)
+        op = asm.device_operator()
+        dev = str(self.dm.device)
+
+        def matvec(x):
+            import warp as wp
+            xd = wp.array(np.ascontiguousarray(x, np.float64),
+                          dtype=wp.float64, device=self.dm.device)
+            yd = wp.zeros(asm.Nfull, dtype=wp.float64, device=self.dm.device)
+            op.matvec(xd, yd)
+            return yd.numpy()
+
+        try:
+            A32_t, _ = asm.device_csr_fp32()    # refreshes the fp32 snapshot
+            if self._cudss_dev is None:
+                self._b_t32 = torch.zeros(asm.Nfull, dtype=torch.float32,
+                                          device=dev)
+                self._cudss_dev = DirectSolver(
+                    A32_t, self._b_t32,
+                    options=DirectSolverOptions(blocking=True))
+                self._cudss_dev.plan()
+            self._cudss_dev.factorize()
+
+            def factor_solve(r):
+                self._b_t32.copy_(torch.from_numpy(
+                    np.ascontiguousarray(r, np.float32)).to(dev))
+                self._cudss_dev.reset_operands(b=self._b_t32)
+                return np.asarray(self._cudss_dev.solve().cpu(), np.float64)
+
+            x, info = fp64_iterative_refinement(
+                matvec, factor_solve, b64, tol=1e-12, max_iter=10)
+            self._ir_counts.append(info["refinements"])
+            self._last_ir = info
+            if not info["converged"]:
+                from ..errors import ConvergenceError
+                raise ConvergenceError(
+                    f"XDD fp32+IR solve did not converge in 10 sweeps "
+                    f"(rel_resid={info['rel_resid']:.2e}) — conditioning "
+                    f"FAIL (§8j G2)")
+            return x
         except Exception:
             try:
                 self._cudss_dev.free()
