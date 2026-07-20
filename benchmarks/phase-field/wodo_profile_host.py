@@ -45,6 +45,63 @@ LAT_PHYS = 3.3
 PHI_S0 = 0.66
 
 
+class LaunchAudit:
+    """Task #40 first deliverable: attribute warp launches / copies to
+    (stage x kernel).  Monkeypatches wp.launch / wp.copy /
+    wp.capture_launch with counting wrappers; stage labels are set by the
+    ProfiledFilm wrappers (solve / gp_eval / fill / bdf / other)."""
+
+    def __init__(self):
+        self.launches = {}          # (stage, kernel-name) -> count
+        self.copies = {}            # stage -> count
+        self.replays = {}           # stage -> graph replays (captured path)
+        self.stage = "other"
+
+    def install(self):
+        self._launch, self._copy = wp.launch, wp.copy
+        self._cap = getattr(wp, "capture_launch", None)
+
+        def launch(*a, **k):
+            kern = a[0] if a else k.get("kernel")
+            name = getattr(kern, "key", None) or repr(kern)
+            name = name.rsplit(".", 1)[-1]
+            key = (self.stage, name)
+            self.launches[key] = self.launches.get(key, 0) + 1
+            return self._launch(*a, **k)
+
+        def copy(*a, **k):
+            self.copies[self.stage] = self.copies.get(self.stage, 0) + 1
+            return self._copy(*a, **k)
+
+        wp.launch, wp.copy = launch, copy
+        if self._cap is not None:
+            def cap(*a, **k):
+                self.replays[self.stage] = self.replays.get(self.stage,
+                                                            0) + 1
+                return self._cap(*a, **k)
+            wp.capture_launch = cap
+
+    def report(self, nsteps):
+        tot = sum(self.launches.values())
+        print(f"\n== LAUNCH AUDIT ({tot} launches = "
+              f"{tot / max(nsteps, 1):.0f}/step; wp.copy "
+              f"{sum(self.copies.values())} = "
+              f"{sum(self.copies.values()) / max(nsteps, 1):.0f}/step; "
+              f"graph replays {sum(self.replays.values())}) ==")
+        by_stage = {}
+        for (st, _), c in self.launches.items():
+            by_stage[st] = by_stage.get(st, 0) + c
+        for st in sorted(by_stage, key=by_stage.get, reverse=True):
+            print(f"  stage {st:12s} {by_stage[st]:9d} launches "
+                  f"({by_stage[st] / max(nsteps, 1):9.0f}/step)  "
+                  f"copies {self.copies.get(st, 0):7d}  "
+                  f"replays {self.replays.get(st, 0):7d}")
+            per = {n: c for (s, n), c in self.launches.items() if s == st}
+            for n in sorted(per, key=per.get, reverse=True)[:12]:
+                print(f"      {n:28s} {per[n]:9d}  "
+                      f"({per[n] / max(nsteps, 1):9.0f}/step)")
+
+
 class _TimedRNG:
     """numpy Generator proxy timing the standard_normal draws."""
 
@@ -64,10 +121,15 @@ class ProfiledFilm(WodoFilmStepper):
     factored v1.4 stage methods (no math changes)."""
 
     def __init__(self, *a, **k):
+        self.audit = k.pop("audit", None)
         super().__init__(*a, **k)
         self.tt = {}
         self.n_it = 0
         self._nrng = _TimedRNG(self._nrng, self.tt)
+
+    def _set_stage(self, s):
+        if self.audit is not None:
+            self.audit.stage = s
 
     def _tic(self, sync=False):
         if sync:
@@ -80,26 +142,34 @@ class ProfiledFilm(WodoFilmStepper):
         self.tt[key] = self.tt.get(key, 0.0) + time.time() - t0
 
     def _bdf_time_device(self, dt):
+        self._set_stage("bdf")
         t0 = self._tic(sync=True)
         r = super()._bdf_time_device(dt)
         self._acc("bdf_hist_dev", t0, sync=True)
+        self._set_stage("other")
         return r
 
     def _gp_eval_device(self, x):
         self.n_it += 1
+        self._set_stage("gp_eval")
         t0 = self._tic(sync=True)
         super()._gp_eval_device(x)
         self._acc("gp_eval_dev", t0, sync=True)
+        self._set_stage("other")
 
     def _fill_device_system(self, *a):
+        self._set_stage("fill")
         t0 = self._tic(sync=True)
         super()._fill_device_system(*a)
         self._acc("fill_kern_scat", t0, sync=True)
+        self._set_stage("other")
 
     def _solve_device_blockch(self, asm):
+        self._set_stage("solve")
         t0 = self._tic(sync=True)
         r = super()._solve_device_blockch(asm)
         self._acc("solve", t0, sync=True)
+        self._set_stage("other")
         return r
 
 
@@ -115,6 +185,7 @@ def main():
     ap.add_argument("--linsolver", type=str, default="blockch")
     ap.add_argument("--pstats-out", type=str,
                     default="logs/wodo_profile_host.pstats")
+    ap.add_argument("--no-launch-audit", action="store_true")
     args = ap.parse_args()
     ny = args.ny if args.ny is not None else args.nx
     nx, nz, device = args.nx, args.nz, args.device
@@ -142,12 +213,13 @@ def main():
     M22 = D0 / (1.0 / (5.0 * pf0) + 1.0 / (NS * PHI_S0))
     kap = f67.kappa_of(5)
     lat_scale = LAT_PHYS / (nx * hc)
+    audit = None if args.no_launch_audit else LaunchAudit()
     st = ProfiledFilm(
         dm, chi=(1.0, 0.3, 0.3), N=(5.0, 5.0, NS),
         M=(M11, 0.0, M22), kappa=(kap, kap), k_e=0.3, dt=args.dt,
         lat_scale=lat_scale, linsolver=args.linsolver, noise=1e-3,
         var_mob=True, b_reg=1e-3, noise_seed=17,
-        use_device_assembly=True)
+        use_device_assembly=True, audit=audit)
     rng = np.random.default_rng(17)
     st.set_initial(
         lambda x: pp0 + 0.01 * rng.standard_normal(len(x)),
@@ -170,6 +242,8 @@ def main():
     st.tt.clear()
     st.n_it = 0
     n0 = len(steps)
+    if audit is not None:
+        audit.install()          # count launches over the timed steps only
     pr = cProfile.Profile()
     t0 = time.time()
     pr.enable()
@@ -195,6 +269,8 @@ def main():
     print(f"  HOST FRACTION (wall - solve): {host:.1f}s = "
           f"{host / max(nst, 1):.2f} s/step = {100 * host / wall:.1f}%")
     print(f"  gpu peak {wp.get_mempool_used_mem_high(device) / 2 ** 30:.1f} GB")
+    if audit is not None:
+        audit.report(nst)
 
     _bos.makedirs(_bos.path.dirname(args.pstats_out) or ".",
                   exist_ok=True)
