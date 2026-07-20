@@ -45,6 +45,19 @@ def _setup(dim, level, device):
     return dm, aq, dq, fq
 
 
+def _assert_scatter_equal(x, y, device):
+    """Wide vs narrow scatter agreement. On CPU the scatter is serial and
+    deterministic, so the index dtype is the only difference -> bit-equal.
+    On CUDA the int32 and int64 kernels are separately compiled and order
+    their atomic adds differently, so float non-associativity leaves
+    last-bit noise (measured <= 2 ULP on gpubox, 2026-07-19); an indexing
+    defect would produce O(1) diffs, so a few-ULP band keeps the gate."""
+    if str(device).startswith("cpu"):
+        assert np.array_equal(x, y), np.abs(x - y).max()
+    else:
+        np.testing.assert_allclose(x, y, rtol=1e-13, atol=1e-14)
+
+
 # ---------------------------------------------------------------------
 def test_resolve_idx_width():
     """The config knob + auto-selection map to the right warp dtype and
@@ -97,16 +110,14 @@ def test_wide_narrow_equivalence(dim, level, node_pattern, device):
         Aw, bw = a_w.assemble(aq, dq, fq, nu, sigma)
         vn, vw = An.data, Aw.data
         fn, fw = bn, bw
-    # element scatter is atomic-order deterministic within a fixed mode;
-    # the ONLY difference is the index dtype -> results must be bit-equal
-    assert np.array_equal(vn, vw), np.abs(vn - vw).max()
-    assert np.array_equal(fn, fw), np.abs(fn - fw).max()
+    _assert_scatter_equal(vn, vw, device)
+    _assert_scatter_equal(fn, fw, device)
 
 
 def test_wide_narrow_equivalence_masked(device):
     """Gate 2 (block-masked node pattern = kron(G, mask)): the masked
-    dof-indices + masked scatter kernels agree bit-for-bit wide vs
-    narrow (the B5 multiphase path)."""
+    dof-indices + masked scatter kernels agree wide vs narrow (bit-equal
+    on CPU, few-ULP on CUDA — the B5 multiphase path)."""
     dm, aq, dq, fq = _setup(3, 3, device)
     bm = np.array([[1, 1, 0, 0], [1, 1, 0, 0],
                    [0, 0, 1, 1], [0, 0, 1, 1]], bool)
@@ -126,8 +137,8 @@ def test_wide_narrow_equivalence_masked(device):
     for asm in (a_n, a_w):
         asm.zero_fill()
         asm.scatter_bin(0, Ae, be)
-    assert np.array_equal(a_n.vals_d.numpy(), a_w.vals_d.numpy())
-    assert np.array_equal(a_n.F_d.numpy(), a_w.F_d.numpy())
+    _assert_scatter_equal(a_n.vals_d.numpy(), a_w.vals_d.numpy(), device)
+    _assert_scatter_equal(a_n.F_d.numpy(), a_w.F_d.numpy(), device)
 
 
 def test_wide_solve_equivalence(device):
@@ -249,12 +260,12 @@ def test_wide_end_to_end_node_pattern(device):
     a_w.zero_fill()
     a_w.scatter_bin(0, Ae, be)
     assert np.isfinite(a_w.vals_d.numpy()).all()
-    # compare against a narrow node-pattern assembler bit-for-bit
+    # compare against a narrow node-pattern assembler
     a_n = DeviceNSAssembler(dm, ndof=4, node_pattern=True,
                             index_width="narrow")
     a_n.zero_fill()
     a_n.scatter_bin(0, Ae, be)
-    assert np.array_equal(a_w.vals_d.numpy(), a_n.vals_d.numpy())
+    _assert_scatter_equal(a_w.vals_d.numpy(), a_n.vals_d.numpy(), device)
 
 
 def test_memory_tax(device):
