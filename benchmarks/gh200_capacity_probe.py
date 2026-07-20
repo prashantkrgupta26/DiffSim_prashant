@@ -137,6 +137,7 @@ def _distil(outdir):
     import re
     idx_mode = mem_txt = None
     dofs = nnz = None
+    chunked = None
     if pf is not None:
         for c in pf["checks"]:
             if c["rule"] == "index-width":
@@ -150,6 +151,10 @@ def _distil(outdir):
                 m = re.search(r"nnz=(\d+)", d)
                 if m:
                     nnz = int(m.group(1))
+                # Task #38 block-row ChunkedCSR: preflight reports
+                # "block-row chunked CSR (C=<n> chunks, auto|forced ...)"
+                m = re.search(r"chunked CSR \(C=(\d+) chunks", d)
+                chunked = f"C={m.group(1)}" if m else "off"
             if c["rule"] == "memory-forecast":
                 mem_txt = c["detail"]
                 m = re.search(r"for ([\d.]+)M dofs", d if False else c["detail"])
@@ -185,6 +190,7 @@ def _distil(outdir):
         "first_step_s": (round(first_step_s, 1)
                          if first_step_s is not None else None),
         "index_width": idx_mode,
+        "chunked": chunked,
         "mass_drift": mass_drift,
         "steps": steps,
         "reason": reason,
@@ -220,6 +226,15 @@ def main(argv=None):
                          "known working set spills a controlled fraction "
                          "into the Grace pool (oversubscription-"
                          "degradation experiment at fixed problem size)")
+    ap.add_argument("--chunking", choices=("auto", "off", "force"),
+                    default=None,
+                    help="Task #38 block-row ChunkedCSR knob, set via a "
+                         "probe-side WodoFilmStepper class attribute "
+                         "(same idiom as --force-narrow). Default: leave "
+                         "the stepper's 'auto' (chunking fires with the "
+                         "wide auto-switch at ~90%% of 2^31 nnz). "
+                         "'off' past 2^31 FAILs loudly (warp array "
+                         "ceiling); 'force' chunks at any size.")
     ap.add_argument("--force-narrow", action="store_true",
                     help="force index_width='narrow' via a probe-side "
                          "WodoFilmStepper class attribute (legal below "
@@ -239,7 +254,8 @@ def main(argv=None):
     os.makedirs(args.outdir, exist_ok=True)
     film_argv = _film_argv(cfg, args.outdir, args.res, args.max_steps,
                            args.sets)
-    in_process = args.managed or args.force_narrow or args.balloon_gb > 0
+    in_process = (args.managed or args.force_narrow
+                  or args.balloon_gb > 0 or args.chunking is not None)
     print("PROBE_CMD python -m diffsim.film " + " ".join(film_argv)
           + (" [in-process:"
              + ("managed" if args.managed else "")
@@ -269,6 +285,12 @@ def main(argv=None):
             WodoFilmStepper._index_width = "narrow"
             print("PROBE_FORCE_NARROW WodoFilmStepper._index_width="
                   "'narrow' (probe-side class attr)", flush=True)
+        if args.chunking is not None:
+            from diffsim.physics.wodo_film import WodoFilmStepper
+            WodoFilmStepper._chunking = args.chunking
+            print(f"PROBE_CHUNKING WodoFilmStepper._chunking="
+                  f"{args.chunking!r} (probe-side class attr)",
+                  flush=True)
         from diffsim.film.__main__ import main as film_main
         try:
             rc = film_main(film_argv)
@@ -284,7 +306,8 @@ def main(argv=None):
     row = {"res": args.res, "wall_total_s": round(wall, 1),
            "film_rc": rc, "managed": args.managed,
            "balloon_gb": args.balloon_gb,
-           "force_narrow": args.force_narrow}
+           "force_narrow": args.force_narrow,
+           "chunking_arg": args.chunking}
     try:
         row.update(_distil(args.outdir))
     except (FileNotFoundError, ValueError) as e:
@@ -293,6 +316,9 @@ def main(argv=None):
         # preflight reads params (config-level 'auto'), not the probe's
         # stepper-class override -- report what actually ran
         row["index_width"] = "narrow-forced(probe)"
+    if args.chunking is not None and args.chunking != "auto":
+        # same params-vs-stepper-attr caveat for the chunking override
+        row["chunked"] = f"{args.chunking}(probe)"
 
     # verdict: physical if it finished max_steps and mass_drift is small
     md = row.get("mass_drift")
@@ -308,7 +334,8 @@ def main(argv=None):
         "PROBE_TABLE "
         f"res={args.res} dofs={row.get('dofs')} nnz={row.get('nnz')} "
         f"gpu_gb={row.get('gpu_gb_peak')} s/step={row.get('s_per_step')} "
-        f"idx={row.get('index_width')} drift={row.get('mass_drift')} "
+        f"idx={row.get('index_width')} chunked={row.get('chunked')} "
+        f"drift={row.get('mass_drift')} "
         f"managed={args.managed} verdict={row.get('verdict')}", flush=True)
     return 0 if rc == 0 else 1
 
