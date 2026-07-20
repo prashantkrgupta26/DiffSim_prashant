@@ -434,7 +434,8 @@ def test_wodo_p2_beats_p1(device):
 # _assert_scatter_equal GPU band (rtol 1e-13 / atol 1e-14) on both
 # devices: an indexing defect would produce O(1) diffs.
 # ---------------------------------------------------------------------
-def _mk_film_dev(device, tstep="bdf1", noise=0.0, p=1):
+def _mk_film_dev(device, tstep="bdf1", noise=0.0, p=1,
+                 gp_residency="persistent"):
     tree0 = build_uniform(5, dim=2)
     keep = tree0.centers()[:, 0] < 4 / 32
     tree = Octree(tree0.keys[keep], tree0.levels[keep], dim=2,
@@ -446,7 +447,8 @@ def _mk_film_dev(device, tstep="bdf1", noise=0.0, p=1):
                          M=(0.225, 0.0, 0.225), kappa=(2e-4, 2e-4),
                          k_e=1.0, dt=1e-3, var_mob=True, b_reg=1e-3,
                          noise=noise, tstep=tstep,
-                         use_device_assembly=True)
+                         use_device_assembly=True,
+                         gp_residency=gp_residency)
     rng = np.random.default_rng(3)
     st.set_initial(
         lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)),
@@ -648,6 +650,149 @@ def test_wodo_device_noise_trajectory_parity(device):
           f"{st_d.h_curr:.6f}")
     assert max(errs) < 1e-11, errs
     assert abs(st_h.h_curr - st_d.h_curr) < 1e-13
+
+
+# -- Task #41: batch-local GP-eval fallback (rung-c memory) --------------
+def _mk_bl_stepper(device, cls, gp_residency, noise, mesh, cons):
+    """One _SpluDeviceFilm/WodoFilmStepper in the given gp_residency
+    mode, initial state fixed by seed (the run() helper below), the #37
+    multi-batch nb_cap=7 forced so partial batches are exercised."""
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), device)
+    st = cls(dm, chi=(1.0, 0.3, 0.3), N=(5.0, 5.0, 1.0),
+             M=(0.225, 0.0, 0.225), kappa=(2e-4, 2e-4), k_e=1.0,
+             dt=1e-3, var_mob=True, b_reg=1e-3, noise=noise, noise_seed=5,
+             linsolver="blockch", use_device_assembly=True,
+             gp_residency=gp_residency)
+    rng = np.random.default_rng(3)
+    st.set_initial(
+        lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)),
+        lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)))
+    st._init_device_assembly()
+    for k_bin, (pv, b, ne, nbf, _g) in enumerate(st._asm._bins):
+        assert ne % 7 != 0 and ne > 7           # partial last batch
+        nl = 4 * nbf
+        st._batch_bufs[k_bin] = (
+            7, wp.zeros((7, nl, nl), dtype=wp.float64, device=device),
+            wp.zeros((7, nl), dtype=wp.float64, device=device))
+    return st
+
+
+@pytest.mark.parametrize("noise", [0.0, 1e-3])
+def test_wodo_gp_residency_parity(device, noise):
+    """Task #41 G1: batch_local GP eval produces the SAME assembled
+    system as persistent — the memory-layout fallback is a pure
+    residency change, not a numerics change.  Drives the FULL
+    _SpluDeviceFilm device data path (real noise draws, device GP,
+    multi-batch fill, flux) for 5 fixed-dt steps in BOTH residency
+    modes with the identical splu solve and identical RNG stream, and
+    asserts the per-step trajectory is bit-equal on CPU / few-ULP on
+    GPU.  nb_cap=7 (not a divisor of ne) forces partial batches, so a
+    batch-offset defect in the batch-local eval/upload is caught."""
+    tree0 = build_uniform(5, dim=2)
+    keep = tree0.centers()[:, 0] < 4 / 32
+    tree = Octree(tree0.keys[keep], tree0.levels[keep], dim=2,
+                  periodic=tree0.periodic)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+
+    def run(gp_residency):
+        st = _mk_bl_stepper(device, _SpluDeviceFilm, gp_residency,
+                            noise, mesh, cons)
+        assert st._gp_batch_local == (gp_residency == "batch_local")
+        return st, _march_fixed_dt(st, 5, 1e-3)
+
+    st_p, xs_p = run("persistent")
+    st_b, xs_b = run("batch_local")
+    if str(device).startswith("cpu"):
+        for i, (a, b) in enumerate(zip(xs_p, xs_b)):
+            assert np.array_equal(a, b), (
+                f"batch_local != persistent bit-for-bit at step {i}: "
+                f"max |d| = {np.abs(a - b).max():.2e}")
+        assert st_p.h_curr == st_b.h_curr
+    else:
+        errs = [np.abs(a - b).max() / max(np.abs(a).max(), 1e-30)
+                for a, b in zip(xs_p, xs_b)]
+        assert max(errs) < 1e-13, errs
+        assert abs(st_p.h_curr - st_b.h_curr) < 1e-14
+    print(f"gp_residency parity (noise={noise}): "
+          f"h {st_p.h_curr:.6f} vs {st_b.h_curr:.6f}")
+
+
+@pytest.mark.parametrize("tstep", ["bdf1", "bdf2"])
+def test_wodo_gp_residency_fill_parity(device, tstep):
+    """Task #41 G1 (assembled system, solver-free): one Newton-iterate
+    fill of asm.vals_d / asm.F_d in batch_local mode equals the
+    persistent fill to few-ULP (bit-equal on CPU) — for BOTH BDF1 and
+    variable-coefficient BDF2 (the batch-local history axpby path).
+    Noise active so the per-batch noise-slice upload is exercised too."""
+    noise = 0.0 if tstep == "bdf2" else 1e-3   # BDF2 is deterministic-only
+
+    def fill(gp_residency):
+        st = _mk_film_dev(device, tstep=tstep, noise=noise,
+                          gp_residency=gp_residency)
+        if tstep == "bdf2":
+            rng = np.random.default_rng(4)
+            st.hist2 = (st.hist[0][0] * 0.9
+                        + 1e-3 * rng.standard_normal(len(st.hist[0][0])),
+                        st.hist[0][1] * 1.1)
+            st.dt_prev = 4e-4
+        st._init_device_assembly()
+        rng = np.random.default_rng(7)
+        x = st.x + 1e-3 * rng.standard_normal(len(st.x))
+        dt, K = 1e-3, 0.31
+        sigma = st._bdf_time_device(dt)
+        minv, mlat = 1.0 / st.h_curr, 1.0 / st.lat_scale
+        mvert = st.y_comp * minv
+        coef = K * minv * st.y_comp
+        st._q_host = None
+        if noise != 0.0:
+            rho = noise * np.sqrt(2.0 / dt)
+            st._q_host = {}
+            for pv, b in st.dm.bins.items():
+                ngp = len(st.mesh.conn_of[pv]) * b["nqp"]
+                q0 = rho * st._nrng.standard_normal((ngp, st.dm.dim))
+                q1 = rho * st._nrng.standard_normal((ngp, st.dm.dim))
+                if st._gp_batch_local:
+                    st._q_host[pv] = (np.ascontiguousarray(q0),
+                                      np.ascontiguousarray(q1))
+                else:
+                    st._upload_dev(st._q_dev[pv][0], q0)
+                    st._upload_dev(st._q_dev[pv][1], q1)
+        st._upload_dev(st._flux_vals_dev, -coef * st._flux_base)
+        st._gp_eval_device(x)
+        st._fill_device_system(x, sigma, coef, K, minv, mlat, mvert,
+                               -1.0, -1.0, 0)
+        return (st._asm.vals_d.numpy().copy(), st._asm.F_d.numpy().copy())
+
+    vp, fp = fill("persistent")
+    vb, fb = fill("batch_local")
+    if str(device).startswith("cpu"):
+        assert np.array_equal(vp, vb), np.abs(vp - vb).max()
+        assert np.array_equal(fp, fb), np.abs(fp - fb).max()
+    else:
+        _close(vb, vp, f"vals_d {tstep}")
+        _close(fb, fp, f"F_d {tstep}")
+
+
+def test_wodo_gp_residency_auto_cpu(device):
+    """Task #41: gp_residency='auto' resolves to persistent on CPU (no
+    free-VRAM query — host RAM is not the constrained resource the
+    fallback targets), and the config knob validates its allowed set."""
+    st = _mk_film_dev(device, gp_residency="auto")
+    st._init_device_assembly()
+    if str(device).startswith("cpu"):
+        assert st._gp_batch_local is False       # auto -> persistent
+    from diffsim.errors import ConfigError
+    tree0 = build_uniform(5, dim=2)
+    keep = tree0.centers()[:, 0] < 4 / 32
+    tree = Octree(tree0.keys[keep], tree0.levels[keep], dim=2,
+                  periodic=tree0.periodic)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), device)
+    with pytest.raises(ConfigError):
+        WodoFilmStepper(dm, use_device_assembly=True,
+                        gp_residency="nonsense")
 
 
 def test_wodo_device_parity_film(device):

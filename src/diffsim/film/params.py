@@ -115,6 +115,7 @@ _SCHEMA = [
     ("numerics", "ic_seed", "ic_seed"),
     ("numerics", "linsolver", "linsolver"),
     ("numerics", "device_assembly", "device_assembly"),
+    ("numerics", "gp_residency", "gp_residency"),
     ("numerics", "newton_tol", "newton_tol"),
     ("numerics", "newton_max", "newton_max"),
     ("stop", "h_min", "h_min"), ("stop", "phis_stop", "phis_stop"),
@@ -164,6 +165,13 @@ class FilmParams:
     ic_seed: int = 1
     linsolver: str = "cudss"              # splu|cudss|blockch|blockch_dev
     device_assembly: bool = True
+    gp_residency: str = "persistent"      # persistent|batch_local|auto
+    #   Task #41 memory fallback: persistent (default) holds the packed
+    #   GP vals/grads/hist/noise buffers resident at full mesh size;
+    #   batch_local re-evaluates them per element batch into a small
+    #   reused buffer (~1/nbatch the GP residency, modest recompute);
+    #   auto picks batch_local when the estimated GP residency would
+    #   exceed half the free VRAM.
     newton_tol: float = 1e-9
     newton_max: int = 50
     # -- stop criteria ---------------------------------------------------
@@ -187,6 +195,8 @@ class FilmParams:
             self.mobility
         assert self.linsolver in ("splu", "cudss", "blockch",
                                   "blockch_dev"), self.linsolver
+        assert self.gp_residency in ("persistent", "batch_local",
+                                     "auto"), self.gp_residency
         assert self.dim in (2, 3), self.dim
         assert len(self.resolution) == self.dim, (
             f"resolution needs {self.dim} entries (vertical last)")
