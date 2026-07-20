@@ -157,6 +157,21 @@ before the solve. Host path stays the default. Requires identity
 constraints (uniform strips — true for every Wodo mesh). Parity gate:
 trajectory agreement < 1e-11 vs the host path (tests/test_wodo_film).
 
+v1.4 DEVICE-RESIDENT GP FIELDS (Task #37, 2026-07-20): the device-bound
+march's remaining per-iterate HOST stages — the numpy GP einsums
+(_gp x 4 fields + 2 BDF-history evals) and the per-batch
+ascontiguousarray + wp.array re-upload of all 12 GP arrays — are the
+forensics-measured ~61 s/step CPU-clock floor (identical on Ada, A100
+and GH200).  v1.4 moves them on device: the kernel takes PACKED fields
+(fk [ngp, 4] / gk [ngp, 4, dim] / hk [ngp, 2] — an indexing-only
+change, so the host path stays bit-for-bit), gp_multifield fills
+persistent per-bin device buffers from a once-per-iterate nodal-state
+upload, the BDF history is GP-evaluated on device only when the
+history object changes, and the Langevin draws (host RNG kept — seed
+contract) go up once per attempt into persistent buffers.  Parity
+gate: the existing < 1e-11 host/device trajectory tests + the stage
+tests (tests/test_wodo_film.py::test_wodo_gp_device_*).
+
 v1.3 LEARNABLE f_mix PERTURBATION (M4-e): optional Chebyshev correction
 to the polymer exchange potential, delta-f'(phi_p) =
 sum_{k=2..4} c_k T_k(s), s = 2 phi_p - 1, added to mu_1 with its
@@ -230,16 +245,16 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
                Ntab: wp.array2d(dtype=wp.float64),
                dNtab: wp.array3d(dtype=wp.float64),
                wtab: wp.array(dtype=wp.float64),
-               p1k: wp.array(dtype=wp.float64),
-               gp1k: wp.array2d(dtype=wp.float64),
-               m1k: wp.array(dtype=wp.float64),
-               gm1k: wp.array2d(dtype=wp.float64),
-               p2k: wp.array(dtype=wp.float64),
-               gp2k: wp.array2d(dtype=wp.float64),
-               m2k: wp.array(dtype=wp.float64),
-               gm2k: wp.array2d(dtype=wp.float64),
-               h1: wp.array(dtype=wp.float64),
-               h2: wp.array(dtype=wp.float64),
+               # v1.4 PACKED GP fields (Task #37): fk [ngp, 4] values,
+               # gk [ngp, 4, dim] gradients, field order (p1, m1, p2,
+               # m2); hk [ngp, 2] BDF history (h1, h2).  Pure indexing
+               # change vs the v1.2 separate arrays — identical float
+               # ops in identical order, so the host path stays
+               # bit-for-bit while the device path can feed persistent
+               # device-resident buffers (multiphase _vals_dev idiom).
+               fk: wp.array2d(dtype=wp.float64),
+               gk: wp.array3d(dtype=wp.float64),
+               hk: wp.array2d(dtype=wp.float64),
                q1: wp.array2d(dtype=wp.float64),
                q2: wp.array2d(dtype=wp.float64),
                theta: wp.array(dtype=wp.float64),
@@ -263,8 +278,8 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
         for q in range(nqp):
             dJxW = wtab[q] * jac
             gp = e * nqp + q
-            p1 = p1k[gp]
-            p2 = p2k[gp]
+            p1 = fk[gp, 0]
+            p2 = fk[gp, 2]
             ps = wp.float64(1.0) - p1 - p2
             mu1b = n1i * (_rlog(p1) + wp.float64(1.0)) \
                 - nsi * (_rlog(ps) + wp.float64(1.0)) \
@@ -339,24 +354,24 @@ def make_wodo_newton(nbf: int, nqp: int, dim: int):
                     if dd == vax:
                         ms = mvert
                     gNa = dNtab[q, a, dd] * dscale * ms
-                    gM1 += gNa * (M11l * gm1k[gp, dd]
-                                  + M12 * gm2k[gp, dd]) * ms
-                    gM2 += gNa * (M12 * gm1k[gp, dd]
-                                  + M22l * gm2k[gp, dd]) * ms
-                    gP1 += gNa * gp1k[gp, dd] * ms
-                    gP2 += gNa * gp2k[gp, dd] * ms
+                    gM1 += gNa * (M11l * gk[gp, 1, dd]
+                                  + M12 * gk[gp, 3, dd]) * ms
+                    gM2 += gNa * (M12 * gk[gp, 1, dd]
+                                  + M22l * gk[gp, 3, dd]) * ms
+                    gP1 += gNa * gk[gp, 0, dd] * ms
+                    gP2 += gNa * gk[gp, 2, dd] * ms
                     gQ1 += gNa * q1[gp, dd] * s1
                     gQ2 += gNa * q2[gp, dd] * s2
                 # R_phi1 = Int v[ phi_t + adv d(phi1)/dtheta ] + Int grad~ v.M grad~ mu
                 #   phi_t -> sigma*phi1 - hist (BDF); adv = K theta/h (frame sweep)
-                r1 = (Na * (sigma * p1k[gp] - h1[gp]
-                            + adv * gp1k[gp, vax]) + gM1 + gQ1) * dJxW
+                r1 = (Na * (sigma * fk[gp, 0] - hk[gp, 0]
+                            + adv * gk[gp, 0, vax]) + gM1 + gQ1) * dJxW
                 # R_mu1 = Int q(mu1 - mu1^FH) - kap1 Int grad~ q . grad~ phi1
-                rm1 = (Na * (m1k[gp] - mu1b)) * dJxW - kap1 * gP1 * dJxW
+                rm1 = (Na * (fk[gp, 1] - mu1b)) * dJxW - kap1 * gP1 * dJxW
                 # R_phi2, R_mu2: identical structure for the second solute
-                r2 = (Na * (sigma * p2k[gp] - h2[gp]
-                            + adv * gp2k[gp, vax]) + gM2 + gQ2) * dJxW
-                rm2 = (Na * (m2k[gp] - mu2b)) * dJxW - kap2 * gP2 * dJxW
+                r2 = (Na * (sigma * fk[gp, 2] - hk[gp, 1]
+                            + adv * gk[gp, 2, vax]) + gM2 + gQ2) * dJxW
+                rm2 = (Na * (fk[gp, 3] - mu2b)) * dJxW - kap2 * gP2 * dJxW
                 wp.atomic_add(be, e, 4 * a + 0, -r1)
                 wp.atomic_add(be, e, 4 * a + 1, -rm1)
                 wp.atomic_add(be, e, 4 * a + 2, -r2)
@@ -536,9 +551,16 @@ class WodoFilmStepper(TernaryCHStepper):
         self.top_faces = np.asarray(faces, np.int64)     # [ntf, nfn]
         self.top_face_M = np.asarray(fmass, np.float64)  # [ntf,nfn,nfn]
 
+    def _full_of(self, vec):
+        """Free -> full nodal vector.  Identity constraints (every Wodo
+        strip) skip the spmv — an identity CSR matvec returns the same
+        floats (one 1.0 * v[i] term), so this is bit-identical on BOTH
+        paths and removes an O(n) host spmv per call (v1.4)."""
+        return vec if self._proj_identity else np.asarray(self.Tc @ vec)
+
     def _top_phis_avg(self, p1_free, p2_free):
-        f1 = np.asarray(self.Tc @ p1_free)
-        f2 = np.asarray(self.Tc @ p2_free)
+        f1 = self._full_of(p1_free)
+        f2 = self._full_of(p2_free)
         return float(np.mean(1.0 - f1[self.top_nodes] - f2[self.top_nodes]))
 
     def set_initial(self, p1_fn, p2_fn):
@@ -731,13 +753,16 @@ class WodoFilmStepper(TernaryCHStepper):
                               device=d)
                 be = wp.zeros((ne, 4 * nbf), dtype=wp.float64, device=d)
                 kk = make_wodo_newton(nbf, nqp, self.dm.dim)
+                # v1.4 packed layout (kernel indexing change only —
+                # this host path stays the bit-for-bit reference)
+                fk = np.stack([fields[i][0][pv] for i in range(4)],
+                              axis=1)
+                gk = np.stack([fields[i][1][pv] for i in range(4)],
+                              axis=1)
+                hk = np.stack([h1_gp[pv], h2_gp[pv]], axis=1)
                 wp.launch(kk, dim=ne, inputs=[
                     b["conn"], b["h"], b["N"], b["dN"], b["w"],
-                    arr(fields[0][0][pv]), arr(fields[0][1][pv]),
-                    arr(fields[1][0][pv]), arr(fields[1][1][pv]),
-                    arr(fields[2][0][pv]), arr(fields[2][1][pv]),
-                    arr(fields[3][0][pv]), arr(fields[3][1][pv]),
-                    arr(h1_gp[pv]), arr(h2_gp[pv]),
+                    arr(fk), arr(gk), arr(hk),
                     arr(q_gp[pv][0]), arr(q_gp[pv][1]),
                     self.theta_wp[pv],
                     wp.float64(self.M11), wp.float64(self.M12),
@@ -830,108 +855,240 @@ class WodoFilmStepper(TernaryCHStepper):
             device=d)
         # per-comp identical base values; scaled by -coef per attempt
         self._flux_base = np.concatenate([self.top_face_M.ravel()] * 2)
+        self._init_device_fields()
+
+    # -- v1.4 device-resident GP fields (Task #37) -----------------------
+    # The forensics-measured ~61 s/step host floor (CPU-clock-bound,
+    # GPU-generation-immune) was dominated by the per-iterate host
+    # numpy GP einsums (_gp x4 + 2 history) and the per-batch
+    # ascontiguousarray + wp.array re-uploads of all 12 GP arrays.
+    # v1.4 keeps them device-resident: the Newton state goes up ONCE
+    # per iterate ([n_nodes, 4], one memcpy), gp_multifield (the
+    # multiphase _gp_eval_dev idiom) fills persistent per-bin
+    # vals/grads buffers, the BDF history is GP-evaluated on device
+    # only when the history CHANGES (held-reference keyed — the #35
+    # reviewer-minor contract: no per-assemble re-upload of unchanged
+    # state), and the batched element launches consume slices of the
+    # persistent buffers.  The host path (_attempt) is untouched and
+    # remains the bit-for-bit parity reference.
+    def _init_device_fields(self):
+        """Once per mesh: persistent device buffers for the packed GP
+        fields, BDF history, Langevin noise and top-flux values."""
+        d = self.dm.device
+        dim = self.dm.dim
+        self._vals_dev, self._grads_dev = {}, {}
+        self._histv_dev, self._hist_dev = {}, {}
+        self._hist2v_dev = None
+        self._q_dev = {}
+        for pv, b in self.dm.bins.items():
+            ngp = len(self.mesh.conn_of[pv]) * b["nqp"]
+            self._vals_dev[pv] = wp.zeros((ngp, 4), dtype=wp.float64,
+                                          device=d)
+            self._grads_dev[pv] = wp.zeros((ngp, 4, dim),
+                                           dtype=wp.float64, device=d)
+            self._histv_dev[pv] = wp.zeros((ngp, 2), dtype=wp.float64,
+                                           device=d)
+            self._hist_dev[pv] = wp.zeros((ngp, 2), dtype=wp.float64,
+                                          device=d)
+            self._q_dev[pv] = (
+                wp.zeros((ngp, dim), dtype=wp.float64, device=d),
+                wp.zeros((ngp, dim), dtype=wp.float64, device=d))
+        self._X_dev = wp.zeros((self.dm.n_nodes, 4), dtype=wp.float64,
+                               device=d)
+        self._Xh_dev = wp.zeros((self.dm.n_nodes, 2), dtype=wp.float64,
+                                device=d)
+        self._Xh2_dev = None            # lazy (BDF2 only)
+        self._hist_up_ref = None        # held reference == cache key
+        self._hist2_up_ref = None
+        self._flux_vals_dev = wp.zeros(len(self._flux_base),
+                                       dtype=wp.float64, device=d)
+        ntf, nfn = self.top_faces.shape
+        self._flux_load_dev = wp.zeros(2 * ntf * nfn, dtype=wp.float64,
+                                       device=d)
+        self._batch_bufs = {}           # persistent Ae/be batch buffers
+
+    @staticmethod
+    def _upload_dev(dst, host):
+        """Host array -> PERSISTENT device buffer (one memcpy, no
+        allocation): the DeviceGPField._upload idiom."""
+        wp.copy(dst, wp.array(np.ascontiguousarray(host, np.float64),
+                              dtype=wp.float64, device="cpu",
+                              copy=False))
+
+    def _gp_eval_device(self, x):
+        """Device GP eval of the Newton state into the persistent
+        packed vals/grads buffers (gp_multifield: same accumulation
+        order as the host _gp einsums to the reassociation-ULP)."""
+        from ..assembly.gp_field import make_gp_multifield
+        d = self.dm.device
+        self._upload_dev(self._X_dev, x.reshape(self.dm.n_nodes, 4))
+        for pv, b in self.dm.bins.items():
+            gpk = make_gp_multifield(b["nbf"], b["nqp"], self.dm.dim, 4)
+            wp.launch(gpk, dim=len(self.mesh.conn_of[pv]),
+                      inputs=[b["conn"], b["h"], b["N"], b["dN"],
+                              self._X_dev, self._vals_dev[pv],
+                              self._grads_dev[pv]], device=d)
+
+    def _bdf_time_device(self, dt):
+        """sigma + device-resident BDF history hk [ngp, 2] per bin (the
+        _bdf_time mirror).  History nodal packs are uploaded and
+        GP-evaluated only when the history OBJECT changes (reference
+        held so the identity key cannot be recycled); the per-attempt
+        work is one tiny axpby kernel per bin.  BDF2 combines with
+        alpha = (1+r)/dt, beta = -r^2/(1+r)/dt — same value as the
+        host (b*v - c*w)/dt to the reassociation ULP."""
+        from ..assembly.gp_field import make_gp_vals, make_gp_axpby
+        d = self.dm.device
+        if self._hist_up_ref is not self.hist[0]:
+            self._upload_dev(self._Xh_dev, np.stack(self.hist[0],
+                                                    axis=1))
+            for pv, b in self.dm.bins.items():
+                wp.launch(make_gp_vals(b["nbf"], b["nqp"], 2),
+                          dim=len(self.mesh.conn_of[pv]),
+                          inputs=[b["conn"], b["N"], self._Xh_dev,
+                                  self._histv_dev[pv]], device=d)
+            self._hist_up_ref = self.hist[0]
+        bdf2 = self.tstep == "bdf2" and self.hist2 is not None
+        if bdf2:
+            if self._Xh2_dev is None:
+                self._Xh2_dev = wp.zeros_like(self._Xh_dev)
+                self._hist2v_dev = {
+                    pv: wp.zeros_like(v)
+                    for pv, v in self._histv_dev.items()}
+            if self._hist2_up_ref is not self.hist2:
+                self._upload_dev(self._Xh2_dev, np.stack(self.hist2,
+                                                         axis=1))
+                for pv, b in self.dm.bins.items():
+                    wp.launch(make_gp_vals(b["nbf"], b["nqp"], 2),
+                              dim=len(self.mesh.conn_of[pv]),
+                              inputs=[b["conn"], b["N"], self._Xh2_dev,
+                                      self._hist2v_dev[pv]], device=d)
+                self._hist2_up_ref = self.hist2
+            rr = dt / self.dt_prev
+            sigma = (1.0 + 2.0 * rr) / (1.0 + rr) / dt
+            al, bl = (1.0 + rr) / dt, -(rr * rr / (1.0 + rr)) / dt
+        else:
+            sigma = 1.0 / dt
+            al, bl = sigma, 0.0
+        ax = make_gp_axpby(2)
+        for pv, hv in self._histv_dev.items():
+            Y = self._hist2v_dev[pv] if bdf2 else hv
+            wp.launch(ax, dim=hv.shape[0],
+                      inputs=[wp.float64(al), hv, wp.float64(bl), Y,
+                              self._hist_dev[pv]], device=d)
+        return sigma
+
+    def _fill_device_system(self, x, sigma, coef, K, minv, mlat, mvert,
+                            Drp, Drf, mobm):
+        """One Newton-iterate numeric fill of asm.vals_d / asm.F_d from
+        the CURRENT persistent GP buffers (_gp_eval_device /
+        _bdf_time_device must have run).  Element launches are BATCHED
+        (G5 rung c): the whole-mesh Ae transient is 30 GB at full res;
+        a batch buffer capped at ~2 GB is filled -> scattered ->
+        reused, and (v1.4) the buffers are PERSISTENT across steps.
+        The top-face enrichment flux (natural BC, not strong rows) is
+        a tiny host-values add; the identity-constraint Tc spmv is
+        elided (bit-identical values, asserted on this path)."""
+        asm = self._asm
+        d = self.dm.device
+        asm.zero_fill()
+        for k_bin, (pv, b, ne, nbf, gdof) in enumerate(asm._bins):
+            nqp = b["nqp"]
+            nl = 4 * nbf
+            if k_bin not in self._batch_bufs:
+                nb_cap = min(ne, max(1, (2 << 30) // (nl * nl * 8)))
+                self._batch_bufs[k_bin] = (
+                    nb_cap,
+                    wp.zeros((nb_cap, nl, nl), dtype=wp.float64,
+                             device=d),
+                    wp.zeros((nb_cap, nl), dtype=wp.float64, device=d))
+            nb_cap, Ae, be = self._batch_bufs[k_bin]
+            kk = make_wodo_newton(nbf, nqp, self.dm.dim)
+            for e0 in range(0, ne, nb_cap):
+                nb = min(nb_cap, ne - e0)
+                s0, s1 = e0 * nqp, (e0 + nb) * nqp
+                Ae.zero_()
+                be.zero_()
+                wp.launch(kk, dim=nb, inputs=[
+                    b["conn"], b["h"][e0:e0 + nb], b["N"], b["dN"],
+                    b["w"],
+                    self._vals_dev[pv][s0:s1],
+                    self._grads_dev[pv][s0:s1],
+                    self._hist_dev[pv][s0:s1],
+                    self._q_dev[pv][0][s0:s1],
+                    self._q_dev[pv][1][s0:s1],
+                    self.theta_wp[pv][s0:s1],
+                    wp.float64(self.M11), wp.float64(self.M12),
+                    wp.float64(self.M22), wp.float64(Drp),
+                    wp.float64(Drf), wp.int32(mobm),
+                    wp.float64(self.c12),
+                    wp.float64(self.c1s), wp.float64(self.c2s),
+                    wp.float64(1.0 / self.N1),
+                    wp.float64(1.0 / self.N2),
+                    wp.float64(1.0 / self.Ns),
+                    wp.float64(self.b_reg),
+                    wp.float64(self.ch2), wp.float64(self.ch3),
+                    wp.float64(self.ch4),
+                    wp.float64(self.kap1), wp.float64(self.kap2),
+                    wp.float64(sigma), wp.float64(mlat),
+                    wp.float64(mvert), wp.float64(minv),
+                    wp.float64(K),
+                    Ae, be], device=d)
+                asm.scatter_batch(k_bin, e0, Ae, be, nb)
+        # top-face enrichment flux (host values -> device add).
+        asm.add_matrix_values(self._flux_slots_d, self._flux_vals_dev)
+        Mf = coef * self.top_face_M
+        load = np.concatenate(
+            [np.einsum("fab,fb->fa", Mf, fv[self.top_faces]).ravel()
+             for fv in (x[0::4], x[2::4])])
+        self._upload_dev(self._flux_load_dev, load)
+        asm.add_rhs_values(self._flux_gdof_d, self._flux_load_dev)
 
     def _attempt_device(self, dt, K):
-        """One implicit solve, fully device-bound (v1.2 docstring):
-        CH-kernel Ae/be blocks scatter into the device CSR via the
-        slot maps; the natural-BC top-face flux (NOT strong rows —
-        set_strong_rows does not apply) is a tiny host-values add into
-        asm.vals_d / asm.F_d; solve = zero-copy torch CSR -> cuDSS."""
+        """One implicit solve, fully device-bound (v1.2 + v1.4
+        docstrings): device GP fields feed the CH kernel from
+        persistent buffers, Ae/be blocks scatter into the device CSR
+        via the slot maps; the natural-BC top-face flux (NOT strong
+        rows — set_strong_rows does not apply) is a tiny host-values
+        add into asm.vals_d / asm.F_d; solve = zero-copy torch CSR ->
+        cuDSS or the device blockch."""
         if self._asm is None:
             self._init_device_assembly()
         asm = self._asm
-        d = self.dm.device
-        # G2: BDF1/BDF2 time term via the A4b sigma/hist rewiring
-        sigma, h1_gp, h2_gp = self._bdf_time(dt)
+        # G2: BDF1/BDF2 time term via the A4b sigma/hist rewiring —
+        # v1.4: history GP-evaluated and combined ON DEVICE
+        sigma = self._bdf_time_device(dt)
         self._sigma = sigma      # blockch meta (device-setup route)
         minv = 1.0 / self.h_curr
         mlat = 1.0 / self.lat_scale
         mvert = self.y_comp * minv
         coef = K * minv * self.y_comp
-        rho = self.noise * np.sqrt(2.0 / dt)
-        q_gp = {}
-        for pv, b in self.dm.bins.items():
-            ngp = len(self.mesh.conn_of[pv]) * b["nqp"]
-            q_gp[pv] = (
-                rho * self._nrng.standard_normal((ngp, self.dm.dim)),
-                rho * self._nrng.standard_normal((ngp, self.dm.dim)))
+        # conserved Langevin flux: host RNG kept (noise_seed contract —
+        # same draw order as the host path), ONE upload per attempt
+        # into the persistent buffers.  noise == 0: the zero draws are
+        # skipped and the persistent zero buffers ride along (exactly
+        # the 0.0 the host path's rho * randn would produce).
+        if self.noise != 0.0:
+            rho = self.noise * np.sqrt(2.0 / dt)
+            for pv, b in self.dm.bins.items():
+                ngp = len(self.mesh.conn_of[pv]) * b["nqp"]
+                self._upload_dev(
+                    self._q_dev[pv][0],
+                    rho * self._nrng.standard_normal((ngp, self.dm.dim)))
+                self._upload_dev(
+                    self._q_dev[pv][1],
+                    rho * self._nrng.standard_normal((ngp, self.dm.dim)))
         negi = self.mob_model == "negi"
         Drp, Drf = (self.D_ratio if (self.var_mob or negi)
                     else (-1.0, -1.0))
         mobm = 1 if negi else 0
         # flux Jacobian values: frozen over the attempt (coef frozen)
-        flux_vals_d = wp.array(
-            np.ascontiguousarray(-coef * self._flux_base),
-            dtype=wp.float64, device=d)
+        self._upload_dev(self._flux_vals_dev, -coef * self._flux_base)
         x = self.x.copy()
-        # element launches are BATCHED (G5 rung c): the whole-mesh Ae
-        # transient is 30 GB at full res; a batch buffer capped at
-        # ~2 GB is filled -> scattered -> reused. Buffers live for the
-        # attempt; small meshes see a single batch (= the old launch).
-        bufs = {}
         for it in range(self.newton_max):
-            fields = [self._gp(x[i::4]) for i in range(4)]
-            asm.zero_fill()
-            for k_bin, (pv, b, ne, nbf, gdof) in enumerate(asm._bins):
-                nqp = b["nqp"]
-                nl = 4 * nbf
-                if k_bin not in bufs:
-                    nb_cap = min(ne, max(1, (2 << 30) // (nl * nl * 8)))
-                    bufs[k_bin] = (
-                        nb_cap,
-                        wp.zeros((nb_cap, nl, nl), dtype=wp.float64,
-                                 device=d),
-                        wp.zeros((nb_cap, nl), dtype=wp.float64,
-                                 device=d))
-                nb_cap, Ae, be = bufs[k_bin]
-                kk = make_wodo_newton(nbf, nqp, self.dm.dim)
-                for e0 in range(0, ne, nb_cap):
-                    nb = min(nb_cap, ne - e0)
-                    s0, s1 = e0 * nqp, (e0 + nb) * nqp
-                    arr = lambda a_: wp.array(
-                        np.ascontiguousarray(a_[s0:s1]),
-                        dtype=wp.float64, device=d)
-                    Ae.zero_()
-                    be.zero_()
-                    wp.launch(kk, dim=nb, inputs=[
-                        b["conn"], b["h"][e0:e0 + nb], b["N"], b["dN"],
-                        b["w"],
-                        arr(fields[0][0][pv]), arr(fields[0][1][pv]),
-                        arr(fields[1][0][pv]), arr(fields[1][1][pv]),
-                        arr(fields[2][0][pv]), arr(fields[2][1][pv]),
-                        arr(fields[3][0][pv]), arr(fields[3][1][pv]),
-                        arr(h1_gp[pv]), arr(h2_gp[pv]),
-                        arr(q_gp[pv][0]), arr(q_gp[pv][1]),
-                        self.theta_wp[pv][s0:s1],
-                        wp.float64(self.M11), wp.float64(self.M12),
-                        wp.float64(self.M22), wp.float64(Drp),
-                        wp.float64(Drf), wp.int32(mobm),
-                    wp.float64(self.c12),
-                        wp.float64(self.c1s), wp.float64(self.c2s),
-                        wp.float64(1.0 / self.N1),
-                        wp.float64(1.0 / self.N2),
-                        wp.float64(1.0 / self.Ns),
-                        wp.float64(self.b_reg),
-                        wp.float64(self.ch2), wp.float64(self.ch3),
-                        wp.float64(self.ch4),
-                        wp.float64(self.kap1), wp.float64(self.kap2),
-                        wp.float64(sigma), wp.float64(mlat),
-                        wp.float64(mvert), wp.float64(minv),
-                        wp.float64(K),
-                        Ae, be], device=d)
-                    asm.scatter_batch(k_bin, e0, Ae, be, nb)
-            # top-face enrichment flux (host values -> device add)
-            asm.add_matrix_values(self._flux_slots_d, flux_vals_d)
-            f1 = np.asarray(self.Tc @ x[0::4])
-            f2 = np.asarray(self.Tc @ x[2::4])
-            Mf = coef * self.top_face_M
-            load = np.concatenate(
-                [np.einsum("fab,fb->fa", Mf, fv[self.top_faces]).ravel()
-                 for fv in (f1, f2)])
-            asm.add_rhs_values(
-                self._flux_gdof_d,
-                wp.array(np.ascontiguousarray(load), dtype=wp.float64,
-                         device=d))
+            self._gp_eval_device(x)
+            self._fill_device_system(x, sigma, coef, K, minv, mlat,
+                                     mvert, Drp, Drf, mobm)
             dx = (self._solve_device_blockch(asm)
                   if self.linsolver in ("blockch", "blockch_dev")
                   else self._solve_device(asm))
@@ -964,8 +1121,8 @@ class WodoFilmStepper(TernaryCHStepper):
                 reason = "wall_cap"
                 break
             p1n, p2n = self.hist[0]
-            phis_avg = float(np.mean(1.0 - np.asarray(self.Tc @ p1n)
-                                     - np.asarray(self.Tc @ p2n)))
+            phis_avg = float(np.mean(1.0 - self._full_of(p1n)
+                                     - self._full_of(p2n)))
             if phis_avg <= phis_stop:
                 reason = "phis_stop"
                 break

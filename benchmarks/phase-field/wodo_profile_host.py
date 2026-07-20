@@ -1,14 +1,17 @@
-"""Task #37 first deliverable: DIRECT stage-level profile of the 3-D
-film production step (wodo_g5_rung physics, blockch + device assembly)
-— names the host-side stages behind the ~61 s/step host floor that the
-A100/GH200 forensics could only infer by subtraction.
+"""Task #37: stage-level profile of the 3-D film production step
+(wodo_g5_rung physics, blockch + device assembly) — names the host-side
+stages behind the forensics' ~61 s/step host floor.
 
-Two instruments, same run:
-  * a ProfiledFilm subclass whose _attempt_device is a stage-timed copy
-    of the production method (wp.synchronize_device brackets so async
-    GPU work lands in the stage that launched it);
-  * cProfile over the timed steps for function-level naming (einsum,
-    standard_normal, wp.array upload, lgmres internals, .numpy pulls).
+BEFORE numbers (pre-v1.4 data path, stage-timed verbatim copy of the
+old _attempt_device): commit 181deeb of this file; measured 2026-07-20
+on gpubox Ada, 128x128x48: 31.60 s/step wall, solve 73.6%, host
+fraction 8.35 s/step (gp_fields 4.43 + upload 0.99 + bdf 0.50 + rng
+0.38 + flux/update 0.3 + elem_kernel 1.69 device).
+
+THIS version instruments the v1.4 device-resident path by wrapping the
+factored stage methods (_bdf_time_device / _gp_eval_device /
+_fill_device_system / _solve_device_blockch) with synchronized timers
++ cProfile for function-level naming.
 
 Run (box):
   LD_LIBRARY_PATH=/usr/lib/wsl/lib .venv/bin/python \
@@ -33,7 +36,7 @@ from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
 from diffsim.mesh.basis import basis_tables
 from diffsim.assembly.operators import DeviceMesh
-from diffsim.physics.wodo_film import WodoFilmStepper, make_wodo_newton
+from diffsim.physics.wodo_film import WodoFilmStepper
 
 import wodo_fig67 as f67
 
@@ -42,15 +45,29 @@ LAT_PHYS = 3.3
 PHI_S0 = 0.66
 
 
+class _TimedRNG:
+    """numpy Generator proxy timing the standard_normal draws."""
+
+    def __init__(self, rng, tt):
+        self._rng, self._tt = rng, tt
+
+    def standard_normal(self, *a, **k):
+        t0 = time.time()
+        r = self._rng.standard_normal(*a, **k)
+        self._tt["noise_rng"] = (self._tt.get("noise_rng", 0.0)
+                                 + time.time() - t0)
+        return r
+
+
 class ProfiledFilm(WodoFilmStepper):
-    """_attempt_device copied VERBATIM from wodo_film.py @ 7aa981f with
-    stage timers + syncs inserted (profiling instrument only — the
-    measured run is the production math, launch for launch)."""
+    """Production stepper with synchronized stage timers around the
+    factored v1.4 stage methods (no math changes)."""
 
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
-        self.tt = {}      # stage -> cumulative seconds
-        self.n_it = 0     # Newton iterates timed
+        self.tt = {}
+        self.n_it = 0
+        self._nrng = _TimedRNG(self._nrng, self.tt)
 
     def _tic(self, sync=False):
         if sync:
@@ -62,132 +79,28 @@ class ProfiledFilm(WodoFilmStepper):
             wp.synchronize_device(self.dm.device)
         self.tt[key] = self.tt.get(key, 0.0) + time.time() - t0
 
-    def _attempt_device(self, dt, K):
-        if self._asm is None:
-            t0 = self._tic()
-            self._init_device_assembly()
-            self._acc("z_asm_setup", t0, sync=True)
-        asm = self._asm
-        d = self.dm.device
-        t0 = self._tic()
-        sigma, h1_gp, h2_gp = self._bdf_time(dt)
-        self._acc("bdf_hist_gp", t0)
-        self._sigma = sigma
-        minv = 1.0 / self.h_curr
-        mlat = 1.0 / self.lat_scale
-        mvert = self.y_comp * minv
-        coef = K * minv * self.y_comp
-        rho = self.noise * np.sqrt(2.0 / dt)
-        t0 = self._tic()
-        q_gp = {}
-        for pv, b in self.dm.bins.items():
-            ngp = len(self.mesh.conn_of[pv]) * b["nqp"]
-            q_gp[pv] = (
-                rho * self._nrng.standard_normal((ngp, self.dm.dim)),
-                rho * self._nrng.standard_normal((ngp, self.dm.dim)))
-        self._acc("noise_rng", t0)
-        negi = self.mob_model == "negi"
-        Drp, Drf = (self.D_ratio if (self.var_mob or negi)
-                    else (-1.0, -1.0))
-        mobm = 1 if negi else 0
-        t0 = self._tic()
-        flux_vals_d = wp.array(
-            np.ascontiguousarray(-coef * self._flux_base),
-            dtype=wp.float64, device=d)
-        self._acc("flux_host", t0, sync=True)
-        x = self.x.copy()
-        bufs = {}
-        for it in range(self.newton_max):
-            self.n_it += 1
-            t0 = self._tic()
-            fields = [self._gp(x[i::4]) for i in range(4)]
-            self._acc("gp_fields", t0)
-            t0 = self._tic(sync=True)
-            asm.zero_fill()
-            self._acc("zero_fill", t0, sync=True)
-            for k_bin, (pv, b, ne, nbf, gdof) in enumerate(asm._bins):
-                nqp = b["nqp"]
-                nl = 4 * nbf
-                if k_bin not in bufs:
-                    nb_cap = min(ne, max(1, (2 << 30) // (nl * nl * 8)))
-                    bufs[k_bin] = (
-                        nb_cap,
-                        wp.zeros((nb_cap, nl, nl), dtype=wp.float64,
-                                 device=d),
-                        wp.zeros((nb_cap, nl), dtype=wp.float64,
-                                 device=d))
-                nb_cap, Ae, be = bufs[k_bin]
-                kk = make_wodo_newton(nbf, nqp, self.dm.dim)
-                for e0 in range(0, ne, nb_cap):
-                    nb = min(nb_cap, ne - e0)
-                    s0, s1 = e0 * nqp, (e0 + nb) * nqp
-                    arr = lambda a_: wp.array(
-                        np.ascontiguousarray(a_[s0:s1]),
-                        dtype=wp.float64, device=d)
-                    t0 = self._tic(sync=True)
-                    ins = [
-                        arr(fields[0][0][pv]), arr(fields[0][1][pv]),
-                        arr(fields[1][0][pv]), arr(fields[1][1][pv]),
-                        arr(fields[2][0][pv]), arr(fields[2][1][pv]),
-                        arr(fields[3][0][pv]), arr(fields[3][1][pv]),
-                        arr(h1_gp[pv]), arr(h2_gp[pv]),
-                        arr(q_gp[pv][0]), arr(q_gp[pv][1])]
-                    self._acc("upload_gp", t0, sync=True)
-                    t0 = self._tic()
-                    Ae.zero_()
-                    be.zero_()
-                    wp.launch(kk, dim=nb, inputs=[
-                        b["conn"], b["h"][e0:e0 + nb], b["N"], b["dN"],
-                        b["w"], *ins,
-                        self.theta_wp[pv][s0:s1],
-                        wp.float64(self.M11), wp.float64(self.M12),
-                        wp.float64(self.M22), wp.float64(Drp),
-                        wp.float64(Drf), wp.int32(mobm),
-                        wp.float64(self.c12),
-                        wp.float64(self.c1s), wp.float64(self.c2s),
-                        wp.float64(1.0 / self.N1),
-                        wp.float64(1.0 / self.N2),
-                        wp.float64(1.0 / self.Ns),
-                        wp.float64(self.b_reg),
-                        wp.float64(self.ch2), wp.float64(self.ch3),
-                        wp.float64(self.ch4),
-                        wp.float64(self.kap1), wp.float64(self.kap2),
-                        wp.float64(sigma), wp.float64(mlat),
-                        wp.float64(mvert), wp.float64(minv),
-                        wp.float64(K),
-                        Ae, be], device=d)
-                    self._acc("elem_kernel", t0, sync=True)
-                    t0 = self._tic()
-                    asm.scatter_batch(k_bin, e0, Ae, be, nb)
-                    self._acc("scatter", t0, sync=True)
-            t0 = self._tic()
-            asm.add_matrix_values(self._flux_slots_d, flux_vals_d)
-            f1 = np.asarray(self.Tc @ x[0::4])
-            f2 = np.asarray(self.Tc @ x[2::4])
-            Mf = coef * self.top_face_M
-            load = np.concatenate(
-                [np.einsum("fab,fb->fa", Mf, fv[self.top_faces]).ravel()
-                 for fv in (f1, f2)])
-            asm.add_rhs_values(
-                self._flux_gdof_d,
-                wp.array(np.ascontiguousarray(load), dtype=wp.float64,
-                         device=d))
-            self._acc("flux_host", t0, sync=True)
-            t0 = self._tic()
-            dx = (self._solve_device_blockch(asm)
-                  if self.linsolver in ("blockch", "blockch_dev")
-                  else self._solve_device(asm))
-            self._acc("solve", t0, sync=True)
-            t0 = self._tic()
-            if not np.isfinite(dx).all() or np.abs(dx).max() > 1e6:
-                self._acc("newton_update", t0)
-                return None, it + 1, False
-            x = x + dx
-            conv = np.abs(dx).max() < self.newton_tol
-            self._acc("newton_update", t0)
-            if conv:
-                return x, it + 1, True
-        return x, self.newton_max, False
+    def _bdf_time_device(self, dt):
+        t0 = self._tic(sync=True)
+        r = super()._bdf_time_device(dt)
+        self._acc("bdf_hist_dev", t0, sync=True)
+        return r
+
+    def _gp_eval_device(self, x):
+        self.n_it += 1
+        t0 = self._tic(sync=True)
+        super()._gp_eval_device(x)
+        self._acc("gp_eval_dev", t0, sync=True)
+
+    def _fill_device_system(self, *a):
+        t0 = self._tic(sync=True)
+        super()._fill_device_system(*a)
+        self._acc("fill_kern_scat", t0, sync=True)
+
+    def _solve_device_blockch(self, asm):
+        t0 = self._tic(sync=True)
+        r = super()._solve_device_blockch(asm)
+        self._acc("solve", t0, sync=True)
+        return r
 
 
 def main():
@@ -254,7 +167,7 @@ def main():
           f"(incl. compile + symbolic setup)", flush=True)
 
     # -- timed, profiled steps ------------------------------------------
-    st.tt = {}
+    st.tt.clear()
     st.n_it = 0
     n0 = len(steps)
     pr = cProfile.Profile()
@@ -281,6 +194,7 @@ def main():
     host = wall - st.tt.get("solve", 0.0)
     print(f"  HOST FRACTION (wall - solve): {host:.1f}s = "
           f"{host / max(nst, 1):.2f} s/step = {100 * host / wall:.1f}%")
+    print(f"  gpu peak {wp.get_mempool_used_mem_high(device) / 2 ** 30:.1f} GB")
 
     _bos.makedirs(_bos.path.dirname(args.pstats_out) or ".",
                   exist_ok=True)

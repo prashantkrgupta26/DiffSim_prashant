@@ -160,6 +160,35 @@ def make_gp_multifield(nbf: int, nqp: int, dim: int, ndof: int):
     return gp_multi
 
 
+def make_gp_vals(nbf: int, nqp: int, ndof: int):
+    """VALUES-ONLY multifield GP eval (gp_multifield sans gradients):
+    X [n_nodes, ndof] -> vals [ne*nqp, ndof].  Task #37: the film BDF
+    history needs only the GP VALUES of the previous-step fields, so
+    the gradient loops (3/4 of the flops) are dropped.  Accumulation
+    order over the basis functions is IDENTICAL to gp_multifield."""
+    key = ("gp_vals", nbf, nqp, ndof)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique", enable_backward=False,
+               module_options={"max_unroll": 0})
+    def gp_vals_k(conn: wp.array2d(dtype=wp.int32),
+                  Ntab: wp.array2d(dtype=wp.float64),
+                  X: wp.array2d(dtype=wp.float64),
+                  vals: wp.array2d(dtype=wp.float64)):
+        e = wp.tid()
+        for q in range(nqp):
+            gp = e * nqp + q
+            for f in range(ndof):
+                acc = wp.float64(0.0)
+                for a in range(nbf):
+                    acc += Ntab[q, a] * X[conn[e, a], f]
+                vals[gp, f] = acc
+
+    _kernel_cache[key] = gp_vals_k
+    return gp_vals_k
+
+
 def make_csr_spmv_ncomp(ncomp: int):
     """Multi-component CSR SpMV: y[row, c] = sum_j A[row, j] x[j, c] —
     the constraint application T @ node_vals per velocity component."""
