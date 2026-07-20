@@ -629,7 +629,7 @@ def _mms_dirichlet_all(sysm, mesh, cons, fields):
         sysm.set_dirichlet(f, nodes, fn(coords[nodes]))
 
 
-def _coupled_mms_system(level, p, device="cpu"):
+def _coupled_mms_system(level, p, device="cpu", assembly="auto"):
     from diffsim.physics.exciton_closures import (
         LangevinRecombination, OnsagerBraunDissociation)
     from diffsim.xdd.params import XDDParams
@@ -650,12 +650,12 @@ def _coupled_mms_system(level, p, device="cpu"):
         dm, lam2=1.0, eps_gp=one, mu_n_gp=mu_n, mu_p_gp=mu_p,
         mu_xd_gp=mu_xd, mu_xa_gp=mu_xa, dist_gp=dist_gp,
         langevin=langevin, onsager=onsager,
-        tau_inv_d=1.0, tau_inv_a=1.0, supg=1.0)
+        tau_inv_d=1.0, tau_inv_a=1.0, supg=1.0, assembly=assembly)
     return sysm, dm, mesh, cons, xq
 
 
 def _mms_solve_ladder(p, device, levels=(3, 4), break_gamma=1.0,
-                      require_converged=True):
+                      require_converged=True, assembly="auto"):
     """Solve the coupled MMS on a mesh ladder from a PERTURBED guess (not
     u*_nodal); return {field: [L2 errors]} vs the ANALYTIC fields.
 
@@ -667,7 +667,8 @@ def _mms_solve_ladder(p, device, levels=(3, 4), break_gamma=1.0,
     exact = [fields[f] for f in range(NDOF)]
     errs = {f: [] for f in range(NDOF)}
     for lv in levels:
-        sysm, dm, mesh, cons, xq = _coupled_mms_system(lv, p, device)
+        sysm, dm, mesh, cons, xq = _coupled_mms_system(lv, p, device,
+                                                       assembly=assembly)
         src_gp = _mms_strong_source_gp(sysm, dm, xq, break_gamma=break_gamma)
         sysm.mms_source = _mms_source_nodal(sysm, dm, xq, src_gp)
         _mms_dirichlet_all(sysm, mesh, cons, fields)

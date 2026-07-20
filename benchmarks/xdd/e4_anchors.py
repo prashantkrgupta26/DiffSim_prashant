@@ -110,7 +110,7 @@ def bilayer_dist_gp(xq, height, h_axis=1):
 
 def run_bilayer_jsc(system: str, *, level: int = 6, device: str = "cpu",
                     linsolver: str = "splu", h_axis: int = 1,
-                    verbose: bool = True) -> dict:
+                    verbose: bool = True, assembly: str = "auto") -> dict:
     """March one material system's analytic bilayer to lit steady state at V̂=0
     and return the Jsc observables.
 
@@ -159,7 +159,7 @@ def run_bilayer_jsc(system: str, *, level: int = 6, device: str = "cpu",
         dm, lam2=lam2, eps_gp=eps, mu_n_gp=mu_n, mu_p_gp=mu_p,
         mu_xd_gp=mu_xd, mu_xa_gp=mu_xa, dist_gp=dist_gp,
         langevin=lang, onsager=ons, tau_inv_d=tau_inv_d, tau_inv_a=tau_inv_a,
-        supg=1.0, carrier_vars="log", linsolver=linsolver)
+        supg=1.0, carrier_vars="log", linsolver=linsolver, assembly=assembly)
 
     # Nondim max generation.  The PHYSICAL G/U0 is ~1e-4 (U0 is enormous for
     # these params) → a negligibly-lit device (J≈0), unrepresentative.  In the
@@ -191,6 +191,7 @@ def run_bilayer_jsc(system: str, *, level: int = 6, device: str = "cpu",
 
     out = dict(
         system=system, level=level, device=device, linsolver=linsolver,
+        assembly=sysm.assembly,
         jny_nondim=jny, jpy_nondim=jpy, J_nondim=float(J), Jmin_nondim=float(Jmin),
         flux_imbalance=float(abs(jny - jpy) / max(J, 1e-30)),
         J0=float(s.J0), U0=float(s.U0), t0=float(s.t0),
@@ -217,13 +218,17 @@ def main():
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--linsolver", default="splu", choices=("splu", "cudss"))
     ap.add_argument("--level", type=int, default=6)
+    ap.add_argument("--assembly", default="auto",
+                    choices=("auto", "host", "device"),
+                    help="Jacobian/residual assembly backend (Task #35): "
+                         "auto = device on CUDA, host on CPU")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
     results = {}
     for system in ("p3ht_pcbm", "pm6_y6"):
         r = run_bilayer_jsc(system, level=args.level, device=args.device,
-                            linsolver=args.linsolver)
+                            linsolver=args.linsolver, assembly=args.assembly)
         anchor = TABLE1_BILAYER_ANCHOR[system]
         r["anchor"] = anchor_ratio(r["jsc_mA_per_cm2"], anchor)
         results[system] = r

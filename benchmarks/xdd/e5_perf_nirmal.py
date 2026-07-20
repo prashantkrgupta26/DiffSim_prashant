@@ -93,7 +93,7 @@ def bilayer_dist_gp(xq, height, h_axis=1):
 
 def build_system(level: int, device: str, params: XDDParams,
                  *, h_axis: int = 1, regime: str = "marchable",
-                 linsolver: str = "splu"):
+                 linsolver: str = "splu", assembly: str = "auto"):
     """Build the XDDSystem at the given uniform level on `device`.
 
     regime:
@@ -158,13 +158,14 @@ def build_system(level: int, device: str, params: XDDParams,
         dm, lam2=lam2, eps_gp=eps, mu_n_gp=mu_n, mu_p_gp=mu_p,
         mu_xd_gp=mu_xd, mu_xa_gp=mu_xa, dist_gp=dist_gp,
         langevin=lang, onsager=ons, tau_inv_d=tau_inv_d, tau_inv_a=tau_inv_a,
-        supg=1.0, carrier_vars="log", linsolver=linsolver)
+        supg=1.0, carrier_vars="log", linsolver=linsolver, assembly=assembly)
     return sysm, mesh, cons, dm, xq, dist_gp
 
 
 def measure(level: int, device: str, n_steps: int, dt_hat: float,
             params: XDDParams, *, h_axis: int = 1, verbose: bool = True,
-            regime: str = "marchable", linsolver: str = "splu"):
+            regime: str = "marchable", linsolver: str = "splu",
+            assembly: str = "auto", profile: bool = False):
     """March `n_steps` fixed-dt BDF1 steps of the 10 GHz rect-sin drive,
     capturing J(t) and per-step wall time.  Returns a results dict.
 
@@ -172,7 +173,7 @@ def measure(level: int, device: str, n_steps: int, dt_hat: float,
     E5-fix GPU sparse direct LU — wired via XDDSystem(linsolver="cudss"))."""
     sysm, mesh, cons, dm, xq, dist_gp = build_system(
         level, device, params, h_axis=h_axis, regime=regime,
-        linsolver=linsolver)
+        linsolver=linsolver, assembly=assembly)
     s = params.scales()
     n_nodes = dm.n_nodes
     if verbose:
@@ -226,6 +227,44 @@ def measure(level: int, device: str, n_steps: int, dt_hat: float,
               f"converged={info.get('converged')} its={info.get('iters')}",
               flush=True)
 
+    # Task #35: measured assembly-budget numbers (the 100M-dof planning line).
+    budget = None
+    if sysm._assembly_device:
+        budget = sysm.device_assembler().budget()
+        if verbose:
+            print(f"[e5] device-assembly budget: nnz={budget['nnz']} "
+                  f"nnz/dof={budget['nnz_per_dof']:.2f} "
+                  f"bytes/dof={budget['bytes_per_dof']:.1f} "
+                  f"csr={budget['csr_gb']:.3f} GB "
+                  f"wide={budget['index_wide']}", flush=True)
+
+    # Optional cProfile of ONE representative step (the G4 attribution).
+    if profile:
+        import cProfile
+        import pstats
+        import io as _io
+        amp = gen.amplitude(t_hat)
+        sysm.set_generation({pv: gd0[pv] * amp for pv in dm.bins},
+                            {pv: ga0[pv] * amp for pv in dm.bins})
+        pr = cProfile.Profile()
+        pr.enable()
+        try:
+            new_state, info = sysm.step_bdf(state, dt_hat, order=1,
+                                            prev=prev_state, **nk)
+        except Exception as exc:
+            info = {"converged": False, "reason": str(exc)}
+            new_state = state
+        pr.disable()
+        if info.get("converged"):
+            prev_state = {f: state[f].copy() for f in range(5)}
+            state = new_state
+            t_hat += dt_hat
+        buf = _io.StringIO()
+        pstats.Stats(pr, stream=buf).sort_stats("cumulative").print_stats(30)
+        print("[e5] === cProfile of one step (cumulative, top 30) ===",
+              flush=True)
+        print(buf.getvalue(), flush=True)
+
     # Timed steps.
     for k in range(n_steps):
         amp = gen.amplitude(t_hat)
@@ -274,6 +313,8 @@ def measure(level: int, device: str, n_steps: int, dt_hat: float,
         end_to_end_projected_s=end_to_end_proj,
         jt_trace=jt,
         linsolver=linsolver,
+        assembly=sysm.assembly,
+        assembly_budget=budget,
         solver=("cudss GPU sparse direct LU (nvmath, plan-once + "
                 "refactorize per Newton iterate; warp assembly on GPU)"
                 if linsolver == "cudss" else
@@ -312,6 +353,12 @@ def main():
                     choices=("splu", "cudss"),
                     help="linear-solve backend: splu (host, E-b baseline) | "
                          "cudss (GPU sparse direct LU, the E5 perf fix)")
+    ap.add_argument("--assembly", default="auto",
+                    choices=("auto", "host", "device"),
+                    help="Jacobian/residual assembly backend (Task #35): "
+                         "auto = device on CUDA, host on CPU")
+    ap.add_argument("--profile", action="store_true",
+                    help="cProfile ONE representative step (G4 attribution)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -324,7 +371,8 @@ def main():
           f"1ns window = {NIRMAL_WINDOW/(args.dt_ps*1e-12):.0f} steps", flush=True)
 
     res = measure(args.level, args.device, args.n_steps, dt_hat, params,
-                  regime=args.regime, linsolver=args.linsolver)
+                  regime=args.regime, linsolver=args.linsolver,
+                  assembly=args.assembly, profile=args.profile)
     gate = gate_arithmetic(res)
     res_out = {k: v for k, v in res.items() if k != "jt_trace"}
     res_out["jt_trace_len"] = len(res["jt_trace"])
