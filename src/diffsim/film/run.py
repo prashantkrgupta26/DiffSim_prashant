@@ -89,7 +89,8 @@ class FilmRun:
             var_mob=r.var_mob, D_ratio=r.D_pair, b_reg=p.b_reg,
             mob_model=("negi" if p.mobility == "negi" else "wodo"),
             f_cheb=tuple(p.f_cheb), tstep=p.tstep,
-            use_device_assembly=p.device_assembly)
+            use_device_assembly=p.device_assembly,
+            gp_residency=p.gp_residency)
         st._solver_cache = _IterCache()
         rng = np.random.default_rng(p.ic_seed)
         st.set_initial(

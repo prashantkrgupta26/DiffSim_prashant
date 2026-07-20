@@ -211,6 +211,23 @@ from ..mesh.nodes import _local_offsets
 from .ternary_ch import TernaryCHStepper, _rlog, _rinv
 
 
+def _cuda_free_gb(device):
+    """Currently-free VRAM (GiB) on a CUDA device, or None on CPU / if
+    the query is unavailable (Task #41 gp_residency='auto' heuristic).
+    Mirrors film/preflight._gpu_free_gb (torch.cuda.mem_get_info)."""
+    try:
+        dev = str(device)
+        if not dev.startswith("cuda"):
+            return None
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        free, _total = torch.cuda.mem_get_info(dev)
+        return free / 1024 ** 3
+    except Exception:
+        return None
+
+
 @wp.func
 def _binv2(x: wp.float64) -> wp.float64:
     # floored 1/x^2 for the b-regularizer (their footnote-2 term)
@@ -435,7 +452,8 @@ class WodoFilmStepper(TernaryCHStepper):
                  lat_scale=1.0, linsolver="splu", noise=0.0,
                  noise_seed=0, var_mob=False, D_ratio=1e-3, b_reg=0.0,
                  f_cheb=(0.0, 0.0, 0.0), use_device_assembly=False,
-                 mob_model="wodo", tstep="bdf1", krylov_graph="auto"):
+                 mob_model="wodo", tstep="bdf1", krylov_graph="auto",
+                 gp_residency="persistent"):
         super().__init__(dm, chi=chi, M=M, kappa=kappa, dt=dt, order=1,
                          newton_tol=newton_tol, newton_max=newton_max)
         # retrofit G1 (2026-07-13): the p == 1 restriction is lifted —
@@ -461,6 +479,27 @@ class WodoFilmStepper(TernaryCHStepper):
             raise ConfigError(f"krylov_graph must be one of "
                               f"{_GRAPH_MODES}, got {krylov_graph!r}")
         self.krylov_graph = krylov_graph
+        # Task #41: GP-field residency mode (device assembly path only).
+        # "persistent" (default, the #37 behavior): the packed GP
+        #   vals/grads + BDF-history + Langevin-noise buffers are
+        #   allocated ONCE per mesh at full [ngp, ...] size and held
+        #   resident across every Newton iterate and step.
+        # "batch_local": the GP fields are evaluated per element BATCH
+        #   into a SINGLE reused buffer sized for one batch ([nb_cap*nqp,
+        #   ...]), not the whole mesh — trading a modest per-iterate
+        #   re-eval (a few extra small kernel launches) for cutting the
+        #   GP residency to ~1/nbatch.  Physics/results are UNCHANGED:
+        #   the batch's conn slice feeds the SAME kernels, so the values
+        #   the element kernel consumes are bit-identical to the slice
+        #   of the persistent buffer it would have read.
+        # "auto": pick batch_local when the estimated persistent GP
+        #   residency would exceed a free-VRAM heuristic (see
+        #   _resolve_gp_residency), else persistent.
+        if gp_residency not in ("persistent", "batch_local", "auto"):
+            raise ConfigError(
+                "gp_residency must be 'persistent', 'batch_local' or "
+                f"'auto', got {gp_residency!r}")
+        self.gp_residency = gp_residency
         # retrofit G2 (A4b pattern, multiphase apack Sec 4b): tstep =
         # "bdf1" (default, existing behavior bit-identically) | "bdf2"
         # = VARIABLE-COEFFICIENT BDF2, deterministic-only.  Per-attempt
@@ -888,28 +927,81 @@ class WodoFilmStepper(TernaryCHStepper):
     # state), and the batched element launches consume slices of the
     # persistent buffers.  The host path (_attempt) is untouched and
     # remains the bit-for-bit parity reference.
+    @staticmethod
+    def _nb_cap(ne, nbf):
+        """Element-batch cap (the _fill_device_system Ae-transient
+        budget): ~2 GB / (4 nbf)^2 doubles per element, at least 1."""
+        nl = 4 * nbf
+        return min(ne, max(1, (2 << 30) // (nl * nl * 8)))
+
+    def _resolve_gp_residency(self):
+        """Task #41: map gp_residency ("persistent"|"batch_local"|
+        "auto") to a concrete boolean self._gp_batch_local.
+
+        HEURISTIC (auto): estimate the PERSISTENT GP residency —
+        vals (4) + grads (4*dim) + hist (2+2) + noise (2*dim) doubles
+        per GP, summed over bins (X nodal packs are O(n_nodes), a lower
+        order term).  If that estimate exceeds a fraction of the CUDA
+        card's currently-free VRAM (default 0.5, so the CSR + blockch
+        buffers keep the other half), pick batch_local; otherwise
+        persistent.  On CPU (no free-VRAM query) auto == persistent
+        (host RAM is not the constrained resource the fallback targets,
+        and CPU parity is the bit-exact reference)."""
+        mode = self.gp_residency
+        if mode != "auto":
+            return mode == "batch_local"
+        dim = self.dm.dim
+        dbl_per_gp = 4 + 4 * dim + 4 + 2 * dim      # vals+grads+hist+noise
+        ngp_total = sum(len(self.mesh.conn_of[pv]) * b["nqp"]
+                        for pv, b in self.dm.bins.items())
+        est_gb = ngp_total * dbl_per_gp * 8 / 1024 ** 3
+        free_gb = _cuda_free_gb(self.dm.device)
+        if free_gb is None:                          # CPU / no query
+            return False
+        # keep half the free pool for the CSR/blockch/solve residents
+        return est_gb > 0.5 * free_gb
+
     def _init_device_fields(self):
-        """Once per mesh: persistent device buffers for the packed GP
-        fields, BDF history, Langevin noise and top-flux values."""
+        """Once per mesh: device buffers for the packed GP fields, BDF
+        history, Langevin noise and top-flux values.
+
+        Task #41: in PERSISTENT mode (default) the GP vals/grads/hist/
+        noise buffers are full-mesh [ngp, ...] and held resident.  In
+        BATCH_LOCAL mode they are sized for ONE element batch
+        ([nb_cap*nqp, ...]) per bin and reused across batches inside
+        _fill_device_system — the memory saving is the whole point, at
+        the cost of a per-batch re-eval.  X / history NODAL packs
+        (O(n_nodes)) stay resident in both modes (a lower-order term,
+        and the batch-local GP kernels read them per batch)."""
         d = self.dm.device
         dim = self.dm.dim
+        self._gp_batch_local = self._resolve_gp_residency()
         self._vals_dev, self._grads_dev = {}, {}
         self._histv_dev, self._hist_dev = {}, {}
         self._hist2v_dev = None
         self._q_dev = {}
+        # host-resident full noise draws (batch_local uploads slices of
+        # these per batch; the RNG stream / draw order is unchanged, so
+        # the seed contract holds bit-for-bit vs persistent)
+        self._q_host = {}
         for pv, b in self.dm.bins.items():
-            ngp = len(self.mesh.conn_of[pv]) * b["nqp"]
-            self._vals_dev[pv] = wp.zeros((ngp, 4), dtype=wp.float64,
+            ne = len(self.mesh.conn_of[pv])
+            nqp = b["nqp"]
+            ngp = ne * nqp
+            # buffer rows: full ngp (persistent) or one batch (local)
+            nrow = (self._nb_cap(ne, b["nbf"]) * nqp
+                    if self._gp_batch_local else ngp)
+            self._vals_dev[pv] = wp.zeros((nrow, 4), dtype=wp.float64,
                                           device=d)
-            self._grads_dev[pv] = wp.zeros((ngp, 4, dim),
+            self._grads_dev[pv] = wp.zeros((nrow, 4, dim),
                                            dtype=wp.float64, device=d)
-            self._histv_dev[pv] = wp.zeros((ngp, 2), dtype=wp.float64,
+            self._histv_dev[pv] = wp.zeros((nrow, 2), dtype=wp.float64,
                                            device=d)
-            self._hist_dev[pv] = wp.zeros((ngp, 2), dtype=wp.float64,
+            self._hist_dev[pv] = wp.zeros((nrow, 2), dtype=wp.float64,
                                           device=d)
             self._q_dev[pv] = (
-                wp.zeros((ngp, dim), dtype=wp.float64, device=d),
-                wp.zeros((ngp, dim), dtype=wp.float64, device=d))
+                wp.zeros((nrow, dim), dtype=wp.float64, device=d),
+                wp.zeros((nrow, dim), dtype=wp.float64, device=d))
         self._X_dev = wp.zeros((self.dm.n_nodes, 4), dtype=wp.float64,
                                device=d)
         self._Xh_dev = wp.zeros((self.dm.n_nodes, 2), dtype=wp.float64,
@@ -917,6 +1009,11 @@ class WodoFilmStepper(TernaryCHStepper):
         self._Xh2_dev = None            # lazy (BDF2 only)
         self._hist_up_ref = None        # held reference == cache key
         self._hist2_up_ref = None
+        # batch_local: nodal history packs held on HOST (values-only GP
+        # eval per batch needs them; O(n_nodes) so cheap to keep)
+        self._Xh_host = None
+        self._Xh2_host = None
+        self._bdf_coefs = None          # (al, bl, bdf2) for batch-local
         self._flux_vals_dev = wp.zeros(len(self._flux_base),
                                        dtype=wp.float64, device=d)
         ntf, nfn = self.top_faces.shape
@@ -933,12 +1030,19 @@ class WodoFilmStepper(TernaryCHStepper):
                               copy=False))
 
     def _gp_eval_device(self, x):
-        """Device GP eval of the Newton state into the persistent
-        packed vals/grads buffers (gp_multifield: same accumulation
-        order as the host _gp einsums to the reassociation-ULP)."""
+        """Device GP eval of the Newton state.  PERSISTENT: fill the
+        full packed vals/grads buffers (gp_multifield: same accumulation
+        order as the host _gp einsums to the reassociation-ULP).
+        BATCH_LOCAL (Task #41): upload the nodal state ONCE; the per-bin
+        GP kernels are deferred to _fill_device_system, which launches
+        them per element batch into the small reused buffers (over a
+        sliced conn so the values are bit-identical to the persistent
+        slice the element kernel would have read)."""
         from ..assembly.gp_field import make_gp_multifield
         d = self.dm.device
         self._upload_dev(self._X_dev, x.reshape(self.dm.n_nodes, 4))
+        if self._gp_batch_local:
+            return
         for pv, b in self.dm.bins.items():
             gpk = make_gp_multifield(b["nbf"], b["nqp"], self.dm.dim, 4)
             wp.launch(gpk, dim=len(self.mesh.conn_of[pv]),
@@ -956,30 +1060,40 @@ class WodoFilmStepper(TernaryCHStepper):
         host (b*v - c*w)/dt to the reassociation ULP."""
         from ..assembly.gp_field import make_gp_vals, make_gp_axpby
         d = self.dm.device
+        bl_mode = self._gp_batch_local
+        # nodal history packs go to device ALWAYS (needed by both the
+        # full-buffer histv eval and the per-batch batch-local eval);
+        # batch_local also keeps a host copy is unnecessary since the
+        # device Xh_dev is sliced-read per batch.  History GP-eval into
+        # the full histv buffers is PERSISTENT-only.
         if self._hist_up_ref is not self.hist[0]:
             self._upload_dev(self._Xh_dev, np.stack(self.hist[0],
                                                     axis=1))
-            for pv, b in self.dm.bins.items():
-                wp.launch(make_gp_vals(b["nbf"], b["nqp"], 2),
-                          dim=len(self.mesh.conn_of[pv]),
-                          inputs=[b["conn"], b["N"], self._Xh_dev,
-                                  self._histv_dev[pv]], device=d)
+            if not bl_mode:
+                for pv, b in self.dm.bins.items():
+                    wp.launch(make_gp_vals(b["nbf"], b["nqp"], 2),
+                              dim=len(self.mesh.conn_of[pv]),
+                              inputs=[b["conn"], b["N"], self._Xh_dev,
+                                      self._histv_dev[pv]], device=d)
             self._hist_up_ref = self.hist[0]
         bdf2 = self.tstep == "bdf2" and self.hist2 is not None
         if bdf2:
             if self._Xh2_dev is None:
                 self._Xh2_dev = wp.zeros_like(self._Xh_dev)
+                # batch-sized in batch_local (histv_dev is batch-sized),
+                # full-sized in persistent
                 self._hist2v_dev = {
                     pv: wp.zeros_like(v)
                     for pv, v in self._histv_dev.items()}
             if self._hist2_up_ref is not self.hist2:
                 self._upload_dev(self._Xh2_dev, np.stack(self.hist2,
                                                          axis=1))
-                for pv, b in self.dm.bins.items():
-                    wp.launch(make_gp_vals(b["nbf"], b["nqp"], 2),
-                              dim=len(self.mesh.conn_of[pv]),
-                              inputs=[b["conn"], b["N"], self._Xh2_dev,
-                                      self._hist2v_dev[pv]], device=d)
+                if not bl_mode:
+                    for pv, b in self.dm.bins.items():
+                        wp.launch(make_gp_vals(b["nbf"], b["nqp"], 2),
+                                  dim=len(self.mesh.conn_of[pv]),
+                                  inputs=[b["conn"], b["N"], self._Xh2_dev,
+                                          self._hist2v_dev[pv]], device=d)
                 self._hist2_up_ref = self.hist2
             rr = dt / self.dt_prev
             sigma = (1.0 + 2.0 * rr) / (1.0 + rr) / dt
@@ -987,6 +1101,11 @@ class WodoFilmStepper(TernaryCHStepper):
         else:
             sigma = 1.0 / dt
             al, bl = sigma, 0.0
+        # batch_local defers the axpby history combine to the per-batch
+        # loop (over the small batch histv buffers); stash the coefs.
+        self._bdf_coefs = (al, bl, bdf2)
+        if bl_mode:
+            return sigma
         ax = make_gp_axpby(2)
         for pv, hv in self._histv_dev.items():
             Y = self._hist2v_dev[pv] if bdf2 else hv
@@ -995,35 +1114,116 @@ class WodoFilmStepper(TernaryCHStepper):
                               self._hist_dev[pv]], device=d)
         return sigma
 
+    def _grow_gp_batch_bufs(self, pv, nrow):
+        """Resize this bin's batch-local GP buffers to hold `nrow` GPs
+        (a caller forced a larger Ae batch than the init estimate)."""
+        d = self.dm.device
+        dim = self.dm.dim
+        self._vals_dev[pv] = wp.zeros((nrow, 4), dtype=wp.float64, device=d)
+        self._grads_dev[pv] = wp.zeros((nrow, 4, dim), dtype=wp.float64,
+                                       device=d)
+        self._histv_dev[pv] = wp.zeros((nrow, 2), dtype=wp.float64, device=d)
+        self._hist_dev[pv] = wp.zeros((nrow, 2), dtype=wp.float64, device=d)
+        self._q_dev[pv] = (wp.zeros((nrow, dim), dtype=wp.float64, device=d),
+                           wp.zeros((nrow, dim), dtype=wp.float64, device=d))
+        if self._hist2v_dev is not None and pv in self._hist2v_dev:
+            self._hist2v_dev[pv] = wp.zeros((nrow, 2), dtype=wp.float64,
+                                            device=d)
+
+    def _gp_eval_batch(self, pv, b, e0, nb):
+        """Task #41 (batch_local): evaluate the packed GP vals/grads,
+        BDF history and Langevin noise for element batch [e0, e0+nb)
+        into the SMALL reused per-bin buffers, at ROW OFFSET ZERO.  The
+        GP kernels run over sliced conn/h ([e0:e0+nb]), so batch row
+        j*nqp+q reads element e0+j exactly as gp_multifield over the
+        full mesh would have written it to global row (e0+j)*nqp+q —
+        i.e. the buffer prefix [0:nb*nqp] is BIT-IDENTICAL to the
+        persistent slice [s0:s1].  Returns the row count nb*nqp."""
+        from ..assembly.gp_field import (make_gp_multifield, make_gp_vals,
+                                          make_gp_axpby)
+        d = self.dm.device
+        dim = self.dm.dim
+        nqp = b["nqp"]
+        nbf = b["nbf"]
+        conn_s = b["conn"][e0:e0 + nb]
+        h_s = b["h"][e0:e0 + nb]
+        nr = nb * nqp
+        # values + gradients (Newton state)
+        wp.launch(make_gp_multifield(nbf, nqp, dim, 4), dim=nb,
+                  inputs=[conn_s, h_s, b["N"], b["dN"], self._X_dev,
+                          self._vals_dev[pv][:nr],
+                          self._grads_dev[pv][:nr]], device=d)
+        # BDF history: values-only GP eval + axpby combine (the
+        # _bdf_time_device work, done per batch here)
+        al, bl, bdf2 = self._bdf_coefs
+        wp.launch(make_gp_vals(nbf, nqp, 2), dim=nb,
+                  inputs=[conn_s, b["N"], self._Xh_dev,
+                          self._histv_dev[pv][:nr]], device=d)
+        if bdf2:
+            wp.launch(make_gp_vals(nbf, nqp, 2), dim=nb,
+                      inputs=[conn_s, b["N"], self._Xh2_dev,
+                              self._hist2v_dev[pv][:nr]], device=d)
+            Y = self._hist2v_dev[pv][:nr]
+        else:
+            Y = self._histv_dev[pv][:nr]
+        wp.launch(make_gp_axpby(2), dim=nr,
+                  inputs=[wp.float64(al), self._histv_dev[pv][:nr],
+                          wp.float64(bl), Y, self._hist_dev[pv][:nr]],
+                  device=d)
+        # Langevin noise: upload the [s0:s1] slice of the full host draw
+        if self._q_host is not None:
+            s0, s1 = e0 * nqp, (e0 + nb) * nqp
+            self._upload_dev(self._q_dev[pv][0][:nr],
+                             self._q_host[pv][0][s0:s1])
+            self._upload_dev(self._q_dev[pv][1][:nr],
+                             self._q_host[pv][1][s0:s1])
+        return nr
+
     def _fill_device_system(self, x, sigma, coef, K, minv, mlat, mvert,
                             Drp, Drf, mobm):
         """One Newton-iterate numeric fill of asm.vals_d / asm.F_d from
-        the CURRENT persistent GP buffers (_gp_eval_device /
-        _bdf_time_device must have run).  Element launches are BATCHED
-        (G5 rung c): the whole-mesh Ae transient is 30 GB at full res;
-        a batch buffer capped at ~2 GB is filled -> scattered ->
-        reused, and (v1.4) the buffers are PERSISTENT across steps.
+        the CURRENT GP buffers.  Element launches are BATCHED (G5 rung
+        c): the whole-mesh Ae transient is 30 GB at full res; a batch
+        buffer capped at ~2 GB is filled -> scattered -> reused, and
+        (v1.4) the buffers are PERSISTENT across steps.
+
+        Task #41: in PERSISTENT mode the element kernel reads the [s0:s1]
+        slice of the full-mesh GP buffers (_gp_eval_device /
+        _bdf_time_device filled them).  In BATCH_LOCAL mode the GP
+        fields for THIS batch are (re-)evaluated into the small reused
+        buffers by _gp_eval_batch and read at row offset zero — same
+        floats, ~1/nbatch the residency.
+
         The top-face enrichment flux (natural BC, not strong rows) is
         a tiny host-values add; the identity-constraint Tc spmv is
         elided (bit-identical values, asserted on this path)."""
         asm = self._asm
         d = self.dm.device
+        bl_mode = self._gp_batch_local
         asm.zero_fill()
         for k_bin, (pv, b, ne, nbf, gdof) in enumerate(asm._bins):
             nqp = b["nqp"]
             nl = 4 * nbf
             if k_bin not in self._batch_bufs:
-                nb_cap = min(ne, max(1, (2 << 30) // (nl * nl * 8)))
+                nb_cap = self._nb_cap(ne, nbf)
                 self._batch_bufs[k_bin] = (
                     nb_cap,
                     wp.zeros((nb_cap, nl, nl), dtype=wp.float64,
                              device=d),
                     wp.zeros((nb_cap, nl), dtype=wp.float64, device=d))
             nb_cap, Ae, be = self._batch_bufs[k_bin]
+            # batch_local: GP buffers must hold one Ae-batch's worth of
+            # GPs; grow them if a caller forced a larger Ae nb_cap.
+            if bl_mode and self._vals_dev[pv].shape[0] < nb_cap * nqp:
+                self._grow_gp_batch_bufs(pv, nb_cap * nqp)
             kk = make_wodo_newton(nbf, nqp, self.dm.dim)
             for e0 in range(0, ne, nb_cap):
                 nb = min(nb_cap, ne - e0)
-                s0, s1 = e0 * nqp, (e0 + nb) * nqp
+                if bl_mode:
+                    nr = self._gp_eval_batch(pv, b, e0, nb)
+                    s0, s1 = 0, nr
+                else:
+                    s0, s1 = e0 * nqp, (e0 + nb) * nqp
                 Ae.zero_()
                 be.zero_()
                 wp.launch(kk, dim=nb, inputs=[
@@ -1034,7 +1234,7 @@ class WodoFilmStepper(TernaryCHStepper):
                     self._hist_dev[pv][s0:s1],
                     self._q_dev[pv][0][s0:s1],
                     self._q_dev[pv][1][s0:s1],
-                    self.theta_wp[pv][s0:s1],
+                    self.theta_wp[pv][e0 * nqp:(e0 + nb) * nqp],
                     wp.float64(self.M11), wp.float64(self.M12),
                     wp.float64(self.M22), wp.float64(Drp),
                     wp.float64(Drf), wp.int32(mobm),
@@ -1081,20 +1281,28 @@ class WodoFilmStepper(TernaryCHStepper):
         mvert = self.y_comp * minv
         coef = K * minv * self.y_comp
         # conserved Langevin flux: host RNG kept (noise_seed contract —
-        # same draw order as the host path), ONE upload per attempt
-        # into the persistent buffers.  noise == 0: the zero draws are
-        # skipped and the persistent zero buffers ride along (exactly
-        # the 0.0 the host path's rho * randn would produce).
+        # same draw order as the host path).  PERSISTENT: ONE upload per
+        # attempt into the full persistent buffers.  BATCH_LOCAL (Task
+        # #41): the SAME full host draws are made (identical RNG stream /
+        # draw order => bit-identical noise), but held on host and
+        # uploaded per element batch into the small _q_dev buffers inside
+        # _fill_device_system.  noise == 0: the zero draws are skipped
+        # and the (zero) buffers ride along (exactly the 0.0 the host
+        # path's rho * randn would produce).
+        self._q_host = None
         if self.noise != 0.0:
             rho = self.noise * np.sqrt(2.0 / dt)
+            self._q_host = {}
             for pv, b in self.dm.bins.items():
                 ngp = len(self.mesh.conn_of[pv]) * b["nqp"]
-                self._upload_dev(
-                    self._q_dev[pv][0],
-                    rho * self._nrng.standard_normal((ngp, self.dm.dim)))
-                self._upload_dev(
-                    self._q_dev[pv][1],
-                    rho * self._nrng.standard_normal((ngp, self.dm.dim)))
+                q0 = rho * self._nrng.standard_normal((ngp, self.dm.dim))
+                q1 = rho * self._nrng.standard_normal((ngp, self.dm.dim))
+                if self._gp_batch_local:
+                    self._q_host[pv] = (np.ascontiguousarray(q0),
+                                        np.ascontiguousarray(q1))
+                else:
+                    self._upload_dev(self._q_dev[pv][0], q0)
+                    self._upload_dev(self._q_dev[pv][1], q1)
         negi = self.mob_model == "negi"
         Drp, Drf = (self.D_ratio if (self.var_mob or negi)
                     else (-1.0, -1.0))
