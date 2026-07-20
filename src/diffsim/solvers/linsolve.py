@@ -143,7 +143,8 @@ def _blockch_pairs(A, b, meta, tol, device):
                 # device BiCGStab 0/0-breaks down on it (frozen-theta
                 # rows carry an exactly-zero residual)
             x_, info = krylov(op, y, tol=rtol, atol=1e-13,
-                              maxiter=4000, diag=dg, check_every=50)
+                              maxiter=4000, diag=dg, check_every=50,
+                              graph=meta.get("krylov_graph"))
             if not info.get("converged"):
                 raise ConvergenceError(f"blockch {label} device solve: {info}")
             inner_it[0] += info.get("iters", 0)
@@ -184,7 +185,8 @@ def _blockch_pairs(A, b, meta, tol, device):
                 return np.zeros_like(y)   # zero rhs (see _dev above)
             x_, info = bicgstab_dev(op, y, tol=1e-8, atol=1e-13,
                                     maxiter=4000, diag=dg,
-                                    check_every=50)
+                                    check_every=50,
+                                    graph=meta.get("krylov_graph"))
             if not info.get("converged"):
                 raise ConvergenceError(
                     f"blockch {label} device solve: {info}")
@@ -595,7 +597,8 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
         if not np.any(y):
             return np.zeros_like(y)       # zero rhs (see _blockch_pairs)
         x_, info = krylov(op, y, tol=rtol, atol=1e-13, maxiter=4000,
-                          diag=dg, check_every=50)
+                          diag=dg, check_every=50,
+                          graph=meta.get("krylov_graph"))
         if not info.get("converged"):
             raise ConvergenceError(f"blockch {label} device solve: {info}")
         inner_it[0] += info.get("iters", 0)
@@ -1001,7 +1004,8 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                 if not np.any(y):
                     return np.zeros_like(y)   # zero rhs (see above)
                 x_, info = krylov(op, y, tol=rtol, atol=1e-13,
-                                  maxiter=4000, diag=dg, check_every=50)
+                                  maxiter=4000, diag=dg, check_every=50,
+                                  graph=meta.get("krylov_graph"))
                 if not info.get("converged"):
                     raise ConvergenceError(f"blockch {label} device solve: "
                                        f"{info}")
