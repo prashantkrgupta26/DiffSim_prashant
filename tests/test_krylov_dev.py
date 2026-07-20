@@ -265,3 +265,29 @@ def test_bicgstab_fused_breakdown_restart_parity(device):
     assert i_off.get("breakdown") == i_f.get("breakdown")
     assert i_off.get("restarts") == i_f.get("restarts")
     assert i_off["iters"] == i_f["iters"]
+
+
+def test_matrix_free_op_falls_back_to_legacy(device):
+    """Regression (G2 catch): cg_dev/bicgstab_dev accept ANY object with
+    .matvec/.n_free/.device — a matrix-free op without CSR device
+    buffers must take the legacy loop under every knob value, not crash
+    in the workspace keying."""
+    from diffsim.solvers.krylov_dev import cg_dev
+    n = 1000
+    A = _spd_csr(n)
+    inner = CSROperator(A, device)
+
+    class Wrapped:                      # operator protocol, no _dev/_spmv
+        device = inner.device
+        n_free = inner.n_free
+
+        def matvec(self, x, y):
+            inner.matvec(x, y)
+
+    b = np.ones(n)
+    diag = np.asarray(A.diagonal())
+    for mode in ("auto", "graph", "fused", "off"):
+        x, info = cg_dev(Wrapped(), b, tol=1e-11, maxiter=4000,
+                         diag=diag, check_every=10, graph=mode)
+        assert info["converged"]
+        assert "graph" not in info      # legacy loop path taken

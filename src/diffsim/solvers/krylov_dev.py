@@ -403,6 +403,15 @@ _WS_CACHE = {}
 _WS_CAP = 32          # FIFO cap: bounds retained device memory
 
 
+def _fusable(op):
+    """The fused/captured path requires a CSROperator-shaped op: stable
+    device buffers (`_dev`) to key the workspace/graph on and a known
+    launch-only `matvec` (`_spmv`).  Arbitrary operator-protocol objects
+    (matrix-free / constrained / test wrappers) take the legacy loop —
+    their matvec closures are not guaranteed capture-safe."""
+    return hasattr(op, "_dev") and hasattr(op, "_spmv")
+
+
 def _op_key(op):
     parts = []
     for a in op._dev:
@@ -534,10 +543,12 @@ def cg_dev(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None,
 
     graph: Task-#40 knob — "auto" (default; fused+captured on CUDA,
     legacy on CPU), "off" (legacy loop bit-for-bit), "fused",
-    "graph" (capture on any device).  diag=None always takes the legacy
-    loop (production paths are Jacobi-preconditioned)."""
+    "graph" (capture on any device).  diag=None or a non-CSROperator op
+    (matrix-free protocol objects) always takes the legacy loop
+    (production blockch/fused-backend inners are Jacobi-preconditioned
+    CSROperators)."""
     fused, cap = _resolve_path(graph, op.device)
-    if fused and diag is not None:
+    if fused and diag is not None and _fusable(op):
         return _cg_fused(op, b, tol, atol, maxiter, diag, check_every,
                          sync_counter, cap)
     _make_kernels()
@@ -800,7 +811,7 @@ def bicgstab_dev(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None,
 
     graph: Task-#40 knob (see cg_dev)."""
     fused, cap = _resolve_path(graph, op.device)
-    if fused and diag is not None:
+    if fused and diag is not None and _fusable(op):
         return _bicgstab_fused(op, b, tol, atol, maxiter, diag,
                                check_every, sync_counter, max_restarts,
                                cap)
