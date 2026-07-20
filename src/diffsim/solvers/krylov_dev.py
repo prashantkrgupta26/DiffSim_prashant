@@ -17,7 +17,34 @@ Scalars array layout (FP64): [rz, pAp, alpha, beta, rz_new, rnorm2, bnorm2].
 TAPE RULE (finding 4c): these kernels are never taped (solves are Tier-2
 VJP boundaries) => enable_backward=False; no loop-reassigned locals are used
 in any accumulation visible to an adjoint anyway.
+
+Task #40 (fused/graph-captured inner loop): the legacy loop above costs
+15 (CG) / 22 (BiCGStab) launches per iteration — measured ~half the
+rung-b solve bucket as per-launch Python overhead (#37 profile: 1.18M
+launches/53 s, 236k _dot_dev/32 s).  The FUSED path folds the scalar
+bookkeeping kernels into the reduction tails (the single-thread final
+reduce also computes alpha/beta/omega and RE-ZEROS the partial buffer,
+restoring the invariant "partial == 0 between dots" so the per-dot
+zero_arr launch disappears) and merges back-to-back dots over the same
+vector into one dual-dot pass: 6 (CG) / 13 (BiCGStab) launches per
+iteration, bit-identical arithmetic per partial-sum slot.  On top of
+that the whole readback-free check_every batch is CUDA-graph captured
+once per (operator-buffers, n, check_every) key and replayed — one
+Python call per batch.  Workspace + graph live in a module cache keyed
+by the operator's device-buffer pointers (the blockch pair buffers are
+persistent and refilled in place, #37 pattern, so the graph stays valid
+across Newton iterates); the workspace holds strong references to those
+buffers so a pointer can never be recycled under a live graph.
+
+Knob: graph="auto"|"off"|"fused"|"graph" per solve, default from
+DIFFSIM_KRYLOV_GRAPH or "auto".  auto = fused+captured on CUDA, LEGACY
+path (bit-for-bit today) on CPU; off = legacy everywhere; fused =
+fused kernels without capture (any device); graph = fused+captured on
+any device (CPU uses warp 1.15 APIC record/replay — test hook; verified
+capture records WITHOUT executing on both backends).
 """
+import os
+
 import numpy as np
 import warp as wp
 
@@ -25,6 +52,39 @@ from ..assembly.operators import _kernel_cache
 
 _NB = 256          # partial-reduction slots
 _BLOCK = 256
+
+_GRAPH_MODES = ("auto", "off", "fused", "graph")
+_graph_mode = None          # None -> DIFFSIM_KRYLOV_GRAPH or "auto"
+
+
+def set_krylov_graph(mode):
+    """Set the module-wide default for the Task-#40 inner-loop path."""
+    global _graph_mode
+    if mode is not None and mode not in _GRAPH_MODES:
+        raise ValueError(f"krylov_graph must be one of {_GRAPH_MODES}")
+    _graph_mode = mode
+
+
+def krylov_graph_mode():
+    if _graph_mode is not None:
+        return _graph_mode
+    env = os.environ.get("DIFFSIM_KRYLOV_GRAPH", "auto")
+    return env if env in _GRAPH_MODES else "auto"
+
+
+def _resolve_path(graph, device):
+    """-> (use_fused, use_capture) for this solve."""
+    mode = graph if graph is not None else krylov_graph_mode()
+    if mode not in _GRAPH_MODES:
+        raise ValueError(f"krylov_graph must be one of {_GRAPH_MODES}")
+    is_cuda = str(device).startswith("cuda")
+    if mode == "off":
+        return False, False
+    if mode == "fused":
+        return True, False
+    if mode == "graph":
+        return True, True
+    return (True, True) if is_cuda else (False, False)   # auto
 
 
 def _get(name):
@@ -125,11 +185,372 @@ def _dot_dev(a, b, n, partial, scal, slot, device):
               device=device)
 
 
+# ---------------------------------------------------------------------------
+# Task #40: fused kernels — reduction tails absorb the scalar bookkeeping
+# kernels and re-zero the partial buffer (invariant: partial == 0 between
+# dots), dual-dot merges back-to-back dots.  Per-slot accumulation pattern
+# is IDENTICAL to the legacy dot_partial/reduce_to pair (same thread ->
+# slot mapping, same per-thread strided sub-sums, single-thread final sum
+# in slot order), so fused results match the legacy loop bit-for-bit on a
+# serial backend and to atomic-scheduling ULP on CUDA.
+# ---------------------------------------------------------------------------
+
+def _make_fused_kernels():
+    if _get("fdot2") is not None:
+        return
+    _make_kernels()
+    _make_bicgstab_kernels()
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def fdot2(a: wp.array(dtype=wp.float64),
+              b: wp.array(dtype=wp.float64),
+              c: wp.array(dtype=wp.float64),
+              e: wp.array(dtype=wp.float64),
+              n: wp.int32,
+              partial: wp.array(dtype=wp.float64)):
+        # dual grid-stride dot: slots [0,NB) accumulate a.b, [NB,2NB) c.e
+        t = wp.tid()
+        s1 = wp.float64(0.0)
+        s2 = wp.float64(0.0)
+        i = t
+        while i < n:
+            s1 += a[i] * b[i]
+            s2 += c[i] * e[i]
+            i += _NB * _BLOCK
+        wp.atomic_add(partial, t % _NB, s1)
+        wp.atomic_add(partial, _NB + t % _NB, s2)
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def freduce_to(partial: wp.array(dtype=wp.float64),
+                   scal: wp.array(dtype=wp.float64), slot: wp.int32):
+        # final sum + RE-ZERO (keeps the partial-buffer invariant)
+        s = wp.float64(0.0)
+        for i in range(_NB):
+            s += partial[i]
+            partial[i] = wp.float64(0.0)
+        scal[slot] = s
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def fcg_red_pap_alpha(partial: wp.array(dtype=wp.float64),
+                          scal: wp.array(dtype=wp.float64)):
+        # pAp = sum(partial); alpha = rz / pAp   (absorbs cg_alpha)
+        s = wp.float64(0.0)
+        for i in range(_NB):
+            s += partial[i]
+            partial[i] = wp.float64(0.0)
+        scal[1] = s
+        scal[2] = scal[0] / s
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def fcg_update_xr_z(x: wp.array(dtype=wp.float64),
+                        r: wp.array(dtype=wp.float64),
+                        p: wp.array(dtype=wp.float64),
+                        Ap: wp.array(dtype=wp.float64),
+                        minv: wp.array(dtype=wp.float64),
+                        z: wp.array(dtype=wp.float64),
+                        scal: wp.array(dtype=wp.float64)):
+        # x/r update + Jacobi apply in one pass (absorbs hadamard)
+        i = wp.tid()
+        a = scal[2]
+        x[i] = x[i] + a * p[i]
+        ri = r[i] - a * Ap[i]
+        r[i] = ri
+        z[i] = minv[i] * ri
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def fcg_red_rz_beta(partial: wp.array(dtype=wp.float64),
+                        scal: wp.array(dtype=wp.float64)):
+        # rz_new = sum[0,NB); rnorm2 = sum[NB,2NB); beta = rz_new/rz;
+        # rz <- rz_new   (absorbs cg_beta_shift)
+        s1 = wp.float64(0.0)
+        s2 = wp.float64(0.0)
+        for i in range(_NB):
+            s1 += partial[i]
+            partial[i] = wp.float64(0.0)
+        for i in range(_NB, 2 * _NB):
+            s2 += partial[i]
+            partial[i] = wp.float64(0.0)
+        scal[4] = s1
+        scal[5] = s2
+        scal[3] = s1 / scal[0]
+        scal[0] = s1
+
+    # -- bicgstab fused tails; scal[11] = device-side "first" flag so the
+    #    batch is uniform (capturable across restarts) --------------------
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def fbs_red_rho_beta(partial: wp.array(dtype=wp.float64),
+                         scal: wp.array(dtype=wp.float64)):
+        s = wp.float64(0.0)
+        for i in range(_NB):
+            s += partial[i]
+            partial[i] = wp.float64(0.0)
+        scal[4] = s                      # rho_new (written even when frozen,
+        if scal[10] != wp.float64(0.0):  # like the legacy reduce_to)
+            return
+        eps = wp.float64(1.0e-12) * scal[5]
+        if wp.abs(scal[4]) < eps:
+            scal[10] = wp.float64(1.0)   # rho breakdown
+        if scal[11] != wp.float64(0.0):
+            scal[9] = wp.float64(0.0)
+            scal[11] = wp.float64(0.0)
+        else:
+            scal[9] = (scal[4] / scal[0]) * (scal[2] / scal[3])
+        scal[0] = scal[4]
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def fbs_p_update_prec(p: wp.array(dtype=wp.float64),
+                          r: wp.array(dtype=wp.float64),
+                          v: wp.array(dtype=wp.float64),
+                          minv: wp.array(dtype=wp.float64),
+                          ph: wp.array(dtype=wp.float64),
+                          scal: wp.array(dtype=wp.float64)):
+        i = wp.tid()
+        if scal[10] != wp.float64(0.0):
+            return                       # frozen: p unchanged => ph would
+        pi = r[i] + scal[9] * (p[i] - scal[3] * v[i])   # recompute equal
+        p[i] = pi
+        ph[i] = minv[i] * pi
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def fbs_red_rhatv_alpha(partial: wp.array(dtype=wp.float64),
+                            scal: wp.array(dtype=wp.float64)):
+        s = wp.float64(0.0)
+        for i in range(_NB):
+            s += partial[i]
+            partial[i] = wp.float64(0.0)
+        scal[1] = s
+        if scal[10] != wp.float64(0.0):
+            return
+        eps = wp.float64(1.0e-12) * scal[5]
+        if wp.abs(scal[1]) < eps:
+            scal[10] = wp.float64(2.0)   # rhat_v breakdown
+            scal[2] = wp.float64(0.0)
+        else:
+            scal[2] = scal[0] / scal[1]
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def fbs_s_update_prec(s: wp.array(dtype=wp.float64),
+                          r: wp.array(dtype=wp.float64),
+                          v: wp.array(dtype=wp.float64),
+                          minv: wp.array(dtype=wp.float64),
+                          sh: wp.array(dtype=wp.float64),
+                          scal: wp.array(dtype=wp.float64)):
+        i = wp.tid()
+        if scal[10] != wp.float64(0.0):
+            return
+        si = r[i] - scal[2] * v[i]
+        s[i] = si
+        sh[i] = minv[i] * si
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def fbs_red_tt_ts_omega(partial: wp.array(dtype=wp.float64),
+                            scal: wp.array(dtype=wp.float64)):
+        s1 = wp.float64(0.0)
+        s2 = wp.float64(0.0)
+        for i in range(_NB):
+            s1 += partial[i]
+            partial[i] = wp.float64(0.0)
+        for i in range(_NB, 2 * _NB):
+            s2 += partial[i]
+            partial[i] = wp.float64(0.0)
+        scal[7] = s1
+        scal[8] = s2
+        if scal[10] != wp.float64(0.0):
+            return
+        if scal[7] > wp.float64(0.0):
+            scal[3] = scal[8] / scal[7]
+        else:
+            scal[3] = wp.float64(0.0)
+
+    for name, k in (("fdot2", fdot2), ("freduce_to", freduce_to),
+                    ("fcg_red_pap_alpha", fcg_red_pap_alpha),
+                    ("fcg_update_xr_z", fcg_update_xr_z),
+                    ("fcg_red_rz_beta", fcg_red_rz_beta),
+                    ("fbs_red_rho_beta", fbs_red_rho_beta),
+                    ("fbs_p_update_prec", fbs_p_update_prec),
+                    ("fbs_red_rhatv_alpha", fbs_red_rhatv_alpha),
+                    ("fbs_s_update_prec", fbs_s_update_prec),
+                    ("fbs_red_tt_ts_omega", fbs_red_tt_ts_omega)):
+        _put(name, k)
+
+
+def _fdot(a, b, n, partial, device):
+    # partial is zero on entry (invariant); caller launches a fused tail
+    wp.launch(_get("dot_partial"), dim=_NB * _BLOCK,
+              inputs=[a, b, n, partial], device=device)
+
+
+class _KrylovWorkspace:
+    """Persistent per-(kind, operator-buffers, n, check_every) device
+    workspace + captured graph.  Holds STRONG references to the
+    operator's device buffers (op_dev) so their pointers cannot be freed
+    and recycled while a captured graph referencing them is alive."""
+
+    def __init__(self, kind, op, n, device, check_every):
+        nv = 5 if kind == "cg" else 9
+        self.vecs = [wp.zeros(n, dtype=wp.float64, device=device)
+                     for _ in range(nv)]
+        self.partial = wp.zeros(2 * _NB, dtype=wp.float64, device=device)
+        self.scal = wp.zeros(12, dtype=wp.float64, device=device)
+        self.minv = wp.zeros(n, dtype=wp.float64, device=device)
+        self.op_dev = op._dev            # strong refs (pointer stability)
+        self.graph = None
+        self.graph_failed = False
+
+
+_WS_CACHE = {}
+_WS_CAP = 32          # FIFO cap: bounds retained device memory
+
+
+def _fusable(op):
+    """The fused/captured path requires a CSROperator-shaped op: stable
+    device buffers (`_dev`) to key the workspace/graph on and a known
+    launch-only `matvec` (`_spmv`).  Arbitrary operator-protocol objects
+    (matrix-free / constrained / test wrappers) take the legacy loop —
+    their matvec closures are not guaranteed capture-safe."""
+    return hasattr(op, "_dev") and hasattr(op, "_spmv")
+
+
+def _op_key(op):
+    parts = []
+    for a in op._dev:
+        parts.append(a.ptr if isinstance(a, wp.array) else ("s", str(a)))
+    return (id(op._spmv), tuple(parts))
+
+
+def _workspace(kind, op, n, device, check_every):
+    key = (kind, str(device), n, check_every, _op_key(op))
+    ws = _WS_CACHE.get(key)
+    if ws is None:
+        while len(_WS_CACHE) >= _WS_CAP:
+            _WS_CACHE.pop(next(iter(_WS_CACHE)))
+        ws = _KrylovWorkspace(kind, op, n, device, check_every)
+        _WS_CACHE[key] = ws
+    return ws
+
+
+def _try_capture(ws, device, batch, check_every):
+    """Capture one readback-free check_every batch into ws.graph.
+    Capture records WITHOUT executing (verified on both backends), so
+    the caller replays the graph for every full batch including the
+    first.  Any failure disables capture for this workspace and the
+    solve proceeds on the fused launch path."""
+    if ws.graph is not None or ws.graph_failed:
+        return
+    try:
+        wp.capture_begin(device)
+        ok = False
+        try:
+            batch(check_every)
+            ok = True
+        finally:
+            try:
+                g = wp.capture_end(device)
+            except Exception:
+                if ok:
+                    raise
+                g = None
+        ws.graph = g
+    except Exception:
+        ws.graph = None
+        ws.graph_failed = True
+
+
+def _upload_into(dst, host_vec, n):
+    wp.copy(dst, wp.array(np.ascontiguousarray(host_vec, np.float64),
+                          dtype=wp.float64, device="cpu"), count=n)
+
+
+def _cg_fused(op, b, tol, atol, maxiter, diag, check_every, sync_counter,
+              capture):
+    """Task-#40 fused (and optionally graph-captured) CG inner loop.
+    Iterate-identical to the legacy cg_dev loop: same kernels-per-slot
+    arithmetic, same batch boundaries, same convergence checks — 6
+    launches/iteration instead of 15, one capture_launch per batch when
+    captured."""
+    _make_fused_kernels()
+    d = op.device
+    n = op.n_free
+    ws = _workspace("cg", op, n, d, check_every)
+    x, r, z, p, Ap = ws.vecs
+    partial, scal, minv = ws.partial, ws.scal, ws.minv
+    bd = wp.array(np.ascontiguousarray(b, np.float64), dtype=wp.float64,
+                  device=d)
+    _upload_into(minv, 1.0 / np.ascontiguousarray(diag, np.float64), n)
+    x.zero_()
+    wp.copy(r, bd)
+    wp.launch(_get("hadamard"), dim=n, inputs=[minv, r, z], device=d)
+    wp.copy(p, z)
+
+    _fdot(r, z, n, partial, d)
+    wp.launch(_get("freduce_to"), dim=1, inputs=[partial, scal, 0],
+              device=d)                                 # rz
+    _fdot(bd, bd, n, partial, d)
+    wp.launch(_get("freduce_to"), dim=1, inputs=[partial, scal, 6],
+              device=d)                                 # bnorm2
+    bnorm = max(np.sqrt(scal.numpy()[6]), 1e-300)       # one entry sync
+    if sync_counter is not None:
+        sync_counter.count += 1
+    thresh2 = max(tol * bnorm, atol) ** 2
+
+    def batch(k):
+        for _ in range(k):
+            op.matvec(p, Ap)
+            _fdot(p, Ap, n, partial, d)
+            wp.launch(_get("fcg_red_pap_alpha"), dim=1,
+                      inputs=[partial, scal], device=d)
+            wp.launch(_get("fcg_update_xr_z"), dim=n,
+                      inputs=[x, r, p, Ap, minv, z, scal], device=d)
+            wp.launch(_get("fdot2"), dim=_NB * _BLOCK,
+                      inputs=[r, z, r, r, n, partial], device=d)
+            wp.launch(_get("fcg_red_rz_beta"), dim=1,
+                      inputs=[partial, scal], device=d)
+            wp.launch(_get("cg_update_p"), dim=n, inputs=[p, z, scal],
+                      device=d)
+
+    if capture:
+        _try_capture(ws, d, batch, check_every)
+
+    it = 0
+    rnorm2 = None
+    while it < maxiter:
+        k = min(check_every, maxiter - it)
+        if ws.graph is not None and k == check_every:
+            wp.capture_launch(ws.graph)
+        else:
+            batch(k)
+        it += k
+        rnorm2 = float(scal.numpy()[5])                 # THE periodic sync
+        if sync_counter is not None:
+            sync_counter.count += 1
+        if rnorm2 < thresh2:
+            return x.numpy(), {"iters": it,
+                               "relres": np.sqrt(rnorm2) / bnorm,
+                               "converged": True,
+                               "graph": ws.graph is not None}
+    return x.numpy(), {"iters": it,
+                       "relres": np.sqrt(rnorm2 if rnorm2 is not None
+                                         else np.inf) / bnorm,
+                       "converged": False, "graph": ws.graph is not None}
+
+
 def cg_dev(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None,
-           check_every=10, sync_counter=None):
+           check_every=10, sync_counter=None, graph=None):
     """Single-sync device CG. op: .matvec(x_wp, y_wp), .n_free, .device.
     Host syncs ONLY at the periodic convergence check (and once at entry for
-    bnorm). Returns (x numpy, info)."""
+    bnorm). Returns (x numpy, info).
+
+    graph: Task-#40 knob — "auto" (default; fused+captured on CUDA,
+    legacy on CPU), "off" (legacy loop bit-for-bit), "fused",
+    "graph" (capture on any device).  diag=None or a non-CSROperator op
+    (matrix-free protocol objects) always takes the legacy loop
+    (production blockch/fused-backend inners are Jacobi-preconditioned
+    CSROperators)."""
+    fused, cap = _resolve_path(graph, op.device)
+    if fused and diag is not None and _fusable(op):
+        return _cg_fused(op, b, tol, atol, maxiter, diag, check_every,
+                         sync_counter, cap)
     _make_kernels()
     d = op.device
     n = op.n_free
@@ -275,14 +696,125 @@ def _make_bicgstab_kernels():
         _put(name, k)
 
 
+def _bicgstab_fused(op, b, tol, atol, maxiter, diag, check_every,
+                    sync_counter, max_restarts, capture):
+    """Task-#40 fused (and optionally graph-captured) BiCGStab.
+    Iterate-identical to the legacy loop (same per-slot arithmetic and
+    freeze-on-breakdown semantics); the "first" flag moves to the device
+    (scal[11]) so every batch is uniform and ONE captured graph covers
+    entry and post-restart batches alike.  13 launches/iteration instead
+    of 22."""
+    _make_fused_kernels()
+    d = op.device
+    n = op.n_free
+    ws = _workspace("bs", op, n, d, check_every)
+    x, r, rhat, p, v, s, t, ph, sh = ws.vecs
+    partial, scal, minv = ws.partial, ws.scal, ws.minv
+    bd = wp.array(np.ascontiguousarray(b, np.float64), dtype=wp.float64,
+                  device=d)
+    _upload_into(minv, 1.0 / np.ascontiguousarray(diag, np.float64), n)
+    x.zero_()
+    wp.copy(r, bd)
+    wp.copy(rhat, bd)
+    for a_ in (p, v, s, t, ph, sh):
+        a_.zero_()
+
+    _fdot(bd, bd, n, partial, d)
+    wp.launch(_get("freduce_to"), dim=1, inputs=[partial, scal, 6],
+              device=d)
+    bnorm = max(np.sqrt(scal.numpy()[6]), 1e-300)
+    if sync_counter is not None:
+        sync_counter.count += 1
+    thresh2 = max(tol * bnorm, atol) ** 2
+
+    def _reset_scal(rn2):
+        st = np.zeros(12)
+        st[0] = st[2] = st[3] = 1.0     # rho/alpha/omega convention
+        st[5] = rn2                     # breakdown thresholds are relative
+        st[6] = bnorm ** 2              # to scal[5]; zero would disarm them
+        st[11] = 1.0                    # device-side "first" flag
+        _upload_into(scal, st, 12)
+
+    _reset_scal(bnorm ** 2)
+
+    def batch(k):
+        for _ in range(k):
+            _fdot(rhat, r, n, partial, d)
+            wp.launch(_get("fbs_red_rho_beta"), dim=1,
+                      inputs=[partial, scal], device=d)
+            wp.launch(_get("fbs_p_update_prec"), dim=n,
+                      inputs=[p, r, v, minv, ph, scal], device=d)
+            op.matvec(ph, v)
+            _fdot(rhat, v, n, partial, d)
+            wp.launch(_get("fbs_red_rhatv_alpha"), dim=1,
+                      inputs=[partial, scal], device=d)
+            wp.launch(_get("fbs_s_update_prec"), dim=n,
+                      inputs=[s, r, v, minv, sh, scal], device=d)
+            op.matvec(sh, t)
+            wp.launch(_get("fdot2"), dim=_NB * _BLOCK,
+                      inputs=[t, t, t, s, n, partial], device=d)
+            wp.launch(_get("fbs_red_tt_ts_omega"), dim=1,
+                      inputs=[partial, scal], device=d)
+            wp.launch(_get("bs_xr_update"), dim=n,
+                      inputs=[x, r, ph, sh, s, t, scal], device=d)
+            _fdot(r, r, n, partial, d)
+            wp.launch(_get("freduce_to"), dim=1, inputs=[partial, scal, 5],
+                      device=d)
+
+    if capture:
+        _try_capture(ws, d, batch, check_every)
+
+    it = 0
+    restarts = 0
+    rnorm2 = np.inf
+    while it < maxiter:
+        k = min(check_every, maxiter - it)
+        if ws.graph is not None and k == check_every:
+            wp.capture_launch(ws.graph)
+        else:
+            batch(k)
+        it += k
+        vals = scal.numpy()                             # THE periodic sync
+        if sync_counter is not None:
+            sync_counter.count += 1
+        rnorm2, flag = float(vals[5]), float(vals[10])
+        if rnorm2 < thresh2:                   # converged wins over any
+            return x.numpy(), {"iters": it,   # concurrent breakdown flag
+                               "relres": np.sqrt(rnorm2) / bnorm,
+                               "converged": True, "restarts": restarts,
+                               "graph": ws.graph is not None}
+        if flag != 0.0:
+            if restarts < max_restarts:
+                restarts += 1
+                wp.copy(rhat, r)                # restart from last good r
+                _reset_scal(rnorm2)
+                continue
+            return x.numpy(), {"iters": it,
+                               "relres": np.sqrt(rnorm2) / bnorm,
+                               "converged": False, "restarts": restarts,
+                               "breakdown": ("rho" if flag == 1.0
+                                             else "rhat_v"),
+                               "graph": ws.graph is not None}
+    return x.numpy(), {"iters": it, "relres": np.sqrt(rnorm2) / bnorm,
+                       "converged": False, "graph": ws.graph is not None}
+
+
 def bicgstab_dev(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None,
-                 check_every=10, sync_counter=None, max_restarts=50):
+                 check_every=10, sync_counter=None, max_restarts=50,
+                 graph=None):
     """Single-sync device BiCGStab (Jacobi-preconditioned). Breakdown guards
     live ON DEVICE (scalars[10]) and FREEZE all update kernels, so the state
     at the periodic host check is the last pre-breakdown iterate; the host
     then RESTARTS (rhat <- r, scalars reset) up to max_restarts times — the
     standard cure for rho-breakdown on hard nonsymmetric systems (measured
-    on the L6 cavity monolithic block). Same contract as krylov.bicgstab."""
+    on the L6 cavity monolithic block). Same contract as krylov.bicgstab.
+
+    graph: Task-#40 knob (see cg_dev)."""
+    fused, cap = _resolve_path(graph, op.device)
+    if fused and diag is not None and _fusable(op):
+        return _bicgstab_fused(op, b, tol, atol, maxiter, diag,
+                               check_every, sync_counter, max_restarts,
+                               cap)
     _make_bicgstab_kernels()
     d = op.device
     n = op.n_free

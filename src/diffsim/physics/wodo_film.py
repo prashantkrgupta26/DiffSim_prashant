@@ -435,7 +435,7 @@ class WodoFilmStepper(TernaryCHStepper):
                  lat_scale=1.0, linsolver="splu", noise=0.0,
                  noise_seed=0, var_mob=False, D_ratio=1e-3, b_reg=0.0,
                  f_cheb=(0.0, 0.0, 0.0), use_device_assembly=False,
-                 mob_model="wodo", tstep="bdf1"):
+                 mob_model="wodo", tstep="bdf1", krylov_graph="auto"):
         super().__init__(dm, chi=chi, M=M, kappa=kappa, dt=dt, order=1,
                          newton_tol=newton_tol, newton_max=newton_max)
         # retrofit G1 (2026-07-13): the p == 1 restriction is lifted —
@@ -453,6 +453,14 @@ class WodoFilmStepper(TernaryCHStepper):
         self._cudss_dev = None      # device-CSR DirectSolver plan
         self.noise = float(noise)
         self._nrng = np.random.default_rng(noise_seed)
+        # Task #40: device-Krylov inner-loop path for the blockch inners
+        # ("auto" = fused + CUDA-graph-captured on CUDA, legacy on CPU;
+        # "off" = the pre-#40 launch-per-op loop bit-for-bit).
+        from ..solvers.krylov_dev import _GRAPH_MODES
+        if krylov_graph not in _GRAPH_MODES:
+            raise ConfigError(f"krylov_graph must be one of "
+                              f"{_GRAPH_MODES}, got {krylov_graph!r}")
+        self.krylov_graph = krylov_graph
         # retrofit G2 (A4b pattern, multiphase apack Sec 4b): tstep =
         # "bdf1" (default, existing behavior bit-identically) | "bdf2"
         # = VARIABLE-COEFFICIENT BDF2, deterministic-only.  Per-attempt
@@ -629,6 +637,7 @@ class WodoFilmStepper(TernaryCHStepper):
                 {"off": 2, "m": self.M22, "kappa": self.kap2}]}
             if self.linsolver == "blockch_dev":
                 meta["inners"] = "device"
+                meta["krylov_graph"] = self.krylov_graph
             self._solver_cache[("blockch_meta", "wodo")] = meta
             try:
                 return solve_linear(A, r, solver="blockch", tol=1e-10,
@@ -707,7 +716,8 @@ class WodoFilmStepper(TernaryCHStepper):
         from ..solvers.linsolve import blockch_pairs_device
         meta = {"sigma": self._sigma, "ndof": 4, "pairs": [
             {"off": 0, "m": self.M11, "kappa": self.kap1},
-            {"off": 2, "m": self.M22, "kappa": self.kap2}]}
+            {"off": 2, "m": self.M22, "kappa": self.kap2}],
+            "krylov_graph": self.krylov_graph}
         try:
             return blockch_pairs_device(
                 asm.indptr, asm.indices, asm.vals_d, asm.F_d.numpy(),
