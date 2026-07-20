@@ -451,10 +451,13 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
     N = len(indptr) - 1
     n = N // ndof
     nnz = len(indices)
-    if nnz >= 2 ** 31:
-        raise BackendError(
-            f"blockch device nnz {nnz} >= 2^31: int32 device slot maps "
-            f"overflow (add an int64 variant)")
+    # P0-2: pos maps (positions in A.data) and the full-A row offsets
+    # index nnz-space -> widen the GATHER index dtype past 2^31.  The
+    # pair/AC BLOCK operators are node-space (always int32).  Node cols
+    # (colnodes) and diag are node-space; only the A.data positions
+    # (pos_d) and the outer full-A indptr widen.
+    idx_np = np.int64 if nnz >= 2 ** 31 else np.int32
+    idx_dt = wp.int64 if nnz >= 2 ** 31 else wp.int32
     fp = (N, nnz, len(meta["pairs"]), len(meta.get("ac", ())))
     setup = (cache or {}).get(("blockch_dev_setup", cache_key))
     if setup is None or setup["fp"] != fp:
@@ -469,7 +472,7 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
                 nnzp=nnzp,
                 rowptr_d=dev(rowptr.astype(np.int32), wp.int32),
                 colnodes_d=dev(colnodes, wp.int32),
-                pos_d={k: dev(v.astype(np.int32), wp.int32)
+                pos_d={k: dev(v.astype(idx_np), idx_dt)
                        for k, v in pos.items()},
                 diag_d=dev(diag.astype(np.int32), wp.int32),
                 amm_d=wp.zeros(nnzp, dtype=wp.float64, device=device),
@@ -489,7 +492,7 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
                 # ss = psi-psi, ts = theta-psi (KWC torque; None when
                 # the pattern drops it), tt = theta-theta
                 pos_d={k: (None if pos[k] is None
-                           else dev(pos[k].astype(np.int32), wp.int32))
+                           else dev(pos[k].astype(idx_np), idx_dt))
                        for k in ("ss", "ts", "tt")},
                 diag_d=dev(diag.astype(np.int32), wp.int32),
                 ss_d=wp.zeros(nnzp, dtype=wp.float64, device=device),
@@ -500,10 +503,13 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
         # idx_dev: caller-provided device (indptr, indices) int32 pair
         # (e.g. DeviceNSAssembler._op_idx) — avoids a DUPLICATE device
         # copy of the full-A indices (4-8 GB at the B4/B5 sizes)
+        # full-A row offsets index nnz-space (widen); column indices are
+        # dof-space (int32).  idx_dev, when provided, already carries the
+        # assembler's chosen width (DeviceNSAssembler._op_idx).
         setup["A_idx_d"] = idx_dev if idx_dev is not None else (
             wp.array(np.ascontiguousarray(
-                np.asarray(indptr).astype(np.int32)),
-                dtype=wp.int32, device=device),
+                np.asarray(indptr).astype(idx_np)),
+                dtype=idx_dt, device=device),
             wp.array(np.ascontiguousarray(
                 np.asarray(indices).astype(np.int32)),
                 dtype=wp.int32, device=device))
@@ -522,7 +528,10 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
         inner_it[0] += info.get("iters", 0)
         return x_
 
-    gat = _gather_kernel()
+    # two gather widths: pos_d index nnz-space (P0-2 wide); diag_d is
+    # node-space (always int32).
+    gat = _gather_kernel(idx_dt)
+    gat_diag = _gather_kernel(wp.int32)
     fill = _blockch_pair_fill_kernel()
     pairs = []
     for p, Pd in zip(meta["pairs"], setup["pairs"]):
@@ -537,7 +546,8 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
             Pd["w2_d"]], device=device)
         dgs = []
         for arr in (Pd["amm_d"], Pd["w1_d"], Pd["w2_d"]):
-            wp.launch(gat, dim=n, inputs=[arr, Pd["diag_d"], Pd["dg_d"]],
+            wp.launch(gat_diag, dim=n,
+                      inputs=[arr, Pd["diag_d"], Pd["dg_d"]],
                       device=device)
             dg = Pd["dg_d"].numpy()
             dg[dg == 0] = 1.0
@@ -569,8 +579,8 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
                       device=device)
         dgs = []
         for arr in (Bd["ss_d"], Bd["tt_d"]):
-            wp.launch(gat, dim=n, inputs=[arr, Bd["diag_d"],
-                                          Bd["dg_d"]], device=device)
+            wp.launch(gat_diag, dim=n, inputs=[arr, Bd["diag_d"],
+                                               Bd["dg_d"]], device=device)
             dg = np.abs(Bd["dg_d"].numpy())
             dg[dg == 0] = 1.0
             dgs.append(dg)

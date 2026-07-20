@@ -24,6 +24,52 @@ from ..errors import BackendError, ConfigError
 from .operators import _kernel_cache
 
 
+# ---------------------------------------------------------------------
+# Mixed-width CSR index templating (Horizon P0-2, idx-widening).
+#
+# The int32 nnz ceiling: row pointers, slot arrays and the in-kernel
+# slot ARITHMETIC index into nnz-space, which climbs past 2^31 at the
+# campaign scales (1.7B and rising). Column indices only ever address
+# DOFS (<< 2^31 at all our scales), so the fix is a MIXED-width CSR:
+# int64 offsets/slots, int32 columns.  Mechanism = the kernel-factory
+# templating already in use — the index dtype joins the cache key, so
+# each warp module is compiled per (idx_dtype, ...) lazily.
+#
+# Narrow mode (idx_dtype == wp.int32) stays the DEFAULT and remains
+# bit-for-bit the pre-P0-2 path: same kernels, same cache keys tail,
+# same int32 arrays.  Wide mode allocates offset/slot arrays as int64
+# and specializes the slot-computing kernels so no arithmetic wraps.
+# ---------------------------------------------------------------------
+IDX_WIDE_THRESHOLD = int(0.9 * 2 ** 31)     # >~90% of 2^31 -> wide path
+
+
+def _resolve_idx_width(index_width, nnz_estimate):
+    """Map the config knob + an nnz estimate to a warp index dtype.
+
+    index_width: "auto" (default) | "narrow" | "wide".  "auto" picks
+    wide once the estimate crosses ~90% of 2^31 (the slot arithmetic
+    headroom); "narrow"/"wide" force the choice.  Returns wp.int32 or
+    wp.int64.  A forced-narrow request that would overflow is REFUSED
+    loudly here (no silent wrap)."""
+    if index_width not in ("auto", "narrow", "wide"):
+        raise ConfigError(
+            f"index_width must be 'auto'|'narrow'|'wide', got "
+            f"{index_width!r}")
+    if index_width == "wide":
+        return wp.int64
+    if index_width == "narrow":
+        if nnz_estimate is not None and nnz_estimate >= 2 ** 31:
+            raise BackendError(
+                f"index_width='narrow' forced but nnz {nnz_estimate} "
+                f">= 2^31: the int32 slot arithmetic would wrap — use "
+                f"index_width='auto' or 'wide'")
+        return wp.int32
+    # auto
+    if nnz_estimate is not None and nnz_estimate >= IDX_WIDE_THRESHOLD:
+        return wp.int64
+    return wp.int32
+
+
 # Auto-switch threshold for the node-graph pattern build (G5 rung c):
 # above this many dof-pair entries (sum over bins of ne*(nbf*ndof)^2)
 # the old host COO/slot build becomes the memory binder (measured
@@ -38,7 +84,8 @@ class DeviceNSAssembler:
     per step on device."""
 
     def __init__(self, dm, sigma_like=1.0, coloring=False, ndof=None,
-                 node_pattern=None, blockmask=None, matvec_only=False):
+                 node_pattern=None, blockmask=None, matvec_only=False,
+                 index_width="auto"):
         # ndof: dofs per node (default dim+1 = the NS layout; 4 for the
         # ternary CH film system, 2 for binary CH — M4 device-bound)
         # blockmask (B5): bool [ndof, ndof] compile-time dof-pair block
@@ -51,6 +98,13 @@ class DeviceNSAssembler:
         # diagonal is forced live (strong rows need it).
         self.dm = dm
         self.coloring = coloring
+        # index-width config (P0-2): resolved to a concrete wp dtype
+        # once the pattern nnz is known (in the pattern builders); the
+        # default "auto" keeps narrow (int32) below ~90% of 2^31 so the
+        # pre-P0-2 path is bit-for-bit unchanged.
+        self._index_width = index_width
+        self._idx_dtype = wp.int32          # provisional; finalized below
+        self._idx_np = np.int32
         ndof = (dm.dim + 1) if ndof is None else int(ndof)
         self.ndof = ndof
         if blockmask is not None:
@@ -183,6 +237,9 @@ class DeviceNSAssembler:
         self.indptr = K.indptr.copy()
         self.indices = K.indices.copy()
         self.nnz = K.nnz
+        # P0-2: resolve the CSR index width from the realized nnz.
+        idx_dt = self._finalize_idx_width(self.nnz)
+        inp = self._idx_np
         # slot index per (element-pair entry): position in the CSR
         # values array. FULLY VECTORIZED via sparse fancy indexing: give
         # the pattern matrix data = arange(nnz), then K2[rr, cc] returns
@@ -208,9 +265,11 @@ class DeviceNSAssembler:
                 self._weight_bins.append(w)
                 self._src_bins.append(src)
         self._slot_bins = slot_bins
-        # device uploads
+        # device uploads.  Slot arrays index nnz-space -> widen with the
+        # CSR (inp/idx_dt); the source (src_d) and dof (gdof_d) arrays
+        # are element-block-local / dof-space and stay int32.
         self._slots_d = [wp.array(np.ascontiguousarray(
-            s.astype(np.int32).ravel()), dtype=wp.int32, device=dm.device)
+            s.astype(inp).ravel()), dtype=idx_dt, device=dm.device)
             for s in slot_bins]
         self._w_d = [None if w is None else wp.array(
             np.ascontiguousarray(w), dtype=wp.float64, device=dm.device)
@@ -265,6 +324,23 @@ class DeviceNSAssembler:
                 bounds = np.searchsorted(color[order],
                                          np.arange(color.max() + 2))
                 self._colors.append((order.astype(np.int32), bounds))
+
+    def _finalize_idx_width(self, nnz):
+        """Resolve the concrete index dtype from the config knob + the
+        realized pattern nnz.  Sets self._idx_dtype (wp) / self._idx_np
+        (numpy).  Also asserts dofs (Nfull) fit int32 — always true at
+        our scales but checked so a wide-mode column-index assumption
+        can never silently break.  Returns the chosen wp dtype."""
+        self._idx_dtype = _resolve_idx_width(self._index_width, nnz)
+        self._idx_np = (np.int64 if self._idx_dtype is wp.int64
+                        else np.int32)
+        if self.Nfull >= 2 ** 31:
+            raise BackendError(
+                f"dof count Nfull={self.Nfull} >= 2^31: column indices "
+                f"stay int32 in mixed-width CSR — this exceeds that "
+                f"assumption (dof-space overflow, not nnz-space)")
+        self.index_wide = self._idx_dtype is wp.int64
+        return self._idx_dtype
 
     # ------------------------------------------------------------------
     # G5 rung c: node-graph symbolic pattern. Build the NODE adjacency
@@ -327,10 +403,13 @@ class DeviceNSAssembler:
                 colpos[ca * ndof + np.where(mask[ca])[0]] = \
                     np.arange(rowcnt[ca])
             self.nnz = gnnz * int(rowcnt.sum())
-        if self.nnz >= 2 ** 31:
-            raise BackendError(
-                f"node-pattern dof nnz {self.nnz} >= 2^31: the int32 device "
-                f"slot arithmetic overflows — needs an int64 kernel variant")
+        # P0-2: pick the CSR index width from the realized nnz (auto:
+        # wide once past ~90% of 2^31).  Replaces the old hard raise —
+        # wide mode carries int64 offsets/slots so the slot arithmetic
+        # no longer wraps.  A forced-narrow past the ceiling still FAILS
+        # loudly inside _finalize_idx_width (no silent wrap).
+        idx_dt = self._finalize_idx_width(self.nnz)
+        inp = self._idx_np
         # dof-level indptr in closed form (int64: values reach nnz)
         if mask is None:
             self.indptr = np.concatenate(
@@ -343,14 +422,15 @@ class DeviceNSAssembler:
             ).astype(np.int64)
         assert self.indptr[-1] == self.nnz
         # dof-level indices by device kernel (one thread per dof row);
-        # int32 mirror kept on host (blockch symbolic setup, csr_slots)
-        self._Gptr_d = wp.array(Gptr.astype(np.int32), dtype=wp.int32,
-                                device=d)
+        # int32 mirror kept on host (blockch symbolic setup, csr_slots).
+        # Gptr indexes into nnz-space (via g0) -> uploaded at the CSR
+        # index width; the COLUMN indices (ind_d) stay int32.
+        self._Gptr_d = wp.array(Gptr.astype(inp), dtype=idx_dt, device=d)
         Gind_d = wp.array(Gind, dtype=wp.int32, device=d)
         ind_d = wp.zeros(self.nnz, dtype=wp.int32, device=d)
         if mask is None:
             self._mask_d = None
-            wp.launch(_dof_indices_kernel(), dim=self.Nfull,
+            wp.launch(_dof_indices_kernel(idx_dt), dim=self.Nfull,
                       inputs=[self._Gptr_d, Gind_d, wp.int32(ndof),
                               ind_d], device=d)
         else:
@@ -359,7 +439,7 @@ class DeviceNSAssembler:
             self._mask_d = dict(rowoff=i32(rowoff), lcols=i32(lcols),
                                 colpos=i32(colpos),
                                 blocknnz=int(rowcnt.sum()))
-            wp.launch(_dof_indices_masked_kernel(), dim=self.Nfull,
+            wp.launch(_dof_indices_masked_kernel(idx_dt), dim=self.Nfull,
                       inputs=[self._Gptr_d, Gind_d, wp.int32(ndof),
                               self._mask_d["rowoff"],
                               self._mask_d["lcols"], ind_d], device=d)
@@ -397,12 +477,15 @@ class DeviceNSAssembler:
         # flat list of ALL slots in the strong rows (to zero)
         spans = np.concatenate([np.arange(s_, e_)
                                 for s_, e_ in zip(starts, ends)])
+        # spans/diag index nnz-space (positions in the values array) ->
+        # widen with the CSR; rows are dof-space (stay int32).
+        idx_dt, inp = self._idx_dtype, self._idx_np
         self._strong = dict(
             rows_d=wp.array(rows.astype(np.int32), dtype=wp.int32,
                             device=self.dm.device),
-            spans_d=wp.array(spans.astype(np.int32), dtype=wp.int32,
+            spans_d=wp.array(spans.astype(inp), dtype=idx_dt,
                              device=self.dm.device),
-            diag_d=wp.array(diag.astype(np.int32), dtype=wp.int32,
+            diag_d=wp.array(diag.astype(inp), dtype=idx_dt,
                             device=self.dm.device),
             n_spans=len(spans), n_rows=len(rows))
 
@@ -466,12 +549,12 @@ class DeviceNSAssembler:
                               aq, fq, wp.float64(nu), wp.float64(sig2tau),
                               be], device=d)
             npair = (nbf * ndof) ** 2
-            scat = _scatter_kernel()
+            scat = _scatter_kernel(self._idx_dtype)
             if self.node_mode:
                 self.scatter_bin(k_bin, Ae, be)   # A and b together
                 continue
             if not self._identity_T:
-                scw = _scatter_weighted_kernel()
+                scw = _scatter_weighted_kernel(self._idx_dtype)
                 wp.launch(scw, dim=len(self._slot_bins[k_bin]),
                           inputs=[Ae.reshape((-1,)), self._src_d[k_bin],
                                   self._w_d[k_bin], self._slots_d[k_bin],
@@ -483,7 +566,7 @@ class DeviceNSAssembler:
             else:
                 order, bounds = self._colors[k_bin]
                 order_d = wp.array(order, dtype=wp.int32, device=d)
-                scat_c = _scatter_colored_kernel()
+                scat_c = _scatter_colored_kernel(self._idx_dtype)
                 for ci in range(len(bounds) - 1):
                     lo, hi = int(bounds[ci]), int(bounds[ci + 1])
                     if hi > lo:
@@ -565,7 +648,7 @@ class DeviceNSAssembler:
         npair = nl * nl
         if self.node_mode:
             if self._blockmask is not None:
-                wp.launch(_scatter_node_masked_kernel(),
+                wp.launch(_scatter_node_masked_kernel(self._idx_dtype),
                           dim=nb * npair,
                           inputs=[Ae_d.reshape((-1,)),
                                   self._gslot_d[k_bin],
@@ -576,7 +659,8 @@ class DeviceNSAssembler:
                                   self._mask_d["colpos"],
                                   self.vals_d], device=d)
             else:
-                wp.launch(_scatter_node_kernel(), dim=nb * npair,
+                wp.launch(_scatter_node_kernel(self._idx_dtype),
+                          dim=nb * npair,
                           inputs=[Ae_d.reshape((-1,)),
                                   self._gslot_d[k_bin],
                                   self._conn_d[k_bin], self._Gptr_d,
@@ -592,7 +676,7 @@ class DeviceNSAssembler:
             raise BackendError(
                 "scatter_batch: constraint-aware path is whole-bin only")
         slots_v = self._slots_d[k_bin][e0 * npair:(e0 + nb) * npair]
-        wp.launch(_scatter_kernel(), dim=nb * npair,
+        wp.launch(_scatter_kernel(self._idx_dtype), dim=nb * npair,
                   inputs=[Ae_d.reshape((-1,)), slots_v, self.vals_d],
                   device=d)
         gdof_v = self._gdof_d[k_bin][e0 * nl:(e0 + nb) * nl]
@@ -640,7 +724,7 @@ class DeviceNSAssembler:
                     be_f[e0 * nl:(e0 + nb) * nl], nb)
             return
         if not self._identity_T:
-            wp.launch(_scatter_weighted_kernel(),
+            wp.launch(_scatter_weighted_kernel(self._idx_dtype),
                       dim=len(self._slot_bins[k_bin]),
                       inputs=[Ae_d.reshape((-1,)), self._src_d[k_bin],
                               self._w_d[k_bin], self._slots_d[k_bin],
@@ -651,7 +735,7 @@ class DeviceNSAssembler:
                               self._bw_d[k_bin], self._gdof_d[k_bin],
                               self.F_d], device=d)
         else:
-            wp.launch(_scatter_kernel(), dim=ne * npair,
+            wp.launch(_scatter_kernel(self._idx_dtype), dim=ne * npair,
                       inputs=[Ae_d.reshape((-1,)), self._slots_d[k_bin],
                               self.vals_d], device=d)
             wp.launch(_scatter_vec_kernel(), dim=ne * nbf * self.ndof,
@@ -668,14 +752,14 @@ class DeviceNSAssembler:
         (the M5 multiphase Newton) realize the same strong-row
         semantics as assemble()."""
         st = self._strong
-        wp.launch(_zero_slots_kernel(), dim=st["n_spans"],
+        wp.launch(_zero_slots_kernel(self._idx_dtype), dim=st["n_spans"],
                   inputs=[st["spans_d"], self.vals_d],
                   device=self.dm.device)
         bv = wp.array(np.ascontiguousarray(
             b_vals if b_vals is not None
             else np.zeros(st["n_rows"])), dtype=wp.float64,
             device=self.dm.device)
-        wp.launch(_diag_one_kernel(), dim=st["n_rows"],
+        wp.launch(_diag_one_kernel(self._idx_dtype), dim=st["n_rows"],
                   inputs=[st["diag_d"], st["rows_d"], bv,
                           self.vals_d, self.F_d],
                   device=self.dm.device)
@@ -698,8 +782,11 @@ class DeviceNSAssembler:
         return slots
 
     def add_matrix_values(self, slots_d, vals_d):
-        """Atomic-add values (device array) at CSR slots (device)."""
-        wp.launch(_scatter_kernel(), dim=len(vals_d),
+        """Atomic-add values (device array) at CSR slots (device).
+        slots_d must carry the assembler's CSR index dtype
+        (self._idx_dtype: int32 narrow, int64 wide) — csr_slots()
+        returns host int64 slots the caller casts to that width."""
+        wp.launch(_scatter_kernel(self._idx_dtype), dim=len(vals_d),
                   inputs=[vals_d, slots_d, self.vals_d],
                   device=self.dm.device)
 
@@ -717,13 +804,16 @@ class DeviceNSAssembler:
         L6, 1.1M dofs, on a 48 GB card — default AND hybrid memory mode;
         the GH200 capacity question made concrete)."""
         if not hasattr(self, "_op_idx"):
-            from .operators import csr_spmv
+            from .operators import make_csr_spmv
+            # indptr (row offsets) indexes nnz-space -> CSR index width;
+            # indices are dof-space (int32).  The spmv kernel specializes
+            # on the offset dtype so the inner loop bound never wraps.
             self._op_idx = (
-                wp.array(self.indptr.astype(np.int32), dtype=wp.int32,
-                         device=self.dm.device),
+                wp.array(self.indptr.astype(self._idx_np),
+                         dtype=self._idx_dtype, device=self.dm.device),
                 wp.array(self.indices.astype(np.int32), dtype=wp.int32,
                          device=self.dm.device))
-            self._op_spmv = csr_spmv
+            self._op_spmv = make_csr_spmv(self._idx_dtype)
         asm = self
 
         class _Op:
@@ -747,12 +837,12 @@ class DeviceNSAssembler:
                 (np.arange(self.nnz, dtype=np.float64), self.indices,
                  self.indptr), shape=(self.Nfull, self.Nfull))
             slots = probe.diagonal().astype(np.int64)
-            self._diag_slots_d = wp.array(slots.astype(np.int32),
-                                          dtype=wp.int32,
+            self._diag_slots_d = wp.array(slots.astype(self._idx_np),
+                                          dtype=self._idx_dtype,
                                           device=self.dm.device)
             self._diag_d = wp.zeros(self.Nfull, dtype=wp.float64,
                                     device=self.dm.device)
-        wp.launch(_gather_kernel(), dim=self.Nfull,
+        wp.launch(_gather_kernel(self._idx_dtype), dim=self.Nfull,
                   inputs=[self.vals_d, self._diag_slots_d, self._diag_d],
                   device=self.dm.device)
         return self._diag_d.numpy()
@@ -773,14 +863,16 @@ class DeviceNSAssembler:
         return A_t, torch.from_dlpack(self.F_d.__dlpack__())
 
 
-def _gather_kernel():
-    key = ("dev_gather",)
+def _gather_kernel(idx_dtype=wp.int32):
+    # slots[] holds nnz-space positions -> its element type widens with
+    # the CSR; narrow (int32) keeps the original cache key untouched.
+    key = ("dev_gather",) if idx_dtype is wp.int32 else ("dev_gather64",)
     if key in _kernel_cache:
         return _kernel_cache[key]
 
     @wp.kernel(module="unique")
     def gat(vals: wp.array(dtype=wp.float64),
-            slots: wp.array(dtype=wp.int32),
+            slots: wp.array(dtype=idx_dtype),
             out: wp.array(dtype=wp.float64)):
         i = wp.tid()
         out[i] = vals[slots[i]]
@@ -789,14 +881,14 @@ def _gather_kernel():
     return gat
 
 
-def _scatter_kernel():
-    key = ("dev_scatter",)
+def _scatter_kernel(idx_dtype=wp.int32):
+    key = ("dev_scatter",) if idx_dtype is wp.int32 else ("dev_scatter64",)
     if key in _kernel_cache:
         return _kernel_cache[key]
 
     @wp.kernel(module="unique")
     def scat(vals_e: wp.array(dtype=wp.float64),
-             slots: wp.array(dtype=wp.int32),
+             slots: wp.array(dtype=idx_dtype),
              out: wp.array(dtype=wp.float64)):
         i = wp.tid()
         wp.atomic_add(out, slots[i], vals_e[i])
@@ -805,14 +897,17 @@ def _scatter_kernel():
     return scat
 
 
-def _scatter_colored_kernel():
-    key = ("dev_scatter_col",)
+def _scatter_colored_kernel(idx_dtype=wp.int32):
+    # slots[] index nnz-space -> widen; idx (element-local read) stays
+    # int32-representable (bounded by ne*npair per bin, chunked).
+    key = ("dev_scatter_col",) if idx_dtype is wp.int32 \
+        else ("dev_scatter_col64",)
     if key in _kernel_cache:
         return _kernel_cache[key]
 
     @wp.kernel(module="unique")
     def scatc(vals_e: wp.array(dtype=wp.float64),
-              slots: wp.array(dtype=wp.int32),
+              slots: wp.array(dtype=idx_dtype),
               order: wp.array(dtype=wp.int32),
               lo: wp.int32, npair: wp.int32,
               out: wp.array(dtype=wp.float64)):
@@ -842,13 +937,15 @@ def _scatter_vec_kernel():
     return scatv
 
 
-def _zero_slots_kernel():
-    key = ("dev_zero_slots",)
+def _zero_slots_kernel(idx_dtype=wp.int32):
+    # spans[] index nnz-space -> widen with the CSR.
+    key = ("dev_zero_slots",) if idx_dtype is wp.int32 \
+        else ("dev_zero_slots64",)
     if key in _kernel_cache:
         return _kernel_cache[key]
 
     @wp.kernel(module="unique")
-    def zk(slots: wp.array(dtype=wp.int32),
+    def zk(slots: wp.array(dtype=idx_dtype),
            vals: wp.array(dtype=wp.float64)):
         i = wp.tid()
         vals[slots[i]] = wp.float64(0.0)
@@ -857,13 +954,15 @@ def _zero_slots_kernel():
     return zk
 
 
-def _diag_one_kernel():
-    key = ("dev_diag_one",)
+def _diag_one_kernel(idx_dtype=wp.int32):
+    # diag[] index nnz-space (rows[] is dof-space, stays int32).
+    key = ("dev_diag_one",) if idx_dtype is wp.int32 \
+        else ("dev_diag_one64",)
     if key in _kernel_cache:
         return _kernel_cache[key]
 
     @wp.kernel(module="unique")
-    def dk(diag: wp.array(dtype=wp.int32),
+    def dk(diag: wp.array(dtype=idx_dtype),
            rows: wp.array(dtype=wp.int32),
            bvals: wp.array(dtype=wp.float64),
            vals: wp.array(dtype=wp.float64),
@@ -876,8 +975,10 @@ def _diag_one_kernel():
     return dk
 
 
-def _scatter_weighted_kernel():
-    key = ("dev_scatter_w",)
+def _scatter_weighted_kernel(idx_dtype=wp.int32):
+    # slots[] index nnz-space; src[] is element-block-local (int32).
+    key = ("dev_scatter_w",) if idx_dtype is wp.int32 \
+        else ("dev_scatter_w64",)
     if key in _kernel_cache:
         return _kernel_cache[key]
 
@@ -885,7 +986,7 @@ def _scatter_weighted_kernel():
     def scw(vals_e: wp.array(dtype=wp.float64),
             src: wp.array(dtype=wp.int32),
             w: wp.array(dtype=wp.float64),
-            slots: wp.array(dtype=wp.int32),
+            slots: wp.array(dtype=idx_dtype),
             out: wp.array(dtype=wp.float64)):
         i = wp.tid()
         wp.atomic_add(out, slots[i], w[i] * vals_e[src[i]])
@@ -894,47 +995,56 @@ def _scatter_weighted_kernel():
     return scw
 
 
-def _dof_indices_kernel():
+def _dof_indices_kernel(idx_dtype=wp.int32):
     """dof-level CSR indices from the node graph, one thread per dof
     row r = ndof*na + ca: entries (q, cb) get column ndof*Gind[g0+q]+cb
     at indptr[r] + ndof*q + cb, indptr[r] = ndof^2*Gptr[na]
-    + ca*ndof*deg(na). int32-safe: nnz < 2^31 asserted at build."""
-    key = ("dev_dof_indices",)
+    + ca*ndof*deg(na).  The WRITE POSITION (base + ndof*q + cb) is in
+    nnz-space and can exceed 2^31 — in wide mode it is computed in
+    int64 (Gptr is uploaded as int64 too, so g0 is already wide) so no
+    arithmetic wraps.  Column VALUES stay int32 (out.dtype)."""
+    key = ("dev_dof_indices",) if idx_dtype is wp.int32 \
+        else ("dev_dof_indices64",)
     if key in _kernel_cache:
         return _kernel_cache[key]
+    IX = idx_dtype
 
     @wp.kernel(module="unique")
-    def dik(Gptr: wp.array(dtype=wp.int32),
+    def dik(Gptr: wp.array(dtype=IX),
             Gind: wp.array(dtype=wp.int32),
             ndof: wp.int32,
             out: wp.array(dtype=wp.int32)):
         r = wp.tid()
         na = r / ndof
         ca = r % ndof
-        g0 = Gptr[na]
-        dnb = Gptr[na + 1] - g0
-        base = ndof * ndof * g0 + ca * ndof * dnb
+        g0 = Gptr[na]                       # nnz-space (IX)
+        # degree fits int32 (used as the range bound); offsets stay IX.
+        dnb = wp.int32(Gptr[na + 1] - g0)
+        base = IX(ndof) * IX(ndof) * g0 + IX(ca) * IX(ndof) * IX(dnb)
         for q in range(dnb):
-            col = ndof * Gind[g0 + q]
+            col = ndof * Gind[g0 + IX(q)]
             for cb in range(ndof):
-                out[base + ndof * q + cb] = col + cb
+                out[base + IX(ndof) * IX(q) + IX(cb)] = col + cb
 
     _kernel_cache[key] = dik
     return dik
 
 
-def _dof_indices_masked_kernel():
+def _dof_indices_masked_kernel(idx_dtype=wp.int32):
     """Masked variant of _dof_indices_kernel (pattern = kron(G, mask)):
     dof row r = ndof*na + ca has deg(na) * rowcnt[ca] entries; the
     entry for neighbor q and the j-th live col of block-row ca sits at
     indptr[r] + rowcnt[ca]*q + j, indptr[r] = blocknnz*Gptr[na]
-    + rowoff[ca]*deg(na); blocknnz = rowoff[ndof]."""
-    key = ("dev_dof_indices_masked",)
+    + rowoff[ca]*deg(na); blocknnz = rowoff[ndof].  Write positions are
+    nnz-space (int64 in wide mode); column values stay int32."""
+    key = ("dev_dof_indices_masked",) if idx_dtype is wp.int32 \
+        else ("dev_dof_indices_masked64",)
     if key in _kernel_cache:
         return _kernel_cache[key]
+    IX = idx_dtype
 
     @wp.kernel(module="unique")
-    def dikm(Gptr: wp.array(dtype=wp.int32),
+    def dikm(Gptr: wp.array(dtype=IX),
              Gind: wp.array(dtype=wp.int32),
              ndof: wp.int32,
              rowoff: wp.array(dtype=wp.int32),
@@ -943,35 +1053,39 @@ def _dof_indices_masked_kernel():
         r = wp.tid()
         na = r / ndof
         ca = r % ndof
-        g0 = Gptr[na]
-        dnb = Gptr[na + 1] - g0
+        g0 = Gptr[na]                       # nnz-space (IX)
+        dnb = wp.int32(Gptr[na + 1] - g0)   # degree fits int32
         ro = rowoff[ca]
         rc = rowoff[ca + 1] - ro
-        base = rowoff[ndof] * g0 + ro * dnb
+        base = IX(rowoff[ndof]) * g0 + IX(ro) * IX(dnb)
         for q in range(dnb):
-            col = ndof * Gind[g0 + q]
+            col = ndof * Gind[g0 + IX(q)]
             for j in range(rc):
-                out[base + rc * q + j] = col + lcols[ro + j]
+                out[base + IX(rc) * IX(q) + IX(j)] = col + lcols[ro + j]
 
     _kernel_cache[key] = dikm
     return dikm
 
 
-def _scatter_node_masked_kernel():
+def _scatter_node_masked_kernel(idx_dtype=wp.int32):
     """Masked variant of _scatter_node_kernel: local pairs whose
     (ca, cb) block is masked out are SKIPPED (the element kernel is
     contractually zero there — exactness gated masked-vs-unmasked);
     live pairs land at blocknnz*Gptr[na] + rowoff[ca]*deg(na)
-    + rowcnt[ca]*(s - g0) + colpos[ca, cb]."""
-    key = ("dev_scatter_node_masked",)
+    + rowcnt[ca]*(s - g0) + colpos[ca, cb].  In wide mode Gptr is
+    int64 (so g0 is nnz-space) and the slot is computed in int64 so
+    the atomic_add index never wraps."""
+    key = ("dev_scatter_node_masked",) if idx_dtype is wp.int32 \
+        else ("dev_scatter_node_masked64",)
     if key in _kernel_cache:
         return _kernel_cache[key]
+    IX = idx_dtype
 
     @wp.kernel(module="unique")
     def scnm(vals_e: wp.array(dtype=wp.float64),
              gslot: wp.array(dtype=wp.int32),
              conn: wp.array2d(dtype=wp.int32),
-             Gptr: wp.array(dtype=wp.int32),
+             Gptr: wp.array(dtype=IX),
              e0: wp.int32, nbf: wp.int32, ndof: wp.int32,
              rowoff: wp.array(dtype=wp.int32),
              colpos: wp.array(dtype=wp.int32),
@@ -992,32 +1106,36 @@ def _scatter_node_masked_kernel():
             e = e0 + el
             s = gslot[e * nbf * nbf + a * nbf + bb]
             na = conn[e, a]
-            g0 = Gptr[na]
+            g0 = Gptr[na]                    # nnz-space (IX)
             dnb = Gptr[na + 1] - g0
             ro = rowoff[ca]
             rc = rowoff[ca + 1] - ro
-            slot = rowoff[ndof] * g0 + ro * dnb + rc * (s - g0) + j
+            slot = IX(rowoff[ndof]) * g0 + IX(ro) * dnb \
+                + IX(rc) * (IX(s) - g0) + IX(j)
             wp.atomic_add(out, slot, vals_e[i])
 
     _kernel_cache[key] = scnm
     return scnm
 
 
-def _scatter_node_kernel():
+def _scatter_node_kernel(idx_dtype=wp.int32):
     """Closed-form slot scatter (node-graph pattern): the dof slot is
     derived in-kernel from the element node-pair's position in G —
     no ne x (nbf*ndof)^2 slot map exists. Batch-local vals_e for the
-    nb elements at global offset e0. All index arithmetic stays below
-    nnz < 2^31 (asserted at build), so int32 is exact."""
-    key = ("dev_scatter_node",)
+    nb elements at global offset e0.  In NARROW mode all slot
+    arithmetic stays below 2^31; in WIDE mode Gptr is int64 (g0 is
+    nnz-space) and the slot is int64 so nothing wraps past 2^31."""
+    key = ("dev_scatter_node",) if idx_dtype is wp.int32 \
+        else ("dev_scatter_node64",)
     if key in _kernel_cache:
         return _kernel_cache[key]
+    IX = idx_dtype
 
     @wp.kernel(module="unique")
     def scn(vals_e: wp.array(dtype=wp.float64),
             gslot: wp.array(dtype=wp.int32),
             conn: wp.array2d(dtype=wp.int32),
-            Gptr: wp.array(dtype=wp.int32),
+            Gptr: wp.array(dtype=IX),
             e0: wp.int32, nbf: wp.int32, ndof: wp.int32,
             out: wp.array(dtype=wp.float64)):
         i = wp.tid()
@@ -1034,9 +1152,10 @@ def _scatter_node_kernel():
         e = e0 + el
         s = gslot[e * nbf * nbf + a * nbf + bb]
         na = conn[e, a]
-        g0 = Gptr[na]
+        g0 = Gptr[na]                        # nnz-space (IX)
         dnb = Gptr[na + 1] - g0
-        slot = ndof * ndof * g0 + ca * ndof * dnb + ndof * (s - g0) + cb
+        slot = IX(ndof) * IX(ndof) * g0 + IX(ca) * IX(ndof) * dnb \
+            + IX(ndof) * (IX(s) - g0) + IX(cb)
         wp.atomic_add(out, slot, vals_e[i])
 
     _kernel_cache[key] = scn

@@ -2542,8 +2542,10 @@ class MultiPhaseStepper:
             if jr:
                 slots = asm.csr_slots(np.concatenate(jr),
                                       np.concatenate(jc))
-                self._wall_slots_d = wp.array(slots.astype(np.int32),
-                                              dtype=wp.int32, device=d)
+                # slots index nnz-space -> assembler CSR index width (P0-2)
+                self._wall_slots_d = wp.array(slots.astype(asm._idx_np),
+                                              dtype=asm._idx_dtype,
+                                              device=d)
                 self._wall_jbase = np.concatenate(jbase)  # x wf/attempt
             else:
                 self._wall_slots_d = None
@@ -2557,8 +2559,9 @@ class MultiPhaseStepper:
                           (1, nfn)).ravel() for i in range(self.M)]
             slots = asm.csr_slots(np.concatenate(fr),
                                   np.concatenate(fc))
-            self._flux_slots_d = wp.array(slots.astype(np.int32),
-                                          dtype=wp.int32, device=d)
+            # slots index nnz-space -> assembler CSR index width (P0-2)
+            self._flux_slots_d = wp.array(slots.astype(asm._idx_np),
+                                          dtype=asm._idx_dtype, device=d)
             self._flux_gdof_d = wp.array(np.concatenate(
                 [(nd * self.top_faces + 2 * i).ravel()
                  for i in range(self.M)]).astype(np.int32),

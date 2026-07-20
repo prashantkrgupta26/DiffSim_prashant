@@ -15,9 +15,14 @@ _VEC = {2: wp.vec2d, 3: wp.vec3d, 4: wp.vec4d}
 
 
 def _csr_to_device(A: sp.csr_matrix, device):
+    # P0-2 mixed-width: row offsets index nnz-space -> stay int64 once
+    # nnz >= 2^31 (near-zero memory tax vs the values); column indices
+    # only address rows/cols (< 2^31 at our scales) -> always int32.
+    wide = A.nnz >= 2 ** 31
+    off_np, off_wp = (np.int64, wp.int64) if wide else (np.int32, wp.int32)
     return (
-        wp.array(np.ascontiguousarray(A.indptr.astype(np.int32)),
-                 dtype=wp.int32, device=device),
+        wp.array(np.ascontiguousarray(A.indptr.astype(off_np)),
+                 dtype=off_wp, device=device),
         wp.array(np.ascontiguousarray(A.indices.astype(np.int32)),
                  dtype=wp.int32, device=device),
         wp.array(np.ascontiguousarray(A.data.astype(np.float64)),
@@ -41,6 +46,42 @@ def csr_spmv(
 
 
 _kernel_cache: dict = {}
+
+
+def make_csr_spmv(idx_dtype=wp.int32):
+    """CSR SpMV specialized on the OFFSET (row-pointer) dtype — the P0-2
+    mixed-width path.  Narrow (int32) returns the module-level csr_spmv
+    unchanged (bit-for-bit).  Wide (int64) compiles a variant whose row-
+    offset loop bound is int64 so the range never wraps past 2^31; the
+    COLUMN indices stay int32 (dof-space)."""
+    if idx_dtype is wp.int32:
+        return csr_spmv
+    key = ("csr_spmv64",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique")
+    def spmv64(
+        indptr: wp.array(dtype=wp.int64),
+        indices: wp.array(dtype=wp.int32),
+        data: wp.array(dtype=wp.float64),
+        x: wp.array(dtype=wp.float64),
+        y: wp.array(dtype=wp.float64),
+    ):
+        row = wp.tid()
+        acc = wp.float64(0.0)
+        # warp's range() is int32-only; the row-offset bounds are int64
+        # (nnz-space) -> walk them with an explicit int64 counter so the
+        # index into data/indices never wraps past 2^31.
+        j = indptr[row]
+        end = indptr[row + 1]
+        while j < end:
+            acc += data[j] * x[indices[j]]
+            j += wp.int64(1)
+        y[row] = acc
+
+    _kernel_cache[key] = spmv64
+    return spmv64
 
 
 def make_poisson_matvec(nbf: int, nqp: int, dim: int = 3):
@@ -375,20 +416,28 @@ class CSROperator:
         self.device = device
         self.n_free = A.shape[0]
         self._dev = _csr_to_device(A, device)
+        # P0-2: pick the SpMV whose offset dtype matches the indptr.  A
+        # host scipy CSR here indexes nnz-space through indptr; if that
+        # exceeds int32 (>2^31 nnz) _csr_to_device keeps int64 offsets
+        # and this selects the wide kernel.  <2^31 -> narrow (unchanged).
+        self._spmv = make_csr_spmv(self._dev[0].dtype)
 
     @classmethod
     def from_device_arrays(cls, indptr_d, indices_d, data_d, n, device):
-        """Wrap an ALREADY-DEVICE CSR (wp.int32 indptr/indices, wp.float64
-        data) without any host round-trip — the G5 device-resident
-        blockch setup consumes assembler-owned value buffers directly."""
+        """Wrap an ALREADY-DEVICE CSR (wp.int32|int64 offsets, int32
+        columns, float64 data) without any host round-trip — the G5
+        device-resident blockch setup consumes assembler-owned value
+        buffers directly.  The SpMV specializes on the offset dtype so a
+        wide (int64-offset) full-A operator never wraps."""
         op = cls.__new__(cls)
         op.device = device
         op.n_free = n
         op._dev = (indptr_d, indices_d, data_d)
+        op._spmv = make_csr_spmv(indptr_d.dtype)
         return op
 
     def matvec(self, x: wp.array, y: wp.array):
-        wp.launch(csr_spmv, dim=self.n_free,
+        wp.launch(self._spmv, dim=self.n_free,
                   inputs=[*self._dev, x, y], device=self.device)
 
     def matvec_numpy(self, x: np.ndarray) -> np.ndarray:
