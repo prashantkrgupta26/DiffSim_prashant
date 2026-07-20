@@ -329,3 +329,108 @@ def test_knob_auto_and_errors(device):
                   mu_p_gp=sysm.mu_p_gp, mu_xd_gp=sysm.mu_xd_gp,
                   mu_xa_gp=sysm.mu_xa_gp, dist_gp=sysm.dist_gp,
                   assembly="bogus")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Task #36 (8j): fp32-storage + FP64-IR gates for the XDD cuDSS consumer.
+# cuDSS is CUDA-only -> these skip on the Mac dev loop (gpubox lane).
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _mms_system_solver(level, device, *, linsolver, val_dtype):
+    """A converged coupled-MMS XDD Newton solve with an explicit
+    linsolver/val_dtype; returns (converged state, sysm)."""
+    from tests.test_exciton_system import (
+        _coupled_mms_system, _mms_fields, _mms_strong_source_gp,
+        _mms_source_nodal, _mms_dirichlet_all)
+    from diffsim.physics.exciton_system import XDDSystem
+    sysm0, dm, mesh, cons, xq = _coupled_mms_system(level, 1, device,
+                                                    assembly="device")
+    # rebuild with the requested linsolver + val_dtype (same coefficients)
+    sysm = XDDSystem(
+        dm, lam2=sysm0.lam2, eps_gp=sysm0.eps_gp, mu_n_gp=sysm0.mu_n_gp,
+        mu_p_gp=sysm0.mu_p_gp, mu_xd_gp=sysm0.mu_xd_gp,
+        mu_xa_gp=sysm0.mu_xa_gp, dist_gp=sysm0.dist_gp,
+        langevin=sysm0.langevin, onsager=sysm0.onsager,
+        tau_inv_d=1.0, tau_inv_a=1.0, supg=1.0, assembly="device",
+        linsolver=linsolver, val_dtype=val_dtype)
+    fields = _mms_fields()
+    src_gp = _mms_strong_source_gp(sysm, dm, xq)
+    sysm.mms_source = _mms_source_nodal(sysm, dm, xq, src_gp)
+    _mms_dirichlet_all(sysm, mesh, cons, fields)
+    coords = dm.mesh.node_coords
+    rng = np.random.default_rng(17)
+    ic = {}
+    for f in range(NDOF):
+        base = fields[f](coords)
+        ic[f] = base + 0.05 * rng.standard_normal(dm.n_nodes)
+    ic[IN] = np.abs(ic[IN]) + 0.05
+    ic[IP] = np.abs(ic[IP]) + 0.05
+    st, info = sysm.solve_newton(ic, max_iter=12)
+    assert info["converged"], (linsolver, val_dtype, info)
+    return st, sysm
+
+
+def test_g1_xdd_fp32_ir_newton_parity(device):
+    """G1 (XDD): the fp32-factor + FP64-IR cuDSS Newton solve converges to
+    the SAME state as the fp64 cuDSS path (<=1e-9 relative per field) — the
+    FP64-refined solve is fp64-accurate, so the converged state is
+    unchanged.  Refinement counts logged and in-range (§8j / G2)."""
+    if device == "cpu":
+        pytest.skip("cuDSS fp32+IR path needs a GPU")
+    st64, s64 = _mms_system_solver(3, device, linsolver="cudss",
+                                   val_dtype="fp64")
+    st32, s32 = _mms_system_solver(3, device, linsolver="cudss",
+                                   val_dtype="fp32")
+    for f in range(NDOF):
+        num = np.linalg.norm(st32[f] - st64[f])
+        den = max(np.linalg.norm(st64[f]), 1e-30)
+        assert num / den < 1e-9, (f, num / den)
+    # G2: refinement counts recorded, each in the §8j band (>10 would have
+    # raised ConvergenceError inside the solve).
+    assert s32._ir_counts, "no refinement counts logged"
+    assert max(s32._ir_counts) <= 10, s32._ir_counts
+    print(f"G1/G2 XDD fp32+IR refinement counts: {s32._ir_counts}")
+
+
+def test_g5_xdd_fp32_gradient_contract(device):
+    """G5 (XDD): the assembled-Jacobian gradient contract (forward J·v vs
+    FD) holds with fp32 STORAGE — the Jacobian A returned for the adjoint
+    is fp64 (vals_d), and the FP64-refined solve keeps the state fp64-
+    accurate, so the three-way contract is preserved.  <=1e-6."""
+    if device == "cpu":
+        pytest.skip("device fp32 storage gate runs in the GPU lane")
+    sysm, dm, mesh, cons, xq = _jac_system(level=3, device=device)
+    sysm.val_dtype = "fp32"                    # fp32 storage on the assembler
+    state = _random_state(dm, seed=0)
+    sysm._current_state = state
+    n = dm.n_nodes
+
+    def flat(st):
+        v = np.empty(n * NDOF)
+        for f in range(NDOF):
+            v[f::NDOF] = st[f]
+        return v
+
+    def unflat(v):
+        return {f: np.ascontiguousarray(v[f::NDOF]) for f in range(NDOF)}
+
+    def res(v):
+        _, r = sysm.device_assembler().assemble(unflat(v),
+                                                need_matrix=False)
+        return r
+
+    A, r0 = sysm.device_assembler().assemble(state, need_matrix=True)
+    # the assembled Jacobian is fp64 (vals_d) even under fp32 storage
+    assert A.dtype == np.float64
+    u0 = flat(state)
+    eps = 1e-7
+    rng = np.random.default_rng(42)
+    worst_fwd = 0.0
+    for _ in range(3):
+        v = rng.standard_normal(len(u0)); v /= np.linalg.norm(v)
+        fd = (res(u0 + eps * v) - res(u0 - eps * v)) / (2.0 * eps)
+        Jv = A @ v
+        worst_fwd = max(worst_fwd,
+                        np.linalg.norm(fd - Jv) / max(np.linalg.norm(Jv),
+                                                      1e-30))
+    assert worst_fwd < 1e-6, worst_fwd
