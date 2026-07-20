@@ -43,7 +43,6 @@ import warp as wp
 
 from ..assembly.device_assembly import DeviceNSAssembler
 from ..assembly.operators import _kernel_cache
-from ..errors import BackendError
 from ..physics.vms import tau_m_metric
 from diffsim.xdd.params import _KB, _Q, _EPS0
 from diffsim.xdd.morphology import tanh_mask, interface_mask
