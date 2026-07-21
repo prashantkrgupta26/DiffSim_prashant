@@ -479,6 +479,25 @@ class WodoFilmStepper(TernaryCHStepper):
             raise ConfigError(f"krylov_graph must be one of "
                               f"{_GRAPH_MODES}, got {krylov_graph!r}")
         self.krylov_graph = krylov_graph
+        # Task #42: device-resident blockch preconditioner apply — r/z stay
+        # on device through the whole apply chain, removing the per-inner-
+        # solve rhs upload / solution download / matvec host round-trips.
+        # MEASURED DEFAULT OFF (rung-b A/B, 2026-07-21): keeping the apply
+        # device-resident is a 50% wall REGRESSION on the Ada box
+        # (35.6 vs 23.6 s/step) — the removed host<->device transfers were
+        # OVERLAPPING the async GPU queue (the #40 lesson), so removing
+        # them saves nothing, while the device<->device copies they are
+        # replaced by (wp.copy of r/z/x_out/minv) sit IN the critical path
+        # and block on the deep queue, doubling wp.copy tottime (88->156 s).
+        # The path is iterate-identical (parity + inner-iter counts match
+        # exactly) — kept as an OPT-IN knob for boxes/tiers where the sync
+        # latency is NOT hidden (e.g. a shallower queue).  Env override:
+        # DIFFSIM_PRECOND_DEV_APPLY=1 to enable.
+        import os as _os
+        self.precond_dev_apply = (
+            _os.environ.get("DIFFSIM_PRECOND_DEV_APPLY", "0") == "1")
+        self.precond_fixed_iters = int(
+            _os.environ.get("DIFFSIM_PRECOND_FIXED_ITERS", "0"))
         # Task #41: GP-field residency mode (device assembly path only).
         # "persistent" (default, the #37 behavior): the packed GP
         #   vals/grads + BDF-history + Langevin-noise buffers are
@@ -830,7 +849,10 @@ class WodoFilmStepper(TernaryCHStepper):
         meta = {"sigma": self._sigma, "ndof": 4, "pairs": [
             {"off": 0, "m": self.M11, "kappa": self.kap1},
             {"off": 2, "m": self.M22, "kappa": self.kap2}],
-            "krylov_graph": self.krylov_graph}
+            "krylov_graph": self.krylov_graph,
+            # Task #42: device-resident preconditioner apply knobs
+            "precond_dev_apply": self.precond_dev_apply,
+            "precond_fixed_iters": self.precond_fixed_iters}
         try:
             return blockch_pairs_device(
                 asm.indptr, asm.indices, asm.vals_d, asm.F_d.numpy(),

@@ -185,6 +185,79 @@ def test_bicgstab_fused_and_graph_match_legacy(device):
         assert _max_rel(x_g, x_f) < 1e-12
 
 
+def test_cg_device_resident_matches_host_entry(device):
+    """Task #42 G1: the device-in/device-out CG entry (b_dev/x_out/
+    diag_dev — the blockch device-resident apply path) produces the SAME
+    iterate as the host-array fused entry.  Bit-equal on serial CPU
+    (identical kernels, only the upload/download boundary moves),
+    few-ULP on CUDA."""
+    from diffsim.solvers.krylov_dev import cg_dev
+    n = 4000
+    A = _spd_csr(n)
+    op = CSROperator(A, device)
+    b = np.random.default_rng(5).standard_normal(n)
+    diag = np.asarray(A.diagonal())
+    kw = dict(tol=1e-12, maxiter=8000, check_every=10)
+    x_host, i_host = cg_dev(op, b, graph="graph", diag=diag, **kw)
+    b_d = wp.array(np.ascontiguousarray(b, np.float64), dtype=wp.float64,
+                   device=device)
+    minv_d = wp.array(np.ascontiguousarray(1.0 / diag, np.float64),
+                      dtype=wp.float64, device=device)
+    x_out = wp.zeros(n, dtype=wp.float64, device=device)
+    ret, i_dev = cg_dev(op, None, graph="graph", b_dev=b_d, x_out=x_out,
+                        diag_dev=minv_d, **kw)
+    assert ret is None                       # solution stayed on device
+    x_dev = x_out.numpy()
+    assert i_host["converged"] and i_dev["converged"]
+    assert i_host["iters"] == i_dev["iters"]
+    if device == "cpu":
+        assert np.array_equal(x_dev, x_host)
+    else:
+        assert _max_rel(x_dev, x_host) < 1e-12
+
+
+def test_bicgstab_device_resident_matches_host_entry(device):
+    """Task #42 G1: device-in/device-out BiCGStab entry parity."""
+    from diffsim.solvers.krylov_dev import bicgstab_dev
+    n = 3000
+    A = _nonsym_csr(n)
+    op = CSROperator(A, device)
+    b = np.random.default_rng(11).standard_normal(n)
+    diag = np.abs(np.asarray(A.diagonal()))
+    kw = dict(tol=1e-12, maxiter=6000, check_every=25)
+    x_host, i_host = bicgstab_dev(op, b, graph="graph", diag=diag, **kw)
+    b_d = wp.array(np.ascontiguousarray(b, np.float64), dtype=wp.float64,
+                   device=device)
+    minv_d = wp.array(np.ascontiguousarray(1.0 / diag, np.float64),
+                      dtype=wp.float64, device=device)
+    x_out = wp.zeros(n, dtype=wp.float64, device=device)
+    ret, i_dev = bicgstab_dev(op, None, graph="graph", b_dev=b_d,
+                              x_out=x_out, diag_dev=minv_d, **kw)
+    assert ret is None
+    x_dev = x_out.numpy()
+    assert i_host["converged"] and i_dev["converged"]
+    assert i_host["iters"] == i_dev["iters"]
+    if device == "cpu":
+        assert np.array_equal(x_dev, x_host)
+    else:
+        assert _max_rel(x_dev, x_host) < 1e-12
+
+
+def test_device_resident_requires_fused_path(device):
+    """Guard: device-resident args on the legacy ('off') path are a
+    programming error (they cannot honor the b_dev/x_out contract)."""
+    from diffsim.solvers.krylov_dev import cg_dev
+    n = 500
+    A = _spd_csr(n)
+    op = CSROperator(A, device)
+    b_d = wp.zeros(n, dtype=wp.float64, device=device)
+    x_out = wp.zeros(n, dtype=wp.float64, device=device)
+    minv_d = wp.ones(n, dtype=wp.float64, device=device)
+    with pytest.raises(ValueError):
+        cg_dev(op, None, graph="off", b_dev=b_d, x_out=x_out,
+               diag_dev=minv_d)
+
+
 def test_fused_partial_tail_batch(device):
     """maxiter not a multiple of check_every: the captured path replays
     full batches and runs the tail on fused launches — iterate-identical
