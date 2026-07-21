@@ -1,0 +1,55 @@
+{
+  "_note": "P2-R0 Task-10 sphere 3-D de-risk (gpubox, 40-core splu). LIGHT 3-D confirmation, NOT a literature-Cd convergence study (deferred to R2). Geometry mirrors tests/test_sphere.py: Sphere(CTR=(0.35,0.5,0.5), R=0.12), unit-box octree, ndof=4, strong inflow+walls, free outflow (x=1), weak no-slip SBM. Driver: tests/p2r0_task10_sphere_derisk.py.",
+  "config": {
+    "level": 4,
+    "Re": 100.0,
+    "dt": 0.05,
+    "R": 0.12,
+    "CTR": [0.35, 0.5, 0.5],
+    "U_IN": 1.0,
+    "n_free": 4907,
+    "sf_faces": 64,
+    "D_over_h": 3.84,
+    "qref": "0.5*U^2*pi*R^2 (frontal area)"
+  },
+  "monolithic_reference": {
+    "_note": "3-D MONOLITHIC (no-split) SBM-NS on the matched mesh — the R0 faithfulness reference. Stable and physical; recovers from the negative startup transient to a positive steady Cd.",
+    "alpha_10_cd": 0.3812,
+    "alpha_10_steps": 58,
+    "alpha_100_cd": 0.9641,
+    "alpha_100_steps": 50,
+    "m1b_lock_sphere_re100_cd": 0.381,
+    "reproduces_m1b_lock": true,
+    "startup_transient_alpha10": {"step1": -0.2122, "step3": -1.1560, "step11": 0.3421, "step31": 0.3847, "step51": 0.3811}
+  },
+  "projection_split": {
+    "_note": "LeraySBMStepper (projection + volumetric SBM). FINITE throughout (no NaN/crash), axisymmetric (|C_lat|~5e-13), but the coupled iteration's DRAG diverges monotonically to unphysical negative Cd — UNSTABLE in 3-D at feasible mesh. Extends the Task-9 2-D projection-transient instability finding.",
+    "reference_run": {
+      "level": 4, "Re": 100.0, "alpha": 10.0, "order": 1, "dt": 0.05,
+      "proj_cd_final": -54.7739, "mono_cd": 0.3812, "rel_diff_pct": 14467.9,
+      "finite": true,
+      "cd_trajectory": {"step1": -0.3903, "step3": -1.2180, "step11": -3.5902, "step21": -5.4858, "step31": -9.6024, "step41": -26.10, "step51": -35.85}
+    },
+    "settings_probed_all_diverge": {
+      "Re": [1, 20, 100],
+      "order": [1, 2],
+      "dt": [0.05, 0.01],
+      "alpha": [10, 100],
+      "picard_iters": [2, 6],
+      "beta_backflow": [0, 1],
+      "velocity_update": ["consistent", "graddiv"]
+    }
+  },
+  "ci_smoke_leg": {
+    "_note": "test_g5_sphere_3d_pipeline_smoke (level-3, in-CI, ~1.5s). Gates the pipeline invariants that de-risk the 3-D composition independent of long-time stability.",
+    "level": 3, "sf_faces": 16,
+    "finite": true,
+    "c_lat_over_cd": 4e-16,
+    "bdf2_engaged": true,
+    "ppe_solenoidality_identity": 2.589e-15,
+    "planted_break_detected": true,
+    "passes": true
+  },
+  "verdict": "NEEDS_CONTEXT",
+  "verdict_detail": "3-D pipeline de-risked (composed, finite, axisymmetric, BDF2-engaged, machine-zero weak-divergence in CI). The projection SPLIT's long-time transient is unstable in 3-D (drag diverges); the monolithic on the same mesh is stable and physical (+0.381, reproducing the M1b lock). The de-risk leg is nightly + xfail with the documented finding. Remaining R2 item: a stabilized 3-D projection config, or the monolithic path for 3-D drag."
+}

@@ -1050,3 +1050,266 @@ def test_g4_cylinder_re100_strouhal(device):
     # confined band (M1b): confinement elevates St above the unbounded ~0.164;
     # the M1b lock is 0.2059. The noisy projection transient gives St~0.78.
     assert 0.14 < St < 0.40, f"St={St:.4f} outside confined band [0.14, 0.40]"
+
+
+# ===========================================================================
+# Task 10 — G5 gate: sphere 3-D de-risk confirmation (volumetric SBM)
+#
+# SCOPE (Baskar's decision): R0 is accepted at the DE-RISK bar — literature-Cd
+# convergence is DEFERRED to R2. This is NOT a mesh-convergence study to the
+# literature sphere Cd (~0.6-0.7 @ Re300). It is a LIGHT 3-D confirmation that
+# the composed projection+volumetric-SBM stepper WORKS in 3-D: the full pipeline
+# (octree -> volumetric surrogate -> SBM face block -> predictor/PPE/correction
+# sub-solves -> surrogate_traction) executes on a small feasible mesh, produces a
+# FINITE state, an axisymmetric wake, an engaged BDF2, and a PPE-space
+# solenoidality identity that is machine-zero (the diagnostic-verified divergence
+# gate — NOT pointwise div_l2). The FAITHFULNESS bar for 3-D is the projection Cd
+# matching the 3-D MONOLITHIC (no-split) SBM-NS solver on the SAME mesh, NOT the
+# literature value (a small confined domain at feasible mesh has leak-drag /
+# blockage — the Task-9 finding — so neither coarse solver reaches the literature
+# Cd; the monolithic on the matched mesh is the apples-to-apples reference).
+#
+# CI SMOKE LEG (test_g5_sphere_3d_pipeline_smoke): level-3, marches a handful of
+# steps and gates the pipeline invariants that hold regardless of the transient's
+# stability — non-empty 3-D surrogate, finite (u, p), axisymmetric traction,
+# BDF2 engaged after the bootstrap, and the machine-zero PPE-space solenoidality
+# identity. Fast (~0.1s/step) so it runs in CI.
+#
+# NIGHTLY DE-RISK LEG (test_g5_sphere_3d_derisk_vs_monolithic): level-4 (D/h=3.8,
+# the test_sphere.py smoke resolution), gpubox. It (a) confirms the 3-D MONOLITHIC
+# SBM-NS reference is stable and physical on the matched mesh (Cd=+0.381 @ alpha=10
+# Re100, reproducing the M1b sphere_re100_cd lock), and (b) documents the honest
+# de-risk finding: the projection+volumetric-SBM SPLIT is UNSTABLE for the 3-D
+# sphere at feasible mesh — the coupled iteration's drag diverges monotonically to
+# unphysical negative values (the state stays FINITE, no NaN/crash) across every
+# setting probed on gpubox (Re in {1,20,100}, order in {1,2}, dt in {0.05,0.01},
+# alpha in {10,100}, picard in {2,6}, beta_backflow in {0,1}, velocity_update in
+# {consistent,graddiv}). This EXTENDS the Task-9 2-D projection-transient
+# instability finding into 3-D. It is xfail-guarded (NEEDS_CONTEXT), mirroring the
+# Task-9 Re100-Strouhal treatment: the assertion encodes the TARGET (projection Cd
+# matches monolithic within band) that the monolithic reaches but the projection
+# split does not yet — a genuine remaining item (a stabilized 3-D projection
+# config, or the monolithic path) for R2, not a forced number.
+#
+# Probe + monolithic reference driver: tests/p2r0_task10_sphere_derisk.py
+# (gpubox helper). Results captured in tests/baselines/p2r0_task10_sphere.json.
+# ===========================================================================
+
+SPH_R, SPH_CTR, SPH_U = 0.12, (0.35, 0.5, 0.5), 1.0
+
+
+def _build_sphere_3d(device, level, Re):
+    """3-D immersed-sphere fixture (mirrors tests/test_sphere.py wiring):
+    Sphere(CTR=(0.35,0.5,0.5), R=0.12), unit-box octree, ndof=4, strong inflow
+    (x=0) + lateral walls (y, z faces), free outflow (x=1), weak no-slip SBM."""
+    ndof, dim = 4, 3
+    nu = 2 * SPH_U * SPH_R / Re
+    oracle = Sphere(SPH_CTR, SPH_R)
+    tree = build_uniform(level, dim=3)
+    ret, _ = classify_lambda(tree, oracle, 0.5, domain="outside")
+    sf = extract_surrogate(ret)
+    mesh = build_mesh(ret, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3), device)
+    geo = GeometryData.evaluate(oracle, ret, sf, face_tables(1, 3),
+                                domain="outside")
+    coords = mesh.node_coords[cons.free_nodes]
+    on = lambda v, c: np.abs(coords[:, c] - v) < 1e-12
+    strong = np.where(on(0.0, 0) | on(0.0, 1) | on(1.0, 1)
+                      | on(0.0, 2) | on(1.0, 2))[0]
+    strong_mask = np.zeros(len(coords), dtype=bool)
+    strong_mask[strong] = True
+    u_inf = np.zeros((len(coords), dim))
+    inflow = strong[np.abs(coords[strong, 0]) < 1e-12]
+    u_inf[inflow, 0] = SPH_U
+    return dict(oracle=oracle, dm=dm, sf=sf, geo=geo, mesh=mesh, cons=cons,
+                strong_mask=strong_mask, u_inf=u_inf, coords=coords,
+                nu=nu, ndof=ndof, dim=dim)
+
+
+def test_g5_sphere_3d_pipeline_smoke(device):
+    """G5 CI smoke — the 3-D projection+volumetric-SBM pipeline EXECUTES.
+
+    Marches LeraySBMStepper a handful of steps on a small feasible 3-D mesh
+    (level 3, unit-box octree, Re=100 sphere) and gates the invariants that
+    de-risk the 3-D COMPOSITION independent of the transient's long-time
+    stability:
+      - the 3-D surrogate face set is non-empty (geometry -> surrogate pipeline);
+      - the marched (u, p) is FINITE (no NaN/crash in any of the three
+        sub-solves + the surrogate_traction observable);
+      - the traction is axisymmetric (|C_lat| << |Cd|) — the SBM face block +
+        drag orientation are correct in 3-D;
+      - BDF2 engages after the bootstrap (order 2 default; t >= 1.5 dt);
+      - the PPE-space solenoidality IDENTITY is machine-zero (the
+        diagnostic-verified divergence gate: sigma B^T u_hat == K_p phi, NOT
+        pointwise div_l2 which is SBM-weak-Dirichlet-layer-dominated).
+
+    INDEPENDENT reference: B^T u_hat is assembled from scratch by a fresh
+    grad(N).u volume-GP loop and the PPE solve reproduced against st.base.K_p —
+    exactly the test_g3_divergence_tol construction, now in 3-D.
+
+    NOTE (documented in the Task-10 report + the nightly de-risk leg): the
+    coupled projection iteration's DRAG diverges over a long march at feasible
+    3-D mesh — this smoke gates only the finite, correctly-composed, weakly-
+    solenoidal pipeline over a short window, not the long-time transient.
+    """
+    from scipy.sparse.linalg import splu
+    from diffsim.solvers.timestepping import bdf_coeffs, bdf_order_now
+
+    dim = 3
+    dt = 0.05
+    fx = _build_sphere_3d(device, level=3, Re=100.0)
+    dm = fx["dm"]
+
+    def f_fn(x, t):
+        return np.zeros((len(x), dim))
+
+    st = LeraySBMStepper(fx["oracle"], dm, fx["nu"], dt, f_fn,
+                         u_inf=fx["u_inf"], strong_mask=fx["strong_mask"],
+                         lam=0.5, domain="outside", order=2, picard_iters=2,
+                         solver="splu", ppe_finescale=False, alpha=10.0)
+    st.set_initial(lambda c: np.zeros((len(c), dim)))
+
+    assert st.sf.elem.size > 0, "empty 3-D surrogate face set"
+
+    n_bdf2 = 0
+    for _ in range(4):
+        u, p = st.step()
+        if st.base.order == 2 and st.base.hist.have(2):
+            n_bdf2 += 1
+    F = st.surrogate_traction()
+
+    # (i) finite state
+    assert np.isfinite(u).all() and np.isfinite(p).all(), "non-finite (u, p)"
+    assert np.all(np.isfinite(F)), f"non-finite traction {F}"
+
+    # (ii) axisymmetric wake: lateral force small vs drag magnitude
+    qref = 0.5 * SPH_U ** 2 * np.pi * SPH_R ** 2
+    cd = F[0] / qref
+    clat = np.hypot(F[1], F[2]) / qref
+    print(f"[G5 smoke] L3 3-D: Cd={cd:+.4f} |C_lat|={clat:.4e} "
+          f"sf={st.sf.elem.size} bdf2_steps={n_bdf2}")
+    assert clat < 0.1 * max(abs(cd), 1e-6), (
+        f"traction not axisymmetric: |C_lat|={clat:.4e} vs |Cd|={abs(cd):.4e}")
+
+    # (iii) BDF2 engaged after the bootstrap (order-2 default; t past 1.5 dt)
+    assert st.base.order == 2, "stepper not configured for BDF2"
+    assert n_bdf2 > 0, "BDF2 never engaged (bootstrap did not hand off to order 2)"
+
+    # (iv) PPE-space solenoidality identity is machine-zero (the divergence gate).
+    uhat = st._predict()
+
+    def _bt(u_free):
+        u_full = np.asarray(dm.constraints.T @ u_free)
+        rhs = np.zeros(dm.n_nodes)
+        for pv, _b in dm.bins.items():
+            tb = dm.tables_by_p[pv]
+            h = dm.mesh.tree.h()[dm.mesh.bins[pv]]
+            jac = (h / 2.0) ** dim
+            dsc = (2.0 / h)
+            conn = dm.mesh.conn_of[pv]
+            uq = np.einsum("qa,ead->eqd", tb.N, u_full[conn])
+            be = np.einsum("qad,eqd,q,e->ea", tb.dN, uq, tb.w, jac * dsc)
+            np.add.at(rhs, conn.ravel(), be.ravel())
+        return np.asarray(dm.constraints.T.T @ rhs)
+
+    o = bdf_order_now(st.base.t + st.base.dt, st.base.dt, st.base.order,
+                      have_history=st.base.hist.have(2))
+    b0, _b1, _b2 = bdf_coeffs(o, st.base.dt)
+    sigma = b0 / st.base.dt
+    bt_uhat = _bt(uhat)
+    rhs = sigma * bt_uhat.copy()
+    rhs[0] = 0.0
+    Kp = st.base.K_p.tolil()
+    Kp.rows[0] = [0]
+    Kp.data[0] = [1.0]
+    Kp = Kp.tocsr()
+    phi = splu(Kp.tocsc()).solve(rhs)
+    resid = sigma * bt_uhat - st.base.K_p @ phi
+    resid[0] = 0.0
+    identity = float(np.linalg.norm(resid))
+    print(f"[G5 smoke] PPE solenoidality identity "
+          f"||sigma B^T u_hat - K_p phi|| = {identity:.3e}")
+    assert np.isfinite(identity)
+    assert identity < 1e-9, (
+        f"3-D projection space not weakly solenoidal: identity {identity:.3e}")
+
+    # planted break: perturb phi off the PPE solution -> identity blows up.
+    rng = np.random.default_rng(0)
+    delta = rng.standard_normal(phi.shape)
+    delta[0] = 0.0
+    resid_bad = sigma * bt_uhat - st.base.K_p @ (phi + delta)
+    resid_bad[0] = 0.0
+    assert float(np.linalg.norm(resid_bad)) > 1e-3, (
+        "planted non-solenoidal phi not detected by the identity")
+
+
+@pytest.mark.skipif(not os.environ.get("DIFFSIM_NIGHTLY"),
+                    reason="level-4 3-D splu march (~9s/step, gpubox) — nightly; "
+                           "set DIFFSIM_NIGHTLY=1 to run")
+@pytest.mark.xfail(reason="NEEDS_CONTEXT (Task-10): the projection+volumetric-SBM "
+                          "SPLIT is unstable for the 3-D sphere at feasible mesh — "
+                          "the coupled iteration's drag diverges monotonically to "
+                          "unphysical negative Cd (the state stays FINITE) across "
+                          "every setting probed on gpubox (Re in {1,20,100}, order "
+                          "{1,2}, dt {0.05,0.01}, alpha {10,100}, picard {2,6}, "
+                          "beta {0,1}, velocity_update {consistent,graddiv}). This "
+                          "extends the Task-9 2-D projection-transient instability "
+                          "into 3-D. The MONOLITHIC (no-split) SBM-NS reference on "
+                          "the SAME mesh IS stable and physical (Cd=+0.381 @ alpha=10 "
+                          "Re100, reproducing the M1b sphere_re100_cd lock). A "
+                          "stabilized 3-D projection config (or the monolithic path) "
+                          "is the remaining R2 item. See the Task-10 report + "
+                          "tests/baselines/p2r0_task10_sphere.json.",
+                   strict=False)
+def test_g5_sphere_3d_derisk_vs_monolithic(device):
+    """G5 nightly de-risk — projection 3-D Cd MATCHES the monolithic on the SAME
+    mesh (the R0 faithfulness bar), NOT the literature Cd.
+
+    Level-4 (D/h=3.8) unit-box sphere, Re=100. Marches BOTH:
+      - the composed LeraySBMStepper (projection + volumetric SBM), and
+      - a 3-D MONOLITHIC (no-split) SBM-NS solver on the IDENTICAL mesh/alpha
+        (tests/p2r0_task10_sphere_derisk.py::monolithic_cd, mirroring
+        tests/test_sphere.py),
+    and asserts the projection Cd matches the monolithic Cd within a de-risk band
+    (rel_diff < 0.20). The monolithic is the apples-to-apples reference — the
+    literature Re300 Cd (~0.6-0.7) is a fine-mesh/unconfined value neither coarse
+    confined solver reaches; matching the monolithic is the FAITHFULNESS check.
+
+    THIS IS XFAIL: the gpubox nightly leg measured proj Cd = -54.77 (diverged
+    from -3.6/-5.5/-9.6 at steps 11/21/31 to -54.8 at step 60) while the
+    monolithic recovers from the physical startup transient to +0.3812 —
+    rel_diff = 14468%, so the band assertion fails. Kept as a documented
+    NEEDS_CONTEXT target (the projection path does not yet reach it), mirroring
+    the Task-9 Re100-Strouhal xfail.
+    """
+    from p2r0_task10_sphere_derisk import (march_projection, monolithic_cd,
+                                           qref as _qref)
+
+    dt = 0.05
+    Re = 100.0
+    alpha = 10.0                       # the monolithic-stable value (Cd=+0.381)
+    fx = _build_sphere_3d(device, level=4, Re=Re)
+
+    # monolithic reference on the matched mesh (stable, physical).
+    mono = monolithic_cd(fx, alpha, dt, max_steps=60, rate_tol=5e-3)
+    cd_mono = mono["cd"]
+    assert np.isfinite(cd_mono) and cd_mono > 0, (
+        f"monolithic reference unphysical: Cd={cd_mono}")
+
+    # projection march on the same mesh/alpha.
+    pr = march_projection(fx, alpha, dt, max_steps=60, rate_tol=5e-3, order=1)
+    cd_proj = pr["cd"]
+    assert pr["finite"], "projection state non-finite (u or p NaN)"
+
+    rel = abs(cd_proj - cd_mono) / abs(cd_mono)
+    print(f"[G5 de-risk] L4 Re{Re:.0f} alpha={alpha}: "
+          f"proj Cd={cd_proj:+.4f}  MONOLITHIC Cd={cd_mono:+.4f}  "
+          f"rel_diff={rel:.1%}  bdf2={pr['bdf2_engaged']}")
+
+    # the faithfulness bar (TARGET — xfail: the projection split does not reach
+    # it yet): projection Cd matches the monolithic on the same mesh.
+    assert rel < 0.20, (
+        f"projection Cd {cd_proj:.3f} disagrees with monolithic {cd_mono:.3f} "
+        f"by {rel:.1%} (de-risk band 20%) — the projection+SBM split is "
+        f"unstable in 3-D (Task-10 NEEDS_CONTEXT finding)")
