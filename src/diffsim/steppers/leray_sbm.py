@@ -1,5 +1,37 @@
 """Volumetric-SBM composed Leray projection stepper (P2-R0, Tasks 2-4).
 
+## P2-R0 SCALING-PATHWAY DECLARATION (Task 11, mandatory)
+
+Recorded 2026-07-21.  Full table in spec §P2-R0 Scaling-pathway declaration.
+
+DEVICE STATUS: R0 is HOST/splu-reference only.  The device port is the R2
+prerequisite (resolution 3 + Task-9/10 findings).  Do NOT read this module as
+device-ready.
+
+STAGE RESIDENCY (summary):
+- Octree / surrogate extraction / distance:  host, per-epoch  (static geometry)
+- SBM face-block assembly:                  host, once-per-epoch  (cached)
+- Predictor sub-solve (nonsymmetric Oseen): host (R0) → device FGMRES #49 (R2)
+- PPE sub-solve (SPD Laplacian):            host (R0) → AMGX AMG/CG (R2)
+- Correction sub-solve (mass matrix):       host (R0) → device (R2)
+
+THE SCALABLE LEVER: the SPD pressure-Poisson (PPE) admits AMG/CG directly
+(AMGX); this is the primary reason projection was chosen over the monolithic
+saddle for the P2 hero path.  R2's device-PPE task is the highest-leverage
+scaling item.  cuDSS cannot reach the 100M-DOF hero (#43); iterative device
+solve (device-FGMRES #49 / AMGX) is the mandated path.
+
+NO NEW NNZ SPACE: the SBM face block scatters ONLY into existing NS node-pair
+slots (verified by tests/test_p2r0_scaling.py::test_no_new_nnz_space).  The
+ChunkedCSR (#38) + fp32-IR (#36) + multi-GPU (S4) 100M-DOF budget is not
+inflated by the SBM composition.
+
+R0 OPEN ITEMS (deferred to R2, not hidden):
+- 3-D pressure-coupling stability (principled penalty α~Pe·p² or implicit PPE).
+- G4/G5 Cd/Strouhal literature convergence (requires device-AMG mesh scales).
+
+
+
 `LeraySBMStepper` COMPOSES `LerayProjectionStepper` (the audited VMS-Helmholtz-
 Leray projection stepper) with an immersed-geometry oracle — it does NOT fork
 the base stepper. It runs the per-epoch surrogate pipeline
