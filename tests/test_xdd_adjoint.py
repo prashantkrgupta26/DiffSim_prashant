@@ -339,3 +339,102 @@ def test_task5_frozen_dt_adaptation(device):
         t += dt
         dt = max(_dt_schedule(t, dt, 1e-3, 1e-1), dt)
     print(f"frozen-dt: {len(steps)} steps, dt {min(dts):.1e}→{max(dts):.1e} (adapted)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Task 6 fold-in: carrier-param (µ_n) transient gate + BDF2 transient gate
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_task6_transient_gradient_mu_n_vs_fd(device):
+    """Carrier-parameter transient gate: dJ/dµ_n through Mode B exercises the
+    carrier SUPG history operators (Hload_n with the drift/τ_M-consistent
+    kernel), which the exciton-sink tau_inv_d gate never touches.  Adjoint vs an
+    INDEPENDENT full-re-march central FD ≤ 5e-5 (µ_n's analytic is the semi-
+    analytic decorrelated derivative — DIFFERENT internal step than the FD)."""
+    from diffsim.xdd.run import march_with_checkpoints
+    from diffsim.xdd.adjoint import XDDTransientAdjoint, MaterialControl
+    sysm, state = build_small_lit_system(device)
+    ctrl = MaterialControl(sysm, param="mu_n")
+    N = 6
+    fs, steps = march_with_checkpoints(sysm, state, dt0_hat=1e-4,
+                                       dt_max_hat=1e-2, max_steps=N, order=1)
+    dJdx = _traj_dJdx(sysm, steps)
+    adj = XDDTransientAdjoint(sysm, [ctrl], steps)
+    g = adj.gradient(dJdx)["mu_n"][0]
+    p0 = ctrl.get()[0]; eps = 1e-4 * max(1.0, abs(p0))
+
+    def J_of(v):
+        ctrl.set(np.array([v]))
+        _, st2 = march_with_checkpoints(sysm, state, dt0_hat=1e-4,
+                                        dt_max_hat=1e-2, max_steps=N, order=1)
+        val = _traj_J(st2); ctrl.set(np.array([p0])); return val
+    fd = (J_of(p0 + eps) - J_of(p0 - eps)) / (2 * eps)
+    rel = abs(g - fd) / max(abs(fd), 1e-12)
+    print(f"\nMode-B transient dJ/dµ_n adj={g:.6e} fd={fd:.6e} rel={rel:.2e}")
+    assert rel < 5e-5, (g, fd)
+
+
+def test_task6_transient_gradient_mu_n_mutation_fails(device):
+    """GATE HYGIENE for the µ_n transient gate: a planted (×1.5) error must make
+    the FD comparison FAIL — proves the carrier-history check is non-vacuous."""
+    from diffsim.xdd.run import march_with_checkpoints
+    from diffsim.xdd.adjoint import XDDTransientAdjoint, MaterialControl
+    sysm, state = build_small_lit_system(device)
+    ctrl = MaterialControl(sysm, param="mu_n")
+    N = 6
+    fs, steps = march_with_checkpoints(sysm, state, dt0_hat=1e-4,
+                                       dt_max_hat=1e-2, max_steps=N, order=1)
+    dJdx = _traj_dJdx(sysm, steps)
+    adj = XDDTransientAdjoint(sysm, [ctrl], steps)
+    g = adj.gradient(dJdx)["mu_n"][0]
+    p0 = ctrl.get()[0]; eps = 1e-4 * max(1.0, abs(p0))
+
+    def J_of(v):
+        ctrl.set(np.array([v]))
+        _, st2 = march_with_checkpoints(sysm, state, dt0_hat=1e-4,
+                                        dt_max_hat=1e-2, max_steps=N, order=1)
+        val = _traj_J(st2); ctrl.set(np.array([p0])); return val
+    fd = (J_of(p0 + eps) - J_of(p0 - eps)) / (2 * eps)
+    rel_good = abs(g - fd) / max(abs(fd), 1e-12)
+    rel_bad = abs(1.5 * g - fd) / max(abs(fd), 1e-12)
+    print(f"\nMode-B µ_n mutation gate: good rel={rel_good:.2e} "
+          f"mutated(×1.5) rel={rel_bad:.2e}")
+    assert rel_good < 5e-5, rel_good
+    assert rel_bad > 5e-5, ("gate vacuous — mutated µ_n gradient not rejected",
+                            rel_bad)
+
+
+def test_task6_transient_gradient_bdf2_vs_fd(device):
+    """BDF2 transient gate: drive order=2 so the tape carries genuine BDF2 steps
+    (hist = (2uⁿ − 0.5uⁿ⁻¹)/dt, coeffs 2/dt on uⁿ and −0.5/dt on uⁿ⁻¹, the n−2
+    prev2 cotangent).  Confirms the frozen-dt reverse handles a BDF2 step: adj
+    vs INDEPENDENT full-re-march central FD ≤ 5e-5, mutation-verified."""
+    from diffsim.xdd.run import march_with_checkpoints
+    from diffsim.xdd.adjoint import XDDTransientAdjoint, MaterialControl
+    sysm, state = build_small_lit_system(device)
+    ctrl = MaterialControl(sysm, param="tau_inv_d")
+    N = 6
+    fs, steps = march_with_checkpoints(sysm, state, dt0_hat=1e-4,
+                                       dt_max_hat=1e-2, max_steps=N, order=2)
+    # the tape MUST contain at least one true BDF2 step (order==2 with a prev2),
+    # else this gate would silently degrade to a BDF1 check.
+    n_bdf2 = sum(1 for s in steps if s["order"] == 2 and s["prev2"] is not None)
+    assert n_bdf2 >= 1, ("march did not produce a BDF2 step", [s["order"] for s in steps])
+    dJdx = _traj_dJdx(sysm, steps)
+    adj = XDDTransientAdjoint(sysm, [ctrl], steps)
+    g = adj.gradient(dJdx)["tau_inv_d"][0]
+    p0 = ctrl.get()[0]; eps = 1e-6 * max(1.0, abs(p0))
+
+    def J_of(v):
+        ctrl.set(np.array([v]))
+        _, st2 = march_with_checkpoints(sysm, state, dt0_hat=1e-4,
+                                        dt_max_hat=1e-2, max_steps=N, order=2)
+        val = _traj_J(st2); ctrl.set(np.array([p0])); return val
+    fd = (J_of(p0 + eps) - J_of(p0 - eps)) / (2 * eps)
+    rel_good = abs(g - fd) / max(abs(fd), 1e-12)
+    rel_bad = abs(1.5 * g - fd) / max(abs(fd), 1e-12)
+    print(f"\nMode-B BDF2 transient ({n_bdf2} BDF2 steps) dJ/dtau adj={g:.6e} "
+          f"fd={fd:.6e} rel={rel_good:.2e} mutated rel={rel_bad:.2e}")
+    assert rel_good < 5e-5, (g, fd)
+    assert rel_bad > 5e-5, ("BDF2 gate vacuous — mutated gradient not rejected",
+                            rel_bad)
