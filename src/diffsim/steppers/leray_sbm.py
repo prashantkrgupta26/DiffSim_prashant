@@ -24,6 +24,7 @@ import scipy.sparse as sp
 from ..mesh.faces import face_tables
 from ..sbm.surrogate import (classify_lambda, extract_surrogate, GeometryData)
 from ..sbm.vector import sbm_vector_dirichlet, surrogate_traction
+from ..solvers.timestepping import bdf_coeffs, bdf_order_now
 from .leray import LerayProjectionStepper
 
 
@@ -122,9 +123,65 @@ class LeraySBMStepper:
             extra_block=(self.Af_c, self.bf_c), sbm_nodes=self._sbm_nodes,
             return_matrix=return_matrix)
 
-    def step(self):
+    def step(self, surrogate_consistent=True):
+        """One projection step with the surrogate-consistent PPE + correction
+        (P2-R0 Task 3).
+
+        The surrogate-consistent boundary condition on the pressure-Poisson
+        increment at the immersed body is HOMOGENEOUS Neumann
+        ``grad(phi).n_hat = 0`` (Suresh pressure-projection SBM paper, Eq. 5 +
+        Remark 3.9) — already the natural BC of the base PPE RHS on the
+        surrogate faces — and the correction leaves the SBM-governed velocity
+        trace to the L2 projection (``sbm_nodes`` skip the box overwrite). The
+        two together preserve the SBM predictor's shifted no-penetration
+        (blockage) through the projection.
+
+        ``surrogate_consistent=False`` is the PLANTED BREAK: it injects the
+        paper-REJECTED non-homogeneous surrogate pressure flux
+        ``oint_sf sigma (u_hat.n_hat) q dS~`` into the PPE RHS, deviating from
+        homogeneous Neumann. This lets the correction push mass through the
+        body, so the no-penetration metric degrades — proving the
+        homogeneous-Neumann BC is load-bearing, not decorative.
+        """
+        flux = None if surrogate_consistent else self._ppe_break_flux
         return self.base.step(extra_block=(self.Af_c, self.bf_c),
-                              sbm_nodes=self._sbm_nodes)
+                              sbm_nodes=self._sbm_nodes,
+                              ppe_surrogate_flux=flux)
+
+    # ---- surrogate-face PPE flux (planted-break only) ----
+    def _ppe_break_flux(self, uhat):
+        """Non-homogeneous surrogate pressure flux (Suresh Remark 3.9 REJECTS
+        this): oint_sf N_a (sigma u_hat.n_hat) corr dS~ over the surrogate
+        faces, scattered to full node-major DOFs. Only used by the
+        planted-break leg to deviate from homogeneous Neumann. Mirrors the
+        surrogate_traction face-loop (geo.n domain-outward; area-corrected via
+        geo.corr)."""
+        dm = self.dm
+        mesh = dm.mesh
+        dim = self.dim
+        sf, geo = self.sf, self.geo
+        pv = int(np.unique(np.asarray(mesh.p_elem)[sf.elem])[0])
+        ftab = face_tables(pv, dim)
+        nqf = ftab.nqf
+        conn = mesh.conn_of[pv][np.searchsorted(mesh.bins[pv], sf.elem)]
+        h = mesh.tree.h()[sf.elem]
+        jacS = (h / 2.0) ** (dim - 1)
+        b0, _b1, _b2 = bdf_coeffs(
+            bdf_order_now(self.base.t + self.dt, self.dt, self.base.order,
+                          have_history=self.base.hist.have(2)), self.dt)
+        sigma = b0 / self.dt
+        # map free-node uhat -> full node-major velocity
+        u_full = np.asarray(dm.constraints.T @ uhat)      # [n_nodes, dim]
+        rhs = np.zeros(dm.n_nodes)
+        for fi in range(len(sf.elem)):
+            f = int(sf.face[fi])
+            un = u_full[conn[fi]]                          # [nbf, dim]
+            for q in range(nqf):
+                w = ftab.w[q] * jacS[fi] * geo.corr[fi * nqf + q]
+                n = geo.n[fi * nqf + q]
+                uq_n = (ftab.N[f][q] @ un) @ n
+                rhs[conn[fi]] += ftab.N[f][q] * (sigma * w * uq_n)
+        return rhs
 
     # ---- observable ----
     def surrogate_traction(self, x_full=None):
@@ -138,3 +195,41 @@ class LeraySBMStepper:
             x_full = np.asarray(self._T_vec @ xfree)
         return surrogate_traction(self.dm, self.sf, self.geo, x_full,
                                   self.nu, self.ndof)
+
+    # ---- no-penetration (blockage) observable ----
+    def surrogate_normal_flux(self, u_free=None):
+        """Area-averaged and net normal velocity at the surrogate boundary —
+        the physical no-penetration / blockage metric (P2-R0 Task 3 gate).
+
+        Returns ``(mean_un, net_flux, area)`` where
+        ``net_flux = oint_sf (u.n_hat) corr dS~`` (area-corrected to the true
+        boundary) and ``mean_un = net_flux / area``. Blockage is preserved
+        when ``|mean_un| << U_in``. This is a GENUINE physical check computed
+        directly from the corrected velocity field (a ``surrogate_traction``-
+        style face loop), INDEPENDENT of the PPE/correction BC assembly it
+        verifies. ``geo.n`` is domain-outward; the normal-velocity sign is
+        immaterial to the blockage magnitude.
+        """
+        dm = self.dm
+        mesh = dm.mesh
+        dim = self.dim
+        sf, geo = self.sf, self.geo
+        if u_free is None:
+            u_free = self.base._uvec(self.base.hist.pre1)
+        u_full = np.asarray(dm.constraints.T @ u_free)      # [n_nodes, dim]
+        pv = int(np.unique(np.asarray(mesh.p_elem)[sf.elem])[0])
+        ftab = face_tables(pv, dim)
+        nqf = ftab.nqf
+        conn = mesh.conn_of[pv][np.searchsorted(mesh.bins[pv], sf.elem)]
+        h = mesh.tree.h()[sf.elem]
+        jacS = (h / 2.0) ** (dim - 1)
+        net, area = 0.0, 0.0
+        for fi in range(len(sf.elem)):
+            f = int(sf.face[fi])
+            un = u_full[conn[fi]]
+            for q in range(nqf):
+                w = ftab.w[q] * jacS[fi] * geo.corr[fi * nqf + q]
+                n = geo.n[fi * nqf + q]
+                net += w * ((ftab.N[f][q] @ un) @ n)
+                area += w
+        return net / area, net, area

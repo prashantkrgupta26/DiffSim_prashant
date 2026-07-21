@@ -258,7 +258,29 @@ class LerayProjectionStepper:
         return A_out if return_matrix else uhat
 
     # ---------------- the step ----------------
-    def step(self, extra_block=None, sbm_nodes=None):
+    def step(self, extra_block=None, sbm_nodes=None, ppe_surrogate_flux=None):
+        """One projection step.
+
+        ``ppe_surrogate_flux`` is the SURROGATE-CONSISTENT PPE boundary hook
+        (P2-R0 Task 3). The surrogate-consistent boundary condition on the
+        pressure-Poisson increment ``phi`` at the immersed body is a
+        HOMOGENEOUS Neumann condition ``grad(phi).n_hat = 0`` (Suresh
+        pressure-projection SBM paper, Eq. 5 + Remark 3.9): this is exactly
+        the NATURAL boundary condition of the divergence-form PPE RHS
+        ``(sigma u_hat, grad q)`` on the surrogate faces (they carry no strong
+        constraint and are not pinned), so the DEFAULT ``None`` already
+        imposes it and PROVES the blockage/no-penetration of the SBM
+        predictor is preserved by the projection: since
+        ``u = u_hat - (1/sigma) grad(phi)`` and ``grad(phi).n_hat = 0`` at the
+        surrogate, ``u.n_hat = u_hat.n_hat`` there (Remark 3.9). Choosing a
+        non-zero surrogate flux (or a ``phi``-Dirichlet pin) instead lets the
+        correction push mass through the body and is REJECTED by the paper;
+        the hook exists so that a wrong/omitted BC can be injected as a
+        planted-break to prove the homogeneous-Neumann choice is
+        load-bearing. When callable, ``ppe_surrogate_flux(uhat)`` returns a
+        FULL node-major (``dm.n_nodes``) scalar added to the PPE RHS before
+        the constraint reduction.
+        """
         dm = self.dm
         dim = dm.dim
         ndof = self.ndof
@@ -310,6 +332,12 @@ class LerayProjectionStepper:
             be = np.einsum("qad,eqd,q,e->ea", tb.dN, fl, w,
                            jac * dsc)
             np.add.at(rhs, conn.ravel(), be.ravel())
+        # Surrogate-consistent PPE boundary hook (Task 3): default None keeps
+        # the homogeneous-Neumann natural BC at the surrogate (Suresh Eq. 5 /
+        # Remark 3.9). A non-None flux is the paper-rejected non-homogeneous
+        # choice, used only as a planted-break to prove the BC is load-bearing.
+        if ppe_surrogate_flux is not None:
+            rhs = rhs + np.asarray(ppe_surrogate_flux(uhat))
         rhs_free = np.asarray(dm.constraints.T.T @ rhs)
         if self.ppe_finescale:
             Kp = self._weighted_stiffness(w_gp).tolil()   # per-step tau_m
@@ -355,9 +383,15 @@ class LerayProjectionStepper:
                 solver=self.solver, sym=True, device=dm.device,
                 cache=self._solver_cache, cache_key="mass")
         # strong Dirichlet on the updated field (draft: trace preserved).
-        # SBM-governed nodes (weak immersed body) are NOT strong-overwritten —
-        # their trace comes from the projection (Task 3 surrogate-consistent
-        # correction refines this); pass sbm_nodes to skip the overwrite.
+        # SURROGATE-CONSISTENT CORRECTION (Task 3): SBM-governed nodes (the
+        # weak immersed body) are NOT strong-overwritten by the box trace —
+        # their corrected velocity IS the L2 projection u = u_hat -
+        # (1/sigma) grad(phi) (Suresh Eq. 6). With homogeneous Neumann on phi
+        # at the surrogate (the default PPE BC above), grad(phi).n_hat = 0
+        # there, so the projection preserves the SBM predictor's shifted
+        # no-penetration u.n_hat ~ 0 (Remark 3.9) instead of stamping the box
+        # inflow onto the body (which would leak flow through it). Pass
+        # sbm_nodes to skip the box overwrite on exactly those nodes.
         if sbm_nodes is None:
             u_new[self.dir_nodes] = gvals
         else:
