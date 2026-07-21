@@ -1177,3 +1177,13 @@ implementation begins.
    surrogate extraction logic in `extract_surrogate` checks neighbor presence,
    not `frac`). The plan lets `element_type=2` override `element_type=0` for
    such elements. **Confirm this override is correct.**
+
+## Supervisor resolutions (2026-07-21 — binding; confirm any code-dependent item at build time)
+
+The plan writer flagged 6 ambiguities. Resolutions:
+1. **VTK type 29 (TriquadraticHexahedron) for 3-D p2** — correct (27-node hex = VTK_TRIQUADRATIC_HEXAHEDRON). Verify `conn_of[2]` node ordering matches VTK's at implementation.
+2. **`.npz`-only source** — support BOTH: a Mesh/run source gives full octree cell topology (the good path, required for the Fig-19 mesh figures); a bare `.npz` degrades to a point-cloud VTU with a WARNING (fine for field contours, NOT for mesh-slice figures). Document the degradation.
+3. **XDD field names in the VTU** — use readable physical names (`phi`,`n`,`p`,`xd`,`xa`); implementer's call, non-blocking.
+4. **LIC on 3-D VTU** — default to a z=0.5 midplane slice, caller-overridable. Fine.
+5. **Surrogate distance `d`** — cell `d_mean` (mean ‖d‖ over surrogate GPs) for FIELD COLORING; the Fig-17b `d`-vs-x PROFILE plot uses GP-level `d` from `GeometryData.d` (a `surface_profile` input, not the VTU). Both, for their two uses.
+6. **element_type priority** — surrogate (2) OVERRIDES interior (0) for elements in `sf.elem` (the SBM-active element wins the label). Correct for the carve-out story.
