@@ -463,21 +463,41 @@ def _upload_into(dst, host_vec, n):
 
 
 def _cg_fused(op, b, tol, atol, maxiter, diag, check_every, sync_counter,
-              capture):
+              capture, b_dev=None, x_out=None, diag_dev=None,
+              fixed_iters=None):
     """Task-#40 fused (and optionally graph-captured) CG inner loop.
     Iterate-identical to the legacy cg_dev loop: same kernels-per-slot
     arithmetic, same batch boundaries, same convergence checks — 6
     launches/iteration instead of 15, one capture_launch per batch when
-    captured."""
+    captured.
+
+    Task #42 device-resident options (all default off = today's path):
+      b_dev      — rhs already on device (wp.array); skips the host upload.
+      x_out      — device buffer to write the solution into; skips the
+                   `x.numpy()` download (returns None for x, and the
+                   caller reads x_out on device).
+      diag_dev   — Jacobi diag already inverted on device (1/diag as a
+                   wp.array in `minv`); skips the diag upload.
+      fixed_iters — run EXACTLY this many iterations with NO convergence
+                   readback (collapse the per-check_every sync to nothing:
+                   the outer FGMRES residual is the only convergence gate).
+                   Must be a multiple of check_every so a single captured
+                   graph covers the whole budget."""
     _make_fused_kernels()
     d = op.device
     n = op.n_free
     ws = _workspace("cg", op, n, d, check_every)
     x, r, z, p, Ap = ws.vecs
     partial, scal, minv = ws.partial, ws.scal, ws.minv
-    bd = wp.array(np.ascontiguousarray(b, np.float64), dtype=wp.float64,
-                  device=d)
-    _upload_into(minv, 1.0 / np.ascontiguousarray(diag, np.float64), n)
+    if b_dev is not None:
+        bd = b_dev                                      # no host upload
+    else:
+        bd = wp.array(np.ascontiguousarray(b, np.float64), dtype=wp.float64,
+                      device=d)
+    if diag_dev is not None:
+        wp.copy(minv, diag_dev)                         # already 1/diag
+    else:
+        _upload_into(minv, 1.0 / np.ascontiguousarray(diag, np.float64), n)
     x.zero_()
     wp.copy(r, bd)
     wp.launch(_get("hadamard"), dim=n, inputs=[minv, r, z], device=d)
@@ -486,13 +506,6 @@ def _cg_fused(op, b, tol, atol, maxiter, diag, check_every, sync_counter,
     _fdot(r, z, n, partial, d)
     wp.launch(_get("freduce_to"), dim=1, inputs=[partial, scal, 0],
               device=d)                                 # rz
-    _fdot(bd, bd, n, partial, d)
-    wp.launch(_get("freduce_to"), dim=1, inputs=[partial, scal, 6],
-              device=d)                                 # bnorm2
-    bnorm = max(np.sqrt(scal.numpy()[6]), 1e-300)       # one entry sync
-    if sync_counter is not None:
-        sync_counter.count += 1
-    thresh2 = max(tol * bnorm, atol) ** 2
 
     def batch(k):
         for _ in range(k):
@@ -508,6 +521,35 @@ def _cg_fused(op, b, tol, atol, maxiter, diag, check_every, sync_counter,
                       inputs=[partial, scal], device=d)
             wp.launch(_get("cg_update_p"), dim=n, inputs=[p, z, scal],
                       device=d)
+
+    if fixed_iters is not None:
+        # Task #42: readback-free fixed-budget inner solve.  Replay the
+        # captured check_every batch fixed_iters/check_every times (the
+        # budget is a check_every multiple); NO scal readback at all.
+        if capture:
+            _try_capture(ws, d, batch, check_every)
+        it = 0
+        while it < fixed_iters:
+            k = min(check_every, fixed_iters - it)
+            if ws.graph is not None and k == check_every:
+                wp.capture_launch(ws.graph)
+            else:
+                batch(k)
+            it += k
+        info = {"iters": it, "converged": True, "fixed": True,
+                "graph": ws.graph is not None}
+        if x_out is not None:
+            wp.copy(x_out, x)                # persist out of the shared ws
+            return None, info
+        return x.numpy(), info
+
+    _fdot(bd, bd, n, partial, d)
+    wp.launch(_get("freduce_to"), dim=1, inputs=[partial, scal, 6],
+              device=d)                                 # bnorm2
+    bnorm = max(np.sqrt(scal.numpy()[6]), 1e-300)       # one entry sync
+    if sync_counter is not None:
+        sync_counter.count += 1
+    thresh2 = max(tol * bnorm, atol) ** 2
 
     if capture:
         _try_capture(ws, d, batch, check_every)
@@ -525,18 +567,25 @@ def _cg_fused(op, b, tol, atol, maxiter, diag, check_every, sync_counter,
         if sync_counter is not None:
             sync_counter.count += 1
         if rnorm2 < thresh2:
-            return x.numpy(), {"iters": it,
-                               "relres": np.sqrt(rnorm2) / bnorm,
-                               "converged": True,
-                               "graph": ws.graph is not None}
-    return x.numpy(), {"iters": it,
-                       "relres": np.sqrt(rnorm2 if rnorm2 is not None
-                                         else np.inf) / bnorm,
-                       "converged": False, "graph": ws.graph is not None}
+            info = {"iters": it, "relres": np.sqrt(rnorm2) / bnorm,
+                    "converged": True, "graph": ws.graph is not None}
+            if x_out is not None:
+                wp.copy(x_out, x)
+                return None, info
+            return x.numpy(), info
+    info = {"iters": it,
+            "relres": np.sqrt(rnorm2 if rnorm2 is not None
+                              else np.inf) / bnorm,
+            "converged": False, "graph": ws.graph is not None}
+    if x_out is not None:
+        wp.copy(x_out, x)
+        return None, info
+    return x.numpy(), info
 
 
 def cg_dev(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None,
-           check_every=10, sync_counter=None, graph=None):
+           check_every=10, sync_counter=None, graph=None,
+           b_dev=None, x_out=None, diag_dev=None, fixed_iters=None):
     """Single-sync device CG. op: .matvec(x_wp, y_wp), .n_free, .device.
     Host syncs ONLY at the periodic convergence check (and once at entry for
     bnorm). Returns (x numpy, info).
@@ -546,11 +595,26 @@ def cg_dev(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None,
     "graph" (capture on any device).  diag=None or a non-CSROperator op
     (matrix-free protocol objects) always takes the legacy loop
     (production blockch/fused-backend inners are Jacobi-preconditioned
-    CSROperators)."""
+    CSROperators).
+
+    Task #42 device-resident options (b_dev / x_out / diag_dev /
+    fixed_iters): keep the rhs and solution on device across the whole
+    blockch apply so the per-inner-solve upload/download syncs collapse
+    to the outer FGMRES check cadence.  Only honored on the fused/CSR
+    path (the production inner); a request for these on the legacy path
+    is a programming error."""
     fused, cap = _resolve_path(graph, op.device)
-    if fused and diag is not None and _fusable(op):
+    dev_resident = (b_dev is not None or x_out is not None
+                    or diag_dev is not None or fixed_iters is not None)
+    if dev_resident and not (fused and _fusable(op)):
+        raise ValueError("cg_dev device-resident args require the fused "
+                         "CSROperator path (graph!='off', diag on a "
+                         "CSROperator)")
+    if fused and (diag is not None or diag_dev is not None) \
+            and _fusable(op):
         return _cg_fused(op, b, tol, atol, maxiter, diag, check_every,
-                         sync_counter, cap)
+                         sync_counter, cap, b_dev=b_dev, x_out=x_out,
+                         diag_dev=diag_dev, fixed_iters=fixed_iters)
     _make_kernels()
     d = op.device
     n = op.n_free
@@ -697,22 +761,36 @@ def _make_bicgstab_kernels():
 
 
 def _bicgstab_fused(op, b, tol, atol, maxiter, diag, check_every,
-                    sync_counter, max_restarts, capture):
+                    sync_counter, max_restarts, capture,
+                    b_dev=None, x_out=None, diag_dev=None,
+                    fixed_iters=None):
     """Task-#40 fused (and optionally graph-captured) BiCGStab.
     Iterate-identical to the legacy loop (same per-slot arithmetic and
     freeze-on-breakdown semantics); the "first" flag moves to the device
     (scal[11]) so every batch is uniform and ONE captured graph covers
     entry and post-restart batches alike.  13 launches/iteration instead
-    of 22."""
+    of 22.
+
+    Task #42 device-resident options (b_dev/x_out/diag_dev/fixed_iters):
+    see _cg_fused.  In fixed_iters mode there is NO readback, so the
+    on-device breakdown FREEZE (state held at the last good iterate) is
+    the only breakdown handling — no host restart; a frozen inner is a
+    valid degraded preconditioner and the outer FGMRES still converges."""
     _make_fused_kernels()
     d = op.device
     n = op.n_free
     ws = _workspace("bs", op, n, d, check_every)
     x, r, rhat, p, v, s, t, ph, sh = ws.vecs
     partial, scal, minv = ws.partial, ws.scal, ws.minv
-    bd = wp.array(np.ascontiguousarray(b, np.float64), dtype=wp.float64,
-                  device=d)
-    _upload_into(minv, 1.0 / np.ascontiguousarray(diag, np.float64), n)
+    if b_dev is not None:
+        bd = b_dev                                      # no host upload
+    else:
+        bd = wp.array(np.ascontiguousarray(b, np.float64), dtype=wp.float64,
+                      device=d)
+    if diag_dev is not None:
+        wp.copy(minv, diag_dev)                         # already 1/diag
+    else:
+        _upload_into(minv, 1.0 / np.ascontiguousarray(diag, np.float64), n)
     x.zero_()
     wp.copy(r, bd)
     wp.copy(rhat, bd)
@@ -764,6 +842,24 @@ def _bicgstab_fused(op, b, tol, atol, maxiter, diag, check_every,
     if capture:
         _try_capture(ws, d, batch, check_every)
 
+    if fixed_iters is not None:
+        # Task #42: readback-free fixed-budget inner solve (no restarts —
+        # on-device breakdown freeze holds the last good iterate).
+        it = 0
+        while it < fixed_iters:
+            k = min(check_every, fixed_iters - it)
+            if ws.graph is not None and k == check_every:
+                wp.capture_launch(ws.graph)
+            else:
+                batch(k)
+            it += k
+        info = {"iters": it, "converged": True, "fixed": True,
+                "restarts": 0, "graph": ws.graph is not None}
+        if x_out is not None:
+            wp.copy(x_out, x)
+            return None, info
+        return x.numpy(), info
+
     it = 0
     restarts = 0
     rnorm2 = np.inf
@@ -779,29 +875,40 @@ def _bicgstab_fused(op, b, tol, atol, maxiter, diag, check_every,
             sync_counter.count += 1
         rnorm2, flag = float(vals[5]), float(vals[10])
         if rnorm2 < thresh2:                   # converged wins over any
-            return x.numpy(), {"iters": it,   # concurrent breakdown flag
-                               "relres": np.sqrt(rnorm2) / bnorm,
-                               "converged": True, "restarts": restarts,
-                               "graph": ws.graph is not None}
+            info = {"iters": it,               # concurrent breakdown flag
+                    "relres": np.sqrt(rnorm2) / bnorm,
+                    "converged": True, "restarts": restarts,
+                    "graph": ws.graph is not None}
+            if x_out is not None:
+                wp.copy(x_out, x)
+                return None, info
+            return x.numpy(), info
         if flag != 0.0:
             if restarts < max_restarts:
                 restarts += 1
                 wp.copy(rhat, r)                # restart from last good r
                 _reset_scal(rnorm2)
                 continue
-            return x.numpy(), {"iters": it,
-                               "relres": np.sqrt(rnorm2) / bnorm,
-                               "converged": False, "restarts": restarts,
-                               "breakdown": ("rho" if flag == 1.0
-                                             else "rhat_v"),
-                               "graph": ws.graph is not None}
-    return x.numpy(), {"iters": it, "relres": np.sqrt(rnorm2) / bnorm,
-                       "converged": False, "graph": ws.graph is not None}
+            info = {"iters": it, "relres": np.sqrt(rnorm2) / bnorm,
+                    "converged": False, "restarts": restarts,
+                    "breakdown": ("rho" if flag == 1.0 else "rhat_v"),
+                    "graph": ws.graph is not None}
+            if x_out is not None:
+                wp.copy(x_out, x)
+                return None, info
+            return x.numpy(), info
+    info = {"iters": it, "relres": np.sqrt(rnorm2) / bnorm,
+            "converged": False, "graph": ws.graph is not None}
+    if x_out is not None:
+        wp.copy(x_out, x)
+        return None, info
+    return x.numpy(), info
 
 
 def bicgstab_dev(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None,
                  check_every=10, sync_counter=None, max_restarts=50,
-                 graph=None):
+                 graph=None, b_dev=None, x_out=None, diag_dev=None,
+                 fixed_iters=None):
     """Single-sync device BiCGStab (Jacobi-preconditioned). Breakdown guards
     live ON DEVICE (scalars[10]) and FREEZE all update kernels, so the state
     at the periodic host check is the last pre-breakdown iterate; the host
@@ -809,12 +916,20 @@ def bicgstab_dev(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None,
     standard cure for rho-breakdown on hard nonsymmetric systems (measured
     on the L6 cavity monolithic block). Same contract as krylov.bicgstab.
 
-    graph: Task-#40 knob (see cg_dev)."""
+    graph: Task-#40 knob (see cg_dev).
+    Task #42 device-resident options (see cg_dev)."""
     fused, cap = _resolve_path(graph, op.device)
-    if fused and diag is not None and _fusable(op):
+    dev_resident = (b_dev is not None or x_out is not None
+                    or diag_dev is not None or fixed_iters is not None)
+    if dev_resident and not (fused and _fusable(op)):
+        raise ValueError("bicgstab_dev device-resident args require the "
+                         "fused CSROperator path")
+    if fused and (diag is not None or diag_dev is not None) \
+            and _fusable(op):
         return _bicgstab_fused(op, b, tol, atol, maxiter, diag,
                                check_every, sync_counter, max_restarts,
-                               cap)
+                               cap, b_dev=b_dev, x_out=x_out,
+                               diag_dev=diag_dev, fixed_iters=fixed_iters)
     _make_bicgstab_kernels()
     d = op.device
     n = op.n_free

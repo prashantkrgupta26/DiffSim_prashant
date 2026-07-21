@@ -385,6 +385,46 @@ def _ac_pattern_maps(indptr, indices, ndof, off):
     return rp1, cn1, pos, diag
 
 
+def _blockch_apply_kernels():
+    """Task #42: node-strided gather/scatter + fused axpy for the
+    DEVICE-RESIDENT blockch apply.  A dof block lives at node-major
+    positions base + i*ndof + off (i in [0, n)); these keep r/z on the
+    device so the per-inner-solve rhs upload / solution download and the
+    per-outer-matvec host round-trip collapse to ONE upload of r + ONE
+    download of z per apply (the outer FGMRES check cadence)."""
+    from ..assembly.operators import _kernel_cache
+    import warp as wp
+    key = ("blockch_apply_gs",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def gather_stride(src: wp.array(dtype=wp.float64),
+                      off: wp.int32, ndof: wp.int32,
+                      out: wp.array(dtype=wp.float64)):
+        i = wp.tid()
+        out[i] = src[i * ndof + off]
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def scatter_stride(vals: wp.array(dtype=wp.float64),
+                       off: wp.int32, ndof: wp.int32,
+                       dst: wp.array(dtype=wp.float64)):
+        i = wp.tid()
+        dst[i * ndof + off] = vals[i]
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def axpy_into(a: wp.array(dtype=wp.float64), c: wp.float64,
+                  b: wp.array(dtype=wp.float64),
+                  out: wp.array(dtype=wp.float64)):
+        # out = a + c*b   (c=-1 gives a-b); a/b/out may alias out=a
+        i = wp.tid()
+        out[i] = a[i] + c * b[i]
+
+    ks = (gather_stride, scatter_stride, axpy_into)
+    _kernel_cache[key] = ks
+    return ks
+
+
 def _blockch_pair_fill_kernel():
     from ..assembly.operators import _kernel_cache
     import warp as wp
@@ -593,6 +633,18 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
     inner_it = [0]
     _cb = lambda *_: inner_it.__setitem__(0, inner_it[0] + 1)
 
+    # Task #42: device-resident apply engages on CUDA whenever the fused
+    # inner path is active (the same knob #40 introduced); "off" keeps
+    # today's host-transfer apply bit-for-bit.  It requires no AC blocks
+    # (the AC lower-triangular chain stays on the host transfer path,
+    # which the film production config never exercises) and a non-chunked
+    # value buffer for the outer spmv graph.
+    from .krylov_dev import _resolve_path
+    _kg = meta.get("krylov_graph")
+    _fused_on, _ = _resolve_path(_kg, device)
+    dev_apply = (_fused_on and str(device).startswith("cuda")
+                 and not meta.get("ac") and jv is None)
+
     def _dev_solve(op, y, dg, rtol, krylov, label):
         if not np.any(y):
             return np.zeros_like(y)       # zero rhs (see _blockch_pairs)
@@ -603,6 +655,16 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
             raise ConvergenceError(f"blockch {label} device solve: {info}")
         inner_it[0] += info.get("iters", 0)
         return x_
+
+    def _dev_solve_resident(op, y_d, minv_d, rtol, krylov, out_d, label):
+        # device-in / device-out: NO host upload of y, NO .numpy() of the
+        # solution — the whole inner solve stays on device (Task #42).
+        _x, info = krylov(op, None, tol=rtol, atol=1e-13, maxiter=4000,
+                          check_every=50, graph=meta.get("krylov_graph"),
+                          b_dev=y_d, x_out=out_d, diag_dev=minv_d)
+        if not info.get("converged"):
+            raise ConvergenceError(f"blockch {label} device solve: {info}")
+        inner_it[0] += info.get("iters", 0)
 
     # two gather widths: pos_d index nnz-space (P0-2 wide / #38
     # chunked); diag_d is node-space (always int32).  _gather_A is the
@@ -643,6 +705,7 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
                 Pd["pos_d"]["mc"], Pd["pos_d"]["mm"],
                 *coefs, *outs], device=device)
         dgs = []
+        minv_ds = []
         for arr in (Pd["amm_d"], Pd["w1_d"], Pd["w2_d"]):
             wp.launch(gat_diag, dim=n,
                       inputs=[arr, Pd["diag_d"], Pd["dg_d"]],
@@ -651,20 +714,33 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
             dg[dg == 0] = 1.0
             dgs.append(dg)
         dgs[2] = np.abs(dgs[2])         # Jacobi sign-guard (indefinite)
+        if dev_apply:
+            # device-resident: 1/diag lives on device (uploaded ONCE per
+            # Newton fill, not per apply).  The host dg above is still
+            # computed for the zero-fix / sign-guard (a one-time setup
+            # readback, negligible vs the per-apply transfers removed).
+            for dg in dgs:
+                minv_ds.append(wp.array(
+                    np.ascontiguousarray(1.0 / dg, np.float64),
+                    dtype=wp.float64, device=device))
         mkop = lambda a_, Pd=Pd: CSROperator.from_device_arrays(
             Pd["rowptr_d"], Pd["colnodes_d"], a_, n, device)
         opM = mkop(Pd["amm_d"])
         opW1, opW2 = mkop(Pd["w1_d"]), mkop(Pd["w2_d"])
         base = np.arange(n, dtype=np.int64) * ndof + p["off"]
-        pairs.append(dict(
-            ci=base, mi=base + 1, m=mmo, Pd=Pd,
+        pd = dict(
+            ci=base, mi=base + 1, m=mmo, Pd=Pd, off=int(p["off"]),
             opAcm=mkop(Pd["acm_d"]), opAmc=mkop(Pd["amc_d"]), opM=opM,
+            opW1=opW1, opW2=opW2,
             msolve=lambda y, o=opM, d_=dgs[0]:
                 _dev_solve(o, y, d_, 1e-10, cg_dev, "mass"),
             w1solve=lambda y, o=opW1, d_=dgs[1]:
                 _dev_solve(o, y, d_, 1e-8, cg_dev, "W1"),
             w2solve=lambda y, o=opW2, d_=dgs[2]:
-                _dev_solve(o, y, d_, 1e-8, bicgstab_dev, "W2")))
+                _dev_solve(o, y, d_, 1e-8, bicgstab_dev, "W2"))
+        if dev_apply:
+            pd["minv_M"], pd["minv_W1"], pd["minv_W2"] = minv_ds
+        pairs.append(pd)
 
     acs = []
     for a_blk, Bd in zip(meta.get("ac", ()), setup["ac"]):
@@ -714,6 +790,61 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
             z[P["mi"]] = zm
         _apply_ac(r, z)
         return z
+
+    # ---- Task #42: device-resident apply -----------------------------
+    # r/z stay on device across the WHOLE preconditioner chain: r is
+    # uploaded ONCE per apply, z downloaded ONCE.  Node-strided gather/
+    # scatter slice the (phi, mu) blocks in place; the inner solves run
+    # device-in/device-out (no per-solve rhs upload or .numpy()); the
+    # opAcm/opM/opAmc matvecs write into device scratch (no matvec_numpy
+    # round-trip).  Same arithmetic and iterate sequence as apply() —
+    # the inner solves still converge to their own tolerances, so the
+    # outer FGMRES sees an identical M^{-1} action (few-ULP; G1).
+    if dev_apply:
+        gk, sk, axpy = _blockch_apply_kernels()
+        r_d = wp.zeros(N, dtype=wp.float64, device=device)
+        z_d = wp.zeros(N, dtype=wp.float64, device=device)
+        # per-pair scratch (rc, rm, a, zc, zm, tmp) reused every apply
+        for P in pairs:
+            P["_sc"] = [wp.zeros(n, dtype=wp.float64, device=device)
+                        for _ in range(6)]
+
+        def apply_dev(r):
+            wp.copy(r_d, wp.array(np.ascontiguousarray(r, np.float64),
+                                  dtype=wp.float64, device=device))
+            wp.copy(z_d, r_d)             # identity on any uncovered dof
+            for P in pairs:
+                rc, rm, a, zc, zm, tmp = P["_sc"]
+                off = P["off"]
+                wp.launch(gk, dim=n, inputs=[r_d, off, ndof, rc],
+                          device=device)
+                wp.launch(gk, dim=n, inputs=[r_d, off + 1, ndof, rm],
+                          device=device)
+                # a = W1^{-1} (rc - Acm M^{-1} rm)
+                _dev_solve_resident(P["opM"], rm, P["minv_M"], 1e-10,
+                                    cg_dev, tmp, "mass")       # tmp=M^{-1}rm
+                P["opAcm"].matvec(tmp, zm)                     # zm=Acm tmp
+                wp.launch(axpy, dim=n, inputs=[rc, wp.float64(-1.0), zm,
+                                               tmp], device=device)
+                _dev_solve_resident(P["opW1"], tmp, P["minv_W1"], 1e-8,
+                                    cg_dev, a, "W1")            # a=W1^{-1}..
+                # zc = W2^{-1} (M a)
+                P["opM"].matvec(a, tmp)                        # tmp=M a
+                _dev_solve_resident(P["opW2"], tmp, P["minv_W2"], 1e-8,
+                                    bicgstab_dev, zc, "W2")     # zc
+                # zm = M^{-1} (rm - Amc zc)
+                P["opAmc"].matvec(zc, tmp)                     # tmp=Amc zc
+                wp.launch(axpy, dim=n, inputs=[rm, wp.float64(-1.0), tmp,
+                                               tmp], device=device)
+                _dev_solve_resident(P["opM"], tmp, P["minv_M"], 1e-10,
+                                    cg_dev, zm, "mass")         # zm
+                wp.launch(sk, dim=n, inputs=[zc, off, ndof, z_d],
+                          device=device)
+                wp.launch(sk, dim=n, inputs=[zm, off + 1, ndof, z_d],
+                          device=device)
+            return z_d.numpy()            # ONE download per apply
+
+        apply = apply_dev
 
     opA = CSROperator.from_device_arrays(*setup["A_idx_d"], vals_d, N,
                                          device)
