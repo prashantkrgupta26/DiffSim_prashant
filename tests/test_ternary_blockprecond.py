@@ -302,6 +302,67 @@ def test_film_blockch_device_resident_apply_parity(device, monkeypatch):
     assert fb == 0, ("fallback engaged on device-resident apply", its_dev)
 
 
+def test_film_blockch_device_outer_fgmres_parity(device, monkeypatch):
+    """Task #49 G1: the device-resident OUTER FGMRES
+    (DIFFSIM_PRECOND_DEV_OUTER=1 — the whole preconditioned solve is one
+    device-resident region: outer Krylov vecops + preconditioner apply +
+    matvec) is trajectory-equivalent to the default host-scipy-lgmres
+    outer (device-resident #37 SETUP on both sides; only the OUTER changes).
+    CUDA-only (the device outer auto-gates off on CPU).  The device FGMRES
+    is right-preconditioned flexible GMRES(30) — the flexible analogue of
+    scipy lgmres with the LGMRES augmentation off — so the iterate matches
+    host to few-ULP where the outer-check cadence agrees; the outer count
+    may shift +-1 by the augmentation difference (documented, task-49 G1),
+    so convergence-history EQUIVALENCE (parity + accept/reject ladder +
+    bounded iters + no fallback) is asserted, not bitwise iters."""
+    if not str(device).startswith("cuda"):
+        pytest.skip("device-outer FGMRES is CUDA-only")
+
+    def run(dev_outer):
+        monkeypatch.setenv("DIFFSIM_PRECOND_DEV_OUTER",
+                           "1" if dev_outer else "0")
+        tree0 = build_uniform(5, dim=2)
+        keep = tree0.centers()[:, 0] < 4 / 32
+        tree = Octree(tree0.keys[keep], tree0.levels[keep], dim=2,
+                      periodic=tree0.periodic)
+        mesh = build_mesh(tree, p=1)
+        cons = build_constraints(mesh)
+        dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2),
+                                  device)
+        st = WodoFilmStepper(dm, chi=(1.0, 0.3, 0.3), N=(5.0, 5.0, 1.0),
+                             M=(0.225, 0.0, 0.225), kappa=(2e-4, 2e-4),
+                             k_e=1.0, dt=1e-3, linsolver="blockch",
+                             use_device_assembly=True)
+        assert st.precond_dev_outer == dev_outer     # knob wired
+        rng = np.random.default_rng(3)
+        st.set_initial(
+            lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)),
+            lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)))
+        st._solver_cache = _RecCache()
+        rec = []
+        st.march(h_min=0.8, phis_stop=0.05, max_steps=10,
+                 callback=lambda s, K, dt, it: rec.append((dt, s.x.copy())))
+        return rec, st.n_reject, st._solver_cache.iters
+
+    rec_host, rej_host, its_host = run(False)
+    rec_dev, rej_dev, its_dev = run(True)
+    assert rej_host == rej_dev and len(rec_host) == len(rec_dev)
+    assert all(abs(a[0] - b[0]) < 1e-9 * a[0]
+               for a, b in zip(rec_host, rec_dev)), "dt ladder diverged"
+    assert len(its_host) == len(its_dev), "solve count diverged"
+    errs = [np.abs(a[1] - b[1]).max() / max(np.abs(a[1]).max(), 1e-30)
+            for a, b in zip(rec_host, rec_dev)]
+    wobble = sum(1 for a, b in zip(its_host, its_dev) if a != b)
+    mx = max(i % 1000 for i in its_dev)
+    fb = sum(1 for i in its_dev if i >= 1000)
+    print(f"device-outer FGMRES parity: {len(rec_host)} steps, max rel "
+          f"err {max(errs):.2e}, outer wobble {wobble}, dev max outer "
+          f"{mx}, fallbacks {fb}")
+    assert max(errs) < 1e-9, errs
+    assert mx <= 12, its_dev
+    assert fb == 0, ("fallback engaged on device outer", its_dev)
+
+
 def test_film_blockch_evaporation(device):
     """The full film physics through the pairwise preconditioner —
     test_wodo_film.py::test_wodo_film_evaporation's config with
