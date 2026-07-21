@@ -36,12 +36,15 @@ _DIST_SCALE = 4e-9
 
 
 def build_small_lit_system(device, level=3, Eg_hat=4.0, mu=0.5, lam2=1e-1,
-                           zeta=1e-3):
+                           zeta=1e-3, want_gen=False):
     """Return (sysm, converged_lit_state) for a small resolvable-Debye bilayer.
 
     Resolvable-Debye + symmetric-transport config so a short BDF march reaches
     steady in a handful of steps.  CW generation at a moderate nondim peak gives
     a nondegenerate lit steady (R̂ nonzero — the closure controls have signal).
+
+    With ``want_gen=True`` additionally returns ``(dist_gp, gen)`` so the
+    illumination control can be constructed against the same generation object.
     """
     tree = build_uniform(level, dim=2)
     mesh = build_mesh(tree, p=1)
@@ -87,4 +90,6 @@ def build_small_lit_system(device, level=3, Eg_hat=4.0, mu=0.5, lam2=1e-1,
     state, info = _march_to_steady(sysm, ic, dt0_hat=1e-6, dt_max_hat=0.1,
                                    max_steps=400, time_stepping_tol=1e-6)
     assert info["criterion_fired"], info.get("reason")
+    if want_gen:
+        return sysm, state, dist_gp, gen
     return sysm, state
