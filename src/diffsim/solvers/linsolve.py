@@ -950,7 +950,7 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
     # readback for the convergence test.  On non-convergence the SAME
     # exact-Schur escalation runs (host lgmres over apply_fb, below), so a
     # degraded preconditioner is caught identically.  The device FGMRES is
-    # right-preconditioned flexible GMMRES(restart=30) — the flexible
+    # right-preconditioned flexible GMRES(restart=30) — the flexible
     # analogue of scipy lgmres with the LGMRES augmentation off (see
     # fgmres_dev docstring); the iterate matches host to few-ULP.
     if dev_outer:
