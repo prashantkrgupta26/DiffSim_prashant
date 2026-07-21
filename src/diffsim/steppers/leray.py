@@ -153,12 +153,10 @@ class LerayProjectionStepper:
     def _uvec(self, flat):
         return flat.reshape(self.n_free, self.dm.dim)
 
-    # ---------------- the step ----------------
-    def step(self):
+    def _predictor_setup(self, t_new):
+        """Common BDF/history setup for the predictor; returns
+        (b0, b1, b2, sigma, u1, u2, fq_base, gvals)."""
         dm = self.dm
-        dim = dm.dim
-        ndof = self.ndof
-        t_new = self.t + self.dt
         o = bdf_order_now(t_new, self.dt, self.order,
                           have_history=self.hist.have(2))
         b0, b1, b2 = bdf_coeffs(o, self.dt)
@@ -171,12 +169,40 @@ class LerayProjectionStepper:
         fq_base = {pv: self.f_fn(self.xq[pv], t_new) - hq[pv]
                    for pv in self.xq}
         gvals = self.g_fn(self.free_coords[self.dir_nodes], t_new)
-        p_node_full = self.p_star
+        return b0, b1, b2, sigma, u1, u2, fq_base, gvals
 
-        # ---- Step 1: nonlinear predictor (Picard over the full block with
-        # pressure DOFS PINNED to p*) ----
+    def _predict(self, t_new=None, extra_block=None, sbm_nodes=None,
+                 return_matrix=False):
+        """Momentum predictor (Algorithm 1 Step 1) as a standalone hook.
+
+        The composed volumetric-SBM stepper injects the shifted-Nitsche
+        vector Dirichlet block via ``extra_block=(A_sbm_c, b_sbm_c)`` (both
+        CONSTRAINED, free-node-major ``n_free*ndof``): the block is added to
+        the assembled momentum system before the strong-row overwrite, and
+        the ``sbm_nodes`` (free-node indices governed WEAKLY by SBM) skip the
+        strong box-Dirichlet overwrite so the immersed body stays weak.
+
+        Keeps the body-fitted path bit-identical when ``extra_block is None``
+        and ``sbm_nodes is None``.
+
+        Returns ``uhat`` (or the assembled csr matrix when
+        ``return_matrix`` is True — for composition tests). Does NOT advance
+        the history or ``p_star``.
+        """
+        dm = self.dm
+        dim = dm.dim
+        ndof = self.ndof
+        if t_new is None:
+            t_new = self.t + self.dt
+        b0, b1, b2, sigma, u1, u2, fq_base, gvals = \
+            self._predictor_setup(t_new)
+        p_node_full = self.p_star
+        strong_skip = (set() if sbm_nodes is None
+                       else set(int(i) for i in np.asarray(sbm_nodes)))
+
         a_node = 2.0 * u1 - u2 if u2 is not None else u1.copy()
         uhat = None
+        A_out = None
         self.predictor_diffs = []
         prev_iter = None
         for _ in range(self.picard_iters):
@@ -197,8 +223,16 @@ class LerayProjectionStepper:
                 dm, aq, dq, fq_it, self.nu, sigma=sigma,
                 sig2tau=((2.0 * sigma) ** 2 if self.timestab else 0.0),
                 gaq_by_bin=(gaq_flat if newton else None), newton=newton)
+            # SBM face block: add the constrained shifted-Nitsche vector
+            # Dirichlet into the momentum system BEFORE strong-row overwrite.
+            if extra_block is not None:
+                A_sbm_c, b_sbm_c = extra_block
+                A = (A + A_sbm_c)
+                b = b + np.asarray(b_sbm_c)
             A = A.tolil()
             for k, i in enumerate(self.dir_nodes):
+                if int(i) in strong_skip:      # SBM-governed: stays weak
+                    continue
                 for c in range(dim):
                     r = i * ndof + c
                     A.rows[r] = [int(r)]
@@ -209,16 +243,33 @@ class LerayProjectionStepper:
                 A.rows[r] = [int(r)]
                 A.data[r] = [1.0]
                 b[r] = p_node_full[i]
+            Acsr = A.tocsr()
             from ..solvers.linsolve import solve_linear
-            x = solve_linear(A.tocsr(), b, solver=self.solver, sym=False,
+            x = solve_linear(Acsr, b, solver=self.solver, sym=False,
                              device=self.dm.device,
                              cache=self._solver_cache)
             uhat = x.reshape(self.n_free, ndof)[:, :dim]
+            A_out = Acsr
             if prev_iter is not None:
                 self.predictor_diffs.append(
                     float(np.abs(uhat - prev_iter).max()))
             prev_iter = uhat
             a_node = uhat
+        return A_out if return_matrix else uhat
+
+    # ---------------- the step ----------------
+    def step(self, extra_block=None, sbm_nodes=None):
+        dm = self.dm
+        dim = dm.dim
+        ndof = self.ndof
+        t_new = self.t + self.dt
+        b0, b1, b2, sigma, u1, u2, fq_base, gvals = \
+            self._predictor_setup(t_new)
+
+        # ---- Step 1: nonlinear predictor (Picard over the full block with
+        # pressure DOFS PINNED to p*) ----
+        uhat = self._predict(t_new=t_new, extra_block=extra_block,
+                             sbm_nodes=sbm_nodes)
         # ---- Step 2: PPE with tau_m fine-scale RHS ----
         uq, guq = self._gp_vals(uhat, grad=True)
         pq_g = self._gp_vals(self.p_star, grad=True)[1]
@@ -303,8 +354,19 @@ class LerayProjectionStepper:
                 self.M, np.asarray(dm.constraints.T.T @ rhs_c),
                 solver=self.solver, sym=True, device=dm.device,
                 cache=self._solver_cache, cache_key="mass")
-        # strong Dirichlet on the updated field (draft: trace preserved)
-        u_new[self.dir_nodes] = gvals
+        # strong Dirichlet on the updated field (draft: trace preserved).
+        # SBM-governed nodes (weak immersed body) are NOT strong-overwritten —
+        # their trace comes from the projection (Task 3 surrogate-consistent
+        # correction refines this); pass sbm_nodes to skip the overwrite.
+        if sbm_nodes is None:
+            u_new[self.dir_nodes] = gvals
+        else:
+            skip = set(int(i) for i in np.asarray(sbm_nodes))
+            keep = [k for k, i in enumerate(self.dir_nodes)
+                    if int(i) not in skip]
+            if keep:
+                keep = np.asarray(keep)
+                u_new[self.dir_nodes[keep]] = gvals[keep]
         # ---- Step 4 ----
         self.p_star = p_hat
         self.hist.rotate(u_new.ravel(), dt=self.dt)
