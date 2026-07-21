@@ -55,11 +55,20 @@ class LaunchAudit:
         self.launches = {}          # (stage, kernel-name) -> count
         self.copies = {}            # stage -> count
         self.replays = {}           # stage -> graph replays (captured path)
+        self.syncs = {}             # stage -> device->host readbacks (.numpy)
+        self.dev_syncs = {}         # stage -> explicit synchronize_device
         self.stage = "other"
 
     def install(self):
         self._launch, self._copy = wp.launch, wp.copy
         self._cap = getattr(wp, "capture_launch", None)
+        # Task #42: the DURABLE lever is the COUNT OF SYNC POINTS (#40 G3).
+        # A per-inner-solve rhs upload + solution `.numpy()` download +
+        # each outer matvec_numpy round-trip is a host-blocking readback
+        # that stalls the pipeline; count them directly (array.numpy is the
+        # device->host sync) alongside explicit synchronize_device calls.
+        self._np = wp.array.numpy
+        self._syncdev = getattr(wp, "synchronize_device", None)
 
         def launch(*a, **k):
             kern = a[0] if a else k.get("kernel")
@@ -73,7 +82,22 @@ class LaunchAudit:
             self.copies[self.stage] = self.copies.get(self.stage, 0) + 1
             return self._copy(*a, **k)
 
+        _self = self
+
+        def arr_numpy(self, *a, **k):
+            # only count device (CUDA) readbacks — host arrays don't sync
+            if str(getattr(self, "device", "cpu")).startswith("cuda"):
+                _self.syncs[_self.stage] = _self.syncs.get(_self.stage, 0) + 1
+            return _self._np(self, *a, **k)
+
         wp.launch, wp.copy = launch, copy
+        wp.array.numpy = arr_numpy
+        if self._syncdev is not None:
+            def syncdev(*a, **k):
+                self.dev_syncs[self.stage] = self.dev_syncs.get(
+                    self.stage, 0) + 1
+                return self._syncdev(*a, **k)
+            wp.synchronize_device = syncdev
         if self._cap is not None:
             def cap(*a, **k):
                 self.replays[self.stage] = self.replays.get(self.stage,
@@ -83,11 +107,18 @@ class LaunchAudit:
 
     def report(self, nsteps):
         tot = sum(self.launches.values())
+        totsync = sum(self.syncs.values())
         print(f"\n== LAUNCH AUDIT ({tot} launches = "
               f"{tot / max(nsteps, 1):.0f}/step; wp.copy "
               f"{sum(self.copies.values())} = "
               f"{sum(self.copies.values()) / max(nsteps, 1):.0f}/step; "
               f"graph replays {sum(self.replays.values())}) ==")
+        print(f"== SYNC AUDIT (Task #42: {totsync} device->host readbacks "
+              f"= {totsync / max(nsteps, 1):.0f}/step; "
+              f"synchronize_device {sum(self.dev_syncs.values())}) ==")
+        for st in sorted(self.syncs, key=self.syncs.get, reverse=True):
+            print(f"  stage {st:12s} {self.syncs[st]:9d} readbacks "
+                  f"({self.syncs[st] / max(nsteps, 1):9.0f}/step)")
         by_stage = {}
         for (st, _), c in self.launches.items():
             by_stage[st] = by_stage.get(st, 0) + c
@@ -95,7 +126,8 @@ class LaunchAudit:
             print(f"  stage {st:12s} {by_stage[st]:9d} launches "
                   f"({by_stage[st] / max(nsteps, 1):9.0f}/step)  "
                   f"copies {self.copies.get(st, 0):7d}  "
-                  f"replays {self.replays.get(st, 0):7d}")
+                  f"replays {self.replays.get(st, 0):7d}  "
+                  f"syncs {self.syncs.get(st, 0):7d}")
             per = {n: c for (s, n), c in self.launches.items() if s == st}
             for n in sorted(per, key=per.get, reverse=True)[:12]:
                 print(f"      {n:28s} {per[n]:9d}  "
