@@ -93,3 +93,40 @@ def build_small_lit_system(device, level=3, Eg_hat=4.0, mu=0.5, lam2=1e-1,
     if want_gen:
         return sysm, state, dist_gp, gen
     return sysm, state
+
+
+def steady_polish(sysm, state):
+    """Polish `state` onto a tight root of the STEADY residual R_steady(u;p)=0.
+
+    The transient BDF march stops on a field-CHANGE criterion at a finite final
+    dt̂, so its fixed point satisfies R_steady=0 only to the march tolerance
+    (~1e-6 in the free dofs).  The implicit steady adjoint linearises the exact
+    steady map, so for a ≤1e-6 gradient gate the FD leg must converge the SAME
+    map: a forward steady Newton solve (σ=0, no BDF history) driven to rtol
+    1e-13.  This is a genuine FORWARD solve — independent of the transposed
+    analytic adjoint — so the gate stays a real check, not a tautology.
+    """
+    from diffsim.physics.exciton_system import NDOF
+    sysm.sigma = 0.0
+    sysm.hist = None
+    st = {f: np.asarray(state[f]).copy() for f in range(NDOF)}
+    out, info = sysm.solve_newton(st, max_iter=30, rtol=1e-13)
+    return out
+
+
+def remarch_steady(sysm, state):
+    """Re-converge the STEADY implicit problem from `state` after a parameter
+    change (the IFT-consistency the steady adjoint models).
+
+    Re-runs ``_march_to_steady`` using the current `state` as the initial
+    condition with the SAME (tight) march controls as the fixture, THEN polishes
+    onto the exact steady root with ``steady_polish`` — so the FD leg of the
+    steady gradient gate genuinely re-solves R_steady(u;p)=0 at the mutated
+    parameter (NOT a frozen-Jacobian probe, and NOT merely the loose transient
+    fixed point).  Returns the new converged steady state.
+    """
+    st = {f: np.asarray(state[f]).copy() for f in state}
+    new_state, info = _march_to_steady(sysm, st, dt0_hat=1e-6, dt_max_hat=0.1,
+                                       max_steps=400, time_stepping_tol=1e-6)
+    assert info["criterion_fired"], info.get("reason")
+    return steady_polish(sysm, new_state)

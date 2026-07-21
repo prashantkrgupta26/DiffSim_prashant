@@ -295,6 +295,147 @@ class MaterialControl:
         return self._dR_dp_full(sysm, state) @ seed_flat
 
 
+class XDDSteadyAdjoint:
+    """Mode A — implicit steady-state adjoint for the XDD 5-field system.
+
+    At a converged state R(u;p)=0, A=∂R/∂u is the Newton Jacobian (the R0
+    assembler ``assemble_newton_system``).  We solve Aᵀλ=∂J/∂u ONCE and reuse
+    the transpose factorization across observable seeds; the per-control
+    gradient is dJ/dp = ∂J/∂p − λᵀ ∂R/∂p (the discrete IFT, phasefield idiom).
+
+    PHYSICAL-`u` PARAMETRISATION.  The host assembler returns the Newton
+    Jacobian in the *log-increment* convention for the carrier rows
+    (``carrier_vars='log'``): its carrier column-blocks are right-multiplied by
+    ``diag(n̂_free)`` so the increment solved for is δ(ln n̂).  But the QoI seed
+    ``∂J/∂u`` and the controls' ``∂R/∂p`` are expressed w.r.t. the PHYSICAL
+    fields (n̂, p̂, X̂, φ̂ — reduced with ``sysm.T.T``).  The adjoint identity
+    demands one consistent parametrisation, so we UNDO the log scaling to obtain
+    ``A_phys = ∂R/∂u_physical`` (right-multiply carrier columns by ``1/n̂_free``)
+    and re-impose the Dirichlet identity rows (which the unscaling would perturb
+    on carrier Dirichlet columns).  A_phys is what we factor and transpose.
+    """
+
+    def __init__(self, sysm, controls):
+        self.sysm = sysm
+        self.controls = list(controls)
+        self._A = None          # A_phys (physical-u Newton Jacobian), CSR
+        self._lu = None         # cached splu of A_phys.T
+        self._dir_rows = None   # flat reduced indices of Dirichlet strong rows
+
+    # -- flat reduced indices of the Dirichlet (strong identity) rows --------
+    def _dirichlet_rows(self):
+        if self._dir_rows is not None:
+            return self._dir_rows
+        sysm = self.sysm
+        nf = sysm.n_free
+        node_to_free = -np.ones(sysm.dm.n_nodes, np.int64)
+        node_to_free[sysm.free] = np.arange(nf)
+        rows = []
+        for field, (nodes, _vals) in sysm.dirichlet.items():
+            for nid in nodes:
+                fi = node_to_free[nid]
+                if fi >= 0:
+                    rows.append(field * nf + fi)
+        self._dir_rows = np.asarray(rows, np.int64)
+        return self._dir_rows
+
+    # -- assemble the STEADY PHYSICAL-u Jacobian at the converged state -------
+    def _physical_jacobian(self, state):
+        import scipy.sparse as sp
+        sysm = self.sysm
+        # STEADY operator: the marched state carries a stale BDF σ=1/dt and a
+        # history load from the last transient step.  The implicit steady
+        # adjoint linearises R_steady(u;p)=0, so reset σ=0 / hist=None before
+        # assembling (else A is the transient Jacobian and the IFT is wrong).
+        sysm.sigma = 0.0
+        sysm.hist = None
+        # Match the Newton driver: the reduce/eliminate log-scaling + Dirichlet
+        # rows read sysm._current_state, so pin it to the converged state.
+        sysm._current_state = state
+        A, _ = sysm.assemble_newton_system(state)
+        A = A.tocsr()
+        if not getattr(sysm, "_log_carriers", False):
+            return A
+        # Undo the carrier log-scaling A_log = A_phys @ diag(scale):
+        #   A_phys = A_log @ diag(1/scale), scale = n̂_free on IN/IP blocks, 1 else.
+        nf = sysm.n_free
+        free = sysm.free
+        inv = np.ones(NDOF * nf)
+        for field in (IN, IP):
+            cur = np.asarray(state[field])[free]
+            inv[field * nf:(field + 1) * nf] = 1.0 / cur
+        A = (A @ sp.diags(inv)).tolil()
+        # Re-impose Dirichlet identity rows (unscaling perturbed the diagonal
+        # entry of carrier Dirichlet columns; the strong rows are u-independent).
+        node_to_free = -np.ones(sysm.dm.n_nodes, np.int64)
+        node_to_free[free] = np.arange(nf)
+        for field, (nodes, vals) in sysm.dirichlet.items():
+            for nid in nodes:
+                fi = node_to_free[nid]
+                if fi < 0:
+                    continue
+                row = field * nf + fi
+                A.rows[row] = [row]
+                A.data[row] = [1.0]
+        return A.tocsr()
+
+    def factorize(self, state):
+        from scipy.sparse.linalg import splu
+        self._A = self._physical_jacobian(state)
+        self._lu = splu(self._A.T.tocsc())
+        return self
+
+    def _solve_T(self, rhs):
+        if self._lu is None:
+            from diffsim.sbm.adjoint import solve_adjoint
+            return solve_adjoint(self._A, np.asarray(rhs, np.float64))
+        return self._lu.solve(np.asarray(rhs, np.float64))
+
+    def _dRdp_eliminated(self, control, state):
+        """The control's reduced ∂R/∂p (size, 5*n_free) with the Dirichlet
+        strong-row columns zeroed.  The forward assembler ELIMINATES the
+        Dirichlet rows (identity rows, BC value p-independent), so their raw
+        residual-derivative entries are not part of R_steady(u;p)=0 and must be
+        dropped before contracting with λ (verified: the un-eliminated rows
+        corrupt the gradient by ~40%)."""
+        rows = np.array(control.sensitivity_rows(self.sysm, state), float)
+        rows[:, self._dirichlet_rows()] = 0.0
+        return rows
+
+    def gradient(self, state, qoi) -> dict:
+        if self._A is None:
+            self.factorize(state)
+        lam = self._solve_T(qoi.dJ_du(self.sysm, state))
+        out = {}
+        for c in self.controls:
+            djdp = qoi.dJ_dp(self.sysm, state, c)               # (size,)
+            out[c.name] = djdp - (self._dRdp_eliminated(c, state) @ lam)
+        return out
+
+    def sensitivity_rows(self, state, obs_seeds) -> np.ndarray:
+        """obs_seeds: (n_obs, 5*n_free) array of ∂o/∂u.  Returns ∂o/∂p as
+        (n_obs, n_p_total), p-columns ordered by self.controls.  Reuses the SAME
+        factored Aᵀ across all seeds (requirement 2 / R3 Fisher rows).
+
+        ∂o/∂p = ∂o/∂p_explicit − (∂o/∂u) A⁻¹ ∂R/∂p = −(∂R/∂p) λ_o with the
+        per-seed adjoint λ_o = A⁻ᵀ (∂o/∂u)ᵀ (explicit ∂o/∂p is 0 for the
+        pure-state observables this map serves)."""
+        if self._A is None:
+            self.factorize(state)
+        obs_seeds = np.atleast_2d(np.asarray(obs_seeds, np.float64))
+        n_obs = obs_seeds.shape[0]
+        dRdp = [self._dRdp_eliminated(c, state) for c in self.controls]
+        cols = sum(c.size for c in self.controls)
+        rows = np.zeros((n_obs, cols))
+        for k in range(n_obs):
+            lam = self._solve_T(obs_seeds[k])
+            off = 0
+            for c, dr in zip(self.controls, dRdp):
+                rows[k, off:off + c.size] = -(dr @ lam)
+                off += c.size
+        return rows
+
+
 class IlluminationControl:
     """Generation control.
 
