@@ -50,7 +50,8 @@ class LeraySBMStepper:
     def __init__(self, oracle, dm, nu, dt, f_fn, *, u_inf, strong_mask,
                  lam=0.5, domain="outside", order=2, picard_iters=2,
                  solver="splu", ppe_finescale=False, alpha=10.0,
-                 beta_backflow=1.0):
+                 beta_backflow=1.0, velocity_update="consistent",
+                 graddiv_scale=1.0):
         self.oracle = oracle
         self.dm = dm
         self.nu = nu
@@ -85,7 +86,8 @@ class LeraySBMStepper:
         base = LerayProjectionStepper(
             dm, nu, dt, f_fn, self._g_box, order=order,
             picard_iters=picard_iters, solver=solver,
-            ppe_finescale=ppe_finescale)
+            ppe_finescale=ppe_finescale,
+            velocity_update=velocity_update, graddiv_scale=graddiv_scale)
         base.dir_nodes = self._strong_nodes
         self.base = base
         self.n_free = base.n_free
