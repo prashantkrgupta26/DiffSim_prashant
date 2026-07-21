@@ -43,7 +43,7 @@ re-homed into the two tracks below with their original intent intact.)*
 Ordered by readiness and campaign pull. Each Pn is a milestone with its
 own spec → plan → gated rungs.
 
-### P1 — SP-1 R1: the XDD adjoint + inverse rung  **[next; recommended]**
+### P1 — SP-1 R1: the XDD adjoint + inverse rung  **[RATIFIED 2026-07-20]**
 Make "differentiable" real for the excitonic DD stack: implicit
 steady-state adjoint + taped-transient (frozen-dt) adjoint; first inverse
 demos (recover a closure parameter / a morphology descriptor from a J–V
@@ -53,7 +53,7 @@ the forward solve 37× cheaper, R1 is unblocked today. *Gates:* three-way
 gradient ≤1e-6 per design variable, dot-product test, one end-to-end
 inverse recovering a planted parameter.
 
-### P2 — NSHT-SBM-Shell: flow over a slender object  **[the next HERO]**
+### P2 — NSHT-SBM-Shell: flow over a slender object  **[RATIFIED 2026-07-20 — the next HERO; absorbs RB1–RB3]**
 The first scaling hero: Navier–Stokes + heat transfer with shifted-boundary
 (SBM) **shell** treatment of a slender/thin object, targeting **100M+ dofs**.
 This is the headline physics milestone after P1 — the single-object
@@ -203,10 +203,11 @@ priority raise)** → S5 ; S3 (THB) exploratory, off the critical path.
   `chenghauy-nshtsbm_shell` (P2), `baskargroup-admanufacturing` (P6).
   Both Dendrite-kt/PETSc/MPI; unzip + read into the respective spec at
   kickoff. (Not committed — gitignored; they're large binaries.)
-- **RB1–RB3** (`flow_film_formulation_p2.md`) — the old M6 flow/film Track
-  B. With P2 now the NS hero, decide whether flow/film folds into P2's
-  scope or stays a separate ruling; settle RB1–RB3 only if it survives
-  independently.
+- **RB1–RB3** (`flow_film_formulation_p2.md`) — RESOLVED 2026-07-20:
+  FOLDED INTO P2. The old M6 flow/film Track B is absorbed by the
+  NSHT-SBM-Shell hero; RB1–RB3 become P2 spec design questions
+  (stabilization/projection/BC choices), settled during the P2 brainstorm
+  rather than as standalone rulings.
 - **8j auto-select promotion** — decided by #36's measured data (feeds
   S2); needs the #43 G4 GH200 numbers first.
 - **THB use-case** (Baskar, open) — what, if anything, THB is decisively
