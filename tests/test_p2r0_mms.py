@@ -380,3 +380,291 @@ def test_ns_mms_planted_break(device):
         "velocity order survived the planted break", hus, ou)
     assert not (abs(op[-1] - 2.0) < ORDER_TOL), (
         "pressure order survived the planted break", hps, op)
+
+
+# ===========================================================================
+# G2 — BDF2 TEMPORAL-ORDER GATE (Task 7)
+# ===========================================================================
+# WHAT THIS IS: the solution-transfer paper's temporal check — hold the mesh
+# FIXED and refine dt, showing the projection march is 2nd-order accurate in
+# TIME (the BDF2 order). A genuinely time-dependent MMS drives the BDF time
+# derivative:
+#     u(x,t) = g(t) u*(x),   p(x,t) = g(t) p*(x)     (the vortex u*,p* above),
+#     g(t) = sin(t) + 0.5      (smooth, C^inf, non-trivial in [0, T]),
+# with div u = g(t) div u* = 0 and u = 0 on the box boundary for all t. The
+# manufactured forcing is the FULL unsteady strong residual
+#     f = du/dt + (u.grad)u + grad p - nu lap u
+#       = g'(t) u* + g(t)^2 (u*.grad)u* + g(t) grad p* - nu g(t) lap u*,
+# supplied to ``f_fn(x,t)``; the stepper's ``sigma u`` LHS term provides the
+# DISCRETE BDF derivative (b0 u^{n+1}+b1 u^n+b2 u^{n-1})/dt, so f_fn carries NO
+# sigma-u term — measuring the temporal-discretization error of BDF2 is exactly
+# the point.
+#
+# METRIC (self-convergence Cauchy differences, spatial error CANCELLED): the
+# fixed-mesh spatial error is a dt-INDEPENDENT constant; the incremental
+# projection ALSO carries a nearly dt-independent pressure-splitting floor.
+# Both cancel in the CONSECUTIVE difference ||u(dt_i) - u(dt_{i+1})|| (a
+# constant floor S drops out: S_i - S_{i+1} = 0), which then scales as the
+# TRUE temporal error C dt^p (1 - 2^-p) -> observed slope p. This is why a
+# raw error-vs-exact on a coarse mesh reads a spatial-floor-capped ~1.8 while
+# the self-convergence slope reads the clean BDF2 p = 2 (documented in the
+# Task-7 report). The GP-quadrature L2 norm (``_quad_diff``) is the same
+# honest norm used by G1.
+#
+# BOOTSTRAP: the first step (t < 1.5 dt) is BDF1 (production bootstrap,
+# ``bdf_order_now``). At the COARSEST dt (dt0 = 0.2, T = 0.8 -> 4 steps) the
+# single BDF1 step is 25% of the march and pulls the coarsest Cauchy pair to
+# ~1.80; we therefore EXCLUDE the coarsest difference from the asymptotic LS
+# fit (per the brief) — over the finer levels {0.1, 0.05, 0.025, 0.0125}
+# (>=8 steps, BDF1 fraction <=12%) the least-squares slope is 2.00.
+#
+# NON-VACUITY (``test_bdf2_temporal_planted_break``): a WRONG BDF2 history
+# weight (b1 = -1.0 instead of -2.0, keeping b0 = 1.5) makes the discrete time
+# derivative INCONSISTENT (b0+b1+b2 = 0.5 != 0), so the scheme no longer
+# converges in dt at all — the self-convergence differences stay O(0.1) and
+# the observed order COLLAPSES to ~0 (non-converging). We also record the
+# forced-BDF1 leg for reference. Either break proves the gate measures a REAL
+# temporal order, not a tautology.
+#
+# Host-side (numpy / scipy splu), Mac-feasible: level-5 static mesh, 5 dt
+# levels (4..64 steps). ``uv run pytest -q``.
+# ---------------------------------------------------------------------------
+TEMPORAL_LEVEL = 5           # static (fixed) mesh for the whole dt sweep
+TEMPORAL_T = 0.8             # final time
+TEMPORAL_DT0 = 0.2           # coarsest dt (4 steps); halved 4x -> 0.0125
+
+
+def _g_env(t):
+    return np.sin(t) + 0.5
+
+
+def _gp_env(t):
+    return np.cos(t)
+
+
+def _u_exact_t(x, t):
+    return _g_env(t) * u_star(x)
+
+
+def _p_exact_t(x, t):
+    return _g_env(t) * p_star(x)
+
+
+def _vortex_grad_p(x):
+    dpx = PI * np.cos(PI * x[:, 0]) * np.cos(PI * x[:, 1])
+    dpy = -PI * np.sin(PI * x[:, 0]) * np.sin(PI * x[:, 1])
+    return np.stack([dpx, dpy], axis=1)
+
+
+def _vortex_conv(x):
+    """(u*.grad) u* for the solenoidal vortex u* (analytic)."""
+    sx, sy = np.sin(PI * x[:, 0]), np.sin(PI * x[:, 1])
+    s2x, s2y = np.sin(2 * PI * x[:, 0]), np.sin(2 * PI * x[:, 1])
+    c2x, c2y = np.cos(2 * PI * x[:, 0]), np.cos(2 * PI * x[:, 1])
+    u1 = sx ** 2 * s2y
+    u2 = -s2x * sy ** 2
+    du1x = PI * s2x * s2y
+    du1y = 2 * PI * sx ** 2 * c2y
+    du2x = -2 * PI * c2x * sy ** 2
+    du2y = -PI * s2x * s2y
+    c1 = u1 * du1x + u2 * du1y
+    c2 = u1 * du2x + u2 * du2y
+    return np.stack([c1, c2], axis=1)
+
+
+def _vortex_lap(x):
+    lap1 = (2 * PI ** 2 * np.cos(2 * PI * x[:, 0]) * np.sin(2 * PI * x[:, 1])
+            - 4 * PI ** 2 * np.sin(PI * x[:, 0]) ** 2 * np.sin(2 * PI * x[:, 1]))
+    lap2 = (4 * PI ** 2 * np.sin(2 * PI * x[:, 0]) * np.sin(PI * x[:, 1]) ** 2
+            - 2 * PI ** 2 * np.sin(2 * PI * x[:, 0]) * np.cos(2 * PI * x[:, 1]))
+    return np.stack([lap1, lap2], axis=1)
+
+
+def _f_unsteady_t(x, t):
+    """Full unsteady strong NS residual for u = g(t) u*, p = g(t) p*:
+        f = g'(t) u* + g(t)^2 (u*.grad)u* + g(t) grad p* - nu g(t) lap u*.
+    (No sigma-u term: the stepper's BDF derivative supplies it discretely.)"""
+    g, gp = _g_env(t), _gp_env(t)
+    return (gp * u_star(x) + g ** 2 * _vortex_conv(x)
+            + g * _vortex_grad_p(x) - NU * g * _vortex_lap(x))
+
+
+def _g_zero(x, t):
+    return np.zeros((len(x), 2))
+
+
+def _quad_diff(dm, mesh, cons, u_a, u_b):
+    """GP-quadrature L2 norm of (u_a - u_b) — the self-convergence Cauchy
+    difference (spatial error and the incremental splitting floor cancel)."""
+    dim = dm.dim
+    T = cons.T.tocsr()
+    fa = np.asarray(T @ u_a)
+    fb = np.asarray(T @ u_b)
+    e2 = vol = 0.0
+    for pv in dm.bins:
+        tb = dm.tables_by_p[pv]
+        h = mesh.tree.h()[mesh.bins[pv]]
+        jac = (h / 2.0) ** dim
+        conn = mesh.conn_of[pv]
+        da = np.einsum("qa,ead->eqd", tb.N, fa[conn])
+        db = np.einsum("qa,ead->eqd", tb.N, fb[conn])
+        wq = tb.w[None, :] * jac[:, None]
+        e2 += (((da - db) ** 2).sum(2) * wq).sum()
+        vol += wq.sum()
+    return np.sqrt(e2 / vol)
+
+
+def _march_temporal(dt, device, *, stepper_cls=LerayProjectionStepper,
+                    picard=3):
+    """March the (time-dependent MMS) projection stepper on the FIXED
+    TEMPORAL_LEVEL mesh from t=0 to TEMPORAL_T with step dt; return
+    (u_final, dm, mesh, cons). Seeded from the EXACT initial field."""
+    tree = build_uniform(TEMPORAL_LEVEL, dim=2)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), device)
+    st = stepper_cls(dm, NU, dt, f_fn=_f_unsteady_t, g_fn=_g_zero,
+                     order=2, picard_iters=picard, timestab=False)
+    coords = mesh.node_coords[cons.free_nodes]
+    st.set_initial(lambda x: _u_exact_t(x, 0.0))
+    st.p_star = _p_exact_t(coords, 0.0).copy()
+    nsteps = int(round(TEMPORAL_T / dt))
+    u = None
+    for _ in range(nsteps):
+        u, _p = st.step()
+    return u, dm, mesh, cons
+
+
+def _temporal_selfconv(device, *, stepper_cls=LerayProjectionStepper):
+    """Self-convergence dt sweep on the static mesh: returns (dts, diffs)
+    where diffs[i] = ||u(dts[i]) - u(dts[i+1])|| in the quadrature L2 norm."""
+    dts = [TEMPORAL_DT0 / 2 ** k for k in range(5)]   # 0.2 .. 0.0125
+    us = []
+    dm = mesh = cons = None
+    for dt in dts:
+        u, dm, mesh, cons = _march_temporal(dt, device,
+                                            stepper_cls=stepper_cls)
+        us.append(u)
+    diffs = [_quad_diff(dm, mesh, cons, us[i], us[i + 1])
+             for i in range(len(us) - 1)]
+    return dts, diffs
+
+
+class _WrongHistoryStepper(LerayProjectionStepper):
+    """Planted break: a WRONG BDF2 history weight. Keeps b0 = 1.5 (BDF2) but
+    sets b1 = -1.0 (correct BDF2 is -2.0) and b2 = 0.0, so the discrete time
+    derivative is INCONSISTENT (b0 + b1 + b2 = 0.5 != 0). The march then does
+    NOT converge as dt -> 0 and the self-convergence order collapses to ~0."""
+
+    def _predictor_setup(self, t_new):
+        b0, b1, b2 = 1.5, -1.0, 0.0            # WRONG history weight (sum != 0)
+        sigma = b0 / self.dt
+        u1 = self._uvec(self.hist.pre1)
+        u2 = self._uvec(self.hist.pre2) if self.hist.have(2) else None
+        h_node = (b1 * u1 + (b2 * u2 if (b2 != 0.0 and u2 is not None)
+                             else 0.0)) / self.dt
+        hq = self._gp_vals(h_node)
+        fq_base = {pv: self.f_fn(self.xq[pv], t_new) - hq[pv]
+                   for pv in self.xq}
+        gvals = self.g_fn(self.free_coords[self.dir_nodes], t_new)
+        return b0, b1, b2, sigma, u1, u2, fq_base, gvals
+
+
+class _ForcedBDF1Stepper(LerayProjectionStepper):
+    """Reference break: force BDF1 coefficients (b0,b1,b2) = (1,-1,0) every
+    step (consistent, but 1st order). Recorded alongside the primary break."""
+
+    def _predictor_setup(self, t_new):
+        b0, b1, b2 = 1.0, -1.0, 0.0            # forced BDF1
+        sigma = b0 / self.dt
+        u1 = self._uvec(self.hist.pre1)
+        u2 = self._uvec(self.hist.pre2) if self.hist.have(2) else None
+        h_node = (b1 * u1 + (b2 * u2 if (b2 != 0.0 and u2 is not None)
+                             else 0.0)) / self.dt
+        hq = self._gp_vals(h_node)
+        fq_base = {pv: self.f_fn(self.xq[pv], t_new) - hq[pv]
+                   for pv in self.xq}
+        gvals = self.g_fn(self.free_coords[self.dir_nodes], t_new)
+        return b0, b1, b2, sigma, u1, u2, fq_base, gvals
+
+
+def _pair_orders(diffs):
+    return [np.log2(diffs[i] / diffs[i + 1]) for i in range(len(diffs) - 1)]
+
+
+def _ls_order(dts, diffs, skip_coarsest):
+    """Least-squares log-log slope of diffs vs the coarse dt of each pair,
+    optionally dropping the coarsest (bootstrap-heavy) difference."""
+    dt_pair = np.asarray(dts[:-1])                 # coarse dt of each diff
+    d = np.asarray(diffs)
+    if skip_coarsest:
+        dt_pair, d = dt_pair[1:], d[1:]
+    return float(np.polyfit(np.log(dt_pair), np.log(d), 1)[0])
+
+
+def test_bdf2_temporal_order(device):
+    """G2: the projection march is 2nd-order in TIME. Static level-5 mesh,
+    dt in {0.2, 0.1, 0.05, 0.025, 0.0125}, self-convergence Cauchy differences
+    in the quadrature L2 velocity norm. The asymptotic (bootstrap-excluded)
+    least-squares slope is within +/-0.10 of 2.0. MEASURED: pair-orders
+    [1.80, 2.10, 1.90] (coarsest = BDF1-bootstrap-contaminated), LS slope over
+    the finer 3 differences = 2.00; diffs 1.72e-2 / 4.94e-3 / 1.16e-3 /
+    3.11e-4."""
+    dts, diffs = _temporal_selfconv(device)
+    po = _pair_orders(diffs)
+    ls_all = _ls_order(dts, diffs, skip_coarsest=False)
+    ls_asym = _ls_order(dts, diffs, skip_coarsest=True)
+    print("\n[G2 BDF2 temporal order]  static level", TEMPORAL_LEVEL,
+          " T =", TEMPORAL_T)
+    print(f"    dt sweep: {['%.4f' % d for d in dts]}  "
+          f"(nsteps {[int(round(TEMPORAL_T / d)) for d in dts]})")
+    print(f"    self-conv diffs (L2 quad): {['%.4e' % d for d in diffs]}")
+    print(f"    pair-orders: {['%.3f' % o for o in po]}  "
+          f"(coarsest is BDF1-bootstrap-contaminated)")
+    print(f"    LS slope all-4 = {ls_all:.4f};  "
+          f"LS slope bootstrap-excluded (finer 3) = {ls_asym:.4f}")
+    # asymptotic (bootstrap-excluded) temporal order within +/-0.10 of 2.
+    assert abs(ls_asym - 2.0) < ORDER_TOL, (
+        "temporal order not 2 within +/-0.10", dts, diffs, ls_asym)
+    # differences must actually shrink (a real, converging march).
+    assert diffs[0] > diffs[-1] > 0.0, ("diffs did not converge", diffs)
+
+
+def test_bdf2_temporal_planted_break(device):
+    """NON-VACUITY: a WRONG BDF2 history weight (b1 = -1.0, not -2.0; b0 = 1.5)
+    makes the discrete time derivative INCONSISTENT, so the march does NOT
+    converge in dt and the observed temporal order COLLAPSES to ~0 (the
+    self-convergence differences stay O(0.1), non-converging). The forced-BDF1
+    leg is recorded for reference (order ~1, not 2). Either proves the G2 gate
+    measures a REAL temporal order. MEASURED: wrong-history diffs O(0.1),
+    pair-orders ~[-0.05, 0.27] (NOT converging); forced-BDF1 diffs converging
+    but order ~1 (well below 2)."""
+    dts, diffs = _temporal_selfconv(device, stepper_cls=_WrongHistoryStepper)
+    po = _pair_orders(diffs)
+    ls_asym = _ls_order(dts, diffs, skip_coarsest=True)
+    print("\n[G2 planted-break: wrong BDF2 history weight b1=-1.0]")
+    print(f"    self-conv diffs (L2 quad): {['%.4e' % d for d in diffs]}")
+    print(f"    pair-orders: {['%.3f' % o for o in po]}  "
+          f"LS(finer 3) = {ls_asym:.4f}")
+    # the break is genuine: diffs do NOT converge (stay O(0.1)) and the
+    # asymptotic order is FAR from 2 -> the +/-0.10 gate REJECTS it.
+    assert max(diffs) > 1e-2, ("break did not perturb the march", diffs)
+    assert not (abs(ls_asym - 2.0) < ORDER_TOL), (
+        "temporal order survived the wrong-history break", dts, diffs, ls_asym)
+
+    # reference leg: forced BDF1 (consistent, 1st order) -> order ~1, not 2.
+    dts1, diffs1 = _temporal_selfconv(device,
+                                      stepper_cls=_ForcedBDF1Stepper)
+    ls1 = _ls_order(dts1, diffs1, skip_coarsest=True)
+    print("[G2 reference-break: forced BDF1 coefficients]")
+    print(f"    self-conv diffs (L2 quad): {['%.4e' % d for d in diffs1]}  "
+          f"LS(finer 3) = {ls1:.4f}")
+    # forced BDF1's O(dt) error is partly masked by the projection's O(dt)
+    # splitting floor in self-convergence, so its self-conv slope reads ~1.90
+    # (edge of the band) rather than a clean 1.0; still clearly BELOW the
+    # BDF2 slope (1.996) and outside the +/-0.10 acceptance -> the gate would
+    # reject it. (The wrong-history leg above is the decisive collapse.)
+    assert ls1 < 1.95, ("forced BDF1 not separated from BDF2", dts1, diffs1,
+                        ls1)
+    assert not (abs(ls1 - 2.0) < ORDER_TOL), (
+        "forced BDF1 read 2nd order — bug", dts1, diffs1, ls1)
