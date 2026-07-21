@@ -15,7 +15,8 @@ import numpy as np
 
 from diffsim.physics.exciton_system import (
     NDOF, IPHI, IN, IP, IXD, IXA,
-    _mass_block, _load_block, _carrier_block, _exciton_block, _gp_value)
+    _mass_block, _load_block, _carrier_block, _exciton_block, _poisson_block,
+    _gp_value)
 
 
 def _reduce_full(sysm, R_full):
@@ -141,19 +142,45 @@ class MaterialControl:
                    ∂R[IXD]/∂τ⁻¹_d = M X̂_D  (pure mass × field)
       "tau_inv_a"  exciton A-row sink: ∂R[IXA]/∂τ⁻¹_a = M X̂_A
 
-    µ derivatives are assembled EXACTLY (not linear-in-s): the SUPG τ_M is a
-    nonlinear function of µ, so ∂R/∂s is formed by re-assembling the full carrier
-    /exciton residual contribution (block K@u minus load F) at the base field —
-    equivalent to a directional derivative of the residual along ∂µ_gp/∂s=base —
-    via a two-point analytic central difference of the (µ-only) residual pieces.
+    µ derivatives — INDEPENDENCE POLICY (so the FD gate is a real, non-vacuous
+    check, NOT a tautology):
+
+      * ``mu_x_donor`` / ``mu_x_acceptor`` — the exciton rows have NO SUPG, so
+        ∂R/∂s is CLOSED-FORM: the exciton block is σ_tot·M + µ̂_X·K_stiff with
+        the load µ-independent, hence ∂R[IX]/∂s = (∂µ̂_X/∂s)·K_stiff @ X̂ =
+        _exciton_block(base, σ=0) @ X̂ (pure stiffness with µ̂→base).  This shares
+        NO code path with the residual FD gate.
+
+      * ``mu_n`` / ``mu_p`` — the carrier rows carry SUPG whose τ_M is a
+        NONLINEAR function of µ.  A closed-form dτ_M/dµ would require mirroring
+        the fused carrier Ae/be warp kernels term-by-term; the sanctioned
+        fallback is a semi-analytic directional derivative that is DECORRELATED
+        from the gate: the analytic uses an internal central step δ=1e-6 while
+        the residual FD gate for µ uses eps=1e-4 (see ``MU_GATE_EPS_REL``).  The
+        two differences are therefore NOT bit-identical; they agree only to
+        O(δ²)+O(eps²) ~1e-8..1e-9, which is what a genuine gate looks like.
+        (Task 7's three-way torch-twin is µ's rigorous independent check.)
     """
+
+    # Residual-FD gate step for the µ (carrier) params.  Deliberately DIFFERENT
+    # from the analytic internal step (1e-6, see _mu_row_residual callers) so the
+    # semi-analytic carrier-µ derivative and its gate are decorrelated, not
+    # bit-for-bit identical — the gate can genuinely fail.
+    MU_GATE_EPS_REL = 1e-4
 
     _SCALARS = ("tau_inv_d", "tau_inv_a")
     _MUFIELDS = {"mu_n": "mu_n_gp", "mu_p": "mu_p_gp",
                  "mu_x_donor": "mu_xd_gp", "mu_x_acceptor": "mu_xa_gp"}
+    # Permittivity: an ε scale multiplier on the Poisson-block GP field eps_gp.
+    # Poisson block is λ²(ε̂ ∇N_b·∇N_a) — LINEAR in ε̂, no SUPG — so the
+    # derivative is a clean closed-form Poisson block (no τ_M).  eps_A / eps_D
+    # scale the acceptor / donor sub-regions (dist_gp<0 donor, ≥0 acceptor;
+    # matches signed_distance_bilayer sign convention).
+    _EPSFIELDS = ("eps_A", "eps_D")
 
     def __init__(self, sysm, param: str):
-        if param not in self._SCALARS and param not in self._MUFIELDS:
+        if (param not in self._SCALARS and param not in self._MUFIELDS
+                and param not in self._EPSFIELDS):
             raise ValueError(f"MaterialControl: unknown param {param!r}")
         self.name = param
         self.size = 1
@@ -163,58 +190,67 @@ class MaterialControl:
             # snapshot the construction-time µ GP field as the scaling base
             self._base_field = {pv: getattr(sysm, self._field)[pv].copy()
                                 for pv in sysm.dm.bins}
+        elif param in self._EPSFIELDS:
+            # snapshot the construction-time ε GP field + the region mask this
+            # param owns (donor for eps_D, acceptor for eps_A).
+            self._eps_base = {pv: sysm.eps_gp[pv].copy() for pv in sysm.dm.bins}
+            is_acceptor = (param == "eps_A")
+            self._eps_mask = {}
+            for pv in sysm.dm.bins:
+                dist = np.asarray(sysm.dist_gp[pv])
+                # dist_gp may be (ngp,) or (ngp, dim); take the scalar sign field
+                d0 = dist if dist.ndim == 1 else dist[..., 0]
+                self._eps_mask[pv] = (d0 >= 0.0) if is_acceptor else (d0 < 0.0)
 
     def get(self) -> np.ndarray:
         s = self._sysm
         if self.name in self._SCALARS:
             return np.array([float(getattr(s, self.name))])
-        return np.array([1.0])          # µ handle = scale multiplier (1 at ctor)
+        return np.array([1.0])   # µ/ε handle = scale multiplier (1 at ctor)
 
     def set(self, p: np.ndarray) -> None:
         s = self._sysm
         v = float(np.asarray(p).ravel()[0])
         if self.name in self._SCALARS:
             setattr(s, self.name, v)
-        else:
+        elif self.name in self._MUFIELDS:
             base = self._base_field
             setattr(s, self._field,
                     {pv: v * base[pv] for pv in s.dm.bins})
+        else:  # eps_A / eps_D — scale only the owned region's ε̂
+            new_eps = {}
+            for pv in s.dm.bins:
+                e = self._eps_base[pv].copy()
+                m = self._eps_mask[pv]
+                e[m] = v * self._eps_base[pv][m]
+                new_eps[pv] = e
+            s.eps_gp = new_eps
 
-    # -- µ-row residual contribution (K@u − load) at a given µ-scale multiplier --
+    # -- carrier µ-row residual contribution (K@u − load) at a µ-scale multiplier --
     def _mu_row_residual(self, sysm, state, cl, scale):
-        """R-contribution of the µ-scaled row(s) at µ_gp = scale·base.
+        """R-contribution of the carrier (mu_n/mu_p) row at µ_gp = scale·base.
 
         Only the terms that actually depend on the µ field are formed; the rest
-        of the residual cancels in the ∂/∂s central difference below.
+        of the residual cancels in the ∂/∂s central difference in _dR_dp_full.
+        (Exciton µ and ε use closed-form derivatives — see _dR_dp_full.)
         """
         dm = sysm.dm
         base = self._base_field
         mu = {pv: scale * base[pv] for pv in dm.bins}
-        out = {}
-        if self.name in ("mu_n", "mu_p"):
-            sign = -1.0 if self.name == "mu_n" else +1.0
-            fld = IN if self.name == "mu_n" else IP
-            aq = {pv: sign * mu[pv][:, None] * cl["gradphi"][pv] for pv in dm.bins}
-            K = _carrier_block(dm, aq, mu, sysm.sigma, sysm._sig2tau(), sysm.supg)
-            # SUPG-consistent load carries the SAME µ-dependent aq/τ_M.
-            Dhat = {pv: cl["kd"][pv] * cl["xd_gp"][pv]
-                        + cl["ka"][pv] * cl["xa_gp"][pv] for pv in dm.bins}
-            s_carr = {pv: Dhat[pv] - cl["R"][pv] + sysm._hist_gp(fld, pv)
-                      for pv in dm.bins}
-            F = _load_block(dm, aq, mu, s_carr, sysm._sig2tau(), sysm.supg)
-            out[fld] = K @ state[fld] - F
-        else:                                    # mu_x_donor / mu_x_acceptor
-            fld = IXD if self.name == "mu_x_donor" else IXA
-            tau = sysm.tau_inv_d if fld == IXD else sysm.tau_inv_a
-            kkey = "kd" if fld == IXD else "ka"
-            sig_gp = {pv: sysm.sigma + tau + cl[kkey][pv] for pv in dm.bins}
-            K = _exciton_block(dm, mu, sig_gp)
-            out[fld] = K @ state[fld]            # load has no µ dependence
-        return fld, out[fld]
+        sign = -1.0 if self.name == "mu_n" else +1.0
+        fld = IN if self.name == "mu_n" else IP
+        aq = {pv: sign * mu[pv][:, None] * cl["gradphi"][pv] for pv in dm.bins}
+        K = _carrier_block(dm, aq, mu, sysm.sigma, sysm._sig2tau(), sysm.supg)
+        # SUPG-consistent load carries the SAME µ-dependent aq/τ_M.
+        Dhat = {pv: cl["kd"][pv] * cl["xd_gp"][pv]
+                    + cl["ka"][pv] * cl["xa_gp"][pv] for pv in dm.bins}
+        s_carr = {pv: Dhat[pv] - cl["R"][pv] + sysm._hist_gp(fld, pv)
+                  for pv in dm.bins}
+        F = _load_block(dm, aq, mu, s_carr, sysm._sig2tau(), sysm.supg)
+        return fld, K @ state[fld] - F
 
     def _dR_dp_full(self, sysm, state) -> np.ndarray:
         dm = sysm.dm
-        cl = sysm._closures(state)
         dR = {f: np.zeros(dm.n_nodes) for f in range(NDOF)}
         if self.name == "tau_inv_d":
             one = {pv: np.ones(len(sysm.dist_gp[pv])) for pv in dm.bins}
@@ -222,9 +258,30 @@ class MaterialControl:
         elif self.name == "tau_inv_a":
             one = {pv: np.ones(len(sysm.dist_gp[pv])) for pv in dm.bins}
             dR[IXA] = _mass_block(dm, one) @ state[IXA]
+        elif self.name in ("eps_A", "eps_D"):
+            # CLOSED-FORM: R[IPHI] = λ²ε̂K φ̂ − M(p̂−n̂).  ε̂ = base + s·(mask·base),
+            # so ∂R[IPHI]/∂s = λ² (∂ε̂/∂s ∇N_b·∇N_a) φ̂ with ∂ε̂/∂s = mask·base.
+            deps = {pv: np.where(self._eps_mask[pv], self._eps_base[pv], 0.0)
+                    for pv in dm.bins}
+            dKphi = _poisson_block(dm, deps, sysm.lam2)
+            dR[IPHI] = dKphi @ state[IPHI]
+        elif self.name in ("mu_x_donor", "mu_x_acceptor"):
+            # CLOSED-FORM: exciton rows have NO SUPG.  K_xi = σ_tot·M + µ̂_X·K_stiff
+            # and the load is µ-independent, so ∂R[IXi]/∂s = (∂µ̂_X/∂s)·K_stiff@X̂.
+            # _exciton_block with σ_gp=0 is exactly the µ̂-weighted stiffness; with
+            # µ̂→base (=∂µ̂_X/∂s) it is the closed-form derivative operator.  Shares
+            # no code with the residual FD gate → non-vacuous.
+            fld = IXD if self.name == "mu_x_donor" else IXA
+            base = self._base_field
+            zero_sig = {pv: np.zeros(len(sysm.dist_gp[pv])) for pv in dm.bins}
+            dK = _exciton_block(dm, base, zero_sig)
+            dR[fld] = dK @ state[fld]
         else:
-            # exact ∂R/∂s of the µ-dependent row via analytic central diff at
-            # µ = (1±δ)·base (the residual pieces are smooth in the scale).
+            # mu_n / mu_p — carrier rows carry SUPG (τ_M nonlinear in µ).
+            # Semi-analytic directional derivative, DECORRELATED from the gate:
+            # analytic internal step δ=1e-6, the µ residual FD gate uses eps=1e-4
+            # (MU_GATE_EPS_REL).  Not bit-identical → the gate can genuinely fail.
+            cl = sysm._closures(state)
             delta = 1e-6
             fld, Rp = self._mu_row_residual(sysm, state, cl, 1.0 + delta)
             _,  Rm = self._mu_row_residual(sysm, state, cl, 1.0 - delta)
@@ -295,6 +352,7 @@ class IlluminationControl:
         p = np.asarray(p, float).ravel()
         self._p = p.copy()
         dm = self._sysm.dm
+        # (no-op handle-keep removed — self._sysm is already an attribute)
         if self.mode == "scalar":
             gd = {pv: p[0] * self._gd0[pv] for pv in dm.bins}
             ga = {pv: p[0] * self._ga0[pv] for pv in dm.bins}
