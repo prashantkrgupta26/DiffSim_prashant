@@ -253,10 +253,14 @@ def main(argv=None):
                          "vals_d). Measures s/step + peak GB vs fp64 (G4, "
                          "measurement-only — the §8j Ada net-loss prior "
                          "stands). NB: the fp32-FACTOR+IR path lives in the "
-                         "cuDSS solve — pair with "
-                         "'--set numerics.linsolver=cudss' to exercise it; "
-                         "the default blockch_dev is ITERATIVE (fp32 storage "
-                         "still halves its vals_d/SpMV bytes, but no factor).")
+                         "cuDSS solve — you MUST pair with "
+                         "'--set numerics.linsolver=cudss' to exercise it. "
+                         "On the default blockch_dev path fp32 has NO effect: "
+                         "the fp32 snapshot is allocated but UNUSED (the "
+                         "iterative blockch SpMV reads the fp64 vals_d — "
+                         "fp32-factor+IR targets cuDSS only, per #36 scope), "
+                         "so it neither halves SpMV bytes nor changes the "
+                         "solve there.")
     args = ap.parse_args(argv)
 
     cfg = args.config
