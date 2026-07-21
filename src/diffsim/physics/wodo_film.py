@@ -768,18 +768,10 @@ class WodoFilmStepper(TernaryCHStepper):
         import torch
         from nvmath.sparse.advanced import DirectSolver
         from ..solvers.iterative_refinement import fp64_iterative_refinement
+        from ..solvers.iterative_refinement_device import WarpIRBackend
         try:
             A32_t, _ = asm.device_csr_fp32()    # refreshes the snapshot
-            b64 = asm.F_d.numpy()
             op = asm.device_operator()          # fp64 SpMV over vals_d
-
-            def matvec(x):
-                xd = wp.array(np.ascontiguousarray(x, np.float64),
-                              dtype=wp.float64, device=self.dm.device)
-                yd = wp.zeros(asm.Nfull, dtype=wp.float64,
-                              device=self.dm.device)
-                op.matvec(xd, yd)
-                return yd.numpy()
 
             if self._cudss_dev is None:
                 # plan the fp32 solver once; the rhs operand is a STABLE
@@ -793,17 +785,13 @@ class WodoFilmStepper(TernaryCHStepper):
                 asm.sync_csr_values()           # no-op unchunked
             self._cudss_dev.factorize()         # refactorize the fp32 A
 
-            def factor_solve(r):
-                # fp32 correction solve: round r to fp32, solve, promote.
-                self._b_t32.copy_(torch.from_numpy(
-                    np.ascontiguousarray(r, np.float32)).to(
-                        self._b_t32.device))
-                self._cudss_dev.reset_operands(b=self._b_t32)
-                return np.asarray(
-                    self._cudss_dev.solve().cpu(), np.float64)
-
+            # Task #43: device-resident IR buffers — the residual, correction
+            # and shadow-matvec stay on the GPU; the fp64 rhs is adopted
+            # zero-copy from asm.F_d.  No per-sweep host round-trip.
+            backend = WarpIRBackend(op, self._cudss_dev, self._b_t32,
+                                    asm.Nfull, self.dm.device, rhs_d=asm.F_d)
             x, info = fp64_iterative_refinement(
-                matvec, factor_solve, b64, tol=1e-12, max_iter=10)
+                None, None, None, tol=1e-12, max_iter=10, backend=backend)
             self._last_ir = info                # per-solve §8j datum
             self._ir_counts = getattr(self, "_ir_counts", [])
             self._ir_counts.append(info["refinements"])

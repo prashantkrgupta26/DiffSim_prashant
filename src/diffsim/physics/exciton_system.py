@@ -1060,18 +1060,11 @@ class XDDSystem:
         import torch
         from nvmath.sparse.advanced import DirectSolver, DirectSolverOptions
         from ..solvers.iterative_refinement import fp64_iterative_refinement
+        from ..solvers.iterative_refinement_device import WarpIRBackend
         asm = self.device_assembler().asm
         b64 = np.ascontiguousarray(b, np.float64)
         op = asm.device_operator()
         dev = str(self.dm.device)
-
-        def matvec(x):
-            import warp as wp
-            xd = wp.array(np.ascontiguousarray(x, np.float64),
-                          dtype=wp.float64, device=self.dm.device)
-            yd = wp.zeros(asm.Nfull, dtype=wp.float64, device=self.dm.device)
-            op.matvec(xd, yd)
-            return yd.numpy()
 
         try:
             A32_t, _ = asm.device_csr_fp32()    # refreshes the fp32 snapshot
@@ -1084,14 +1077,14 @@ class XDDSystem:
                 self._cudss_dev.plan()
             self._cudss_dev.factorize()
 
-            def factor_solve(r):
-                self._b_t32.copy_(torch.from_numpy(
-                    np.ascontiguousarray(r, np.float32)).to(dev))
-                self._cudss_dev.reset_operands(b=self._b_t32)
-                return np.asarray(self._cudss_dev.solve().cpu(), np.float64)
-
+            # Task #43: device-resident IR buffers.  The XDD rhs `b` arrives
+            # on the host (Newton driver), so it is uploaded ONCE here (no
+            # asm.F_d alias for this consumer); the residual/correction/
+            # shadow-matvec then stay device-resident across sweeps.
+            backend = WarpIRBackend(op, self._cudss_dev, self._b_t32,
+                                    asm.Nfull, self.dm.device)
             x, info = fp64_iterative_refinement(
-                matvec, factor_solve, b64, tol=1e-12, max_iter=10)
+                None, None, b64, tol=1e-12, max_iter=10, backend=backend)
             self._ir_counts.append(info["refinements"])
             self._last_ir = info
             if not info["converged"]:
