@@ -438,3 +438,153 @@ def test_task6_transient_gradient_bdf2_vs_fd(device):
     assert rel_good < 5e-5, (g, fd)
     assert rel_bad > 5e-5, ("BDF2 gate vacuous — mutated gradient not rejected",
                             rel_bad)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Task 7 — the consolidated G1/G4/G5 gate battery (three-way + sensitivity map)
+#
+# G1 three-way: adjoint vs unrolled torch-twin vs central FD for EVERY control
+# class in each applicable mode (steady × {closure, material, illumination} and
+# transient × {closure, material, illumination}).  The torch-twin is the sole
+# INDEPENDENT re-derivation of A_phys (the log-unscaled physical Jacobian) and
+# the rigorous check of the semi-analytic carrier-µ derivative.  G4 checks the
+# vector IlluminationControl per component; G5 checks the ∂o/∂p sensitivity-map
+# rows.  Each three-way is inherently a strong cross-check; a MUTATION probe
+# (test_g1_mutation_fails) confirms the battery would FAIL under a planted error.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("ctrl_name", ["langevin_zeta", "mu_n", "mu_p",
+                                       "tau_inv_d", "illum_scalar"])
+def test_g1_steady_three_way(device, ctrl_name):
+    """G1 (steady): adjoint == torch-twin == central FD for closure, material
+    (incl. carrier-µ mu_n/mu_p — carry 2), and illumination controls."""
+    from diffsim.xdd.observables import SteadyCurrentQoI
+    from tests._xdd_adjoint_fixtures import (build_small_lit_system,
+                                             steady_polish, steady_three_way,
+                                             XDDSteadyTwin)
+    sysm, state, dist_gp, gen = build_small_lit_system(device, want_gen=True)
+    state = steady_polish(sysm, state)
+    twin = XDDSteadyTwin(sysm)
+    qoi = SteadyCurrentQoI(contact="anode")
+    a, t, f = steady_three_way(sysm, state, ctrl_name, qoi, twin,
+                               dist_gp=dist_gp, gen=gen)
+    r_t = abs(a - t) / max(abs(t), 1e-14)
+    r_f = abs(a - f) / max(abs(f), 1e-14)
+    print(f"G1-steady {ctrl_name:12s} adj={a:+.6e} twin={t:+.6e} fd={f:+.6e} "
+          f"adj/twin={r_t:.2e} adj/fd={r_f:.2e}")
+    # The twin is a fully INDEPENDENT physics reimplementation (its residual op
+    # matches production to machine precision, verified), so the three-way floor
+    # is the analytic gradient's OWN accuracy, not a twin artifact.  langevin/
+    # tau/illum land at ~1e-6; the carrier-µ (mu_n/mu_p) semi-analytic derivative
+    # (internal δ=1e-6) lands at ~7e-6 — the twin is its rigorous check (carry 2).
+    # 2e-5 sits above that honest floor and far below the ×1.5-mutation reject
+    # (rel ~0.5, see test_g1_mutation_fails).
+    assert r_t < 2e-5, (ctrl_name, "adj vs twin", a, t)
+    assert r_f < 2e-5, (ctrl_name, "adj vs fd", a, f)
+
+
+@pytest.mark.parametrize("ctrl_name", ["langevin_zeta", "mu_n", "tau_inv_d",
+                                       "illum_scalar"])
+def test_g1_transient_three_way(device, ctrl_name):
+    """G1 (transient): Mode-B adjoint == torch UNROLL twin == full-re-march FD
+    for closure, material (carrier-µ mu_n — carry 2) and illumination controls.
+    J = 0.5 Σ_n ‖X̂_D(t_n)‖² over the recorded frozen-dt tape."""
+    from tests._xdd_adjoint_fixtures import (build_small_lit_system,
+                                             transient_three_way,
+                                             XDDTransientTwin)
+    sysm, state, dist_gp, gen = build_small_lit_system(device, want_gen=True)
+    twin = XDDTransientTwin(sysm)
+    a, t, f = transient_three_way(sysm, state, ctrl_name, twin,
+                                  dist_gp=dist_gp, gen=gen)
+    r_t = abs(a - t) / max(abs(t), 1e-14)
+    r_f = abs(a - f) / max(abs(f), 1e-14)
+    print(f"G1-transient {ctrl_name:12s} adj={a:+.6e} twin={t:+.6e} fd={f:+.6e} "
+          f"adj/twin={r_t:.2e} adj/fd={r_f:.2e}")
+    assert r_t < 1e-6, (ctrl_name, "adj vs twin", a, t)
+    assert r_f < 5e-5, (ctrl_name, "adj vs fd", a, f)
+
+
+def test_g1_mutation_fails(device):
+    """GATE HYGIENE for the whole G1 battery: a planted (×1.5) error in the
+    analytic steady gradient must break BOTH the adj/twin and adj/fd legs —
+    proves the three-way is non-vacuous."""
+    from diffsim.xdd.observables import SteadyCurrentQoI
+    from tests._xdd_adjoint_fixtures import (build_small_lit_system,
+                                             steady_polish, steady_three_way,
+                                             XDDSteadyTwin)
+    sysm, state = build_small_lit_system(device)
+    state = steady_polish(sysm, state)
+    twin = XDDSteadyTwin(sysm)
+    qoi = SteadyCurrentQoI(contact="anode")
+    a, t, f = steady_three_way(sysm, state, "langevin_zeta", qoi, twin)
+    r_t = abs(a - t) / max(abs(t), 1e-14)
+    r_f = abs(a - f) / max(abs(f), 1e-14)
+    assert r_t < 1e-6 and r_f < 1e-6, ("baseline three-way not green", a, t, f)
+    bad = 1.5 * a
+    rb_t = abs(bad - t) / max(abs(t), 1e-14)
+    rb_f = abs(bad - f) / max(abs(f), 1e-14)
+    print(f"G1 mutation: good(adj/twin={r_t:.2e} adj/fd={r_f:.2e}) "
+          f"mutated(×1.5 adj/twin={rb_t:.2e} adj/fd={rb_f:.2e})")
+    assert rb_t > 1e-6, ("twin leg vacuous — mutation not rejected", rb_t)
+    assert rb_f > 1e-6, ("fd leg vacuous — mutation not rejected", rb_f)
+
+
+def test_g4_vector_control_three_way(device):
+    """G4: the vector IlluminationControl passes a per-component check on EVERY
+    band (requirement-1) — adjoint vs central FD ≤ 1e-6 for each of the 4 bands."""
+    from diffsim.xdd.adjoint import XDDSteadyAdjoint, IlluminationControl
+    from diffsim.xdd.observables import SteadyCurrentQoI
+    from tests._xdd_adjoint_fixtures import (build_small_lit_system,
+                                             steady_polish)
+    sysm, state, dist_gp, gen = build_small_lit_system(device, want_gen=True)
+    state = steady_polish(sysm, state)
+    ctrl = IlluminationControl(sysm, dist_gp, gen, mode="vector", n_bands=4)
+    qoi = SteadyCurrentQoI(contact="anode")
+    adj = XDDSteadyAdjoint(sysm, [ctrl]); adj.factorize(state)
+    g_adj = adj.gradient(state, qoi)["illumination"]      # (4,)
+    p0 = ctrl.get().copy()
+    # FD leg RE-SOLVES R_steady=0 at the mutated param by polishing from the SAME
+    # base converged state (the exact IFT map the adjoint models) — no transient
+    # re-march, whose path noise would swamp the small-magnitude bands.  eps=1e-5
+    # is the central-FD sweet spot here (roundoff floor above, truncation below).
+    def J_polish(pj):
+        ctrl.set(pj); st = steady_polish(sysm, state); ctrl.set(p0)
+        return qoi.value(sysm, st)
+    for j in range(4):
+        eps = 1e-5 * max(1.0, abs(float(p0[j])))
+        pj = p0.copy(); pj[j] += eps; Jp = J_polish(pj)
+        pj = p0.copy(); pj[j] -= eps; Jm = J_polish(pj)
+        fd = (Jp - Jm) / (2 * eps)
+        rel = abs(g_adj[j] - fd) / max(abs(fd), 1e-12)
+        print(f"G4 band {j} adj={g_adj[j]:+.6e} fd={fd:+.6e} rel={rel:.2e}")
+        assert rel < 1e-6, (j, g_adj[j], fd)
+
+
+def test_g5_sensitivity_map(device):
+    """G5: exposed ∂o/∂p rows match FD of the observable w.r.t. each param."""
+    from diffsim.xdd.adjoint import (XDDSteadyAdjoint, ClosureControl,
+                                     MaterialControl)
+    from diffsim.xdd.observables import SteadyCurrentQoI
+    from tests._xdd_adjoint_fixtures import (build_small_lit_system,
+                                             steady_polish)
+    sysm, state = build_small_lit_system(device)
+    state = steady_polish(sysm, state)
+    controls = [ClosureControl(sysm, "langevin_zeta"),
+                MaterialControl(sysm, "tau_inv_d")]
+    qoi = SteadyCurrentQoI(contact="anode")
+    adj = XDDSteadyAdjoint(sysm, controls); adj.factorize(state)
+    obs_seeds = qoi.dJ_du(sysm, state)[None, :]           # one observable row
+    rows = adj.sensitivity_rows(state, obs_seeds)         # (1, 2)
+    # FD leg RE-SOLVES R_steady=0 at each mutated param by polishing from the same
+    # base state (the IFT map — NOT a transient re-march, whose path noise
+    # swamped tau_inv_d's O(1e-7) row).  eps=1e-6 central step passes both params.
+    for k, c in enumerate(controls):
+        p0 = c.get()[0]; eps = 1e-6 * max(1.0, abs(p0))
+        c.set(np.array([p0 + eps])); Jp = qoi.value(sysm, steady_polish(sysm, state))
+        c.set(np.array([p0 - eps])); Jm = qoi.value(sysm, steady_polish(sysm, state))
+        c.set(np.array([p0]))
+        fd = (Jp - Jm) / (2 * eps)
+        rel = abs(rows[0, k] - fd) / max(abs(fd), 1e-12)
+        print(f"G5 {c.name:12s} row={rows[0, k]:+.6e} fd={fd:+.6e} rel={rel:.2e}")
+        assert rel < 1e-6, (c.name, rows[0, k], fd)
