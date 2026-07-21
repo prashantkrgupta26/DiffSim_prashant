@@ -113,15 +113,60 @@ class ClosureControl:
                 s.onsager, params=s.onsager.params.replace(**{self.name: v}))
 
     # -- the shared primitive: dR/dp as reduced-space rows (size, 5*n_free) --
+    # -- parameter-derivative prefactor WITHOUT dividing by the live param ----
+    # Both A3 closures are exactly LINEAR in their control parameter, so
+    #   ∂R̂/∂ζ = R̂/ζ = (the ζ-independent prefactor)     [Langevin]
+    #   ∂k̂/∂s = k̂/s = (the s-independent prefactor)      [Onsager scaling]
+    # The naive R̂/ζ and k̂/s forms NaN if an optimizer drives the control to 0
+    # (and LangevinRecombination even rejects ζ≤0 at construction).  DIV-BY-PARAM
+    # HARDENING (Task-2 M2 carry): re-evaluate the closure with the parameter
+    # factored out (set to 1) to read the prefactor directly — finite at param=0,
+    # exact by linearity, and shares the closure's own code path.
+    def _langevin_dRhat(self, sysm, state, cl):
+        import dataclasses
+        lang0 = sysm.langevin
+        if float(lang0.zeta) > 1e-8:          # numerically safe: divide as before
+            z = float(lang0.zeta)
+            return {pv: cl["R"][pv] / z for pv in sysm.dm.bins}
+        # near-zero ζ: evaluate R̂ at ζ=1 (the ζ-independent prefactor) directly.
+        dm = sysm.dm
+        n_gp = _gp_value(dm, state[IN]); p_gp = _gp_value(dm, state[IP])
+        lang1 = dataclasses.replace(lang0, zeta=1.0)
+        out = {}
+        for pv in dm.bins:
+            r1, _, _ = lang1(n_gp[pv], p_gp[pv], sysm.dist_gp[pv])
+            out[pv] = np.broadcast_to(r1, n_gp[pv].shape).copy()
+        return out
+
+    def _onsager_dk(self, sysm, state, cl, fld_key):
+        import dataclasses
+        scale_key = ("ex_diss_d_scaling" if fld_key == "kd"
+                     else "ex_diss_a_scaling")
+        sval = float(getattr(sysm.onsager.params, scale_key))
+        if abs(sval) > 1e-8:                   # numerically safe: divide as before
+            return {pv: cl[fld_key][pv] / sval for pv in sysm.dm.bins}
+        # near-zero scaling: evaluate k̂ at scaling=1 (the s-independent prefactor).
+        dm = sysm.dm
+        gmag = cl["gmag"]
+        ons1 = dataclasses.replace(
+            sysm.onsager,
+            params=sysm.onsager.params.replace(**{scale_key: 1.0}))
+        out = {}
+        for pv in dm.bins:
+            kd_, ka_, _ = ons1(gmag[pv], sysm.dist_gp[pv])
+            k1 = kd_ if fld_key == "kd" else ka_
+            out[pv] = np.broadcast_to(k1, cl[fld_key][pv].shape).copy()
+        return out
+
     def _dR_dp_full(self, sysm, state) -> np.ndarray:
         dm = sysm.dm
         cl = sysm._closures(state)
         dR = {f: np.zeros(dm.n_nodes) for f in range(NDOF)}
         z_aq = {pv: np.zeros((len(sysm.dist_gp[pv]), dm.dim)) for pv in dm.bins}
         if self.name == "langevin_zeta":
-            zeta = float(sysm.langevin.zeta)
-            # R̂ is linear in zeta -> dR̂/dzeta = R̂/zeta at GPs
-            dRhat = {pv: cl["R"][pv] / zeta for pv in dm.bins}
+            # R̂ is linear in zeta -> dR̂/dzeta = R̂/zeta at GPs (hardened: no
+            # division by ζ when ζ→0, see _langevin_dRhat).
+            dRhat = self._langevin_dRhat(sysm, state, cl)
             # carrier rows: source is (D̂ − R̂) entering via −load; exciton feed
             # +R̂.  Mirror residual_full's assembly with dRhat in place of R̂.
             fcar = {pv: -dRhat[pv] for pv in dm.bins}       # d(−R̂)/dzeta
@@ -145,8 +190,9 @@ class ClosureControl:
             fld_key = "kd" if self.name == "ex_diss_d_scaling" else "ka"
             xkey = "xd_gp" if self.name == "ex_diss_d_scaling" else "xa_gp"
             xfld = IXD if self.name == "ex_diss_d_scaling" else IXA
-            sval = float(self.get()[0])
-            dk = {pv: cl[fld_key][pv] / sval for pv in dm.bins}
+            # k̂ linear in the scaling -> dk̂/ds = k̂/s (hardened: no division by
+            # the scaling when s→0, see _onsager_dk).
+            dk = self._onsager_dk(sysm, state, cl, fld_key)
             # carrier source +D̂ contribution d/ds = dk·X̂  (enters −load)
             dDs = {pv: dk[pv] * cl[xkey][pv] for pv in dm.bins}
             Fn = _load_block(dm, sysm._aq(cl["gradphi"], sysm.mu_n_gp, -1.0),
