@@ -41,6 +41,13 @@
       "config": "level 4 3D, BDF1 pseudo-time, 56 steps",
       "rtol_note": "pipeline lock; D/h=3.8 preasymptotic",
       "value": 0.381
+    },
+    "p2r0_sphere_re100_derisk_cd": {
+      "config": "P2-R0 Task-10 3-D de-risk (gpubox). MONOLITHIC (no-split) SBM-NS reference on the matched level-4 mesh (D/h=3.84), Re=100, alpha=10, dt=0.05 — the R0 FAITHFULNESS reference for the projection+SBM 3-D path. Reproduces sphere_re100_cd=0.381. NOTE: R0 accepted at the DE-RISK bar; literature Re300 Cd (~0.6-0.7) DEFERRED to R2. Re100 used as the feasible-mesh de-risk case (Re300 transient unstable at feasible mesh; documented in the Task-10 report). Key renamed from p2r0_sphere_re300_cd (held a Re100 value) per whole-branch review.",
+      "rtol_note": "monolithic matched-mesh reference; the projection SPLIT diverges in 3-D (Task-10 NEEDS_CONTEXT, xfail nightly). See .superpowers/sdd/p2r0-task-10-report.md + tests/baselines/p2r0_task10_sphere.json.",
+      "value": 0.3812,
+      "monolithic_alpha100_cd": 0.9641,
+      "projection_split_verdict": "NEEDS_CONTEXT (diverges; extends Task-9 2-D finding to 3-D)"
     }
   }
 }

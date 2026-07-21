@@ -35,9 +35,29 @@ from ..solvers.timestepping import bdf_coeffs, bdf_order_now, History
 class LerayProjectionStepper:
     def __init__(self, dm, nu, dt, f_fn, g_fn, order=2, picard_iters=2,
                  solver="splu",
-                 timestab=True, ppe_finescale=False, predictor="picard"):
+                 timestab=True, ppe_finescale=False, predictor="picard",
+                 velocity_update="consistent", graddiv_scale=1.0):
         self.dm, self.nu, self.dt, self.order = dm, nu, dt, order
         self.picard_iters = picard_iters
+        # P2-R0 velocity-update EXPERIMENT knob (default "consistent" =
+        # unchanged behaviour). Controls Step 3 (the velocity update) and,
+        # for "graddiv", an EXTRA grad-div penalty in the predictor:
+        #   "consistent" — consistent-mass L2 re-projection (Algorithm 1).
+        #   "lumped"      — row-sum (lumped) diagonal mass in Step 3, so the
+        #                   update collocates to the nodal
+        #                   u = u_hat - (1/sigma) grad(phi), which better
+        #                   preserves the discrete pointwise divergence
+        #                   relation than the consistent-mass smear.
+        #   "graddiv"     — consistent-mass update PLUS a graddiv_scale-times
+        #                   tau_C (div w, div u) grad-div (LSIC) penalty added
+        #                   to the predictor system, which damps the predicted
+        #                   (hence corrected) pointwise divergence directly.
+        if velocity_update not in ("consistent", "lumped", "graddiv"):
+            raise ValueError(
+                f"velocity_update must be consistent|lumped|graddiv, "
+                f"got {velocity_update!r}")
+        self.velocity_update = velocity_update
+        self.graddiv_scale = float(graddiv_scale)
         # 'picard' (v1) or 'newton' (the draft's Algorithm 1): Newton adds
         # the (du.grad)a cross-block in the momentum operator and folds the
         # (a.grad)a RHS partner into f_eff (which hands it SUPG/PSPG
@@ -74,6 +94,22 @@ class LerayProjectionStepper:
         self._K_p_lu = None
         self.M = self._mass_matrix()
         self._M_lu = None            # mass solves go through solve_linear
+        # Step-3 update operator: consistent M (default), or the row-sum
+        # (lumped) diagonal of M — a diagonal solve that nodally collocates
+        # u = u_hat - (1/sigma) grad(phi) (P2-R0 velocity-update experiment).
+        if self.velocity_update == "lumped":
+            row_sum = np.asarray(self.M.sum(axis=1)).ravel()
+            self.M_lumped = sp.diags(row_sum, format="csr")
+        else:
+            self.M_lumped = None
+        # Extra grad-div (LSIC) block for the "graddiv" variant — a scaled
+        # vector-Laplacian-of-divergence penalty tau_C (div w, div u) added to
+        # the predictor momentum system. Zero unless graddiv_scale > 0 and the
+        # variant is selected; assembled once (tau_C frozen at the steady,
+        # velocity-independent value, |u|-part dropped for a cached operator).
+        self._graddiv_block = None
+        if self.velocity_update == "graddiv" and self.graddiv_scale != 0.0:
+            self._graddiv_block = self._graddiv_matrix()
 
     # ---------------- helpers ----------------
     def _mass_matrix(self):
@@ -96,6 +132,62 @@ class LerayProjectionStepper:
                           shape=(Nn, Nn)).tocsr()
         T = dm.constraints.T.tocsr()
         return (T.T @ M @ T).tocsr()
+
+    def _graddiv_matrix(self):
+        """Extra grad-div (LSIC) penalty block for the predictor (P2-R0
+        velocity-update experiment, "graddiv"). Assembles the CONSTRAINED,
+        free-node-major, VECTOR (ndof=dim+1) operator
+
+            G[a i, b j] = scale * tau_C * int (dN_a/dx_i)(dN_b/dx_j) dV
+
+        added to the momentum block so the predictor damps ||div u_hat||
+        pointwise. tau_C is the metric-form grad-div parameter frozen at the
+        steady limit (|u|-independent so the block caches; the transient
+        (2 b0/dt)^2 term is dropped from tau_M here). The pressure rows/cols
+        (component ``dim``) are left zero, so this is purely a momentum-side
+        stabilization. Returns a CSR of shape (n_free*ndof, n_free*ndof)."""
+        dm = self.dm
+        dim = dm.dim
+        ndof = self.ndof
+        # steady tau_M = 1/sqrt(CI_F nu^2 G:G), tau_C = 1/(tau_M g.g), with
+        # G:G = dim (2/h)^4, g.g = dim (2/h)^2 on axis-aligned cubes (vms.py).
+        from ..physics.vms import CI_F
+        rows, cols, vals = [], [], []
+        for pv, b in dm.bins.items():
+            tb = dm.tables_by_p[pv]
+            h = dm.mesh.tree.h()[dm.mesh.bins[pv]]
+            jac = (h / 2.0) ** dim
+            dsc = (2.0 / h)
+            ne = len(h)
+            GG = dim * (2.0 / h) ** 4
+            gg = dim * (2.0 / h) ** 2
+            tauM = 1.0 / np.sqrt(CI_F * self.nu ** 2 * GG)
+            tauC = 1.0 / (tauM * gg)                      # [ne]
+            coef = self.graddiv_scale * tauC              # [ne]
+            # per-element grad-div: Ge[e, a, i, b, j]
+            #   = coef[e] * (dN_a/dx_i)(dN_b/dx_j) * w * jac
+            # dN scaled to physical by dsc; note (dsc*dsc) folded into GdG.
+            GdG = np.einsum("qad,qbc,q->abdc", tb.dN, tb.dN, tb.w)  # ref
+            conn = dm.mesh.conn_of[pv].astype(np.int64)
+            nbf = conn.shape[1]
+            scale_e = coef * (dsc ** 2) * jac             # [ne]
+            for a in range(nbf):
+                for bcol in range(nbf):
+                    for i in range(dim):
+                        for j in range(dim):
+                            r = conn[:, a] * ndof + i
+                            c = conn[:, bcol] * ndof + j
+                            v = GdG[a, bcol, i, j] * scale_e
+                            rows.append(r)
+                            cols.append(c)
+                            vals.append(v)
+        Nn = dm.n_nodes * ndof
+        G = sp.coo_matrix((np.concatenate(vals),
+                           (np.concatenate(rows), np.concatenate(cols))),
+                          shape=(Nn, Nn)).tocsr()
+        T = dm.constraints.T.tocsr()
+        T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
+        return (T_vec.T @ G @ T_vec).tocsr()
 
     def _weighted_stiffness(self, w_gp_by_bin):
         """K_w[a,b] = int w(x) grad N_a . grad N_b — per-GP weights (the
@@ -153,12 +245,10 @@ class LerayProjectionStepper:
     def _uvec(self, flat):
         return flat.reshape(self.n_free, self.dm.dim)
 
-    # ---------------- the step ----------------
-    def step(self):
+    def _predictor_setup(self, t_new):
+        """Common BDF/history setup for the predictor; returns
+        (b0, b1, b2, sigma, u1, u2, fq_base, gvals)."""
         dm = self.dm
-        dim = dm.dim
-        ndof = self.ndof
-        t_new = self.t + self.dt
         o = bdf_order_now(t_new, self.dt, self.order,
                           have_history=self.hist.have(2))
         b0, b1, b2 = bdf_coeffs(o, self.dt)
@@ -171,12 +261,40 @@ class LerayProjectionStepper:
         fq_base = {pv: self.f_fn(self.xq[pv], t_new) - hq[pv]
                    for pv in self.xq}
         gvals = self.g_fn(self.free_coords[self.dir_nodes], t_new)
-        p_node_full = self.p_star
+        return b0, b1, b2, sigma, u1, u2, fq_base, gvals
 
-        # ---- Step 1: nonlinear predictor (Picard over the full block with
-        # pressure DOFS PINNED to p*) ----
+    def _predict(self, t_new=None, extra_block=None, sbm_nodes=None,
+                 return_matrix=False):
+        """Momentum predictor (Algorithm 1 Step 1) as a standalone hook.
+
+        The composed volumetric-SBM stepper injects the shifted-Nitsche
+        vector Dirichlet block via ``extra_block=(A_sbm_c, b_sbm_c)`` (both
+        CONSTRAINED, free-node-major ``n_free*ndof``): the block is added to
+        the assembled momentum system before the strong-row overwrite, and
+        the ``sbm_nodes`` (free-node indices governed WEAKLY by SBM) skip the
+        strong box-Dirichlet overwrite so the immersed body stays weak.
+
+        Keeps the body-fitted path bit-identical when ``extra_block is None``
+        and ``sbm_nodes is None``.
+
+        Returns ``uhat`` (or the assembled csr matrix when
+        ``return_matrix`` is True — for composition tests). Does NOT advance
+        the history or ``p_star``.
+        """
+        dm = self.dm
+        dim = dm.dim
+        ndof = self.ndof
+        if t_new is None:
+            t_new = self.t + self.dt
+        b0, b1, b2, sigma, u1, u2, fq_base, gvals = \
+            self._predictor_setup(t_new)
+        p_node_full = self.p_star
+        strong_skip = (set() if sbm_nodes is None
+                       else set(int(i) for i in np.asarray(sbm_nodes)))
+
         a_node = 2.0 * u1 - u2 if u2 is not None else u1.copy()
         uhat = None
+        A_out = None
         self.predictor_diffs = []
         prev_iter = None
         for _ in range(self.picard_iters):
@@ -197,8 +315,21 @@ class LerayProjectionStepper:
                 dm, aq, dq, fq_it, self.nu, sigma=sigma,
                 sig2tau=((2.0 * sigma) ** 2 if self.timestab else 0.0),
                 gaq_by_bin=(gaq_flat if newton else None), newton=newton)
+            # SBM face block: add the constrained shifted-Nitsche vector
+            # Dirichlet into the momentum system BEFORE strong-row overwrite.
+            if extra_block is not None:
+                A_sbm_c, b_sbm_c = extra_block
+                A = (A + A_sbm_c)
+                b = b + np.asarray(b_sbm_c)
+            # P2-R0 "graddiv" variant: add the cached extra grad-div (LSIC)
+            # penalty to the momentum system (RHS unchanged — homogeneous
+            # penalty). No-op for the other variants (block is None).
+            if self._graddiv_block is not None:
+                A = (A + self._graddiv_block)
             A = A.tolil()
             for k, i in enumerate(self.dir_nodes):
+                if int(i) in strong_skip:      # SBM-governed: stays weak
+                    continue
                 for c in range(dim):
                     r = i * ndof + c
                     A.rows[r] = [int(r)]
@@ -209,16 +340,55 @@ class LerayProjectionStepper:
                 A.rows[r] = [int(r)]
                 A.data[r] = [1.0]
                 b[r] = p_node_full[i]
+            Acsr = A.tocsr()
             from ..solvers.linsolve import solve_linear
-            x = solve_linear(A.tocsr(), b, solver=self.solver, sym=False,
+            x = solve_linear(Acsr, b, solver=self.solver, sym=False,
                              device=self.dm.device,
                              cache=self._solver_cache)
             uhat = x.reshape(self.n_free, ndof)[:, :dim]
+            A_out = Acsr
             if prev_iter is not None:
                 self.predictor_diffs.append(
                     float(np.abs(uhat - prev_iter).max()))
             prev_iter = uhat
             a_node = uhat
+        return A_out if return_matrix else uhat
+
+    # ---------------- the step ----------------
+    def step(self, extra_block=None, sbm_nodes=None, ppe_surrogate_flux=None):
+        """One projection step.
+
+        ``ppe_surrogate_flux`` is the SURROGATE-CONSISTENT PPE boundary hook
+        (P2-R0 Task 3). The surrogate-consistent boundary condition on the
+        pressure-Poisson increment ``phi`` at the immersed body is a
+        HOMOGENEOUS Neumann condition ``grad(phi).n_hat = 0`` (Suresh
+        pressure-projection SBM paper, Eq. 5 + Remark 3.9): this is exactly
+        the NATURAL boundary condition of the divergence-form PPE RHS
+        ``(sigma u_hat, grad q)`` on the surrogate faces (they carry no strong
+        constraint and are not pinned), so the DEFAULT ``None`` already
+        imposes it and PROVES the blockage/no-penetration of the SBM
+        predictor is preserved by the projection: since
+        ``u = u_hat - (1/sigma) grad(phi)`` and ``grad(phi).n_hat = 0`` at the
+        surrogate, ``u.n_hat = u_hat.n_hat`` there (Remark 3.9). Choosing a
+        non-zero surrogate flux (or a ``phi``-Dirichlet pin) instead lets the
+        correction push mass through the body and is REJECTED by the paper;
+        the hook exists so that a wrong/omitted BC can be injected as a
+        planted-break to prove the homogeneous-Neumann choice is
+        load-bearing. When callable, ``ppe_surrogate_flux(uhat)`` returns a
+        FULL node-major (``dm.n_nodes``) scalar added to the PPE RHS before
+        the constraint reduction.
+        """
+        dm = self.dm
+        dim = dm.dim
+        ndof = self.ndof
+        t_new = self.t + self.dt
+        b0, b1, b2, sigma, u1, u2, fq_base, gvals = \
+            self._predictor_setup(t_new)
+
+        # ---- Step 1: nonlinear predictor (Picard over the full block with
+        # pressure DOFS PINNED to p*) ----
+        uhat = self._predict(t_new=t_new, extra_block=extra_block,
+                             sbm_nodes=sbm_nodes)
         # ---- Step 2: PPE with tau_m fine-scale RHS ----
         uq, guq = self._gp_vals(uhat, grad=True)
         pq_g = self._gp_vals(self.p_star, grad=True)[1]
@@ -259,6 +429,12 @@ class LerayProjectionStepper:
             be = np.einsum("qad,eqd,q,e->ea", tb.dN, fl, w,
                            jac * dsc)
             np.add.at(rhs, conn.ravel(), be.ravel())
+        # Surrogate-consistent PPE boundary hook (Task 3): default None keeps
+        # the homogeneous-Neumann natural BC at the surrogate (Suresh Eq. 5 /
+        # Remark 3.9). A non-None flux is the paper-rejected non-homogeneous
+        # choice, used only as a planted-break to prove the BC is load-bearing.
+        if ppe_surrogate_flux is not None:
+            rhs = rhs + np.asarray(ppe_surrogate_flux(uhat))
         rhs_free = np.asarray(dm.constraints.T.T @ rhs)
         if self.ppe_finescale:
             Kp = self._weighted_stiffness(w_gp).tolil()   # per-step tau_m
@@ -299,12 +475,35 @@ class LerayProjectionStepper:
                 be = np.einsum("qa,eq,q,e->ea", tb.N, integ, tb.w, jac)
                 np.add.at(rhs_c, dm.mesh.conn_of[pv].ravel(), be.ravel())
             from ..solvers.linsolve import solve_linear
-            u_new[:, c] = solve_linear(
-                self.M, np.asarray(dm.constraints.T.T @ rhs_c),
-                solver=self.solver, sym=True, device=dm.device,
-                cache=self._solver_cache, cache_key="mass")
-        # strong Dirichlet on the updated field (draft: trace preserved)
-        u_new[self.dir_nodes] = gvals
+            # P2-R0 velocity-update experiment: "lumped" uses the row-sum
+            # diagonal mass (a nodal-collocation update); default consistent M.
+            if self.velocity_update == "lumped":
+                rhs_free = np.asarray(dm.constraints.T.T @ rhs_c)
+                u_new[:, c] = rhs_free / self.M_lumped.diagonal()
+            else:
+                u_new[:, c] = solve_linear(
+                    self.M, np.asarray(dm.constraints.T.T @ rhs_c),
+                    solver=self.solver, sym=True, device=dm.device,
+                    cache=self._solver_cache, cache_key="mass")
+        # strong Dirichlet on the updated field (draft: trace preserved).
+        # SURROGATE-CONSISTENT CORRECTION (Task 3): SBM-governed nodes (the
+        # weak immersed body) are NOT strong-overwritten by the box trace —
+        # their corrected velocity IS the L2 projection u = u_hat -
+        # (1/sigma) grad(phi) (Suresh Eq. 6). With homogeneous Neumann on phi
+        # at the surrogate (the default PPE BC above), grad(phi).n_hat = 0
+        # there, so the projection preserves the SBM predictor's shifted
+        # no-penetration u.n_hat ~ 0 (Remark 3.9) instead of stamping the box
+        # inflow onto the body (which would leak flow through it). Pass
+        # sbm_nodes to skip the box overwrite on exactly those nodes.
+        if sbm_nodes is None:
+            u_new[self.dir_nodes] = gvals
+        else:
+            skip = set(int(i) for i in np.asarray(sbm_nodes))
+            keep = [k for k, i in enumerate(self.dir_nodes)
+                    if int(i) not in skip]
+            if keep:
+                keep = np.asarray(keep)
+                u_new[self.dir_nodes[keep]] = gvals[keep]
         # ---- Step 4 ----
         self.p_star = p_hat
         self.hist.rotate(u_new.ravel(), dt=self.dt)

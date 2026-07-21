@@ -148,3 +148,71 @@ GUARD in all prompts. Compute on **gpubox** for anything beyond file-level
 CPU checks (the standing preference); the Mac only for quick unit checks.
 The VMS-projection paper (`local_code_old/ns_projection_vms_paper.pdf`) and
 the C++/Dendrite reference are the parity oracles — consult, never commit.
+
+---
+
+## P2-R0 Scaling-pathway declaration
+
+**Recorded at Task 11 close (2026-07-21). Binding per `production-code-conventions.md` §Scaling-pathway declaration (ratified 2026-07-19).**
+
+### R0 honest status
+
+R0 validated the discretization:
+- G1 MMS spatial order: velocity 2.01 / 2.07, pressure 2.07 / 2.02 (2-D p1).
+- G2 BDF2 temporal order: 1.996 (projection march).
+- G3 SBM consistency: surrogate-consistent no-penetration 1e-12, planted-break decisive.
+- 2-D faithfulness to the monolithic saddle-point stepper confirmed.
+
+**OPEN items deferred to R2:**
+- 3-D projection has an open pressure-coupling stability item (stabilized config: principled penalty α~Pe·p² or implicit fine-scale PPE). Not hidden — it is the R2 task.
+- Literature Cd/Strouhal convergence (G4 cylinder, G5 sphere Re300) deferred to R2 (Task-9/10 requirements). The immersed-body benchmarks require the device-AMG path to reach the mesh resolutions the references demand.
+
+**R0 device status:** HOST/splu-reference only. The device port is the R2 prerequisite (per resolution 3 + Task-9/10 findings). R0 does NOT claim device-readiness.
+
+### Stage residency table
+
+| Stage | Residency | Notes |
+|-------|-----------|-------|
+| Octree build + mesh | host, per-epoch | static geometry — acceptable; never on the critical-step path |
+| Volumetric surrogate extraction (`classify_lambda`, `extract_surrogate`) | host, per-epoch | geometry is static in R0; R3 introduces adaptive transfer |
+| Distance/normal evaluation (`GeometryData.evaluate`) | host, per-epoch | KD-tree closest-point; amortized over all steps in the epoch |
+| SBM face-block assembly (`sbm_vector_dirichlet`) | host, once-per-epoch | geometry-only block cached; backflow increment per-step host |
+| Predictor sub-solve (nonlinear VMS momentum, nonsymmetric) | **host (R0)** → **device (R2)** | R0: splu reference; R2: device FGMRES (#49) + block-ILU/AMG; the nonsymmetric Oseen system is the harder device solve |
+| Pressure-Poisson (PPE) sub-solve (SPD, scalar Laplacian) | **host (R0)** → **device/AMG (R2)** | **The AMG/AMGX-scalable lever** — the SPD pressure-Poisson is the primary reason projection was chosen over the monolithic saddle: it admits AMG/CG, replaces the indefinite Schur complement, and is the unlock for 100M-DOF throughput. R0 validates on splu; R2 ports to AMG/AMGX. cuDSS cannot reach the hero (#43) — iterative device solve (device-FGMRES #49 / AMGX) is the mandated path. |
+| Velocity-update (correction) sub-solve (mass matrix, SPD, H¹) | **host (R0)** → **device (R2)** | Diagonal-dominant mass; cheapest of the three sub-solves; lumped mass is an admissible approximation at scale |
+| BDF history rotate / `divergence_l2` diagnostic | host | negligible cost; diagnostic only |
+| Surrogate traction / Cd extraction | host, per-output step | face-GP loop; small; amortized |
+
+**No new nnz-space arrays beyond the standard NS system** (verified by `tests/test_p2r0_scaling.py::test_no_new_nnz_space`): the SBM face block `Af_c` scatters only into existing node-pair slots already present in the `assemble_linear_ns` COO graph. The SBM composition is pattern-conservative.
+
+### 100M-DOF budget line
+
+- **NS system:** `ndof = dim + 1` (3 in 2-D, 4 in 3-D); p1 hex; nnz/dof ≈ 27 × ndof² / ndof ≈ 27 × ndof (element bandwidth); index width: mixed-width CSR per the P0-2 templating.
+- **SBM addition:** zero new nnz outside the NS pattern (face-block node pairs ⊆ element-connectivity pairs). The PPE and mass sub-solves are scalar (nnz/dof ≈ 27 for p1 hex), standard ChunkedCSR-compatible.
+- **At 100M DOFs:** same ChunkedCSR (#38) + fp32-IR (#36) + multi-GPU halos (S4) requirements as any 100M NS solve (umbrella §8). R0 introduces nothing that violates them — the SBM composition is additive in values, not in structure.
+- **Multi-GPU comms:** halos at partition boundaries for the predictor + PPE as in the monolithic NS; the SBM face block is local to the patch (surrogate faces are a local subset; no inter-partition face communication beyond the standard NS halo).
+
+### Deployment tiers
+
+| Tier | Hardware | Scope |
+|------|----------|-------|
+| Workstation / Mac | CPU (host splu) | R0 gate battery — MMS, BDF2 order, SBM consistency, scaling assertion |
+| Workstation single-GPU (gpubox) | A100 / H100 | R0 cylinder/sphere benchmarks (G4/G5 nightly, when R2 device path lands) |
+| Single big node | GH200 / Horizon NVL4 | Hero 3-D runs at 10M–100M DOFs (R2+); PPE-AMG the unlock |
+| Multi-node | Horizon gb-large / AWS on-demand | Multi-GPU 100M+ DOF studies (R3+); standard NS halo + SBM local patch |
+
+### The scalable lever: SPD pressure-Poisson → AMG/AMGX (R2 prerequisite)
+
+The projection split replaces the indefinite monolithic Schur-complement solve with three sequential sub-solves of which the **pressure-Poisson (PPE) is SPD and scalar** — the exact system class that AMG/CG (and AMGX) accelerate most effectively. This is the quantitative reason projection was chosen over the monolithic saddle for the P2 hero path:
+
+- Monolithic saddle at 100M DOFs requires an indefinite block preconditioner (Schur-complement approximation) with no proven scalable AMG path.
+- The PPE Laplacian admits algebraic multigrid directly; the AMGX stub (`solvers/amgx.py`) already identifies it as the target.
+- R2's device-PPE task is therefore the single highest-leverage item in the P2 scaling plan.
+
+The predictor (nonsymmetric Oseen, step 1) requires device FGMRES (#49) + block-ILU or AMG as preconditioner — tractable but harder than the PPE. The correction (mass matrix, step 3) is SPD diagonal-dominant and cheapest of the three.
+
+**R2 dependencies (not hidden):**
+1. Device port of the predictor → FGMRES #49 + block-AMG/ILU.
+2. Device port of the PPE → AMGX AMG/CG (the scalable lever).
+3. 3-D pressure-coupling stability: principled penalty α~Pe·p² or implicit fine-scale PPE (open item from R0 3-D formulation).
+4. G4/G5 literature Cd/Strouhal convergence at reference mesh resolutions.
