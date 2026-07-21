@@ -554,6 +554,69 @@ def _march_to_steady(sysm, state, *,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# march_with_checkpoints — Mode-B transient-adjoint tape (record-then-reverse)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def march_with_checkpoints(sysm, state, *, dt0_hat, dt_max_hat, max_steps,
+                           order=1, newton_kw=None, h_axis=1):
+    """BDF march that CHECKPOINTS the converged full state + exact dt/BDF
+    metadata per accepted step (host) — the Mode-B transient-adjoint tape.
+
+    Adaptive dt on the FORWARD is fine; the recorded dt's are exactly what the
+    reverse sweep FREEZES (the backward pass never calls ``_dt_schedule``).  The
+    per-step record carries the full converged ``state``, the ``prev`` /
+    ``prev2`` histories used to form that step, the recorded ``dt_hat`` / BDF
+    ``order`` / ``sigma``, and the generation GP fields ``gd`` / ``ga`` in force
+    at the step (so ``XDDTransientAdjoint`` can rebuild ``Aₙ`` at the recorded
+    state under the recorded σ/history without re-adapting).
+
+    Returns
+    -------
+    (final_state, steps)
+        steps : list of per-step dicts with keys
+            {state, prev, prev2, dt_hat, order, sigma, t_hat, gd, ga}.
+    """
+    nk = newton_kw or {}
+    dt_floor = 1e-20
+    t_hat = 0.0
+    dt_hat = dt0_hat
+    prev = {f: state[f].copy() for f in range(NDOF)}
+    prev2 = None
+    steps: List[dict] = []
+    gd, ga = sysm._gen()
+    for _ in range(max_steps):
+        use_order = 2 if (order == 2 and len(steps) >= 1 and prev2 is not None) else 1
+        try:
+            new_state, info = sysm.step_bdf(state, dt_hat, order=use_order,
+                                            prev=prev, prev2=prev2, **nk)
+        except Exception as exc:
+            info = {"converged": False, "reason": str(exc)}
+            new_state = state
+        if not info["converged"]:
+            dt_hat *= 0.5
+            if dt_hat < dt_floor:
+                break
+            continue
+        t_hat += dt_hat
+        steps.append({
+            "state": {f: new_state[f].copy() for f in range(NDOF)},
+            "prev": {f: prev[f].copy() for f in range(NDOF)},
+            "prev2": (None if prev2 is None
+                      else {f: prev2[f].copy() for f in range(NDOF)}),
+            "dt_hat": dt_hat, "order": use_order,
+            "sigma": sysm.sigma, "t_hat": t_hat,
+            "gd": {pv: gd[pv].copy() for pv in sysm.dm.bins},
+            "ga": {pv: ga[pv].copy() for pv in sysm.dm.bins},
+        })
+        prev2 = {f: prev[f].copy() for f in range(NDOF)}
+        prev = {f: new_state[f].copy() for f in range(NDOF)}
+        state = new_state
+        dt_sched = _dt_schedule(t_hat, dt_hat, dt0_hat, dt_max_hat)
+        dt_hat = max(dt_sched, dt_hat)
+    return state, steps
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # _post_process — volume-integrated diagnostic quantities
 # ══════════════════════════════════════════════════════════════════════════════
 

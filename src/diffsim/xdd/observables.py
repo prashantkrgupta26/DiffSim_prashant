@@ -642,3 +642,235 @@ def fit_decay_rate(t: np.ndarray, y: np.ndarray, *,
         return float("nan")
     slope = np.polyfit(t[m], np.log(y[m]), 1)[0]
     return -float(slope)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# R1 — differentiable steady QoI faces (steady adjoint RHS seeds)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SteadyCurrentQoI:
+    """Differentiable designated contact current as a steady QoI.
+
+    ``value`` = ``designated_current(Jny, Jpy, contact)`` (a fixed contact, NOT
+    the nonsmooth min).  The adjoint flows from ``dJ_du``, the flat reduced
+    field-major seed (5·n_free,) consumed as the Mode-A steady-adjoint RHS
+    (Task 4 passes a matching flat reduced λ).
+
+    Design (see task-3 brief / ``run._flux_pair``).  With the designated
+    contact ``Jc = Σ_{i∈wall} (Kc @ ĉ)[i]`` where ``Kc = _carrier_block(σ=0,
+    SUPG=0)`` (electrons at the anode, holes at the cathode):
+
+      • ∂Jc/∂ĉ  = Kcᵀ e_wall           (Kc is φ̂-dependent but ĉ-independent).
+      • ∂Jc/∂φ̂ = the CONSERVATIVE drift cross-term — the SAME weighted-stiffness
+        block the residual Jacobian uses (exciton_system ``build_jacobian``):
+        ``∂(∫ sign·μ̂ ĉ (∇φ̂·∇N_a))/∂φ̂ = _poisson_block(sign·μ̂·ĉ, lam2=1)``,
+        NOT the (∇ĉ·∇N_b)N_a advection-mass block.
+
+    ``designated_current`` returns |Jc|, so the seed carries an overall
+    sign(Jc).  Assembled dR is transposed and reduced with ``sysm.T.T`` per
+    field into a flat (5·n_free,) vector.
+    """
+
+    def __init__(self, contact: str = "anode", h_axis: int = 1):
+        if contact not in ("anode", "cathode"):
+            raise ValueError(
+                "SteadyCurrentQoI: contact must be 'anode' or 'cathode' "
+                f"(got {contact!r}); the nonsmooth min is not differentiable.")
+        self.contact = contact
+        self.h_axis = h_axis
+
+    def value(self, sysm, state) -> float:
+        jny, jpy = contact_flux_pair(sysm, state, h_axis=self.h_axis)
+        return designated_current(jny, jpy, contact=self.contact)
+
+    def dJ_du(self, sysm, state) -> np.ndarray:
+        """∂J/∂u as a flat (5·n_free,) reduced field-major seed (adjoint RHS)."""
+        from diffsim.physics.exciton_system import (
+            _carrier_block, _poisson_block, NDOF, IPHI, IN, IP)
+
+        dm = sysm.dm
+        cl = sysm._closures(state)
+        coords = dm.mesh.node_coords
+        hc = coords[:, self.h_axis]
+        lo, hi = hc.min(), hc.max()
+        if self.contact == "anode":
+            wall = np.where(np.abs(hc - lo) < 1e-9)[0]
+            mu_gp, fld, sign = sysm.mu_n_gp, IN, -1.0
+            c_gp = cl["n_gp"]
+        else:
+            wall = np.where(np.abs(hc - hi) < 1e-9)[0]
+            mu_gp, fld, sign = sysm.mu_p_gp, IP, +1.0
+            c_gp = cl["p_gp"]
+
+        # ĉ-flux Galerkin operator Kc (σ=0, SUPG=0) — the _flux_pair operator.
+        aq = sysm._aq(cl["gradphi"], mu_gp, sign)
+        Kc = _carrier_block(dm, aq, mu_gp, 0.0, 0.0, 0.0)
+        e = np.zeros(dm.n_nodes)
+        e[wall] = 1.0
+
+        # ∂(Σ_wall Kc@ĉ)/∂ĉ = Kcᵀ e   (Kc independent of ĉ).
+        dJ_dc = Kc.T @ e
+        # ∂(Σ_wall Kc@ĉ)/∂φ̂ = conservative drift cross-term (weighted stiffness):
+        #   ∂/∂φ̂ ∫ sign·μ̂ ĉ (∇φ̂·∇N_a) = _poisson_block(sign·μ̂·ĉ, lam2=1).
+        cdrift = {pv: sign * mu_gp[pv] * c_gp[pv] for pv in dm.bins}
+        Kphi = _poisson_block(dm, cdrift, 1.0)
+        dJ_dphi = Kphi.T @ e
+
+        # designated_current = |Jc| → overall sign(Jc).
+        jny, jpy = contact_flux_pair(sysm, state, h_axis=self.h_axis)
+        Jc = jny if self.contact == "anode" else jpy
+        sgn = 1.0 if Jc >= 0 else -1.0
+
+        dR = {f: np.zeros(dm.n_nodes) for f in range(NDOF)}
+        dR[fld] = sgn * dJ_dc
+        dR[IPHI] = sgn * dJ_dphi
+        return np.concatenate(
+            [np.asarray(sysm.T.T @ dR[f]) for f in range(NDOF)])
+
+    def dJ_dp(self, sysm, state, control) -> np.ndarray:
+        """Explicit ∂J/∂p for a control — 0 for this pure-state QoI.
+
+        Returned for forward-compat req 2 (the QoI exposes both the dJ/du seed
+        and the ∂J/∂p sensitivity face; Task 4's driver builds the full
+        sensitivity rows from these plus the adjoint).
+        """
+        return np.zeros(control.size)
+
+
+class JVMisfitQoI:
+    """Full-curve J–V misfit  Σ_V (J_model(V) − J_data(V))²  as a steady QoI.
+
+    R1 keeps the SINGLE-BIAS reduced form: the driver holds one operating bias
+    and this evaluates the one misfit term there (the full sweep is "sum the
+    single-bias adjoint over sweep points" — each bias contributes an
+    independent adjoint solve with this same seed at that bias).
+
+    value  = (J_model − J_data)²
+    dJ/du  = 2 (J_model − J_data) · dJ_model/du   (chain rule through the
+             differentiable designated current).
+    """
+
+    def __init__(self, target_current: float, contact: str = "anode",
+                 h_axis: int = 1):
+        self.target = float(target_current)
+        self._cur = SteadyCurrentQoI(contact=contact, h_axis=h_axis)
+
+    def value(self, sysm, state) -> float:
+        return (self._cur.value(sysm, state) - self.target) ** 2
+
+    def dJ_du(self, sysm, state) -> np.ndarray:
+        r = self._cur.value(sysm, state) - self.target
+        return 2.0 * r * self._cur.dJ_du(sysm, state)
+
+    def dJ_dp(self, sysm, state, control) -> np.ndarray:
+        return np.zeros(control.size)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# R1 — differentiable TRANSIENT QoI faces (trajectory functionals; Mode B)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _params_of(sysm):
+    """Best-effort XDDParams handle for τ̂_r (attached by the fixture/driver)."""
+    p = getattr(sysm, "params", None)
+    if p is None:
+        raise ValueError("TRPLMisfitQoI needs params: pass params=... or set "
+                         "sysm.params")
+    return p
+
+
+def _pl_integral_grad_nodal(sysm, field_index, tau_r_inv_hat, weight):
+    """∂(∫ w·X̂/τ̂_r dV)/∂X̂_nodal = weight·(1/τ̂_r)·(Nᵀ dV) — the GP-quadrature
+    adjoint of the nodal→GP interpolation used by ``pl_species_integral``.
+
+    Returns the (n_nodes,) nodal cotangent of the LINEAR PL-integral functional;
+    contracting it with a nodal δX̂ reproduces the exact directional derivative of
+    ``pl_species_integral`` (verified independently by the FD gate)."""
+    dm = sysm.dm
+    h_all = dm.mesh.tree.h()
+    g = np.zeros(dm.n_nodes)
+    for pv, b in dm.bins.items():
+        conn = dm.mesh.conn_of[pv]
+        N = dm.tables_by_p[pv].N               # [nqp, nbf]
+        eids = dm.mesh.bins[pv]; he = h_all[eids]
+        jac = (0.5 * he) ** dm.dim; nqp = b["nqp"]
+        wt = dm.tables_by_p[pv].w; ne = len(eids)
+        dV = (np.tile(wt, ne) * np.repeat(jac, nqp)).reshape(ne, nqp)
+        # contribution to node a: Σ_q dV[e,q] N[q,a]
+        ge = np.einsum("eq,qa->ea", dV, N)     # [ne, nbf]
+        np.add.at(g, conn.ravel(), ge.ravel())
+    return weight * tau_r_inv_hat * g
+
+
+class TRPLMisfitQoI:
+    """TRPL decay misfit  Σ_n (PL(tₙ) − PL_data(tₙ))²  as a TRAJECTORY QoI.
+
+    ``PL(tₙ) = Σ_i weight_i·(1/τ̂_r,i)·∫X̂_i dV̂`` (the R0 ``pl_species_integral``),
+    a LINEAR functional of the nodal X̂ field, so the per-step exciton seed is
+    exact and cheap.  ``dJ_dx_list`` produces the per-step reduced seeds
+    ``∂J/∂xₙ`` (flat field-major, 5·n_free per step) that Mode-B
+    (``XDDTransientAdjoint.gradient``) consumes; nonzero only on the exciton
+    (IXD/IXA) fields since PL depends only on X̂.
+    """
+
+    def __init__(self, target_decay, weight_donor=1.0, weight_acceptor=1.0,
+                 params=None):
+        self.target = [float(x) for x in target_decay]
+        self.wd = float(weight_donor); self.wa = float(weight_acceptor)
+        self._params = params
+
+    def _pl(self, sysm, state):
+        from diffsim.physics.exciton_system import IXD, IXA
+        p = self._params if self._params is not None else _params_of(sysm)
+        trd = _tau_r_inv_hat(p, "donor"); tra = _tau_r_inv_hat(p, "acceptor")
+        pl_d = pl_species_integral(sysm, state, trd, IXD, weight=self.wd)
+        pl_a = pl_species_integral(sysm, state, tra, IXA, weight=self.wa)
+        return pl_d + pl_a
+
+    def value(self, sysm, steps) -> float:
+        return sum((self._pl(sysm, s["state"]) - self.target[n]) ** 2
+                   for n, s in enumerate(steps))
+
+    def dJ_dx_list(self, sysm, steps):
+        from diffsim.physics.exciton_system import IXD, IXA, NDOF
+        p = self._params if self._params is not None else _params_of(sysm)
+        trd = _tau_r_inv_hat(p, "donor"); tra = _tau_r_inv_hat(p, "acceptor")
+        gD = _pl_integral_grad_nodal(sysm, IXD, trd, self.wd)   # (n_nodes,)
+        gA = _pl_integral_grad_nodal(sysm, IXA, tra, self.wa)
+        seeds = []
+        for n, s in enumerate(steps):
+            r = self._pl(sysm, s["state"]) - self.target[n]
+            seed = {f: np.zeros(sysm.dm.n_nodes) for f in range(NDOF)}
+            seed[IXD] = 2.0 * r * gD
+            seed[IXA] = 2.0 * r * gA
+            seeds.append(np.concatenate([np.asarray(sysm.T.T @ seed[f])
+                                         for f in range(NDOF)]))
+        return seeds
+
+
+class JtMisfitQoI:
+    """J(t) light-modulation misfit  Σ_n (J_model(tₙ) − J_data(tₙ))²  as a
+    TRAJECTORY QoI.
+
+    Mirrors ``TRPLMisfitQoI`` but the per-step observable is the differentiable
+    designated contact current (``SteadyCurrentQoI(contact).value`` /
+    ``dJ_du`` evaluated at each recorded state — the Task-3 current-seed math).
+    ``dJ_dx_list`` produces the per-step reduced seeds
+    ``∂J/∂xₙ = 2 (J_model(tₙ) − J_data(tₙ)) · ∂J_model/∂xₙ`` (flat field-major,
+    5·n_free per step) that Mode-B consumes.
+    """
+
+    def __init__(self, target_Jt, contact="anode", h_axis=1):
+        self.target = [float(x) for x in target_Jt]
+        self._cur = SteadyCurrentQoI(contact=contact, h_axis=h_axis)
+
+    def value(self, sysm, steps) -> float:
+        return sum((self._cur.value(sysm, s["state"]) - self.target[n]) ** 2
+                   for n, s in enumerate(steps))
+
+    def dJ_dx_list(self, sysm, steps):
+        seeds = []
+        for n, s in enumerate(steps):
+            r = self._cur.value(sysm, s["state"]) - self.target[n]
+            seeds.append(2.0 * r * self._cur.dJ_du(sysm, s["state"]))
+        return seeds

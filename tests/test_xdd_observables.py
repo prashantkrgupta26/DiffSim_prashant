@@ -490,3 +490,247 @@ def test_gate_d7_capture_trace():
     assert tr["J"][2] == pytest.approx(min(0.30, 0.28))
     tra = capture_trace(hist, t0=t0, contact="anode")
     assert tra["J"][1] == pytest.approx(0.20)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# R1 — differentiable steady QoIs + FD-gated dJ/du (Task 3)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _scatter_state(sysm, state, vec):
+    """Apply a flat reduced field-major perturbation `vec` (5·n_free,) to a full
+    state through T per field, returning a new full-nodal state dict."""
+    from diffsim.physics.exciton_system import NDOF
+    nf = sysm.n_free
+    st = {}
+    for f in range(NDOF):
+        duf = vec[f * nf:(f + 1) * nf]
+        st[f] = state[f] + np.asarray(sysm.T @ duf)
+    return st
+
+
+def _fd_directional(qoi, sysm, state, vec, eps=1e-6):
+    """Central FD of a QoI's `value` along the reduced direction `vec`."""
+    Jp = qoi.value(sysm, _scatter_state(sysm, state, +eps * vec))
+    Jm = qoi.value(sysm, _scatter_state(sysm, state, -eps * vec))
+    return (Jp - Jm) / (2.0 * eps)
+
+
+@pytest.mark.ad
+def test_steady_qoi_dJdu_matches_fd(device):
+    """G_D_R1a: SteadyCurrentQoI.dJ_du(anode) matches a central FD directional
+    derivative of value to ~1e-6 (the adjoint RHS seed)."""
+    from diffsim.physics.exciton_system import NDOF
+    from diffsim.xdd.observables import SteadyCurrentQoI
+    from tests._xdd_adjoint_fixtures import build_small_lit_system
+
+    sysm, state = build_small_lit_system(device)
+    qoi = SteadyCurrentQoI(contact="anode")
+    seed = qoi.dJ_du(sysm, state)
+    assert seed.shape == (NDOF * sysm.n_free,)
+
+    rng = np.random.default_rng(0)
+    v = rng.standard_normal(NDOF * sysm.n_free)
+    fd = _fd_directional(qoi, sysm, state, v)
+    dd = float(seed @ v)
+    rel = abs(dd - fd) / max(abs(fd), 1e-12)
+    print(f"\nSteadyCurrentQoI(anode) dJ/du·v adj/fd rel = {rel:.2e}")
+    assert rel < 1e-6, (dd, fd)
+
+
+@pytest.mark.ad
+def test_steady_qoi_cathode_dJdu_matches_fd(device):
+    """G_D_R1b: the cathode designated current seed also matches FD."""
+    from diffsim.physics.exciton_system import NDOF
+    from diffsim.xdd.observables import SteadyCurrentQoI
+    from tests._xdd_adjoint_fixtures import build_small_lit_system
+
+    sysm, state = build_small_lit_system(device)
+    qoi = SteadyCurrentQoI(contact="cathode")
+    seed = qoi.dJ_du(sysm, state)
+    rng = np.random.default_rng(1)
+    v = rng.standard_normal(NDOF * sysm.n_free)
+    fd = _fd_directional(qoi, sysm, state, v)
+    dd = float(seed @ v)
+    rel = abs(dd - fd) / max(abs(fd), 1e-12)
+    print(f"\nSteadyCurrentQoI(cathode) dJ/du·v adj/fd rel = {rel:.2e}")
+    assert rel < 1e-6, (dd, fd)
+
+
+@pytest.mark.ad
+def test_steady_qoi_dJdu_mutation_fails(device):
+    """G_D_R1c GATE HYGIENE: the FD gate is INDEPENDENT of the analytic seed —
+    a planted error in dJ/du must make the FD comparison FAIL.  (Guards against
+    the degenerate "same difference compared to itself" gate.)"""
+    from diffsim.physics.exciton_system import NDOF
+    from diffsim.xdd.observables import SteadyCurrentQoI
+    from tests._xdd_adjoint_fixtures import build_small_lit_system
+
+    sysm, state = build_small_lit_system(device)
+    qoi = SteadyCurrentQoI(contact="anode")
+    seed = qoi.dJ_du(sysm, state)
+    # plant a non-trivial error: scale the seed by 1.5
+    bad = 1.5 * seed
+    rng = np.random.default_rng(0)
+    v = rng.standard_normal(NDOF * sysm.n_free)
+    fd = _fd_directional(qoi, sysm, state, v)
+    dd_bad = float(bad @ v)
+    rel_bad = abs(dd_bad - fd) / max(abs(fd), 1e-12)
+    print(f"\nMUTATION check: planted-error dJ/du·v adj/fd rel = {rel_bad:.2e} "
+          f"(must be >> 1e-6)")
+    assert rel_bad > 1e-3, rel_bad
+
+
+@pytest.mark.ad
+def test_jv_misfit_dJdu_matches_fd(device):
+    """G_D_R1d: JVMisfitQoI single-bias value = (J_model−J_data)² and its
+    dJ/du = 2 r · dJ_model/du matches FD."""
+    from diffsim.physics.exciton_system import NDOF
+    from diffsim.xdd.observables import SteadyCurrentQoI, JVMisfitQoI
+    from tests._xdd_adjoint_fixtures import build_small_lit_system
+
+    sysm, state = build_small_lit_system(device)
+    cur = SteadyCurrentQoI(contact="anode")
+    J_model = cur.value(sysm, state)
+    target = J_model - 0.3            # nonzero residual so 2r != 0
+    qoi = JVMisfitQoI(target, contact="anode")
+    assert qoi.value(sysm, state) == pytest.approx((J_model - target) ** 2, rel=1e-12)
+
+    seed = qoi.dJ_du(sysm, state)
+    rng = np.random.default_rng(2)
+    v = rng.standard_normal(NDOF * sysm.n_free)
+    fd = _fd_directional(qoi, sysm, state, v)
+    dd = float(seed @ v)
+    rel = abs(dd - fd) / max(abs(fd), 1e-12)
+    print(f"\nJVMisfitQoI dJ/du·v adj/fd rel = {rel:.2e}")
+    assert rel < 1e-6, (dd, fd)
+
+
+@pytest.mark.ad
+def test_steady_qoi_dJ_dp_zero(device):
+    """G_D_R1e: pure-state QoIs return a zeroed ∂J/∂p of the control's size
+    (forward-compat req 2: the seed AND the sensitivity face are both present)."""
+    from diffsim.xdd.observables import SteadyCurrentQoI, JVMisfitQoI
+    from diffsim.xdd.adjoint import ClosureControl
+    from tests._xdd_adjoint_fixtures import build_small_lit_system
+
+    sysm, state = build_small_lit_system(device)
+    ctrl = ClosureControl(sysm, "langevin_zeta")
+    for qoi in (SteadyCurrentQoI(contact="anode"), JVMisfitQoI(0.0)):
+        dJdp = qoi.dJ_dp(sysm, state, ctrl)
+        assert dJdp.shape == (ctrl.size,)
+        assert np.allclose(dJdp, 0.0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# R1 — differentiable TRANSIENT QoI faces (Task 6): TRPL / J(t) misfit seeds
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.ad
+def test_trpl_qoi_seed_matches_fd(device):
+    """G_D_R1f: TRPLMisfitQoI per-step exciton seed ∂J/∂xₙ matches FD against
+    `value` (the PL integral is LINEAR in the nodal X̂, so the seed is exact)."""
+    from diffsim.xdd.run import march_with_checkpoints
+    from diffsim.xdd.observables import TRPLMisfitQoI
+    from tests._xdd_adjoint_fixtures import build_small_lit_system
+    from diffsim.physics.exciton_system import NDOF
+
+    sysm, state = build_small_lit_system(device)
+    _, steps = march_with_checkpoints(sysm, state, dt0_hat=1e-4,
+                                      dt_max_hat=1e-2, max_steps=5, order=1)
+    target = [0.0] * len(steps)
+    qoi = TRPLMisfitQoI(target, weight_donor=1.0, weight_acceptor=1.0)
+    seeds = qoi.dJ_dx_list(sysm, steps)
+    # FD one step's state along a random direction over ALL fields (the PL
+    # integral depends on X̂_D and X̂_A; the seed is exactly zero on φ̂/n̂/p̂, so
+    # perturbing every field is a clean, complete check of the exciton seed).
+    n = 2
+    rng = np.random.default_rng(3); nf = sysm.n_free
+    v = rng.standard_normal(NDOF * nf); eps = 1e-6
+
+    def perturbed_value(sgn):
+        base = steps[n]["state"]
+        newst = {f: base[f].copy() + sgn * eps * (sysm.T @ v[f * nf:(f + 1) * nf])
+                 for f in range(NDOF)}
+        st2 = [dict(s) for s in steps]
+        st2[n] = {**steps[n], "state": newst}
+        return qoi.value(sysm, st2)
+
+    fd = (perturbed_value(+1) - perturbed_value(-1)) / (2 * eps)
+    dd = float(seeds[n] @ v)
+    rel = abs(dd - fd) / max(abs(fd), 1e-12)
+    print(f"\nTRPLMisfitQoI seed adj/fd rel = {rel:.2e}")
+    assert rel < 1e-6, (dd, fd)
+
+
+@pytest.mark.ad
+def test_trpl_qoi_seed_mutation_fails(device):
+    """GATE HYGIENE: a planted (×1.5) error in the TRPL exciton seed must make
+    the FD comparison FAIL — the gate is INDEPENDENT of the analytic seed."""
+    from diffsim.xdd.run import march_with_checkpoints
+    from diffsim.xdd.observables import TRPLMisfitQoI
+    from tests._xdd_adjoint_fixtures import build_small_lit_system
+    from diffsim.physics.exciton_system import NDOF
+
+    sysm, state = build_small_lit_system(device)
+    _, steps = march_with_checkpoints(sysm, state, dt0_hat=1e-4,
+                                      dt_max_hat=1e-2, max_steps=5, order=1)
+    # nonzero target so the residual r (hence the seed) is nonzero
+    qoi = TRPLMisfitQoI([0.7] * len(steps), weight_donor=1.0, weight_acceptor=1.0)
+    seeds = qoi.dJ_dx_list(sysm, steps)
+    n = 2
+    rng = np.random.default_rng(5); nf = sysm.n_free
+    v = rng.standard_normal(NDOF * nf); eps = 1e-6
+
+    def perturbed_value(sgn):
+        base = steps[n]["state"]
+        newst = {f: base[f].copy() + sgn * eps * (sysm.T @ v[f * nf:(f + 1) * nf])
+                 for f in range(NDOF)}
+        st2 = [dict(s) for s in steps]
+        st2[n] = {**steps[n], "state": newst}
+        return qoi.value(sysm, st2)
+
+    fd = (perturbed_value(+1) - perturbed_value(-1)) / (2 * eps)
+    dd_good = float(seeds[n] @ v)
+    dd_bad = 1.5 * dd_good
+    rel_good = abs(dd_good - fd) / max(abs(fd), 1e-12)
+    rel_bad = abs(dd_bad - fd) / max(abs(fd), 1e-12)
+    print(f"\nTRPL MUTATION check: good rel={rel_good:.2e} "
+          f"mutated(×1.5) rel={rel_bad:.2e} (must be >> 1e-6)")
+    assert rel_good < 1e-6, rel_good
+    assert rel_bad > 1e-3, ("gate vacuous — mutated TRPL seed not rejected",
+                            rel_bad)
+
+
+@pytest.mark.ad
+def test_jt_misfit_qoi_seed_matches_fd(device):
+    """G_D_R1g: JtMisfitQoI per-step seed (via SteadyCurrentQoI.dJ_du at each
+    recorded state) matches FD against `value` on a chosen step."""
+    from diffsim.xdd.run import march_with_checkpoints
+    from diffsim.xdd.observables import JtMisfitQoI
+    from tests._xdd_adjoint_fixtures import build_small_lit_system
+    from diffsim.physics.exciton_system import NDOF
+
+    sysm, state = build_small_lit_system(device)
+    _, steps = march_with_checkpoints(sysm, state, dt0_hat=1e-4,
+                                      dt_max_hat=1e-2, max_steps=5, order=1)
+    # nonzero per-step current targets so 2·r is nonzero at the tested step
+    target = [0.0] * len(steps)
+    qoi = JtMisfitQoI(target, contact="anode")
+    seeds = qoi.dJ_dx_list(sysm, steps)
+    n = 2
+    rng = np.random.default_rng(7); nf = sysm.n_free
+    v = rng.standard_normal(NDOF * nf); eps = 1e-6
+
+    def perturbed_value(sgn):
+        base = steps[n]["state"]
+        newst = {f: base[f].copy() + sgn * eps * (sysm.T @ v[f * nf:(f + 1) * nf])
+                 for f in range(NDOF)}
+        st2 = [dict(s) for s in steps]
+        st2[n] = {**steps[n], "state": newst}
+        return qoi.value(sysm, st2)
+
+    fd = (perturbed_value(+1) - perturbed_value(-1)) / (2 * eps)
+    dd = float(seeds[n] @ v)
+    rel = abs(dd - fd) / max(abs(fd), 1e-12)
+    print(f"\nJtMisfitQoI seed adj/fd rel = {rel:.2e}")
+    assert rel < 1e-6, (dd, fd)
