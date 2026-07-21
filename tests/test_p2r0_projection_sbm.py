@@ -263,3 +263,119 @@ def test_ppe_surrogate_consistent_no_penetration(device):
     # longer far below the predictor (it can even exceed it).
     assert break_blockage > 0.1, (
         f"planted break should leak visibly, got {break_blockage:.4f}")
+
+
+# ---------------------------------------------------------------------------
+# Task 4 — the composed driver LeraySBMStepper (end-to-end BDF2 march).
+#
+# A caller supplies ONLY an immersed-geometry oracle + box boundary data
+# (u_inf, strong_mask) and gets a full BDF2 projection+SBM march with the same
+# ergonomics as the base stepper (set_initial, step, divergence_l2) plus the
+# surrogate_traction observable. This gate marches ~40 BDF2 steps past a Re20
+# cylinder and asserts:
+#   - the (u, p) state stays FINITE and PHYSICAL (bounded, |u| ~ O(U_in));
+#   - the SBM no-penetration / blockage is preserved through the march
+#     (INDEPENDENT physical face-loop check, surrogate_normal_flux);
+#   - divergence stays finite and bounded (the tight global 1e-2 target is a
+#     projection-convergence item for Tasks 6/9 -- see report);
+#   - drag points DOWNSTREAM: Cd = F_x / (0.5 U_in^2 (2R)) > 0;
+#   - BDF2 is engaged after the BDF1 bootstrap (base.order == 2 and we marched
+#     well past 1.5 dt).
+
+def test_leray_sbm_full_march_smoke(device):
+    dim = 2
+    dt = 0.02
+    # Fixture penalty (not the API default alpha=10): a coarse level-5 Re20
+    # cylinder marched 40 steps develops a transient whose weak-SBM predictor
+    # leaks unless the shifted-Nitsche penalty is stiff enough. alpha=1000 keeps
+    # the blockage O(1e-1) over the whole march (still an open convergence item
+    # -- see report/NEEDS_CONTEXT; the tight <U_in penetration wants more
+    # projection iterations, exposed via picard_iters for Tasks 6/9).
+    alpha = 1000.0
+    oracle, dm, sf, geo, strong_mask, u_inf, mesh, cons = _build_re20(device)
+
+    def f_fn(x, t):
+        return np.zeros((len(x), dim))
+
+    st = LeraySBMStepper(oracle, dm, NU, dt, f_fn,
+                         u_inf=u_inf, strong_mask=strong_mask,
+                         lam=0.5, domain="outside", order=2, picard_iters=2,
+                         solver="splu", ppe_finescale=False, alpha=alpha,
+                         beta_backflow=1.0)
+    st.set_initial(lambda c: np.zeros((len(c), dim)))
+    assert st.sf.elem.size > 0, "empty surrogate face set"
+
+    nsteps = 40
+    for _ in range(nsteps):
+        u_new, p_hat = st.step()
+    # BDF2 must be the configured target order, and we marched past the
+    # BDF1->BDF2 bootstrap gate (t >= 1.5 dt) many times over.
+    assert st.base.order == 2, "base target order not BDF2"
+    assert st.t > 1.5 * dt, "did not march past the BDF2 bootstrap gate"
+
+    # (1) finite + physical: no NaN/Inf, velocity magnitude is O(U_in) (the
+    # exterior flow around a Re20 cylinder does not blow up).
+    assert np.all(np.isfinite(u_new)), "velocity field not finite"
+    assert np.all(np.isfinite(p_hat)), "pressure field not finite"
+    umax = float(np.abs(u_new).max())
+    assert umax < 10.0 * U_IN, f"velocity unphysically large: {umax}"
+
+    # (2) blockage preserved through the march (independent physical check):
+    # the corrected normal velocity at the surrogate stays a modest fraction of
+    # U_in over the whole 40-step transient (no through-body leak).
+    mean_un, net, area = st.surrogate_normal_flux()
+    blockage = abs(mean_un) / U_IN
+    assert blockage < 1.5e-1, f"blockage not preserved through march: {blockage:.4f}"
+
+    # (3) divergence finite and bounded (projection-convergence trend is
+    # reported for Tasks 6/9; here we only require it does not blow up).
+    div = st.divergence_l2()
+    assert np.isfinite(div) and div < 20.0, f"divergence unbounded: {div}"
+
+    # (4) drag points downstream: Cd > 0 (surrogate_traction orientation
+    # contract: F_x is the streamwise force of the fluid on the body).
+    F = st.surrogate_traction()
+    Cd = F[0] / (0.5 * U_IN ** 2 * 2.0 * R)
+    assert np.all(np.isfinite(F)), "surrogate traction not finite"
+    assert Cd > 0.0, f"drag not downstream: Cd = {Cd:.4f}"
+
+
+def test_leray_sbm_divergence_vs_picard(device):
+    """Divergence-vs-picard_iters trend on the composed exterior projection --
+    the data Tasks 6/9 need to decide whether driving the predictor<->PPE
+    coupling harder reduces the immersed-projection divergence (an open
+    convergence item; div ~ O(few) on this fixture, penalty-independent).
+
+    The stepper EXPOSES picard_iters as the projection-convergence control;
+    this test records the trend and asserts only that the march stays finite
+    for every setting (it is a diagnostic, not a tight gate). If more Picard
+    reduces div, Tasks 6/9 can gate on it; if not, they need a separate
+    divergence-cleanup sub-solve.
+    """
+    dim = 2
+    dt = 0.02
+    oracle, dm, sf, geo, strong_mask, u_inf, mesh, cons = _build_re20(device)
+
+    def f_fn(x, t):
+        return np.zeros((len(x), dim))
+
+    trend = {}
+    for pit in (1, 2, 4):
+        st = LeraySBMStepper(oracle, dm, NU, dt, f_fn,
+                             u_inf=u_inf, strong_mask=strong_mask,
+                             lam=0.5, domain="outside", order=2,
+                             picard_iters=pit, solver="splu",
+                             ppe_finescale=False, alpha=1000.0)
+        st.set_initial(lambda c: np.zeros((len(c), dim)))
+        for _ in range(15):
+            st.step()
+        div = st.divergence_l2()
+        blk = abs(st.surrogate_normal_flux()[0]) / U_IN
+        assert np.isfinite(div), f"div not finite at picard_iters={pit}"
+        trend[pit] = (round(div, 4), round(blk, 4))
+    print("\n[div,blockage vs picard_iters]", trend)
+    # every setting stays finite and bounded (physical-check hygiene). Whether
+    # more Picard reduces the immersed-projection divergence is the open
+    # convergence question this trend feeds to Tasks 6/9.
+    assert all(np.isfinite(d) and d < 50.0 for d, _ in trend.values()), (
+        f"divergence unbounded for some picard_iters: {trend}")

@@ -1,4 +1,4 @@
-"""Volumetric-SBM composed Leray projection stepper (P2-R0, Task 2).
+"""Volumetric-SBM composed Leray projection stepper (P2-R0, Tasks 2-4).
 
 `LeraySBMStepper` COMPOSES `LerayProjectionStepper` (the audited VMS-Helmholtz-
 Leray projection stepper) with an immersed-geometry oracle — it does NOT fork
@@ -9,9 +9,27 @@ the geometry-only shifted-Nitsche vector Dirichlet face block ONCE
 predictor sub-solve via the `extra_block`/`sbm_nodes` hook added to
 `leray.py::LerayProjectionStepper._predict`.
 
-R0 scope (Task 2): the SBM block is wired into the PREDICTOR only. The
-surrogate-consistent PPE + correction boundary (no-penetration preservation)
-land in Task 3; the finalized end-to-end driver ergonomics land in Task 4.
+END-TO-END DRIVER (Task 4): a caller supplies ONLY an immersed-geometry oracle
++ box boundary data (`u_inf`, `strong_mask`) and gets a full BDF2
+projection+SBM march with the base stepper's ergonomics — `set_initial`,
+`step() -> (u_new, p_hat)`, `divergence_l2()` — plus the `surrogate_traction`
+observable. The BDF1->BDF2 bootstrap is handled by the base `History`
+(`bdf_order_now` gates BDF1 until `t >= 1.5 dt` and 2 history slots exist).
+Backflow (inflow) stabilization on the surrogate faces is wired PER STEP: the
+advecting field `a_face` is the current velocity `u^n` sampled at the
+surrogate-face GPs, and its `-beta (a.n)_- N N` contribution is added to the
+cached geometry block (which stays untouched — the Task-2 caching invariant).
+
+Pipeline per step: predictor (SBM Dirichlet + backflow, box strong) -> PPE with
+surrogate-consistent homogeneous-Neumann BC (Task 3) -> L2 correction leaving
+the SBM trace to the projection (`sbm_nodes` skip the box overwrite) -> BDF
+history rotate.
+
+CONVERGENCE CONTROL: `picard_iters` is threaded to the base predictor and is
+the exposed knob for driving the predictor<->PPE coupling (Tasks 6/9 use it to
+probe whether more Picard reduces the immersed-projection divergence — an open
+convergence item; on the coarse Re20 fixture div stays O(10), not the tight
+body-fitted target).
 
 The immersed body is enforced WEAKLY (SBM, on the surrogate faces); the box
 inflow/walls are enforced STRONGLY from the driver-supplied `strong_mask` +
@@ -76,12 +94,16 @@ class LeraySBMStepper:
         T = dm.constraints.T.tocsr()
         self._T_vec = sp.kron(T, sp.identity(self.ndof, format="csr"),
                               format="csr")
-        g_body = lambda y: np.zeros((len(y), self.dim))  # no-slip
+        self._g_body = lambda y: np.zeros((len(y), self.dim))  # no-slip
         Af, bf = sbm_vector_dirichlet(
-            dm, self.sf, self.geo, g_body, nu, self.ndof, alpha=alpha,
+            dm, self.sf, self.geo, self._g_body, nu, self.ndof, alpha=alpha,
             a_face=None, beta_backflow=beta_backflow)
         self.Af_c = (self._T_vec.T @ Af @ self._T_vec).tocsr()
         self.bf_c = np.asarray(self._T_vec.T @ bf)
+
+        # --- surrogate-face GP evaluation cache (for the per-step backflow
+        # advecting field a_face on sf; matches the geo.n GP layout (fi, q)) ---
+        self._bf_setup()
 
         # --- SBM-governed free nodes: surrogate-face nodes that must NOT get
         # the strong box-row overwrite (weak body). Computed from the face
@@ -106,6 +128,70 @@ class LeraySBMStepper:
         fn = free_of[glob]
         return fn[fn >= 0]
 
+    # ---- per-step backflow (inflow-stabilization) advecting field ----
+    def _bf_setup(self):
+        """Cache the surrogate-face GP tables so the per-step backflow
+        advecting field ``a_face`` (the CURRENT velocity sampled at the
+        surrogate-face GPs, ordered ``(fi, q)`` to match ``geo.n``) can be
+        rebuilt cheaply each step. Backflow adds ``-beta (a.n)_- N N`` on the
+        surrogate faces (inflow through an outflow face is penalized), which
+        suppresses spurious inflow through the immersed body during the
+        transient — the same production ``inflow_g < 0`` branch that
+        ``sbm_vector_dirichlet`` assembles from ``a_face``."""
+        dm = self.dm
+        mesh = dm.mesh
+        sf = self.sf
+        self._bf_pv = int(np.unique(np.asarray(mesh.p_elem)[sf.elem])[0])
+        self._bf_ftab = face_tables(self._bf_pv, self.dim)
+        self._bf_conn = mesh.conn_of[self._bf_pv][
+            np.searchsorted(mesh.bins[self._bf_pv], sf.elem)]     # [Nf, nbf]
+
+    def _a_face(self, u_free):
+        """Advecting field at the surrogate-face GPs from a free-node velocity
+        ``u_free`` [n_free, dim], flattened ``(fi, q)`` -> [ne_f*nqf, dim]."""
+        dm = self.dm
+        u_full = np.asarray(dm.constraints.T @ u_free)            # [n_nodes, dim]
+        ftab = self._bf_ftab
+        nqf = ftab.nqf
+        conn = self._bf_conn
+        sf = self.sf
+        af = np.empty((len(sf.elem) * nqf, self.dim))
+        for fi in range(len(sf.elem)):
+            f = int(sf.face[fi])
+            un = u_full[conn[fi]]                                 # [nbf, dim]
+            for q in range(nqf):
+                af[fi * nqf + q] = ftab.N[f][q] @ un
+        return af
+
+    def _backflow_block(self, u_free):
+        """Constrained free-node-major backflow matrix addition assembled from
+        the current advecting field on the surrogate faces. Zero advecting
+        field -> zero block (so BDF1 step-0 from rest adds nothing). The
+        geometry-only base block ``Af_c`` stays cached and untouched (Task-2
+        caching invariant); this is the velocity-dependent increment added to
+        it per step."""
+        if self.beta_backflow == 0.0:
+            return None
+        a_face = self._a_face(u_free)
+        if not np.any(a_face):
+            return None
+        # Reuse sbm_vector_dirichlet's backflow assembly by differencing the
+        # a_face block against the geometry-only block (both share the same
+        # consistency/penalty terms; the difference is exactly the backflow Ab).
+        Af_bf, _ = sbm_vector_dirichlet(
+            self.dm, self.sf, self.geo, self._g_body, self.nu, self.ndof,
+            alpha=self.alpha, a_face=a_face, beta_backflow=self.beta_backflow)
+        Ab = (self._T_vec.T @ Af_bf @ self._T_vec).tocsr() - self.Af_c
+        return Ab
+
+    def _extra_block(self, u_free):
+        """Predictor SBM extra-block = cached geometry block + per-step
+        backflow increment."""
+        Ab = self._backflow_block(u_free)
+        if Ab is None:
+            return (self.Af_c, self.bf_c)
+        return ((self.Af_c + Ab).tocsr(), self.bf_c)
+
     # ---- public ergonomics (delegate to the base) ----
     def set_initial(self, u0_fn):
         self.base.set_initial(u0_fn)
@@ -117,11 +203,19 @@ class LeraySBMStepper:
     def t(self):
         return self.base.t
 
+    def _current_a_free(self):
+        """Free-node velocity that drives the per-step backflow advecting
+        field: the current state ``u^n`` (``hist.pre1``), or zeros before
+        ``set_initial`` (step 0 from rest -> no backflow)."""
+        if self.base.hist.pre1 is None:
+            return np.zeros((self.n_free, self.dim))
+        return self.base._uvec(self.base.hist.pre1)
+
     # ---- predictor hook (Task 2): SBM block into the momentum sub-solve ----
     def _predict(self, return_matrix=False):
         return self.base._predict(
-            extra_block=(self.Af_c, self.bf_c), sbm_nodes=self._sbm_nodes,
-            return_matrix=return_matrix)
+            extra_block=self._extra_block(self._current_a_free()),
+            sbm_nodes=self._sbm_nodes, return_matrix=return_matrix)
 
     def step(self, surrogate_consistent=True):
         """One projection step with the surrogate-consistent PPE + correction
@@ -144,9 +238,9 @@ class LeraySBMStepper:
         homogeneous-Neumann BC is load-bearing, not decorative.
         """
         flux = None if surrogate_consistent else self._ppe_break_flux
-        return self.base.step(extra_block=(self.Af_c, self.bf_c),
-                              sbm_nodes=self._sbm_nodes,
-                              ppe_surrogate_flux=flux)
+        return self.base.step(
+            extra_block=self._extra_block(self._current_a_free()),
+            sbm_nodes=self._sbm_nodes, ppe_surrogate_flux=flux)
 
     # ---- surrogate-face PPE flux (planted-break only) ----
     def _ppe_break_flux(self, uhat):
