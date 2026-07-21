@@ -307,6 +307,15 @@ class _Recorder:
              "phi_max": round(float(self.pmax), 6),
              "wall_s": round(wall, 1),
              "onset": self.onset, "onset_vertical": self.onset_v}
+        # Task #43 (§8j / G4): surface the fp32-factor+IR refinement counts
+        # when the mixed-precision cuDSS path ran (present only for
+        # val_dtype='fp32' + linsolver='cudss'); the per-solve sweep count
+        # is the transferable datum the GH200 G4 measurement reports.
+        ir_counts = getattr(st, "_ir_counts", None)
+        if ir_counts:
+            s["ir_refinements"] = list(ir_counts)
+            s["ir_refine_max"] = max(ir_counts)
+            s["ir_refine_mean"] = round(sum(ir_counts) / len(ir_counts), 2)
         if self.p.dim == 2 and self.nacc:
             s["L_c"] = round(analysis.characteristic_length(
                 self.grid(p2), self.p.Lx, st.h_curr), 6)
