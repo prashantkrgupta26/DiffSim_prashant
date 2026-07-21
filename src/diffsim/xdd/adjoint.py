@@ -13,10 +13,53 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
+import scipy.sparse as sp
+
 from diffsim.physics.exciton_system import (
     NDOF, IPHI, IN, IP, IXD, IXA,
     _mass_block, _load_block, _carrier_block, _exciton_block, _poisson_block,
-    _gp_value)
+    _gp_value, _tau_gp)
+
+
+def _hist_load_matrix(dm, aq_gp, mu_gp, sig2tau, supg):
+    """Nodal→nodal history-LOAD operator ``Hload`` such that
+
+        Hload @ v  ==  _load_block(aq_gp, mu_gp, _gp_value(dm, v), sig2tau, supg)
+
+    for any full nodal vector ``v``.  Mirrors ``make_xdd_carrier_be`` VERBATIM
+    (Galerkin ``N_a`` term + SUPG ``τ_M·U·∇N_a`` term, ``U = −aq`` the drift
+    velocity) with the GP source expanded through the nodal→GP interpolation
+    ``fq = Σ_b N_b v_b``, so the operator is EXACT — not a mass approximation.
+    The Mode-B history cotangent coupling contracts with ``Hloadᵀ``.
+    """
+    h_all = dm.mesh.tree.h()
+    rows, cols, vals = [], [], []
+    for pv, b in dm.bins.items():
+        conn = dm.mesh.conn_of[pv].astype(np.int64)
+        ne, nbf = conn.shape
+        nqp = b["nqp"]
+        N = dm.tables_by_p[pv].N                 # [nqp, nbf]
+        dN = dm.tables_by_p[pv].dN               # [nqp, nbf, dim]
+        w = dm.tables_by_p[pv].w                 # [nqp]
+        eids = dm.mesh.bins[pv]
+        he = h_all[eids]                         # [ne]
+        jac = (0.5 * he) ** dm.dim               # [ne]
+        dscale = 2.0 / he                        # [ne]
+        dJxW = w[None, :] * jac[:, None]         # [ne, nqp]
+        a = aq_gp[pv].reshape(ne, nqp, dm.dim)   # drift weight at GPs
+        tau = _tau_gp(dm, aq_gp, mu_gp, sig2tau, supg)[pv].reshape(ne, nqp)
+        # U·∇N_a = −(aq·∇N_a)·dscale       [ne, nqp, nbf]
+        Ugw = -np.einsum("eqd,qad->eqa", a, dN) * dscale[:, None, None]
+        # test function  Φ_a = N_a + τ_M·Ugw_a   [ne, nqp, nbf]
+        Phi = N[None, :, :] + tau[:, :, None] * Ugw
+        # Ae[e,a,b] = Σ_q Φ[e,q,a]·N[q,b]·dJxW[e,q]
+        Ae = np.einsum("eqa,qb,eq->eab", Phi, N, dJxW)
+        rows.append(np.repeat(conn, nbf, axis=1).ravel())
+        cols.append(np.tile(conn, (1, nbf)).ravel())
+        vals.append(Ae.ravel())
+    return sp.coo_matrix(
+        (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+        shape=(dm.n_nodes, dm.n_nodes)).tocsr()
 
 
 def _reduce_full(sysm, R_full):
@@ -434,6 +477,190 @@ class XDDSteadyAdjoint:
                 rows[k, off:off + c.size] = -(dr @ lam)
                 off += c.size
         return rows
+
+
+class XDDTransientAdjoint:
+    """Mode B — taped transient (frozen-dt) adjoint over a checkpointed march.
+
+    Re-targets the ``sbm/transient_adjoint.py::TransientAdjoint`` record-then-
+    reverse pattern to the XDD 5-field stepper.  For a trajectory functional
+    ``J = Σ_n j(u_n)`` over the ``march_with_checkpoints`` tape, the reverse
+    sweep solves per step
+
+        Aₙᵀ λₙ = (∂J/∂uₙ)  +  pendingₙ
+
+    with ``Aₙ = ∂Rₙ/∂u`` REBUILT at the recorded state under the recorded σ /
+    history / generation (dt FROZEN — the backward pass never re-adapts), then
+    couples each λₙ back to the BDF history steps via
+
+        pending[n−k][f] += (bdf_coeff/dtₙ) · (T.T @ Hload_fᵀ @ (T @ λₙ_f))
+
+    on the TIME-STEPPED fields ``{IN, IP, IXD, IXA}`` only (φ̂ has no time term —
+    ``step_bdf`` zeros ``hist_full[IPHI]``).  ``Hload_f`` is the exact history-
+    load operator (SUPG-consistent for carriers).  BDF1: coeff ``1/dt`` on
+    ``uⁿ``.  BDF2 (``hist=(2uⁿ−0.5uⁿ⁻¹)/dt``): coeffs ``2/dt`` on ``uⁿ`` and
+    ``−0.5/dt`` on ``uⁿ⁻¹`` (read directly off ``step_bdf``).  Per-step control
+    VJPs accumulate ``−λₙᵀ ∂Rₙ/∂p`` into each control's gradient.
+
+    PHYSICAL-``u`` PARAMETRISATION.  Like Mode A, the recorded ``Aₙ`` is the
+    log-increment Newton Jacobian for the carrier rows; the seeds and control
+    ``∂R/∂p`` are physical, so we UNDO the carrier log-scaling and re-impose the
+    Dirichlet identity rows to obtain ``A_phys = ∂R/∂u_physical``.  The Dirichlet
+    strong rows are BC identities (u-independent, not physics residuals): λ is
+    zeroed there before the history coupling, and the controls' ∂R/∂p Dirichlet
+    columns are dropped (both the Mode-A conventions).
+    """
+
+    _TFIELDS = (IN, IP, IXD, IXA)
+
+    def __init__(self, sysm, controls, steps):
+        self.sysm = sysm
+        self.controls = list(controls)
+        self.steps = steps
+        self._dir_rows = None
+
+    # -- flat reduced indices of the Dirichlet (strong identity) rows --------
+    def _dirichlet_rows(self):
+        if self._dir_rows is not None:
+            return self._dir_rows
+        sysm = self.sysm
+        nf = sysm.n_free
+        node_to_free = -np.ones(sysm.dm.n_nodes, np.int64)
+        node_to_free[sysm.free] = np.arange(nf)
+        rows = []
+        for field, (nodes, _vals) in sysm.dirichlet.items():
+            for nid in nodes:
+                fi = node_to_free[nid]
+                if fi >= 0:
+                    rows.append(field * nf + fi)
+        self._dir_rows = np.asarray(rows, np.int64)
+        return self._dir_rows
+
+    # -- re-establish the recorded transient σ / history / generation --------
+    def _restore_step(self, rec):
+        """Pin sysm to the recorded step's frozen σ / BDF history / generation.
+
+        The history is rebuilt from the recorded prev/prev2 at the recorded dt
+        and BDF order — exactly ``step_bdf``'s construction, frozen (the driver
+        never calls ``_dt_schedule`` on the backward pass)."""
+        s = self.sysm
+        dt = rec["dt_hat"]
+        s.sigma = rec["sigma"]
+        if rec["order"] == 1 or rec["prev2"] is None:
+            hist_full = {f: (1.0 / dt) * rec["prev"][f] for f in range(NDOF)}
+        else:
+            hist_full = {f: (2.0 * rec["prev"][f] - 0.5 * rec["prev2"][f]) / dt
+                         for f in range(NDOF)}
+        hist_full[IPHI] = np.zeros(s.dm.n_nodes)
+        s.hist = {f: _gp_value(s.dm, hist_full[f]) for f in range(NDOF)}
+        s.set_generation(rec["gd"], rec["ga"])
+        s._current_state = rec["state"]
+
+    # -- physical-u Jacobian at the recorded (transient) step ----------------
+    def _physical_jacobian(self, rec):
+        sysm = self.sysm
+        self._restore_step(rec)
+        state = rec["state"]
+        A, _ = sysm.assemble_newton_system(state)
+        A = A.tocsr()
+        if not getattr(sysm, "_log_carriers", False):
+            return A
+        nf = sysm.n_free
+        free = sysm.free
+        inv = np.ones(NDOF * nf)
+        for field in (IN, IP):
+            cur = np.asarray(state[field])[free]
+            inv[field * nf:(field + 1) * nf] = 1.0 / cur
+        A = (A @ sp.diags(inv)).tolil()
+        node_to_free = -np.ones(sysm.dm.n_nodes, np.int64)
+        node_to_free[free] = np.arange(nf)
+        for field, (nodes, vals) in sysm.dirichlet.items():
+            for nid in nodes:
+                fi = node_to_free[nid]
+                if fi < 0:
+                    continue
+                row = field * nf + fi
+                A.rows[row] = [row]
+                A.data[row] = [1.0]
+        return A.tocsr()
+
+    def _solve_T(self, A, rhs):
+        from scipy.sparse.linalg import splu
+        return splu(A.T.tocsc()).solve(np.asarray(rhs, np.float64))
+
+    # -- history-load operators for the recorded step's time-stepped fields --
+    def _hist_load_ops(self, rec):
+        """Per-field exact history-load matrix Hload_f at the recorded state /
+        frozen σ.  Carriers carry the SUPG-consistent drift/τ_M (sig2tau=(2σ)²);
+        excitons are pure mass-weighted (z_aq, supg=0)."""
+        s = self.sysm
+        dm = s.dm
+        cl = s._closures(rec["state"])
+        s2t = (2.0 * s.sigma) ** 2
+        aq_n = s._aq(cl["gradphi"], s.mu_n_gp, -1.0)
+        aq_p = s._aq(cl["gradphi"], s.mu_p_gp, +1.0)
+        z_aq = {pv: np.zeros((len(s.dist_gp[pv]), dm.dim)) for pv in dm.bins}
+        return {
+            IN:  _hist_load_matrix(dm, aq_n, s.mu_n_gp, s2t, s.supg),
+            IP:  _hist_load_matrix(dm, aq_p, s.mu_p_gp, s2t, s.supg),
+            IXD: _hist_load_matrix(dm, z_aq, s.mu_xd_gp, 0.0, 0.0),
+            IXA: _hist_load_matrix(dm, z_aq, s.mu_xa_gp, 0.0, 0.0),
+        }
+
+    def _dRdp_eliminated(self, control, state):
+        rows = np.array(control.sensitivity_rows(self.sysm, state), float)
+        rows[:, self._dirichlet_rows()] = 0.0
+        return rows
+
+    def gradient(self, dJdx_list, qoi=None) -> dict:
+        s = self.sysm
+        nf = s.n_free
+        T = s.T
+        N = len(self.steps)
+        grads = {c.name: np.zeros(c.size) for c in self.controls}
+        pending = [np.zeros(NDOF * nf) for _ in range(N)]
+        dir_rows = self._dirichlet_rows()
+        for n in range(N - 1, -1, -1):
+            rec = self.steps[n]
+            A = self._physical_jacobian(rec)          # restores σ/hist/gen too
+            rhs = np.asarray(dJdx_list[n], np.float64) + pending[n]
+            lam = self._solve_T(A, rhs)
+            # strong Dirichlet rows are BC identities, not physics residuals:
+            # their cotangent does not propagate into ∂R/∂p or the history.
+            lam[dir_rows] = 0.0
+            # per-step control VJP: −λᵀ ∂Rₙ/∂p
+            for c in self.controls:
+                grads[c.name] -= self._dRdp_eliminated(c, rec["state"]) @ lam
+            # BDF history cotangent to earlier steps (frozen dt / order)
+            dt = rec["dt_hat"]
+            if rec["order"] == 1 or rec["prev2"] is None:
+                coeffs = [(1, 1.0 / dt)]
+            else:
+                coeffs = [(1, 2.0 / dt), (2, -0.5 / dt)]
+            if any(n - k >= 0 for k, _ in coeffs):
+                Hops = self._hist_load_ops(rec)
+                for k, ck in coeffs:
+                    if n - k < 0:
+                        continue
+                    for f in self._TFIELDS:
+                        lam_f = lam[f * nf:(f + 1) * nf]
+                        # (bdf_coeff)·Tᵀ Hload_fᵀ T λ_f  (physical-u space)
+                        contrib = ck * (T.T @ (Hops[f].T @ (T @ lam_f)))
+                        pending[n - k][f * nf:(f + 1) * nf] += np.asarray(contrib)
+        return grads
+
+    def sensitivity_rows(self, obs_seed_list) -> np.ndarray:
+        """Requirement-2 transient rows: reuse ``gradient`` per observable seed
+        list, stacking ∂o/∂p across controls (columns ordered by controls)."""
+        cols = sum(c.size for c in self.controls)
+        out = np.zeros((len(obs_seed_list), cols))
+        for i, seeds in enumerate(obs_seed_list):
+            g = self.gradient(seeds)
+            off = 0
+            for c in self.controls:
+                out[i, off:off + c.size] = g[c.name]
+                off += c.size
+        return out
 
 
 class IlluminationControl:

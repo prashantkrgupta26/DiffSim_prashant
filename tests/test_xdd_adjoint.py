@@ -215,3 +215,127 @@ def test_task2_vector_illumination_residual_derivative_matches_fd(device):
         rel = np.abs(rows[j] - fd).max() / scale
         print(f"IlluminationControl[band {j}] dR/dp adj/fd rel = {rel:.2e}")
         assert rel < 1e-6, (j, rows[j], fd)
+
+
+# ── Task 5: Mode-B taped frozen-dt transient adjoint ───────────────────────────
+
+def test_g3_checkpoint_equivalence(device):
+    """G3a: the checkpointing march reproduces the plain march trajectory
+    (converged state per step is bit-identical) — the record adds no drift."""
+    from diffsim.xdd.run import march_with_checkpoints, _march_to_steady
+    sysm, state = build_small_lit_system(device)
+    # Plain march: fixed step count (time_stepping_tol=0 disables early stop).
+    fs_plain, info = _march_to_steady(sysm, state, dt0_hat=1e-4, dt_max_hat=1e-2,
+                                      max_steps=12, time_stepping_tol=0.0)
+    sysm2, state2 = build_small_lit_system(device)
+    fs_ckpt, steps = march_with_checkpoints(sysm2, state2, dt0_hat=1e-4,
+                                            dt_max_hat=1e-2, max_steps=12, order=1)
+    from diffsim.physics.exciton_system import NDOF
+    for f in range(NDOF):
+        assert np.allclose(fs_plain[f], fs_ckpt[f], atol=1e-12, rtol=0), f
+    # frozen-dt tape sanity: recorded dt's are the FORWARD-adapted values and the
+    # sigma per step is exactly 1/dt_hat (BDF1) — the reverse sweep freezes these.
+    for s in steps:
+        assert abs(s["sigma"] - 1.0 / s["dt_hat"]) < 1e-14, s["dt_hat"]
+
+
+def _traj_J(all_steps):
+    from diffsim.physics.exciton_system import IXD
+    return 0.5 * sum(float(s["state"][IXD] @ s["state"][IXD]) for s in all_steps)
+
+
+def _traj_dJdx(sysm, steps):
+    from diffsim.physics.exciton_system import IXD, NDOF
+    dJdx = []
+    for s in steps:
+        seed = {f: np.zeros(sysm.dm.n_nodes) for f in range(NDOF)}
+        seed[IXD] = s["state"][IXD]
+        dJdx.append(np.concatenate([np.asarray(sysm.T.T @ seed[f])
+                                    for f in range(NDOF)]))
+    return dJdx
+
+
+def test_task5_transient_gradient_lifetime_vs_fd(device):
+    """G3b: frozen-dt reverse sweep reproduces the tape gradient (independent FD
+    leg re-runs the FULL forward march per perturbation)."""
+    from diffsim.xdd.run import march_with_checkpoints
+    from diffsim.xdd.adjoint import XDDTransientAdjoint, MaterialControl
+    sysm, state = build_small_lit_system(device)
+    ctrl = MaterialControl(sysm, param="tau_inv_d")
+    N = 6
+    fs, steps = march_with_checkpoints(sysm, state, dt0_hat=1e-4,
+                                       dt_max_hat=1e-2, max_steps=N, order=1)
+    # frozen-dt: the reverse sweep uses the RECORDED per-step dt (σ=1/dt) and
+    # never re-adapts.  (A longer march genuinely adapts dt off the log
+    # schedule — see test_task5_frozen_dt_adaptation; here the tape's σ/dt tie
+    # is the contract the reverse freezes.)
+    for s in steps:
+        assert abs(s["sigma"] - 1.0 / s["dt_hat"]) < 1e-14
+    dJdx = _traj_dJdx(sysm, steps)
+    adj = XDDTransientAdjoint(sysm, [ctrl], steps)
+    g = adj.gradient(dJdx)["tau_inv_d"][0]
+    p0 = ctrl.get()[0]; eps = 1e-6 * max(1.0, abs(p0))
+
+    def J_of(v):
+        ctrl.set(np.array([v]))
+        _, st2 = march_with_checkpoints(sysm, state, dt0_hat=1e-4,
+                                        dt_max_hat=1e-2, max_steps=N, order=1)
+        val = _traj_J(st2); ctrl.set(np.array([p0])); return val
+    fd = (J_of(p0 + eps) - J_of(p0 - eps)) / (2 * eps)
+    rel = abs(g - fd) / max(abs(fd), 1e-12)
+    print(f"Mode-B transient dJ/dtau adj={g:.6e} fd={fd:.6e} rel={rel:.2e}")
+    assert rel < 5e-5, (g, fd)
+
+
+def test_task5_transient_gradient_mutation_fails(device):
+    """GATE HYGIENE: a planted (×1.5) error in the transient adjoint gradient must
+    make the FD gate FAIL — proves the check is non-vacuous."""
+    from diffsim.xdd.run import march_with_checkpoints
+    from diffsim.xdd.adjoint import XDDTransientAdjoint, MaterialControl
+    sysm, state = build_small_lit_system(device)
+    ctrl = MaterialControl(sysm, param="tau_inv_d")
+    N = 6
+    fs, steps = march_with_checkpoints(sysm, state, dt0_hat=1e-4,
+                                       dt_max_hat=1e-2, max_steps=N, order=1)
+    dJdx = _traj_dJdx(sysm, steps)
+    adj = XDDTransientAdjoint(sysm, [ctrl], steps)
+    g = adj.gradient(dJdx)["tau_inv_d"][0]
+    p0 = ctrl.get()[0]; eps = 1e-6 * max(1.0, abs(p0))
+
+    def J_of(v):
+        ctrl.set(np.array([v]))
+        _, st2 = march_with_checkpoints(sysm, state, dt0_hat=1e-4,
+                                        dt_max_hat=1e-2, max_steps=N, order=1)
+        val = _traj_J(st2); ctrl.set(np.array([p0])); return val
+    fd = (J_of(p0 + eps) - J_of(p0 - eps)) / (2 * eps)
+    rel_good = abs(g - fd) / max(abs(fd), 1e-12)
+    bad = 1.5 * g
+    rel_bad = abs(bad - fd) / max(abs(fd), 1e-12)
+    print(f"Mode-B mutation gate: good rel={rel_good:.2e} mutated(×1.5) rel={rel_bad:.2e}")
+    assert rel_good < 5e-5, rel_good
+    assert rel_bad > 5e-5, ("gate is vacuous — mutated gradient not rejected",
+                            rel_bad)
+
+
+def test_task5_frozen_dt_adaptation(device):
+    """Frozen-dt contract: the FORWARD march adapts dt off the log schedule, and
+    the recorded tape freezes those exact per-step dt's (σₙ = 1/dtₙ) — the
+    reverse sweep rebuilds Aₙ at the recorded dt and NEVER calls _dt_schedule."""
+    from diffsim.xdd.run import march_with_checkpoints, _dt_schedule
+    sysm, state = build_small_lit_system(device)
+    # dt0=1e-3, dt_max=1e-1: after t crosses 1e-2, 1e-1 the schedule grows dt.
+    fs, steps = march_with_checkpoints(sysm, state, dt0_hat=1e-3,
+                                       dt_max_hat=1e-1, max_steps=40, order=1)
+    dts = [s["dt_hat"] for s in steps]
+    assert max(dts) > min(dts) + 1e-30, ("forward march did not adapt dt", dts)
+    # every recorded step ties σ=1/dt (frozen BDF1 coefficient)
+    for s in steps:
+        assert abs(s["sigma"] - 1.0 / s["dt_hat"]) < 1e-14
+    # the recorded dt sequence equals the deterministic forward schedule replayed
+    # (proves the tape is the genuine adaptive-forward dt, not a re-derived one).
+    t = 0.0; dt = 1e-3
+    for s in steps:
+        assert abs(s["dt_hat"] - dt) < 1e-14, (s["dt_hat"], dt)
+        t += dt
+        dt = max(_dt_schedule(t, dt, 1e-3, 1e-1), dt)
+    print(f"frozen-dt: {len(steps)} steps, dt {min(dts):.1e}→{max(dts):.1e} (adapted)")
