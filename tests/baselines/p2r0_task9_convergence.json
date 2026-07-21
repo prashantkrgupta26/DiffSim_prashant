@@ -1,0 +1,377 @@
+{
+  "re20_cd_confined": {
+    "reference": {
+      "m1b_monolithic": 2.847,
+      "unbounded_classical": 2.0,
+      "note": "14% blockage, no-slip walls"
+    },
+    "levels": {
+      "5": {
+        "level": 5,
+        "h": 0.03125,
+        "n_free": 1081,
+        "n_surrogate_faces": 18,
+        "best": {
+          "alpha": 75.0,
+          "cd": 2.1052501606755487,
+          "cl": 2.379049338482478e-15,
+          "steps": 53,
+          "blockage": 0.2720968431170739,
+          "converged": true,
+          "physical": true,
+          "wall_s": 2.8,
+          "plateau_median_cd": 2.2770824273445065,
+          "plateau_cd_spread": 1.842412269114168,
+          "n_physical_alphas": 6
+        },
+        "alpha_probe": [
+          {
+            "alpha": 40.0,
+            "cd": 1.3170449194191465,
+            "cl": -1.586032892321652e-15,
+            "steps": 34,
+            "blockage": 0.2899649379586951,
+            "converged": true,
+            "physical": true,
+            "wall_s": 2.7
+          },
+          {
+            "alpha": 60.0,
+            "cd": 1.764801434600241,
+            "cl": -8.029291517378364e-15,
+            "steps": 44,
+            "blockage": 0.27206704677869276,
+            "converged": true,
+            "physical": true,
+            "wall_s": 3.0
+          },
+          {
+            "alpha": 75.0,
+            "cd": 2.1052501606755487,
+            "cl": 2.379049338482478e-15,
+            "steps": 53,
+            "blockage": 0.2720968431170739,
+            "converged": true,
+            "physical": true,
+            "wall_s": 2.8
+          },
+          {
+            "alpha": 90.0,
+            "cd": 2.4489146940134643,
+            "cl": -5.9476233462061955e-15,
+            "steps": 62,
+            "blockage": 0.27325310115898144,
+            "converged": true,
+            "physical": true,
+            "wall_s": 3.5
+          },
+          {
+            "alpha": 100.0,
+            "cd": 2.6812937119630256,
+            "cl": -5.9476233462061955e-15,
+            "steps": 68,
+            "blockage": 0.2743383204281986,
+            "converged": true,
+            "physical": true,
+            "wall_s": 3.6
+          },
+          {
+            "alpha": 120.0,
+            "cd": 3.1594571885333145,
+            "cl": 2.9738116731030978e-15,
+            "steps": 82,
+            "blockage": 0.282872040368496,
+            "converged": true,
+            "physical": true,
+            "wall_s": 4.7
+          }
+        ]
+      },
+      "6": {
+        "level": 6,
+        "h": 0.015625,
+        "n_free": 4179,
+        "n_surrogate_faces": 34,
+        "best": {
+          "alpha": 60.0,
+          "cd": 2.987672312887126,
+          "cl": -1.3629970168389197e-14,
+          "steps": 181,
+          "blockage": 0.4816623597494631,
+          "converged": true,
+          "physical": true,
+          "wall_s": 57.9,
+          "plateau_median_cd": 2.796579876747276,
+          "plateau_cd_spread": 0.3821848722797001,
+          "n_physical_alphas": 2
+        },
+        "alpha_probe": [
+          {
+            "alpha": 40.0,
+            "cd": 2.6054874406074258,
+            "cl": 6.9388939039072276e-15,
+            "steps": 149,
+            "blockage": 0.5155925803351606,
+            "converged": true,
+            "physical": true,
+            "wall_s": 51.1
+          },
+          {
+            "alpha": 60.0,
+            "cd": 2.987672312887126,
+            "cl": -1.3629970168389197e-14,
+            "steps": 181,
+            "blockage": 0.4816623597494631,
+            "converged": true,
+            "physical": true,
+            "wall_s": 57.9
+          },
+          {
+            "alpha": 75.0,
+            "converged": false,
+            "physical": false,
+            "error": "no convergence in 200 steps; last Cd=3.2697",
+            "wall_s": 67.0
+          },
+          {
+            "alpha": 90.0,
+            "converged": false,
+            "physical": false,
+            "error": "no convergence in 200 steps; last Cd=3.4838",
+            "wall_s": 67.1
+          },
+          {
+            "alpha": 100.0,
+            "converged": false,
+            "physical": false,
+            "error": "no convergence in 200 steps; last Cd=3.5916",
+            "wall_s": 70.7
+          },
+          {
+            "alpha": 120.0,
+            "converged": false,
+            "physical": false,
+            "error": "no convergence in 200 steps; last Cd=3.7506",
+            "wall_s": 68.2
+          }
+        ]
+      },
+      "7": {
+        "level": 7,
+        "h": 0.0078125,
+        "n_free": 16424,
+        "n_surrogate_faces": 72,
+        "best": {
+          "alpha": 60.0,
+          "cd": 0.6728976039542023,
+          "cl": -6.492822152941763e-15,
+          "steps": 87,
+          "blockage": 0.0677009762435454,
+          "converged": true,
+          "physical": true,
+          "wall_s": 171.7,
+          "plateau_median_cd": 0.7165806071546897,
+          "plateau_cd_spread": 0.2941404075867352,
+          "n_physical_alphas": 4
+        },
+        "alpha_probe": [
+          {
+            "alpha": 40.0,
+            "cd": 0.5542468709237867,
+            "cl": -7.632783294297951e-15,
+            "steps": 68,
+            "blockage": 0.0701406367612066,
+            "converged": true,
+            "physical": true,
+            "wall_s": 136.2
+          },
+          {
+            "alpha": 60.0,
+            "cd": 0.6728976039542023,
+            "cl": -6.492822152941763e-15,
+            "steps": 87,
+            "blockage": 0.0677009762435454,
+            "converged": true,
+            "physical": true,
+            "wall_s": 171.7
+          },
+          {
+            "alpha": 75.0,
+            "cd": 0.7602636103551772,
+            "cl": 8.029291517378364e-15,
+            "steps": 101,
+            "blockage": 0.06742889792776945,
+            "converged": true,
+            "physical": true,
+            "wall_s": 203.3
+          },
+          {
+            "alpha": 90.0,
+            "cd": 0.8483872785105219,
+            "cl": -1.4274296030894868e-14,
+            "steps": 114,
+            "blockage": 0.06728513741785713,
+            "converged": true,
+            "physical": true,
+            "wall_s": 229.8
+          }
+        ],
+        "note": "tight tol rate_tol=5e-3 max_steps=500"
+      },
+      "7_looseTol_ratetol1e-2": {
+        "level": 7,
+        "h": 0.0078125,
+        "n_free": 16424,
+        "n_surrogate_faces": 72,
+        "best": {
+          "alpha": 75.0,
+          "cd": 0.7594469912771099,
+          "cl": -1.586032892321652e-14,
+          "steps": 98,
+          "blockage": 0.06595490660430865,
+          "converged": true,
+          "physical": true,
+          "wall_s": 195.8,
+          "plateau_median_cd": 0.8034580968480429,
+          "plateau_cd_spread": 0.4741148775981374,
+          "n_physical_alphas": 6
+        },
+        "alpha_probe": [
+          {
+            "alpha": 40.0,
+            "cd": 0.5537012792847784,
+            "cl": -6.9388939039072276e-15,
+            "steps": 66,
+            "blockage": 0.06853347181202124,
+            "converged": true,
+            "physical": true,
+            "wall_s": 131.7
+          },
+          {
+            "alpha": 60.0,
+            "cd": 0.6723583409353805,
+            "cl": -7.137148015447434e-15,
+            "steps": 85,
+            "blockage": 0.06653287707594809,
+            "converged": true,
+            "physical": true,
+            "wall_s": 169.9
+          },
+          {
+            "alpha": 75.0,
+            "cd": 0.7594469912771099,
+            "cl": -1.586032892321652e-14,
+            "steps": 98,
+            "blockage": 0.06595490660430865,
+            "converged": true,
+            "physical": true,
+            "wall_s": 195.8
+          },
+          {
+            "alpha": 90.0,
+            "cd": 0.847469202418976,
+            "cl": -1.2985644305883527e-14,
+            "steps": 111,
+            "blockage": 0.06600400333607948,
+            "converged": true,
+            "physical": true,
+            "wall_s": 224.6
+          },
+          {
+            "alpha": 100.0,
+            "cd": 0.9070616595037375,
+            "cl": -3.96508223080413e-15,
+            "steps": 120,
+            "blockage": 0.06634698692201427,
+            "converged": true,
+            "physical": true,
+            "wall_s": 238.3
+          },
+          {
+            "alpha": 120.0,
+            "cd": 1.0278161568829158,
+            "cl": -3.3009309571444385e-14,
+            "steps": 137,
+            "blockage": 0.06685490571146482,
+            "converged": true,
+            "physical": true,
+            "wall_s": 279.1
+          }
+        ]
+      }
+    }
+  },
+  "_updated": "2026-07-21 13:48:41",
+  "re100_strouhal_confined": {
+    "reference": {
+      "m1b_lock": 0.2059,
+      "paper_A_family": 0.17,
+      "note": "14% blockage no-slip walls; confinement elevates St"
+    },
+    "levels": {
+      "6": {
+        "level": 6,
+        "h": 0.015625,
+        "n_free": 4179,
+        "alpha": 1000.0,
+        "St": 0.7848484848484848,
+        "cl_amp": 311.6779596792915,
+        "tail_crossings": 112,
+        "t_end": 40.0,
+        "wall_s": 695.9,
+        "cl_tail": [
+          109.12981,
+          61.09682,
+          42.20081,
+          28.94939,
+          42.93646,
+          15.20783,
+          39.11861,
+          13.88206,
+          -15.28756,
+          -38.77116,
+          -80.91527,
+          -28.33201,
+          -4.80924,
+          -6.39665,
+          -7.00388,
+          63.20948,
+          -16.11853,
+          -39.17543,
+          -52.24099,
+          -27.98425,
+          -31.4967,
+          -55.26405,
+          -130.17503,
+          -63.63715,
+          -140.35741,
+          -28.95874,
+          -26.09443,
+          -50.27328,
+          -79.3989,
+          -0.65477,
+          -41.77994,
+          -44.41923,
+          -41.17268,
+          10.74803,
+          -3.01896,
+          -11.08687,
+          49.92502,
+          74.62619,
+          5.8352,
+          -47.10213,
+          -29.06662,
+          -8.41493,
+          -17.93759,
+          -72.57368,
+          -41.37307,
+          -35.1766,
+          -45.16216,
+          -25.54942,
+          -27.13547,
+          11.32431
+        ]
+      }
+    }
+  }
+}
