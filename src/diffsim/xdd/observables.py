@@ -764,3 +764,113 @@ class JVMisfitQoI:
 
     def dJ_dp(self, sysm, state, control) -> np.ndarray:
         return np.zeros(control.size)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# R1 — differentiable TRANSIENT QoI faces (trajectory functionals; Mode B)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _params_of(sysm):
+    """Best-effort XDDParams handle for τ̂_r (attached by the fixture/driver)."""
+    p = getattr(sysm, "params", None)
+    if p is None:
+        raise ValueError("TRPLMisfitQoI needs params: pass params=... or set "
+                         "sysm.params")
+    return p
+
+
+def _pl_integral_grad_nodal(sysm, field_index, tau_r_inv_hat, weight):
+    """∂(∫ w·X̂/τ̂_r dV)/∂X̂_nodal = weight·(1/τ̂_r)·(Nᵀ dV) — the GP-quadrature
+    adjoint of the nodal→GP interpolation used by ``pl_species_integral``.
+
+    Returns the (n_nodes,) nodal cotangent of the LINEAR PL-integral functional;
+    contracting it with a nodal δX̂ reproduces the exact directional derivative of
+    ``pl_species_integral`` (verified independently by the FD gate)."""
+    dm = sysm.dm
+    h_all = dm.mesh.tree.h()
+    g = np.zeros(dm.n_nodes)
+    for pv, b in dm.bins.items():
+        conn = dm.mesh.conn_of[pv]
+        N = dm.tables_by_p[pv].N               # [nqp, nbf]
+        eids = dm.mesh.bins[pv]; he = h_all[eids]
+        jac = (0.5 * he) ** dm.dim; nqp = b["nqp"]
+        wt = dm.tables_by_p[pv].w; ne = len(eids)
+        dV = (np.tile(wt, ne) * np.repeat(jac, nqp)).reshape(ne, nqp)
+        # contribution to node a: Σ_q dV[e,q] N[q,a]
+        ge = np.einsum("eq,qa->ea", dV, N)     # [ne, nbf]
+        np.add.at(g, conn.ravel(), ge.ravel())
+    return weight * tau_r_inv_hat * g
+
+
+class TRPLMisfitQoI:
+    """TRPL decay misfit  Σ_n (PL(tₙ) − PL_data(tₙ))²  as a TRAJECTORY QoI.
+
+    ``PL(tₙ) = Σ_i weight_i·(1/τ̂_r,i)·∫X̂_i dV̂`` (the R0 ``pl_species_integral``),
+    a LINEAR functional of the nodal X̂ field, so the per-step exciton seed is
+    exact and cheap.  ``dJ_dx_list`` produces the per-step reduced seeds
+    ``∂J/∂xₙ`` (flat field-major, 5·n_free per step) that Mode-B
+    (``XDDTransientAdjoint.gradient``) consumes; nonzero only on the exciton
+    (IXD/IXA) fields since PL depends only on X̂.
+    """
+
+    def __init__(self, target_decay, weight_donor=1.0, weight_acceptor=1.0,
+                 params=None):
+        self.target = [float(x) for x in target_decay]
+        self.wd = float(weight_donor); self.wa = float(weight_acceptor)
+        self._params = params
+
+    def _pl(self, sysm, state):
+        from diffsim.physics.exciton_system import IXD, IXA
+        p = self._params if self._params is not None else _params_of(sysm)
+        trd = _tau_r_inv_hat(p, "donor"); tra = _tau_r_inv_hat(p, "acceptor")
+        pl_d = pl_species_integral(sysm, state, trd, IXD, weight=self.wd)
+        pl_a = pl_species_integral(sysm, state, tra, IXA, weight=self.wa)
+        return pl_d + pl_a
+
+    def value(self, sysm, steps) -> float:
+        return sum((self._pl(sysm, s["state"]) - self.target[n]) ** 2
+                   for n, s in enumerate(steps))
+
+    def dJ_dx_list(self, sysm, steps):
+        from diffsim.physics.exciton_system import IXD, IXA, NDOF
+        p = self._params if self._params is not None else _params_of(sysm)
+        trd = _tau_r_inv_hat(p, "donor"); tra = _tau_r_inv_hat(p, "acceptor")
+        gD = _pl_integral_grad_nodal(sysm, IXD, trd, self.wd)   # (n_nodes,)
+        gA = _pl_integral_grad_nodal(sysm, IXA, tra, self.wa)
+        seeds = []
+        for n, s in enumerate(steps):
+            r = self._pl(sysm, s["state"]) - self.target[n]
+            seed = {f: np.zeros(sysm.dm.n_nodes) for f in range(NDOF)}
+            seed[IXD] = 2.0 * r * gD
+            seed[IXA] = 2.0 * r * gA
+            seeds.append(np.concatenate([np.asarray(sysm.T.T @ seed[f])
+                                         for f in range(NDOF)]))
+        return seeds
+
+
+class JtMisfitQoI:
+    """J(t) light-modulation misfit  Σ_n (J_model(tₙ) − J_data(tₙ))²  as a
+    TRAJECTORY QoI.
+
+    Mirrors ``TRPLMisfitQoI`` but the per-step observable is the differentiable
+    designated contact current (``SteadyCurrentQoI(contact).value`` /
+    ``dJ_du`` evaluated at each recorded state — the Task-3 current-seed math).
+    ``dJ_dx_list`` produces the per-step reduced seeds
+    ``∂J/∂xₙ = 2 (J_model(tₙ) − J_data(tₙ)) · ∂J_model/∂xₙ`` (flat field-major,
+    5·n_free per step) that Mode-B consumes.
+    """
+
+    def __init__(self, target_Jt, contact="anode", h_axis=1):
+        self.target = [float(x) for x in target_Jt]
+        self._cur = SteadyCurrentQoI(contact=contact, h_axis=h_axis)
+
+    def value(self, sysm, steps) -> float:
+        return sum((self._cur.value(sysm, s["state"]) - self.target[n]) ** 2
+                   for n, s in enumerate(steps))
+
+    def dJ_dx_list(self, sysm, steps):
+        seeds = []
+        for n, s in enumerate(steps):
+            r = self._cur.value(sysm, s["state"]) - self.target[n]
+            seeds.append(2.0 * r * self._cur.dJ_du(sysm, s["state"]))
+        return seeds

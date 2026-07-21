@@ -619,3 +619,118 @@ def test_steady_qoi_dJ_dp_zero(device):
         dJdp = qoi.dJ_dp(sysm, state, ctrl)
         assert dJdp.shape == (ctrl.size,)
         assert np.allclose(dJdp, 0.0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# R1 — differentiable TRANSIENT QoI faces (Task 6): TRPL / J(t) misfit seeds
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.ad
+def test_trpl_qoi_seed_matches_fd(device):
+    """G_D_R1f: TRPLMisfitQoI per-step exciton seed ∂J/∂xₙ matches FD against
+    `value` (the PL integral is LINEAR in the nodal X̂, so the seed is exact)."""
+    from diffsim.xdd.run import march_with_checkpoints
+    from diffsim.xdd.observables import TRPLMisfitQoI
+    from tests._xdd_adjoint_fixtures import build_small_lit_system
+    from diffsim.physics.exciton_system import NDOF
+
+    sysm, state = build_small_lit_system(device)
+    _, steps = march_with_checkpoints(sysm, state, dt0_hat=1e-4,
+                                      dt_max_hat=1e-2, max_steps=5, order=1)
+    target = [0.0] * len(steps)
+    qoi = TRPLMisfitQoI(target, weight_donor=1.0, weight_acceptor=1.0)
+    seeds = qoi.dJ_dx_list(sysm, steps)
+    # FD one step's state along a random direction over ALL fields (the PL
+    # integral depends on X̂_D and X̂_A; the seed is exactly zero on φ̂/n̂/p̂, so
+    # perturbing every field is a clean, complete check of the exciton seed).
+    n = 2
+    rng = np.random.default_rng(3); nf = sysm.n_free
+    v = rng.standard_normal(NDOF * nf); eps = 1e-6
+
+    def perturbed_value(sgn):
+        base = steps[n]["state"]
+        newst = {f: base[f].copy() + sgn * eps * (sysm.T @ v[f * nf:(f + 1) * nf])
+                 for f in range(NDOF)}
+        st2 = [dict(s) for s in steps]
+        st2[n] = {**steps[n], "state": newst}
+        return qoi.value(sysm, st2)
+
+    fd = (perturbed_value(+1) - perturbed_value(-1)) / (2 * eps)
+    dd = float(seeds[n] @ v)
+    rel = abs(dd - fd) / max(abs(fd), 1e-12)
+    print(f"\nTRPLMisfitQoI seed adj/fd rel = {rel:.2e}")
+    assert rel < 1e-6, (dd, fd)
+
+
+@pytest.mark.ad
+def test_trpl_qoi_seed_mutation_fails(device):
+    """GATE HYGIENE: a planted (×1.5) error in the TRPL exciton seed must make
+    the FD comparison FAIL — the gate is INDEPENDENT of the analytic seed."""
+    from diffsim.xdd.run import march_with_checkpoints
+    from diffsim.xdd.observables import TRPLMisfitQoI
+    from tests._xdd_adjoint_fixtures import build_small_lit_system
+    from diffsim.physics.exciton_system import NDOF
+
+    sysm, state = build_small_lit_system(device)
+    _, steps = march_with_checkpoints(sysm, state, dt0_hat=1e-4,
+                                      dt_max_hat=1e-2, max_steps=5, order=1)
+    # nonzero target so the residual r (hence the seed) is nonzero
+    qoi = TRPLMisfitQoI([0.7] * len(steps), weight_donor=1.0, weight_acceptor=1.0)
+    seeds = qoi.dJ_dx_list(sysm, steps)
+    n = 2
+    rng = np.random.default_rng(5); nf = sysm.n_free
+    v = rng.standard_normal(NDOF * nf); eps = 1e-6
+
+    def perturbed_value(sgn):
+        base = steps[n]["state"]
+        newst = {f: base[f].copy() + sgn * eps * (sysm.T @ v[f * nf:(f + 1) * nf])
+                 for f in range(NDOF)}
+        st2 = [dict(s) for s in steps]
+        st2[n] = {**steps[n], "state": newst}
+        return qoi.value(sysm, st2)
+
+    fd = (perturbed_value(+1) - perturbed_value(-1)) / (2 * eps)
+    dd_good = float(seeds[n] @ v)
+    dd_bad = 1.5 * dd_good
+    rel_good = abs(dd_good - fd) / max(abs(fd), 1e-12)
+    rel_bad = abs(dd_bad - fd) / max(abs(fd), 1e-12)
+    print(f"\nTRPL MUTATION check: good rel={rel_good:.2e} "
+          f"mutated(×1.5) rel={rel_bad:.2e} (must be >> 1e-6)")
+    assert rel_good < 1e-6, rel_good
+    assert rel_bad > 1e-3, ("gate vacuous — mutated TRPL seed not rejected",
+                            rel_bad)
+
+
+@pytest.mark.ad
+def test_jt_misfit_qoi_seed_matches_fd(device):
+    """G_D_R1g: JtMisfitQoI per-step seed (via SteadyCurrentQoI.dJ_du at each
+    recorded state) matches FD against `value` on a chosen step."""
+    from diffsim.xdd.run import march_with_checkpoints
+    from diffsim.xdd.observables import JtMisfitQoI
+    from tests._xdd_adjoint_fixtures import build_small_lit_system
+    from diffsim.physics.exciton_system import NDOF
+
+    sysm, state = build_small_lit_system(device)
+    _, steps = march_with_checkpoints(sysm, state, dt0_hat=1e-4,
+                                      dt_max_hat=1e-2, max_steps=5, order=1)
+    # nonzero per-step current targets so 2·r is nonzero at the tested step
+    target = [0.0] * len(steps)
+    qoi = JtMisfitQoI(target, contact="anode")
+    seeds = qoi.dJ_dx_list(sysm, steps)
+    n = 2
+    rng = np.random.default_rng(7); nf = sysm.n_free
+    v = rng.standard_normal(NDOF * nf); eps = 1e-6
+
+    def perturbed_value(sgn):
+        base = steps[n]["state"]
+        newst = {f: base[f].copy() + sgn * eps * (sysm.T @ v[f * nf:(f + 1) * nf])
+                 for f in range(NDOF)}
+        st2 = [dict(s) for s in steps]
+        st2[n] = {**steps[n], "state": newst}
+        return qoi.value(sysm, st2)
+
+    fd = (perturbed_value(+1) - perturbed_value(-1)) / (2 * eps)
+    dd = float(seeds[n] @ v)
+    rel = abs(dd - fd) / max(abs(fd), 1e-12)
+    print(f"\nJtMisfitQoI seed adj/fd rel = {rel:.2e}")
+    assert rel < 1e-6, (dd, fd)

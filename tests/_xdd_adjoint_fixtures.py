@@ -74,6 +74,9 @@ def build_small_lit_system(device, level=3, Eg_hat=4.0, mu=0.5, lam2=1e-1,
                      langevin=lang, onsager=ons,
                      tau_inv_d=tau_inv, tau_inv_a=tau_inv,
                      carrier_vars="log", assembly="host")
+    # Attach the XDDParams handle so the R1 PL/TRPL QoIs can read τ̂_r via
+    # _params_of(sysm) (the driver/fixture is the sanctioned owner of params).
+    sysm.params = p
     bilayer_electrode_bcs(sysm, mesh, cons, Eg_hat=Eg_hat, V_app_hat=0.0,
                           minority_ln=-Eg_hat)
 
