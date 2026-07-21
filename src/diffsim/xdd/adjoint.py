@@ -9,6 +9,48 @@ splu(A.T)/solve_linear transposed solve — nothing is forked.
 """
 from __future__ import annotations
 
+# ── Scaling-pathway declaration (spec §5, standing rule) ─────────────────────
+# Stage residency (host | device | either):
+#   adjoint assembly (∂R/∂u, ∂R/∂p)  — DEVICE. Same 5-field block system as the
+#                                      R0 forward; reuse `exciton_device`
+#                                      assembly. R1 introduces NO new nnz-space
+#                                      arrays — the transposed operator is the
+#                                      converged forward Newton Jacobian Aᵀ.
+#   transposed / linear solve        — DEVICE. Workstation (2-D production):
+#                                      cuDSS direct / fp32-IR / graph-captured
+#                                      Krylov, exactly the merged forward path.
+#                                      HERO SCALE (100M-DOF): this MUST be an
+#                                      ITERATIVE path, NOT cuDSS direct. #43's
+#                                      G4 established a direct-solver CAPACITY
+#                                      WALL — cuDSS CANNOT factorize the hero
+#                                      (15.15M dofs, 1.6B nnz) on GH200. The
+#                                      transposed steady solve at hero scale
+#                                      therefore takes the device-FGMRES route
+#                                      (#49 direction, consistent with the P2
+#                                      projection choice). Do NOT claim cuDSS
+#                                      carries the adjoint to the hero.
+#   Mode-B checkpoint storage        — HOST, O(steps) converged full states at
+#                                      2-D production size. The step count is
+#                                      BOUNDED and declared honestly:
+#                                      XDD_R1_TRANSIENT_STEP_BUDGET. Long
+#                                      horizons at hero scale are the binding
+#                                      HOST resource and are a later rung
+#                                      (binomial/Revolve NOTED, NOT built).
+#   observables + sensitivity rows   — DEVICE (assembled with the forward
+#                                      observables).
+# 100M-DOF budget: the adjoint is the SAME sparse system as the forward, so the
+# #35 device assembly, #38 ChunkedCSR, and #36 fp32-IR machinery carry it
+# unchanged — R1 adds no nnz-space arrays. The item declared honestly is the
+# transient checkpoint budget (host), NOT the solve; and at hero scale the
+# transposed direct solve is off the table (cuDSS capacity wall, #43 G4) — the
+# iterative/device-FGMRES path is the pathway.
+# Deployment tiers:
+#   workstation single-GPU (gpubox)  — ALL R1 gates + inverse demos (2-D scale).
+#   single big node (GH200 / NVL4)   — hero rung; iterative transposed solve +
+#                                      deferred long-horizon checkpointing.
+#   multi-node                       — later; no R1 stage halos.
+XDD_R1_TRANSIENT_STEP_BUDGET = 16      # declared bounded Mode-B step count (2-D)
+
 from typing import Protocol, runtime_checkable
 
 import numpy as np

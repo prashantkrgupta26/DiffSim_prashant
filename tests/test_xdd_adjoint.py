@@ -588,3 +588,28 @@ def test_g5_sensitivity_map(device):
         rel = abs(rows[0, k] - fd) / max(abs(fd), 1e-12)
         print(f"G5 {c.name:12s} row={rows[0, k]:+.6e} fd={fd:+.6e} rel={rel:.2e}")
         assert rel < 1e-6, (c.name, rows[0, k], fd)
+
+
+# ── Task 9: scaling-pathway declaration + bounded checkpoint-budget gate ───────
+
+def test_g3_checkpoint_budget_declared(device):
+    """Spec §5: the transient (Mode-B) checkpoint budget is a first-class,
+    testable artifact.  The declared step count is BOUNDED, the gates run at it,
+    and the host checkpoint memory is O(steps) full states of size 5·n_nodes at
+    the 2-D fixture scale — below a hard 512 MB ceiling."""
+    from diffsim.xdd.adjoint import XDD_R1_TRANSIENT_STEP_BUDGET
+    from diffsim.xdd.run import march_with_checkpoints
+    from tests._xdd_adjoint_fixtures import build_small_lit_system
+    assert isinstance(XDD_R1_TRANSIENT_STEP_BUDGET, int)
+    assert 1 <= XDD_R1_TRANSIENT_STEP_BUDGET <= 64      # bounded, 2-D scale
+    sysm, state = build_small_lit_system(device)
+    _, steps = march_with_checkpoints(
+        sysm, state, dt0_hat=1e-4, dt_max_hat=1e-2,
+        max_steps=XDD_R1_TRANSIENT_STEP_BUDGET, order=1)
+    assert len(steps) <= XDD_R1_TRANSIENT_STEP_BUDGET
+    # host checkpoint budget: O(steps) full states of size 5*n_nodes each
+    per_state_floats = 5 * sysm.dm.n_nodes
+    budget_floats = len(steps) * per_state_floats * 3   # state+prev+prev2
+    print(f"Mode-B checkpoint budget: {len(steps)} steps × {per_state_floats} "
+          f"floats ≈ {budget_floats*8/1e6:.2f} MB (host, 2-D fixture)")
+    assert budget_floats * 8 < 512e6                    # < 512 MB at 2-D scale
