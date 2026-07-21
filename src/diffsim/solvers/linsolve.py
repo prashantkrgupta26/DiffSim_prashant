@@ -648,9 +648,21 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
     # transfers overlapped the GPU queue, so residency adds blocking
     # device copies for no sync-latency saving; see the wodo_film knob
     # docstring and the task-42 report G3).  Opt-in via meta.
-    dev_apply = (_fused_on and str(device).startswith("cuda")
+    # Task #49: the device-resident OUTER FGMRES (precond_dev_outer)
+    # subsumes the device-resident apply — with the whole outer solve on
+    # device, the r/z copies at the apply boundary become intra-device, so
+    # the outer implies the apply.  The #42 apply-only knob
+    # (precond_dev_apply) stays for the host-lgmres-outer + device-apply
+    # A/B; the outer knob overrides it (device apply is mandatory under a
+    # device outer).  Both require the fused CUDA path, no AC blocks, and a
+    # stored (non-matrix-free) outer.
+    dev_outer = (_fused_on and str(device).startswith("cuda")
                  and not meta.get("ac") and jv is None
-                 and meta.get("precond_dev_apply", False))
+                 and meta.get("precond_dev_outer", False))
+    dev_apply = dev_outer or (
+        _fused_on and str(device).startswith("cuda")
+        and not meta.get("ac") and jv is None
+        and meta.get("precond_dev_apply", False))
 
     def _dev_solve(op, y, dg, rtol, krylov, label):
         if not np.any(y):
@@ -678,9 +690,43 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
     _fixed = meta.get("precond_fixed_iters", 0)
     _fixed = None if not _fixed else int(_fixed)
 
+    # Task #49: device |.|_inf for the zero-rhs guard (one scalar readback)
+    _amax_scratch = {}
+
+    def _amax_dev(y_d):
+        from ..assembly.operators import _kernel_cache
+        k = _kernel_cache.get(("blockch_amax",))
+        if k is None:
+            @wp.kernel(module="unique", enable_backward=False)
+            def amax(a: wp.array(dtype=wp.float64),
+                     out: wp.array(dtype=wp.float64)):
+                i = wp.tid()
+                wp.atomic_max(out, 0, wp.abs(a[i]))
+            _kernel_cache[("blockch_amax",)] = k = amax
+        s = _amax_scratch.get("s")
+        if s is None:
+            s = _amax_scratch["s"] = wp.zeros(1, dtype=wp.float64,
+                                              device=device)
+        s.zero_()
+        wp.launch(k, dim=y_d.shape[0], inputs=[y_d, s], device=device)
+        return float(s.numpy()[0])
+
     def _dev_solve_resident(op, y_d, minv_d, rtol, krylov, out_d, label):
         # device-in / device-out: NO host upload of y, NO .numpy() of the
         # solution — the whole inner solve stays on device (Task #42).
+        #
+        # Task #49 ZERO-RHS GUARD (the #42-review latent bug): the host
+        # _dev_solve short-circuits `if not np.any(y): return zeros` — a
+        # structurally-zero rhs sub-vector is exact-zero and the device
+        # BiCGStab 0/0-breaks down on it (frozen rows carry an exactly-zero
+        # residual).  The resident path lacked this, so on a zero block the
+        # device outer would DIVERGE in inner-iteration count from host.
+        # We test ||y_d||_inf on device (one scalar readback, negligible vs
+        # a whole inner solve) and write an exact zero solution when it is
+        # structurally zero, matching the host iterate exactly.
+        if _amax_dev(y_d) == 0.0:
+            out_d.zero_()
+            return
         _x, info = krylov(op, None, tol=rtol, atol=1e-13, maxiter=4000,
                           check_every=50, graph=meta.get("krylov_graph"),
                           b_dev=y_d, x_out=out_d, diag_dev=minv_d,
@@ -839,16 +885,18 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
         for P, psc in zip(pairs, sc["pairs"]):
             P["_sc"] = psc
 
-        def apply_dev(r):
-            wp.copy(r_d, wp.array(np.ascontiguousarray(r, np.float64),
-                                  dtype=wp.float64, device=device))
-            wp.copy(z_d, r_d)             # identity on any uncovered dof
+        def _apply_resident(rin_d, zout_d):
+            # device-in/device-out preconditioner apply: the WHOLE M^{-1}
+            # chain on device.  Task #49's device outer calls this directly
+            # (rin_d = the Arnoldi basis vector, zout_d = its preconditioned
+            # image) so the r/z NEVER touch the host — the point of the task.
+            wp.copy(zout_d, rin_d)        # identity on any uncovered dof
             for P in pairs:
                 rc, rm, a, zc, zm, tmp = P["_sc"]
                 off = P["off"]
-                wp.launch(gk, dim=n, inputs=[r_d, off, ndof, rc],
+                wp.launch(gk, dim=n, inputs=[rin_d, off, ndof, rc],
                           device=device)
-                wp.launch(gk, dim=n, inputs=[r_d, off + 1, ndof, rm],
+                wp.launch(gk, dim=n, inputs=[rin_d, off + 1, ndof, rm],
                           device=device)
                 # a = W1^{-1} (rc - Acm M^{-1} rm)
                 _dev_solve_resident(P["opM"], rm, P["minv_M"], 1e-10,
@@ -868,10 +916,15 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
                                                tmp], device=device)
                 _dev_solve_resident(P["opM"], tmp, P["minv_M"], 1e-10,
                                     cg_dev, zm, "mass")         # zm
-                wp.launch(sk, dim=n, inputs=[zc, off, ndof, z_d],
+                wp.launch(sk, dim=n, inputs=[zc, off, ndof, zout_d],
                           device=device)
-                wp.launch(sk, dim=n, inputs=[zm, off + 1, ndof, z_d],
+                wp.launch(sk, dim=n, inputs=[zm, off + 1, ndof, zout_d],
                           device=device)
+
+        def apply_dev(r):
+            wp.copy(r_d, wp.array(np.ascontiguousarray(r, np.float64),
+                                  dtype=wp.float64, device=device))
+            _apply_resident(r_d, z_d)
             return z_d.numpy()            # ONE download per apply
 
         apply = apply_dev
@@ -886,10 +939,41 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
     # full-A device spmv is used (the B2 path, unchanged).
     A_matvec = jv if jv is not None else opA.matvec_numpy
     it = [0]
-    x, info = _lgmres(LinearOperator((N, N), A_matvec), b,
-                      M=LinearOperator((N, N), apply),
-                      rtol=tol, atol=1e-13, maxiter=100,
-                      callback=lambda _: it.__setitem__(0, it[0] + 1))
+
+    # ---- Task #49: device-resident OUTER FGMRES ----------------------
+    # The lever #40/#42 converged on: replace the host scipy lgmres outer
+    # with an on-device flexible GMRES so the ENTIRE preconditioned solve
+    # is device-resident — the outer Krylov vecops, the preconditioner
+    # apply (_apply_resident), and the matvec (opA.matvec) all stay on the
+    # GPU.  The r/z host<->device copies at the apply boundaries become
+    # intra-device (free); the only host contact is the periodic residual
+    # readback for the convergence test.  On non-convergence the SAME
+    # exact-Schur escalation runs (host lgmres over apply_fb, below), so a
+    # degraded preconditioner is caught identically.  The device FGMRES is
+    # right-preconditioned flexible GMMRES(restart=30) — the flexible
+    # analogue of scipy lgmres with the LGMRES augmentation off (see
+    # fgmres_dev docstring); the iterate matches host to few-ULP.
+    if dev_outer:
+        from .fgmres_dev import fgmres_dev
+        b_dev = wp.array(np.ascontiguousarray(b, np.float64),
+                         dtype=wp.float64, device=device)
+        x_dev, finfo = fgmres_dev(
+            opA.matvec, b_dev, _apply_resident, N, device,
+            tol=tol, atol=1e-13, restart=30, maxiter=100)
+        it[0] = finfo["outer"]
+        if finfo["converged"]:
+            if cache is not None:
+                cache[("blockch_iters", cache_key)] = (it[0], inner_it[0])
+            return x_dev.numpy()
+        # not converged on the device outer: fall through to the host
+        # exact-Schur escalation (identical to the lgmres info!=0 branch),
+        # which the two-factor form's escape hatch handles.
+        info = -1
+    else:
+        x, info = _lgmres(LinearOperator((N, N), A_matvec), b,
+                          M=LinearOperator((N, N), apply),
+                          rtol=tol, atol=1e-13, maxiter=100,
+                          callback=lambda _: it.__setitem__(0, it[0] + 1))
     if info != 0:
         # ESCALATE: per-pair exact Schur; Acc gathered lazily on device
         def _mk_schur(P):

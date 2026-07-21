@@ -498,6 +498,21 @@ class WodoFilmStepper(TernaryCHStepper):
             _os.environ.get("DIFFSIM_PRECOND_DEV_APPLY", "0") == "1")
         self.precond_fixed_iters = int(
             _os.environ.get("DIFFSIM_PRECOND_FIXED_ITERS", "0"))
+        # Task #49: device-resident OUTER FGMRES — the whole preconditioned
+        # solve (outer Krylov vecops + preconditioner apply + matvec) is
+        # ONE device-resident region, so the r/z host<->device copies at the
+        # apply boundaries become intra-device (free).  This is the lever
+        # #40/#42 converged on: individual per-point host ops overlapped the
+        # async queue, but the WHOLE outer on device removes the boundary
+        # entirely.  Auto-engages on CUDA (fused path) unless explicitly
+        # disabled; env override DIFFSIM_PRECOND_DEV_OUTER (0/1).  Implies
+        # the device-resident apply (a device outer with a host apply is
+        # incoherent).  Default AUTO = on for CUDA (measured G3, task-49).
+        _dvo = _os.environ.get("DIFFSIM_PRECOND_DEV_OUTER", "auto")
+        self.precond_dev_outer = (
+            True if _dvo == "1" else
+            False if _dvo == "0" else
+            str(getattr(self.dm, "device", "cpu")).startswith("cuda"))
         # Task #41: GP-field residency mode (device assembly path only).
         # "persistent" (default, the #37 behavior): the packed GP
         #   vals/grads + BDF-history + Langevin-noise buffers are
@@ -840,7 +855,9 @@ class WodoFilmStepper(TernaryCHStepper):
             "krylov_graph": self.krylov_graph,
             # Task #42: device-resident preconditioner apply knobs
             "precond_dev_apply": self.precond_dev_apply,
-            "precond_fixed_iters": self.precond_fixed_iters}
+            "precond_fixed_iters": self.precond_fixed_iters,
+            # Task #49: device-resident outer FGMRES
+            "precond_dev_outer": self.precond_dev_outer}
         try:
             return blockch_pairs_device(
                 asm.indptr, asm.indices, asm.vals_d, asm.F_d.numpy(),
