@@ -637,13 +637,20 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
     # inner path is active (the same knob #40 introduced); "off" keeps
     # today's host-transfer apply bit-for-bit.  It requires no AC blocks
     # (the AC lower-triangular chain stays on the host transfer path,
-    # which the film production config never exercises) and a non-chunked
-    # value buffer for the outer spmv graph.
+    # which the film production config never exercises) and a stored
+    # (non-matrix-free) outer.  The pair operators are node-space CSR
+    # (always flat), so a chunked full-A vals_d is fine — the apply never
+    # touches the chunked outer spmv.
     from .krylov_dev import _resolve_path
     _kg = meta.get("krylov_graph")
     _fused_on, _ = _resolve_path(_kg, device)
+    # DEFAULT OFF (measured regression on the Ada box — the host<->device
+    # transfers overlapped the GPU queue, so residency adds blocking
+    # device copies for no sync-latency saving; see the wodo_film knob
+    # docstring and the task-42 report G3).  Opt-in via meta.
     dev_apply = (_fused_on and str(device).startswith("cuda")
-                 and not meta.get("ac") and jv is None)
+                 and not meta.get("ac") and jv is None
+                 and meta.get("precond_dev_apply", False))
 
     def _dev_solve(op, y, dg, rtol, krylov, label):
         if not np.any(y):
@@ -656,12 +663,28 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
         inner_it[0] += info.get("iters", 0)
         return x_
 
+    # Task #42: OPTIONAL fixed inner-iteration budget (readback-free inner
+    # solves — collapses the per-check_every scal.numpy() to nothing, so
+    # the ONLY sync per apply is the single r upload + z download).  The
+    # inners are a PRECONDITIONER, so a fixed budget makes the M^-1 action
+    # inexact-but-deterministic and the outer FGMRES residual is the true
+    # gate.  MEASURED (film config): a budget that does not fully converge
+    # the mass/W1 solves weakens the preconditioner enough to trip the
+    # exact-Schur escalation (10x-cost fallback), so the DEFAULT is
+    # convergence-checked inners (fixed disabled) — the device residency
+    # already removes the dominant per-apply wp.copy transfers.  meta
+    # override "precond_fixed_iters" (>0) opts into the readback-free
+    # budget where a regime tolerates it.
+    _fixed = meta.get("precond_fixed_iters", 0)
+    _fixed = None if not _fixed else int(_fixed)
+
     def _dev_solve_resident(op, y_d, minv_d, rtol, krylov, out_d, label):
         # device-in / device-out: NO host upload of y, NO .numpy() of the
         # solution — the whole inner solve stays on device (Task #42).
         _x, info = krylov(op, None, tol=rtol, atol=1e-13, maxiter=4000,
                           check_every=50, graph=meta.get("krylov_graph"),
-                          b_dev=y_d, x_out=out_d, diag_dev=minv_d)
+                          b_dev=y_d, x_out=out_d, diag_dev=minv_d,
+                          fixed_iters=_fixed)
         if not info.get("converged"):
             raise ConvergenceError(f"blockch {label} device solve: {info}")
         inner_it[0] += info.get("iters", 0)
@@ -802,12 +825,19 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
     # outer FGMRES sees an identical M^{-1} action (few-ULP; G1).
     if dev_apply:
         gk, sk, axpy = _blockch_apply_kernels()
-        r_d = wp.zeros(N, dtype=wp.float64, device=device)
-        z_d = wp.zeros(N, dtype=wp.float64, device=device)
-        # per-pair scratch (rc, rm, a, zc, zm, tmp) reused every apply
-        for P in pairs:
-            P["_sc"] = [wp.zeros(n, dtype=wp.float64, device=device)
-                        for _ in range(6)]
+        # apply scratch cached with the setup (allocated once per pattern,
+        # not per Newton iterate): r_d/z_d (N) + 6 node buffers per pair.
+        sc = setup.get("apply_scratch")
+        if sc is None:
+            sc = {"r_d": wp.zeros(N, dtype=wp.float64, device=device),
+                  "z_d": wp.zeros(N, dtype=wp.float64, device=device),
+                  "pairs": [[wp.zeros(n, dtype=wp.float64, device=device)
+                             for _ in range(6)]
+                            for _ in pairs]}
+            setup["apply_scratch"] = sc
+        r_d, z_d = sc["r_d"], sc["z_d"]
+        for P, psc in zip(pairs, sc["pairs"]):
+            P["_sc"] = psc
 
         def apply_dev(r):
             wp.copy(r_d, wp.array(np.ascontiguousarray(r, np.float64),

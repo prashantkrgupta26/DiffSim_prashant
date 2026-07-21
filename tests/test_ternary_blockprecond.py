@@ -250,6 +250,58 @@ def test_film_blockch_device_setup_parity(device):
     assert fb == 0, ("fallback engaged", its_d)
 
 
+def test_film_blockch_device_resident_apply_parity(device, monkeypatch):
+    """Task #42 G1: the OPT-IN device-resident preconditioner apply
+    (DIFFSIM_PRECOND_DEV_APPLY=1 — r/z stay on device through the whole
+    blockch apply chain) is iterate-identical to the default host-transfer
+    device apply.  Both sides use the device-resident #37 SETUP; only the
+    APPLY residency differs, so any trajectory difference is the residency
+    change alone.  CUDA-only (the device-resident path auto-gates off on
+    CPU); asserts few-ULP parity + identical outer-iteration ladders + no
+    exact-Schur fallback (a degraded preconditioner would trip it)."""
+    if not str(device).startswith("cuda"):
+        pytest.skip("device-resident apply is CUDA-only")
+
+    def run(dev_apply):
+        monkeypatch.setenv("DIFFSIM_PRECOND_DEV_APPLY",
+                           "1" if dev_apply else "0")
+        tree0 = build_uniform(5, dim=2)
+        keep = tree0.centers()[:, 0] < 4 / 32
+        tree = Octree(tree0.keys[keep], tree0.levels[keep], dim=2,
+                      periodic=tree0.periodic)
+        mesh = build_mesh(tree, p=1)
+        cons = build_constraints(mesh)
+        dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2),
+                                  device)
+        st = WodoFilmStepper(dm, chi=(1.0, 0.3, 0.3), N=(5.0, 5.0, 1.0),
+                             M=(0.225, 0.0, 0.225), kappa=(2e-4, 2e-4),
+                             k_e=1.0, dt=1e-3, linsolver="blockch",
+                             use_device_assembly=True)
+        assert st.precond_dev_apply == dev_apply    # knob wired
+        rng = np.random.default_rng(3)
+        st.set_initial(
+            lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)),
+            lambda x: 0.2 + 0.01 * rng.standard_normal(len(x)))
+        st._solver_cache = _RecCache()
+        rec = []
+        st.march(h_min=0.8, phis_stop=0.05, max_steps=10,
+                 callback=lambda s, K, dt, it: rec.append((dt, s.x.copy())))
+        return rec, st._solver_cache.iters
+
+    rec_host, its_host = run(False)
+    rec_dev, its_dev = run(True)
+    assert len(rec_host) == len(rec_dev)
+    errs = [np.abs(a[1] - b[1]).max() / max(np.abs(a[1]).max(), 1e-30)
+            for a, b in zip(rec_host, rec_dev)]
+    wobble = sum(1 for a, b in zip(its_host, its_dev) if a != b)
+    fb = sum(1 for i in its_dev if i >= 1000)
+    print(f"device-resident apply parity: {len(rec_host)} steps, "
+          f"max rel err {max(errs):.2e}, outer wobble {wobble}, "
+          f"fallbacks {fb}")
+    assert max(errs) < 1e-9, errs
+    assert fb == 0, ("fallback engaged on device-resident apply", its_dev)
+
+
 def test_film_blockch_evaporation(device):
     """The full film physics through the pairwise preconditioner —
     test_wodo_film.py::test_wodo_film_evaporation's config with
