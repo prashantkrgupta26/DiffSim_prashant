@@ -490,3 +490,132 @@ def test_gate_d7_capture_trace():
     assert tr["J"][2] == pytest.approx(min(0.30, 0.28))
     tra = capture_trace(hist, t0=t0, contact="anode")
     assert tra["J"][1] == pytest.approx(0.20)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# R1 — differentiable steady QoIs + FD-gated dJ/du (Task 3)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _scatter_state(sysm, state, vec):
+    """Apply a flat reduced field-major perturbation `vec` (5·n_free,) to a full
+    state through T per field, returning a new full-nodal state dict."""
+    from diffsim.physics.exciton_system import NDOF
+    nf = sysm.n_free
+    st = {}
+    for f in range(NDOF):
+        duf = vec[f * nf:(f + 1) * nf]
+        st[f] = state[f] + np.asarray(sysm.T @ duf)
+    return st
+
+
+def _fd_directional(qoi, sysm, state, vec, eps=1e-6):
+    """Central FD of a QoI's `value` along the reduced direction `vec`."""
+    Jp = qoi.value(sysm, _scatter_state(sysm, state, +eps * vec))
+    Jm = qoi.value(sysm, _scatter_state(sysm, state, -eps * vec))
+    return (Jp - Jm) / (2.0 * eps)
+
+
+@pytest.mark.ad
+def test_steady_qoi_dJdu_matches_fd(device):
+    """G_D_R1a: SteadyCurrentQoI.dJ_du(anode) matches a central FD directional
+    derivative of value to ~1e-6 (the adjoint RHS seed)."""
+    from diffsim.physics.exciton_system import NDOF
+    from diffsim.xdd.observables import SteadyCurrentQoI
+    from tests._xdd_adjoint_fixtures import build_small_lit_system
+
+    sysm, state = build_small_lit_system(device)
+    qoi = SteadyCurrentQoI(contact="anode")
+    seed = qoi.dJ_du(sysm, state)
+    assert seed.shape == (NDOF * sysm.n_free,)
+
+    rng = np.random.default_rng(0)
+    v = rng.standard_normal(NDOF * sysm.n_free)
+    fd = _fd_directional(qoi, sysm, state, v)
+    dd = float(seed @ v)
+    rel = abs(dd - fd) / max(abs(fd), 1e-12)
+    print(f"\nSteadyCurrentQoI(anode) dJ/du·v adj/fd rel = {rel:.2e}")
+    assert rel < 1e-6, (dd, fd)
+
+
+@pytest.mark.ad
+def test_steady_qoi_cathode_dJdu_matches_fd(device):
+    """G_D_R1b: the cathode designated current seed also matches FD."""
+    from diffsim.physics.exciton_system import NDOF
+    from diffsim.xdd.observables import SteadyCurrentQoI
+    from tests._xdd_adjoint_fixtures import build_small_lit_system
+
+    sysm, state = build_small_lit_system(device)
+    qoi = SteadyCurrentQoI(contact="cathode")
+    seed = qoi.dJ_du(sysm, state)
+    rng = np.random.default_rng(1)
+    v = rng.standard_normal(NDOF * sysm.n_free)
+    fd = _fd_directional(qoi, sysm, state, v)
+    dd = float(seed @ v)
+    rel = abs(dd - fd) / max(abs(fd), 1e-12)
+    print(f"\nSteadyCurrentQoI(cathode) dJ/du·v adj/fd rel = {rel:.2e}")
+    assert rel < 1e-6, (dd, fd)
+
+
+@pytest.mark.ad
+def test_steady_qoi_dJdu_mutation_fails(device):
+    """G_D_R1c GATE HYGIENE: the FD gate is INDEPENDENT of the analytic seed —
+    a planted error in dJ/du must make the FD comparison FAIL.  (Guards against
+    the degenerate "same difference compared to itself" gate.)"""
+    from diffsim.physics.exciton_system import NDOF
+    from diffsim.xdd.observables import SteadyCurrentQoI
+    from tests._xdd_adjoint_fixtures import build_small_lit_system
+
+    sysm, state = build_small_lit_system(device)
+    qoi = SteadyCurrentQoI(contact="anode")
+    seed = qoi.dJ_du(sysm, state)
+    # plant a non-trivial error: scale the seed by 1.5
+    bad = 1.5 * seed
+    rng = np.random.default_rng(0)
+    v = rng.standard_normal(NDOF * sysm.n_free)
+    fd = _fd_directional(qoi, sysm, state, v)
+    dd_bad = float(bad @ v)
+    rel_bad = abs(dd_bad - fd) / max(abs(fd), 1e-12)
+    print(f"\nMUTATION check: planted-error dJ/du·v adj/fd rel = {rel_bad:.2e} "
+          f"(must be >> 1e-6)")
+    assert rel_bad > 1e-3, rel_bad
+
+
+@pytest.mark.ad
+def test_jv_misfit_dJdu_matches_fd(device):
+    """G_D_R1d: JVMisfitQoI single-bias value = (J_model−J_data)² and its
+    dJ/du = 2 r · dJ_model/du matches FD."""
+    from diffsim.physics.exciton_system import NDOF
+    from diffsim.xdd.observables import SteadyCurrentQoI, JVMisfitQoI
+    from tests._xdd_adjoint_fixtures import build_small_lit_system
+
+    sysm, state = build_small_lit_system(device)
+    cur = SteadyCurrentQoI(contact="anode")
+    J_model = cur.value(sysm, state)
+    target = J_model - 0.3            # nonzero residual so 2r != 0
+    qoi = JVMisfitQoI(target, contact="anode")
+    assert qoi.value(sysm, state) == pytest.approx((J_model - target) ** 2, rel=1e-12)
+
+    seed = qoi.dJ_du(sysm, state)
+    rng = np.random.default_rng(2)
+    v = rng.standard_normal(NDOF * sysm.n_free)
+    fd = _fd_directional(qoi, sysm, state, v)
+    dd = float(seed @ v)
+    rel = abs(dd - fd) / max(abs(fd), 1e-12)
+    print(f"\nJVMisfitQoI dJ/du·v adj/fd rel = {rel:.2e}")
+    assert rel < 1e-6, (dd, fd)
+
+
+@pytest.mark.ad
+def test_steady_qoi_dJ_dp_zero(device):
+    """G_D_R1e: pure-state QoIs return a zeroed ∂J/∂p of the control's size
+    (forward-compat req 2: the seed AND the sensitivity face are both present)."""
+    from diffsim.xdd.observables import SteadyCurrentQoI, JVMisfitQoI
+    from diffsim.xdd.adjoint import ClosureControl
+    from tests._xdd_adjoint_fixtures import build_small_lit_system
+
+    sysm, state = build_small_lit_system(device)
+    ctrl = ClosureControl(sysm, "langevin_zeta")
+    for qoi in (SteadyCurrentQoI(contact="anode"), JVMisfitQoI(0.0)):
+        dJdp = qoi.dJ_dp(sysm, state, ctrl)
+        assert dJdp.shape == (ctrl.size,)
+        assert np.allclose(dJdp, 0.0)

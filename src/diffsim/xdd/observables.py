@@ -642,3 +642,125 @@ def fit_decay_rate(t: np.ndarray, y: np.ndarray, *,
         return float("nan")
     slope = np.polyfit(t[m], np.log(y[m]), 1)[0]
     return -float(slope)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# R1 — differentiable steady QoI faces (steady adjoint RHS seeds)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SteadyCurrentQoI:
+    """Differentiable designated contact current as a steady QoI.
+
+    ``value`` = ``designated_current(Jny, Jpy, contact)`` (a fixed contact, NOT
+    the nonsmooth min).  The adjoint flows from ``dJ_du``, the flat reduced
+    field-major seed (5·n_free,) consumed as the Mode-A steady-adjoint RHS
+    (Task 4 passes a matching flat reduced λ).
+
+    Design (see task-3 brief / ``run._flux_pair``).  With the designated
+    contact ``Jc = Σ_{i∈wall} (Kc @ ĉ)[i]`` where ``Kc = _carrier_block(σ=0,
+    SUPG=0)`` (electrons at the anode, holes at the cathode):
+
+      • ∂Jc/∂ĉ  = Kcᵀ e_wall           (Kc is φ̂-dependent but ĉ-independent).
+      • ∂Jc/∂φ̂ = the CONSERVATIVE drift cross-term — the SAME weighted-stiffness
+        block the residual Jacobian uses (exciton_system ``build_jacobian``):
+        ``∂(∫ sign·μ̂ ĉ (∇φ̂·∇N_a))/∂φ̂ = _poisson_block(sign·μ̂·ĉ, lam2=1)``,
+        NOT the (∇ĉ·∇N_b)N_a advection-mass block.
+
+    ``designated_current`` returns |Jc|, so the seed carries an overall
+    sign(Jc).  Assembled dR is transposed and reduced with ``sysm.T.T`` per
+    field into a flat (5·n_free,) vector.
+    """
+
+    def __init__(self, contact: str = "anode", h_axis: int = 1):
+        if contact not in ("anode", "cathode"):
+            raise ValueError(
+                "SteadyCurrentQoI: contact must be 'anode' or 'cathode' "
+                f"(got {contact!r}); the nonsmooth min is not differentiable.")
+        self.contact = contact
+        self.h_axis = h_axis
+
+    def value(self, sysm, state) -> float:
+        jny, jpy = contact_flux_pair(sysm, state, h_axis=self.h_axis)
+        return designated_current(jny, jpy, contact=self.contact)
+
+    def dJ_du(self, sysm, state) -> np.ndarray:
+        """∂J/∂u as a flat (5·n_free,) reduced field-major seed (adjoint RHS)."""
+        from diffsim.physics.exciton_system import (
+            _carrier_block, _poisson_block, NDOF, IPHI, IN, IP)
+
+        dm = sysm.dm
+        cl = sysm._closures(state)
+        coords = dm.mesh.node_coords
+        hc = coords[:, self.h_axis]
+        lo, hi = hc.min(), hc.max()
+        if self.contact == "anode":
+            wall = np.where(np.abs(hc - lo) < 1e-9)[0]
+            mu_gp, fld, sign = sysm.mu_n_gp, IN, -1.0
+            c_gp = cl["n_gp"]
+        else:
+            wall = np.where(np.abs(hc - hi) < 1e-9)[0]
+            mu_gp, fld, sign = sysm.mu_p_gp, IP, +1.0
+            c_gp = cl["p_gp"]
+
+        # ĉ-flux Galerkin operator Kc (σ=0, SUPG=0) — the _flux_pair operator.
+        aq = sysm._aq(cl["gradphi"], mu_gp, sign)
+        Kc = _carrier_block(dm, aq, mu_gp, 0.0, 0.0, 0.0)
+        e = np.zeros(dm.n_nodes)
+        e[wall] = 1.0
+
+        # ∂(Σ_wall Kc@ĉ)/∂ĉ = Kcᵀ e   (Kc independent of ĉ).
+        dJ_dc = Kc.T @ e
+        # ∂(Σ_wall Kc@ĉ)/∂φ̂ = conservative drift cross-term (weighted stiffness):
+        #   ∂/∂φ̂ ∫ sign·μ̂ ĉ (∇φ̂·∇N_a) = _poisson_block(sign·μ̂·ĉ, lam2=1).
+        cdrift = {pv: sign * mu_gp[pv] * c_gp[pv] for pv in dm.bins}
+        Kphi = _poisson_block(dm, cdrift, 1.0)
+        dJ_dphi = Kphi.T @ e
+
+        # designated_current = |Jc| → overall sign(Jc).
+        jny, jpy = contact_flux_pair(sysm, state, h_axis=self.h_axis)
+        Jc = jny if self.contact == "anode" else jpy
+        sgn = 1.0 if Jc >= 0 else -1.0
+
+        dR = {f: np.zeros(dm.n_nodes) for f in range(NDOF)}
+        dR[fld] = sgn * dJ_dc
+        dR[IPHI] = sgn * dJ_dphi
+        return np.concatenate(
+            [np.asarray(sysm.T.T @ dR[f]) for f in range(NDOF)])
+
+    def dJ_dp(self, sysm, state, control) -> np.ndarray:
+        """Explicit ∂J/∂p for a control — 0 for this pure-state QoI.
+
+        Returned for forward-compat req 2 (the QoI exposes both the dJ/du seed
+        and the ∂J/∂p sensitivity face; Task 4's driver builds the full
+        sensitivity rows from these plus the adjoint).
+        """
+        return np.zeros(control.size)
+
+
+class JVMisfitQoI:
+    """Full-curve J–V misfit  Σ_V (J_model(V) − J_data(V))²  as a steady QoI.
+
+    R1 keeps the SINGLE-BIAS reduced form: the driver holds one operating bias
+    and this evaluates the one misfit term there (the full sweep is "sum the
+    single-bias adjoint over sweep points" — each bias contributes an
+    independent adjoint solve with this same seed at that bias).
+
+    value  = (J_model − J_data)²
+    dJ/du  = 2 (J_model − J_data) · dJ_model/du   (chain rule through the
+             differentiable designated current).
+    """
+
+    def __init__(self, target_current: float, contact: str = "anode",
+                 h_axis: int = 1):
+        self.target = float(target_current)
+        self._cur = SteadyCurrentQoI(contact=contact, h_axis=h_axis)
+
+    def value(self, sysm, state) -> float:
+        return (self._cur.value(sysm, state) - self.target) ** 2
+
+    def dJ_du(self, sysm, state) -> np.ndarray:
+        r = self._cur.value(sysm, state) - self.target
+        return 2.0 * r * self._cur.dJ_du(sysm, state)
+
+    def dJ_dp(self, sysm, state, control) -> np.ndarray:
+        return np.zeros(control.size)
