@@ -35,9 +35,29 @@ from ..solvers.timestepping import bdf_coeffs, bdf_order_now, History
 class LerayProjectionStepper:
     def __init__(self, dm, nu, dt, f_fn, g_fn, order=2, picard_iters=2,
                  solver="splu",
-                 timestab=True, ppe_finescale=False, predictor="picard"):
+                 timestab=True, ppe_finescale=False, predictor="picard",
+                 velocity_update="consistent", graddiv_scale=1.0):
         self.dm, self.nu, self.dt, self.order = dm, nu, dt, order
         self.picard_iters = picard_iters
+        # P2-R0 velocity-update EXPERIMENT knob (default "consistent" =
+        # unchanged behaviour). Controls Step 3 (the velocity update) and,
+        # for "graddiv", an EXTRA grad-div penalty in the predictor:
+        #   "consistent" — consistent-mass L2 re-projection (Algorithm 1).
+        #   "lumped"      — row-sum (lumped) diagonal mass in Step 3, so the
+        #                   update collocates to the nodal
+        #                   u = u_hat - (1/sigma) grad(phi), which better
+        #                   preserves the discrete pointwise divergence
+        #                   relation than the consistent-mass smear.
+        #   "graddiv"     — consistent-mass update PLUS a graddiv_scale-times
+        #                   tau_C (div w, div u) grad-div (LSIC) penalty added
+        #                   to the predictor system, which damps the predicted
+        #                   (hence corrected) pointwise divergence directly.
+        if velocity_update not in ("consistent", "lumped", "graddiv"):
+            raise ValueError(
+                f"velocity_update must be consistent|lumped|graddiv, "
+                f"got {velocity_update!r}")
+        self.velocity_update = velocity_update
+        self.graddiv_scale = float(graddiv_scale)
         # 'picard' (v1) or 'newton' (the draft's Algorithm 1): Newton adds
         # the (du.grad)a cross-block in the momentum operator and folds the
         # (a.grad)a RHS partner into f_eff (which hands it SUPG/PSPG
@@ -74,6 +94,22 @@ class LerayProjectionStepper:
         self._K_p_lu = None
         self.M = self._mass_matrix()
         self._M_lu = None            # mass solves go through solve_linear
+        # Step-3 update operator: consistent M (default), or the row-sum
+        # (lumped) diagonal of M — a diagonal solve that nodally collocates
+        # u = u_hat - (1/sigma) grad(phi) (P2-R0 velocity-update experiment).
+        if self.velocity_update == "lumped":
+            row_sum = np.asarray(self.M.sum(axis=1)).ravel()
+            self.M_lumped = sp.diags(row_sum, format="csr")
+        else:
+            self.M_lumped = None
+        # Extra grad-div (LSIC) block for the "graddiv" variant — a scaled
+        # vector-Laplacian-of-divergence penalty tau_C (div w, div u) added to
+        # the predictor momentum system. Zero unless graddiv_scale > 0 and the
+        # variant is selected; assembled once (tau_C frozen at the steady,
+        # velocity-independent value, |u|-part dropped for a cached operator).
+        self._graddiv_block = None
+        if self.velocity_update == "graddiv" and self.graddiv_scale != 0.0:
+            self._graddiv_block = self._graddiv_matrix()
 
     # ---------------- helpers ----------------
     def _mass_matrix(self):
@@ -96,6 +132,62 @@ class LerayProjectionStepper:
                           shape=(Nn, Nn)).tocsr()
         T = dm.constraints.T.tocsr()
         return (T.T @ M @ T).tocsr()
+
+    def _graddiv_matrix(self):
+        """Extra grad-div (LSIC) penalty block for the predictor (P2-R0
+        velocity-update experiment, "graddiv"). Assembles the CONSTRAINED,
+        free-node-major, VECTOR (ndof=dim+1) operator
+
+            G[a i, b j] = scale * tau_C * int (dN_a/dx_i)(dN_b/dx_j) dV
+
+        added to the momentum block so the predictor damps ||div u_hat||
+        pointwise. tau_C is the metric-form grad-div parameter frozen at the
+        steady limit (|u|-independent so the block caches; the transient
+        (2 b0/dt)^2 term is dropped from tau_M here). The pressure rows/cols
+        (component ``dim``) are left zero, so this is purely a momentum-side
+        stabilization. Returns a CSR of shape (n_free*ndof, n_free*ndof)."""
+        dm = self.dm
+        dim = dm.dim
+        ndof = self.ndof
+        # steady tau_M = 1/sqrt(CI_F nu^2 G:G), tau_C = 1/(tau_M g.g), with
+        # G:G = dim (2/h)^4, g.g = dim (2/h)^2 on axis-aligned cubes (vms.py).
+        from ..physics.vms import CI_F
+        rows, cols, vals = [], [], []
+        for pv, b in dm.bins.items():
+            tb = dm.tables_by_p[pv]
+            h = dm.mesh.tree.h()[dm.mesh.bins[pv]]
+            jac = (h / 2.0) ** dim
+            dsc = (2.0 / h)
+            ne = len(h)
+            GG = dim * (2.0 / h) ** 4
+            gg = dim * (2.0 / h) ** 2
+            tauM = 1.0 / np.sqrt(CI_F * self.nu ** 2 * GG)
+            tauC = 1.0 / (tauM * gg)                      # [ne]
+            coef = self.graddiv_scale * tauC              # [ne]
+            # per-element grad-div: Ge[e, a, i, b, j]
+            #   = coef[e] * (dN_a/dx_i)(dN_b/dx_j) * w * jac
+            # dN scaled to physical by dsc; note (dsc*dsc) folded into GdG.
+            GdG = np.einsum("qad,qbc,q->abdc", tb.dN, tb.dN, tb.w)  # ref
+            conn = dm.mesh.conn_of[pv].astype(np.int64)
+            nbf = conn.shape[1]
+            scale_e = coef * (dsc ** 2) * jac             # [ne]
+            for a in range(nbf):
+                for bcol in range(nbf):
+                    for i in range(dim):
+                        for j in range(dim):
+                            r = conn[:, a] * ndof + i
+                            c = conn[:, bcol] * ndof + j
+                            v = GdG[a, bcol, i, j] * scale_e
+                            rows.append(r)
+                            cols.append(c)
+                            vals.append(v)
+        Nn = dm.n_nodes * ndof
+        G = sp.coo_matrix((np.concatenate(vals),
+                           (np.concatenate(rows), np.concatenate(cols))),
+                          shape=(Nn, Nn)).tocsr()
+        T = dm.constraints.T.tocsr()
+        T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
+        return (T_vec.T @ G @ T_vec).tocsr()
 
     def _weighted_stiffness(self, w_gp_by_bin):
         """K_w[a,b] = int w(x) grad N_a . grad N_b — per-GP weights (the
@@ -229,6 +321,11 @@ class LerayProjectionStepper:
                 A_sbm_c, b_sbm_c = extra_block
                 A = (A + A_sbm_c)
                 b = b + np.asarray(b_sbm_c)
+            # P2-R0 "graddiv" variant: add the cached extra grad-div (LSIC)
+            # penalty to the momentum system (RHS unchanged — homogeneous
+            # penalty). No-op for the other variants (block is None).
+            if self._graddiv_block is not None:
+                A = (A + self._graddiv_block)
             A = A.tolil()
             for k, i in enumerate(self.dir_nodes):
                 if int(i) in strong_skip:      # SBM-governed: stays weak
@@ -378,10 +475,16 @@ class LerayProjectionStepper:
                 be = np.einsum("qa,eq,q,e->ea", tb.N, integ, tb.w, jac)
                 np.add.at(rhs_c, dm.mesh.conn_of[pv].ravel(), be.ravel())
             from ..solvers.linsolve import solve_linear
-            u_new[:, c] = solve_linear(
-                self.M, np.asarray(dm.constraints.T.T @ rhs_c),
-                solver=self.solver, sym=True, device=dm.device,
-                cache=self._solver_cache, cache_key="mass")
+            # P2-R0 velocity-update experiment: "lumped" uses the row-sum
+            # diagonal mass (a nodal-collocation update); default consistent M.
+            if self.velocity_update == "lumped":
+                rhs_free = np.asarray(dm.constraints.T.T @ rhs_c)
+                u_new[:, c] = rhs_free / self.M_lumped.diagonal()
+            else:
+                u_new[:, c] = solve_linear(
+                    self.M, np.asarray(dm.constraints.T.T @ rhs_c),
+                    solver=self.solver, sym=True, device=dm.device,
+                    cache=self._solver_cache, cache_key="mass")
         # strong Dirichlet on the updated field (draft: trace preserved).
         # SURROGATE-CONSISTENT CORRECTION (Task 3): SBM-governed nodes (the
         # weak immersed body) are NOT strong-overwritten by the box trace —
