@@ -36,3 +36,6 @@ benchmarks/data/negi2018/
 # --- private review material (never push) ---
 CriticalEvaluations/
 previous_codes/
+
+# Reference C++/MPI group codes (Dendrite-kt), large binaries — parity anchors, not tracked
+local_code_old/
