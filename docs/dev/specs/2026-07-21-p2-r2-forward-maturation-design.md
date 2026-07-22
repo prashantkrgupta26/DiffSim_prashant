@@ -177,3 +177,23 @@ R2a (3-D stability) is closed with a **pivot**, recorded in
 
 The shell, the heroes (truck/maize), and the steady-adjoint (R3) all build on
 the monolithic 3-D forward engine — none required the split specifically.
+
+## ADDENDUM 2026-07-22 (2) — R2b.1 banked: cuDSS delivered, block-precond → overnight handoff
+
+R2b.1 progress this session:
+- **cuDSS unblock DELIVERED** (the banked win): monolithic sphere Cd, Re=100 —
+  L4=0.964 (==splu, 4.7× faster), **L5=1.448** (clears the CPU-splu wall). L6
+  (1.09M) cuDSS `ALLOC_FAILED` (direct GPU-memory wall). Baseline
+  `tests/baselines/p2r2c_monolithic_sphere_convergence.json`. `monolithic_cd`
+  now takes `solver=` routing through `solve_linear` (`e72121d`).
+- **AMGX rebuilt on gpubox** (CUDA 12.4/sm_89; was missing — also fixes the 2
+  suite amgx-parity failures).
+- **Block-preconditioner (the L6+ scalability path): NOT YET SCALING.** It
+  converges on a tiny L3 saddle but cliff-fails at L5 (143k) regardless of F
+  strength / Schur mode (Cahouet-Chabard AND PSPG C-block) / GMRES restart — a
+  structural, scale-specific breakdown, not a tuning weakness. Deferred to a
+  focused instrumented investigation: **`docs/dev/2026-07-22-block-precond-scaling-handoff.md`**
+  (detailed cold-start notes; branch `r2b1`, all knobs committed).
+
+R2b.1 status: cuDSS validation banked; the iterative block-precond scalability
+path is the open R&D item (handoff). All on branch `r2b1` (unmerged, unpushed).
