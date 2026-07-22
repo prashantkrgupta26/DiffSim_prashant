@@ -78,7 +78,7 @@ from diffsim.physics.poisson import gauss_points                              # 
 # ---------------------------------------------------------------------------
 DT = 0.05
 LEVEL = 4
-RE = 1.0        # Re=1: Stokes, isolates pressure coupling
+RE = float(os.environ.get("RE", "1.0"))   # Re=1 Stokes default; RE=100 tests the Re confound
 ALPHA = 100.0
 STEPS = int(os.environ.get("STEPS", "30"))
 
