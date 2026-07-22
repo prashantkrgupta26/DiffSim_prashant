@@ -144,3 +144,36 @@ A stable, scalable, literature-validated volumetric NS-SBM forward stepper —
 the foundation the **shell** (next), the **heroes** (B1 truck / B2 maize),
 and the **steady-adjoint** (R3, deliverable C — the differentiable maize-
 ideotype design engine) all require.
+
+---
+
+## ADDENDUM 2026-07-22 — R2a outcome & re-scope to the monolithic 3-D engine
+
+R2a (3-D stability) is closed with a **pivot**, recorded in
+`docs/dev/2026-07-22-p2-r2a-projection-3d-findings.md`. Summary:
+
+- The full diagnostic chain proved the 3-D failure is the **projection split**,
+  not the SBM. **Control:** the monolithic reference uses the *identical*
+  `sbm_vector_dirichlet` block and is correct (`Cd=40.04` at Re=1, `+0.96` at
+  Re=100 on level-4). The split converges to a weak, wrong fixed point
+  (lagged-pressure predictor never builds the driving pressure); worst at low
+  Re, not eliminated at Re=100. This is a numerical-methods problem, not a knob.
+
+**Re-scope of the sub-phases:**
+
+- **R2a → DONE (pivoted).** 3-D forward engine = the **monolithic SBM-NS saddle
+  solve** (proven faithful with our own SBM). The projection-split-in-3-D moves
+  to a dedicated research track (`docs/dev/2026-07-22-projection-sbm-3d-research-item.md`),
+  still the intended 100M-scalability path.
+- **R2b (device port) — re-scoped to the monolithic path.** The scalability
+  lever is now the **monolithic block-preconditioner** (`solvers/block_precond.py`,
+  already AMGX-backed) rather than the SPD-PPE→AMGX projection port. Port the
+  monolithic 3-D march to a single GPU to reach the L8–L9 validation meshes.
+  (The projection SPD-PPE→AMGX port is deferred with the projection research.)
+- **R2c (literature validation) — on the monolithic engine.** Cylinder Cd /
+  Strouhal and sphere Cd mesh-convergence, marched with the monolithic solver.
+  The gate (monotone convergence to each reference within tolerance) is
+  unchanged; only the engine changed.
+
+The shell, the heroes (truck/maize), and the steady-adjoint (R3) all build on
+the monolithic 3-D forward engine — none required the split specifically.
