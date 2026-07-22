@@ -83,7 +83,8 @@ class LeraySBMStepper:
                  lam=0.5, domain="outside", order=2, picard_iters=2,
                  solver="splu", ppe_finescale=False, alpha=10.0,
                  beta_backflow=1.0, velocity_update="consistent",
-                 graddiv_scale=1.0):
+                 graddiv_scale=1.0, pressure_update="standard",
+                 ppe_fine_scale=False):
         self.oracle = oracle
         self.dm = dm
         self.nu = nu
@@ -119,7 +120,8 @@ class LeraySBMStepper:
             dm, nu, dt, f_fn, self._g_box, order=order,
             picard_iters=picard_iters, solver=solver,
             ppe_finescale=ppe_finescale,
-            velocity_update=velocity_update, graddiv_scale=graddiv_scale)
+            velocity_update=velocity_update, graddiv_scale=graddiv_scale,
+            pressure_update=pressure_update, ppe_fine_scale=ppe_fine_scale)
         base.dir_nodes = self._strong_nodes
         self.base = base
         self.n_free = base.n_free

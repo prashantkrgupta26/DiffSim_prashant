@@ -36,7 +36,8 @@ class LerayProjectionStepper:
     def __init__(self, dm, nu, dt, f_fn, g_fn, order=2, picard_iters=2,
                  solver="splu",
                  timestab=True, ppe_finescale=False, predictor="picard",
-                 velocity_update="consistent", graddiv_scale=1.0):
+                 velocity_update="consistent", graddiv_scale=1.0,
+                 pressure_update="standard", ppe_fine_scale=False):
         self.dm, self.nu, self.dt, self.order = dm, nu, dt, order
         self.picard_iters = picard_iters
         # P2-R0 velocity-update EXPERIMENT knob (default "consistent" =
@@ -58,6 +59,30 @@ class LerayProjectionStepper:
                 f"got {velocity_update!r}")
         self.velocity_update = velocity_update
         self.graddiv_scale = float(graddiv_scale)
+        # P2-R2a pressure-treatment enum (default "standard" = unchanged classic
+        # incremental p_hat = p* + phi). Folds Taly's pressure_extrap_c into one
+        # enum (see the plan's interaction table): standard/rotational are
+        # pressure-extrap order 1 (p*=p^n, BDF2-compatible); chorin is order 0
+        # (p*=0, 1st-order). We never use 2nd-order pressure extrapolation.
+        #   "standard"   — classic incremental: p_hat = p* + phi (Algorithm 1).
+        #   "rotational" — Timmermans consistent-incremental:
+        #                    p_hat = p* + phi - nu * q,  M_p q = B^T u_hat.
+        #   "chorin"     — non-incremental confirmation: p* reset to 0 each step
+        #                  (no accumulation); p_hat = phi. 1st-order in time.
+        if pressure_update not in ("standard", "rotational", "chorin"):
+            raise ValueError(
+                f"pressure_update must be standard|rotational|chorin, "
+                f"got {pressure_update!r}")
+        self.pressure_update = pressure_update
+        # P2-R2a VMS fine-scale-consistency lever (default False = unchanged).
+        # NOTE: spelled with an underscore to distinguish from the PRE-EXISTING
+        # self.ppe_finescale flag (leray.py, dt=Δt/b0 τ_m bug, audit §5) which
+        # R2a leaves untouched. When True: the fine-scale velocity -tau_M r_m
+        # enters BOTH the PPE source (sigma (grad q, -tau_M r_m)) AND the
+        # velocity update (u = u_hat - tau_M r_m - (1/sigma)(grad p_hat -
+        # grad p*)) — matching Taly Proj_Linear_PPE/VUE_Integrands. tau_M here
+        # is computed with the CORRECT dt (NOT dt/b0).
+        self.ppe_fine_scale = bool(ppe_fine_scale)
         # 'picard' (v1) or 'newton' (the draft's Algorithm 1): Newton adds
         # the (du.grad)a cross-block in the momentum operator and folds the
         # (a.grad)a RHS partner into f_eff (which hands it SUPG/PSPG
@@ -239,6 +264,33 @@ class LerayProjectionStepper:
                 gout[pv] = g.reshape((-1, dm.dim) + full.shape[1:])
         return (out, gout) if grad else out
 
+    def _weak_div_free(self, u_free):
+        """Assemble the free-node weak divergence B^T u_hat (scalar, n_free)
+        from a free-node velocity field u_free [n_free, dim].
+
+        Used by the rotational pressure update when ppe_fine_scale=True (the
+        rhs_free already carries the fine-scale source and cannot be reused as
+        sigma * B^T u_hat). Assembles int grad(N_a) . u dV in the scalar free-
+        node space, then pins free-node 0 to zero (same convention as the PPE).
+        """
+        dm = self.dm
+        dim = dm.dim
+        uq = self._gp_vals(u_free)
+        rhs = np.zeros(dm.n_nodes)
+        for pv, b_ in dm.bins.items():
+            tb = dm.tables_by_p[pv]
+            h = dm.mesh.tree.h()[dm.mesh.bins[pv]]
+            nqp = tb.nqp
+            ne = len(h)
+            jac = (h / 2.0) ** dim
+            dsc = (2.0 / h)
+            fl = uq[pv].reshape(ne, nqp, dim)
+            be = np.einsum("qad,eqd,q,e->ea", tb.dN, fl, tb.w, jac * dsc)
+            np.add.at(rhs, dm.mesh.conn_of[pv].ravel(), be.ravel())
+        bt_free = np.asarray(dm.constraints.T.T @ rhs)
+        bt_free[0] = 0.0  # pin free-node 0 (same convention as PPE)
+        return bt_free
+
     def set_initial(self, u0_fn):
         self.hist.rotate(u0_fn(self.free_coords).ravel())
 
@@ -382,6 +434,11 @@ class LerayProjectionStepper:
         dim = dm.dim
         ndof = self.ndof
         t_new = self.t + self.dt
+        # P2-R2a: Chorin (non-incremental) confirmation mode — zero the
+        # accumulated pressure each step so the predictor never sees a
+        # compounding grad p* and p_hat = phi (pressure-extrap order 0).
+        if self.pressure_update == "chorin":
+            self.p_star = np.zeros(self.n_free)
         b0, b1, b2, sigma, u1, u2, fq_base, gvals = \
             self._predictor_setup(t_new)
 
@@ -393,6 +450,7 @@ class LerayProjectionStepper:
         uq, guq = self._gp_vals(uhat, grad=True)
         pq_g = self._gp_vals(self.p_star, grad=True)[1]
         w_gp = {}
+        fs_vel = {}   # P2-R2a: cached -tau_M r_m per bin for velocity update
         rhs = np.zeros(dm.n_nodes)
         for pv, b_ in dm.bins.items():
             tb = dm.tables_by_p[pv]
@@ -408,7 +466,26 @@ class LerayProjectionStepper:
             #   + grad p* - f  (BDF history already inside fq_base's -h term)
             agu = np.einsum("gd,gdc->gc",
                             aqv, guq[pv].reshape(-1, dim, dim))
-            if self.ppe_finescale:
+            if self.ppe_fine_scale:
+                # NEW VMS-consistent PPE source (Taly Proj_Linear_PPE_Integrands
+                # line ~294): flux = sigma*(u_hat - tau_M R). tau_M uses the
+                # CORRECT dt (self.dt), NOT self.dt/b0 (the old ppe_finescale
+                # bug). R is the coarse momentum residual already assembled here
+                #   R = sigma*u_hat + a.grad u_hat + grad(p*) - f
+                # where the pressure term is grad(p_star) — the LAGGED pressure
+                # p^n (Taly NL integrands use vpre1.gradp, NOT p^{n+1}, NOT the
+                # extrapolated p*). In our INCREMENTAL setting p_star IS the
+                # lagged pressure the PPE re-solves against, so pq_g (=grad p*)
+                # is exactly Taly's lagged-pressure gradient — REUSE it, do NOT
+                # recompute a second, subtly-different residual.
+                taum_fs = tau_hbased_host(umag, he, self.nu,
+                                          dt=(self.dt if self.timestab else None),
+                                          dim=dim)
+                r_m = (sigma * aqv + agu + pq_g[pv].reshape(-1, dim)
+                       - fq_base[pv])
+                fs_vel[pv] = taum_fs[:, None] * r_m  # -tau_M r_m (stashed)
+                flux = sigma * (aqv - fs_vel[pv])
+            elif self.ppe_finescale:      # PRE-EXISTING flag, untouched
                 # IMPLICIT fine scale (draft-faithful; findings 5b): the
                 # phi-part of r_m moves to the LHS -> weight (1/sigma+tau_m)
                 # on the stiffness; RHS flux = u_hat - tau_m r_m_expl
@@ -458,7 +535,24 @@ class LerayProjectionStepper:
         # RHS carries only (u_hat, grad q)-type terms, so the solution IS
         # the increment. (Treating it as the total pressure double-counts
         # p* every step — measured compounding blowup ~7e5.)
-        p_hat = self.p_star + phi
+        # ---- pressure update (P2-R2a pressure_update enum) ----
+        if self.pressure_update == "chorin":
+            p_hat = phi.copy()             # p* zeroed at top of step(); no accum.
+        elif self.pressure_update == "rotational":
+            # Timmermans: p_hat = p* + phi - nu * q, M_p q = B^T u_hat.
+            if self.ppe_fine_scale:
+                # rhs_free carries the fine-scale term, so recompute B^T u_hat
+                # directly from u_hat (weak divergence, pinned at free-node 0).
+                bt_uhat = self._weak_div_free(uhat)
+            else:
+                bt_uhat = rhs_free / sigma     # rhs_free = sigma * B^T u_hat
+            from ..solvers.linsolve import solve_linear
+            q = solve_linear(self.M, bt_uhat, solver=self.solver, sym=True,
+                             device=self.dm.device, cache=self._solver_cache,
+                             cache_key="mass")   # SAME key as velocity update
+            p_hat = self.p_star + phi - self.nu * q
+        else:                                    # "standard" (default)
+            p_hat = self.p_star + phi
         # ---- Step 3: velocity update u = u_hat - (1/sigma) grad(phi) ----
         dphi_g = self._gp_vals(phi, grad=True)[1]
         u_new = np.empty_like(uhat)
@@ -472,6 +566,12 @@ class LerayProjectionStepper:
                 jac = (h / 2.0) ** dim
                 integ = (uq[pv].reshape(ne, nqp, dim)[:, :, c]
                          - dphi_g[pv].reshape(ne, nqp, dim)[:, :, c] / sigma)
+                if self.ppe_fine_scale:
+                    # -tau_M r_m fine-scale velocity (Taly VUE line ~230);
+                    # fs_vel[pv] = tau_M r_m cached from the PPE loop — the
+                    # SAME fine-scale velocity as the PPE source, ensuring
+                    # VMS consistency between the PPE source and velocity update.
+                    integ = integ - fs_vel[pv].reshape(ne, nqp, dim)[:, :, c]
                 be = np.einsum("qa,eq,q,e->ea", tb.N, integ, tb.w, jac)
                 np.add.at(rhs_c, dm.mesh.conn_of[pv].ravel(), be.ravel())
             from ..solvers.linsolve import solve_linear
