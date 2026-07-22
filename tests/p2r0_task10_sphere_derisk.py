@@ -175,6 +175,45 @@ def monolithic_cd(fx, alpha, dt, max_steps, rate_tol, solver="splu"):
     prev_u = None
     cd = None
     steps = 0
+
+    # ---- blockamgx meta (geometry-static; assembled ONCE) ----------------
+    # For solver="blockamgx" the monolithic saddle is solved by the
+    # host-orchestrated block-preconditioned FGMRES (Cahouet-Chabard Schur +
+    # AMG-on-F, block_precond.BlockAMGPreconditioner). It needs the pressure
+    # stiffness Kp and mass-diagonal Mp_diag on the SAME free-node pressure
+    # space, pinned at the SAME node the monolithic march pins the pressure
+    # DOF, plus the strong-Dirichlet velocity row ids. All are geometry-
+    # static (sigma=1/dt is constant here), so we build them ONCE before the
+    # Picard loop and reuse the cache every step. This mirrors the R2b.1
+    # de-risk build_saddle contract exactly (tests/p2r2b1_blockamgx_derisk.py).
+    solve_cache = None
+    cache_key = None
+    if solver == "blockamgx":
+        from diffsim.steppers.leray import LerayProjectionStepper
+        # reuse the Leray scalar pressure stiffness K_p = T^T K T and
+        # consistent mass M = T^T M T (both free-node scalar pressure space).
+        stp = LerayProjectionStepper(
+            dm, nu, dt,
+            lambda xx, t: np.zeros((len(xx), dim)),   # f_fn (body force)
+            lambda xx, t: np.zeros((len(xx), dim)),   # g_fn (Dirichlet data)
+            solver="splu")
+        p_pin = int(np.argmax(coords.sum(1)))         # scalar pressure node
+        Kp = stp.K_p.tolil()
+        Kp.rows[p_pin] = [p_pin]                       # pin consistently with
+        Kp.data[p_pin] = [1.0]                         # the monolithic p pin
+        Kp = Kp.tocsr()
+        Mp_diag = np.asarray(stp.M.diagonal()).copy()
+        Mp_diag[p_pin] = 1.0
+        # strong-Dirichlet velocity row ids (the SAME identity rows the march
+        # overwrites below): free-node i x ndof + component c, c in [0, dim).
+        dir_rows = np.asarray(
+            [int(i) * ndof + c for i in strong for c in range(dim)],
+            dtype=np.int64)
+        cache_key = "monolithic_cd"
+        solve_cache = {("blockamgx_meta", cache_key): dict(
+            n_nodes=nfree, ndof=ndof, Kp=Kp, Mp_diag=Mp_diag,
+            sigma=sigma, nu=nu, dir_rows=dir_rows)}
+
     for step in range(max_steps):
         u_node = x.reshape(nfree, ndof)[:, :dim]
         aq, dq = gp_field(u_node)
@@ -194,6 +233,10 @@ def monolithic_cd(fx, alpha, dt, max_steps, rate_tol, solver="splu"):
         b[pin] = 0.0
         if solver == "splu":
             x = splu(A.tocsr().tocsc()).solve(b)
+        elif solver == "blockamgx":
+            x = solve_linear(A.tocsr(), b, solver=solver, sym=False,
+                             device=dm.device, cache=solve_cache,
+                             cache_key=cache_key)
         else:
             x = solve_linear(A.tocsr(), b, solver=solver, sym=False,
                              device=dm.device)

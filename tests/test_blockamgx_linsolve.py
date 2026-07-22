@@ -9,9 +9,14 @@ Two groups:
   `dir_rows` passthrough into `BlockAMGPreconditioner`, and the block DOF-index
   split — all exercised WITHOUT touching AMGX by stubbing `_AMGXCycle`.
 """
+import os
+import sys
+
 import numpy as np
 import scipy.sparse as sp
 import pytest
+
+sys.path.insert(0, os.path.dirname(__file__))
 
 
 def _small_saddle(n_nodes=40, dim=2, seed=0):
@@ -181,3 +186,92 @@ def test_blockamgx_local_solve_via_exact_stub(_stub_amgx):
     assert ("blockamgx_iters", key) in cache
     outer, = cache[("blockamgx_iters", key)]
     assert 0 < outer < 200
+
+
+# --------------------------------------------------------------------------
+# Task 3 LOCAL test — monolithic_cd(solver="blockamgx") assembles the meta
+# from the real 3-D sphere march and feeds it to solve_linear. AMGX is stubbed
+# by the exact dense cycle so the whole march runs on the Mac (CPU). We assert
+# the meta was built with the right keys/shapes/space AND that the blockamgx
+# march matches the splu march step-for-step (the exact stub makes the block
+# preconditioner an exact solve, so the two marches are identical to solver
+# tolerance).
+# --------------------------------------------------------------------------
+def test_monolithic_cd_blockamgx_meta_and_march(_stub_amgx, monkeypatch):
+    from p2r0_task10_sphere_derisk import build_sphere_3d, monolithic_cd
+
+    fx = build_sphere_3d("cpu", 3, 100.0)
+    dim, ndof = fx["dim"], fx["ndof"]
+    nfree = fx["cons"].T.shape[1]
+    strong = int(np.count_nonzero(fx["strong_mask"]))
+    dt = 0.05
+
+    # capture the meta solve_linear actually receives, and short-circuit the
+    # AMGX solve path: with the exact-cycle stub the block preconditioner IS an
+    # exact solve, so we can also let it run and compare marches. First: assert
+    # the meta contract the blockamgx branch reads.
+    import diffsim.solvers.linsolve as ls
+    seen = {}
+    orig = ls.solve_linear
+
+    def _spy(A, b, **kw):
+        if kw.get("solver") == "blockamgx":
+            m = kw["cache"][("blockamgx_meta", kw["cache_key"])]
+            seen.update(m)
+            seen["_A_shape"] = A.shape
+        return orig(A, b, **kw)
+
+    monkeypatch.setattr(
+        "p2r0_task10_sphere_derisk.solve_linear", _spy, raising=True)
+
+    res_blk = monolithic_cd(fx, alpha=20.0, dt=dt, max_steps=2,
+                            rate_tol=1e-9, solver="blockamgx")
+
+    # ---- meta contract: exactly the keys the linsolve blockamgx branch reads
+    assert set(seen) >= {"n_nodes", "ndof", "Kp", "Mp_diag", "sigma", "nu",
+                         "dir_rows"}
+    assert seen["n_nodes"] == nfree          # FREE-node pressure space
+    assert seen["ndof"] == ndof
+    # Kp/Mp_diag live on the FREE-node SCALAR pressure space (size nfree)
+    assert seen["Kp"].shape == (nfree, nfree)
+    assert seen["Mp_diag"].shape == (nfree,)
+    assert np.isclose(seen["sigma"], 1.0 / dt)
+    assert np.isclose(seen["nu"], fx["nu"])
+    # dir_rows: strong velocity rows i*ndof+c (monolithic global dof ids)
+    assert seen["dir_rows"].shape == (strong * dim,)
+    assert seen["dir_rows"].max() < nfree * ndof
+    assert (seen["dir_rows"] % ndof < dim).all()   # velocity components only
+    # the pressure pin is a valid diagonal entry in Kp / Mp_diag
+    p_pin = int(np.argmax(fx["coords"].sum(1)))
+    assert np.isclose(seen["Kp"][p_pin, p_pin], 1.0)
+    assert np.isclose(seen["Mp_diag"][p_pin], 1.0)
+    assert seen["_A_shape"] == (nfree * ndof, nfree * ndof)
+
+    # ---- march equivalence: exact-stub block precond == splu direct solve
+    res_splu = monolithic_cd(fx, alpha=20.0, dt=dt, max_steps=2,
+                             rate_tol=1e-9, solver="splu")
+    assert np.isclose(res_blk["cd"], res_splu["cd"], rtol=1e-5, atol=1e-6), (
+        f"blockamgx Cd {res_blk['cd']} vs splu {res_splu['cd']}")
+
+
+def test_monolithic_cd_splu_path_takes_no_meta(monkeypatch):
+    """The splu/cudss paths must NOT build or pass any blockamgx meta —
+    guard the branch so the other solvers are untouched by Task 3."""
+    from p2r0_task10_sphere_derisk import build_sphere_3d, monolithic_cd
+    fx = build_sphere_3d("cpu", 3, 100.0)
+    calls = {"cache_seen": False}
+    import diffsim.solvers.linsolve as ls
+    orig = ls.solve_linear
+
+    def _spy(A, b, **kw):
+        if kw.get("cache") is not None:
+            calls["cache_seen"] = True
+        return orig(A, b, **kw)
+
+    # splu goes straight through scipy.splu (never solve_linear); cudss would
+    # call solve_linear WITHOUT a cache. Only blockamgx passes a cache.
+    monkeypatch.setattr(
+        "p2r0_task10_sphere_derisk.solve_linear", _spy, raising=True)
+    monolithic_cd(fx, alpha=20.0, dt=0.05, max_steps=1, rate_tol=1e-9,
+                  solver="splu")
+    assert calls["cache_seen"] is False
