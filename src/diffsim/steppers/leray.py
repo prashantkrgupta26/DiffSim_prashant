@@ -37,7 +37,8 @@ class LerayProjectionStepper:
                  solver="splu",
                  timestab=True, ppe_finescale=False, predictor="picard",
                  velocity_update="consistent", graddiv_scale=1.0,
-                 pressure_update="standard", ppe_fine_scale=False):
+                 pressure_update="standard", ppe_fine_scale=False,
+                 pressure_outflow_nodes=None):
         self.dm, self.nu, self.dt, self.order = dm, nu, dt, order
         self.picard_iters = picard_iters
         # P2-R0 velocity-update EXPERIMENT knob (default "consistent" =
@@ -83,6 +84,24 @@ class LerayProjectionStepper:
         # grad p*)) — matching Taly Proj_Linear_PPE/VUE_Integrands. tau_M here
         # is computed with the CORRECT dt (NOT dt/b0).
         self.ppe_fine_scale = bool(ppe_fine_scale)
+        # P2-R2a OUTFLOW-BC lever (Task 3b, Baskar outflow-BC route; default
+        # None = UNCHANGED enclosed-flow node-0 pin). The current PPE pins a
+        # single arbitrary FREE node (node 0) as "enclosed flow", which leaves
+        # the outflow pressure floating for an EXTERNAL flow with a free
+        # outflow face -> the incremental p* drifts (bake-off 556166d: no
+        # stable config). Taly ns_vms instead imposes a physical Dirichlet
+        # pressure BC on the outlet nodes (NS_VMS_Proj_PPE.h::fillEssBC).
+        # When ``pressure_outflow_nodes`` is a non-empty array of FREE-node
+        # indices, the PPE applies Dirichlet p=0 on ALL those rows (zero row,
+        # unit diagonal, zero rhs) INSTEAD of the single node-0 pin, EVERYWHERE
+        # the code pins the pressure/PPE (PPE solve, weak-div-free helper, and
+        # the rotational B^T u helper) so the projection/consistency paths stay
+        # mutually consistent. ``None`` keeps the exact node-0 pin (bit-for-bit).
+        if pressure_outflow_nodes is None:
+            self.pressure_outflow_nodes = None
+        else:
+            pon = np.unique(np.asarray(pressure_outflow_nodes, dtype=np.int64))
+            self.pressure_outflow_nodes = pon if pon.size else None
         # 'picard' (v1) or 'newton' (the draft's Algorithm 1): Newton adds
         # the (du.grad)a cross-block in the momentum operator and folds the
         # (a.grad)a RHS partner into f_eff (which hands it SUPG/PSPG
@@ -264,6 +283,29 @@ class LerayProjectionStepper:
                 gout[pv] = g.reshape((-1, dm.dim) + full.shape[1:])
         return (out, gout) if grad else out
 
+    def _pin_rows(self):
+        """Free-node rows the PPE/consistency paths pin the pressure at.
+
+        Default (``pressure_outflow_nodes is None``) — the single enclosed-flow
+        node-0 pin (unchanged). Otherwise — the outflow Dirichlet nodes (Taly
+        physical outlet pressure BC). ALL pin sites (the PPE solve, the weak-
+        div-free helper, the rotational B^T u helper) route through here so
+        they pin the SAME rows and stay consistent."""
+        if self.pressure_outflow_nodes is None:
+            return (0,)
+        return self.pressure_outflow_nodes
+
+    def _apply_pin_lil(self, Kp_lil, rhs_free):
+        """Apply the pressure pin (Dirichlet p=0) to a LIL PPE operator +
+        free-space rhs, honoring ``pressure_outflow_nodes``. Zeros each pinned
+        row to a unit diagonal and zeros the matching rhs entry."""
+        for r in self._pin_rows():
+            r = int(r)
+            Kp_lil.rows[r] = [r]
+            Kp_lil.data[r] = [1.0]
+            rhs_free[r] = 0.0
+        return Kp_lil, rhs_free
+
     def _weak_div_free(self, u_free):
         """Assemble the free-node weak divergence B^T u_hat (scalar, n_free)
         from a free-node velocity field u_free [n_free, dim].
@@ -288,7 +330,11 @@ class LerayProjectionStepper:
             be = np.einsum("qad,eqd,q,e->ea", tb.dN, fl, tb.w, jac * dsc)
             np.add.at(rhs, dm.mesh.conn_of[pv].ravel(), be.ravel())
         bt_free = np.asarray(dm.constraints.T.T @ rhs)
-        bt_free[0] = 0.0  # pin free-node 0 (same convention as PPE)
+        # pin the SAME rows as the PPE (free-node 0, or the outflow Dirichlet
+        # nodes when pressure_outflow_nodes is set) so the rotational B^T u
+        # helper stays consistent with the PPE pin convention.
+        for r in self._pin_rows():
+            bt_free[int(r)] = 0.0
         return bt_free
 
     def set_initial(self, u0_fn):
@@ -515,22 +561,24 @@ class LerayProjectionStepper:
         rhs_free = np.asarray(dm.constraints.T.T @ rhs)
         if self.ppe_finescale:
             Kp = self._weighted_stiffness(w_gp).tolil()   # per-step tau_m
-            Kp.rows[0] = [0]
-            Kp.data[0] = [1.0]
-            rhs_free[0] = 0.0
+            # pin: node-0 (enclosed flow) OR the outflow Dirichlet nodes.
+            Kp, rhs_free = self._apply_pin_lil(Kp, rhs_free)
             from ..solvers.linsolve import solve_linear
             phi = solve_linear(Kp.tocsr(), rhs_free, solver=self.solver,
                                sym=True, device=self.dm.device,
                                cache=self._solver_cache)
         else:
             Kp = self.K_p.tolil()
-            Kp.rows[0] = [0]
-            Kp.data[0] = [1.0]
-            rhs_free[0] = 0.0                      # pin (enclosed flow)
+            # pin (enclosed flow: node 0) OR the outflow Dirichlet nodes.
+            Kp, rhs_free = self._apply_pin_lil(Kp, rhs_free)
             from ..solvers.linsolve import solve_linear
+            # NOTE: the "ppe" cache_key must NOT be reused across different pin
+            # patterns; the outflow pin changes the factorized operator, so key
+            # it only for the default node-0 pin (unchanged fast path).
+            cache_key = "ppe" if self.pressure_outflow_nodes is None else None
             phi = solve_linear(Kp.tocsr(), rhs_free, solver=self.solver,
                                sym=True, device=self.dm.device,
-                               cache=self._solver_cache, cache_key="ppe")
+                               cache=self._solver_cache, cache_key=cache_key)
         # The PPE unknown is the pressure INCREMENT phi = p_hat - p*: the
         # RHS carries only (u_hat, grad q)-type terms, so the solution IS
         # the increment. (Treating it as the total pressure double-counts

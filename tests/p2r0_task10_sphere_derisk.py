@@ -76,6 +76,20 @@ def build_sphere_3d(device, level, Re):
                 nu=nu, ndof=ndof, dim=dim)
 
 
+def outflow_free_nodes(fx, tol=1e-12):
+    """FREE-node indices on the outflow face (x = x_max = 1.0) of the unit box.
+
+    These are the nodes where the Taly-style physical Dirichlet pressure BC is
+    imposed on the PPE (``pressure_outflow_nodes``). The fixture is an EXTERNAL
+    flow with strong inflow (x=0) + lateral walls and a FREE OUTFLOW at x=1
+    (see build_sphere_3d). Indexing is in the stepper's FREE-node space
+    (``coords`` = mesh.node_coords[cons.free_nodes]), consistent with
+    ``LerayProjectionStepper.pressure_outflow_nodes``.
+    """
+    coords = fx["coords"]
+    return np.where(np.abs(coords[:, 0] - 1.0) < tol)[0]
+
+
 def qref():
     return 0.5 * U_IN ** 2 * np.pi * R ** 2      # frontal area (as test_sphere)
 

@@ -393,6 +393,129 @@ def test_chorin_pressure_reset(device):
 
 
 # ---------------------------------------------------------------------------
+# Task 3b: outflow-Dirichlet PPE BC lever (pressure_outflow_nodes)
+# ---------------------------------------------------------------------------
+
+def test_outflow_pin_default_is_node0(device):
+    """pressure_outflow_nodes=None keeps the enclosed-flow node-0 pin: the PPE
+    Kp row 0 is unit-diagonal, rhs_free[0]==0, and NO other row is pinned by
+    the outflow lever. We capture the PPE operator+rhs handed to solve_linear."""
+    import diffsim.solvers.linsolve as linsolve_mod
+
+    st = _small_2d_stepper(device)   # default: pressure_outflow_nodes=None
+    assert st.pressure_outflow_nodes is None
+    assert st._pin_rows() == (0,)
+
+    ic = lambda c: 0.1 * np.stack([c[:, 1], -c[:, 0]], axis=1)
+    st.set_initial(ic)
+
+    captured = {}
+    _orig = linsolve_mod.solve_linear
+
+    def _patched(A, b, **kwargs):
+        if kwargs.get("cache_key") == "ppe":
+            captured["A"] = A.tocsr().copy()
+            captured["b"] = b.copy()
+        return _orig(A, b, **kwargs)
+
+    linsolve_mod.solve_linear = _patched
+    try:
+        st.step()
+    finally:
+        linsolve_mod.solve_linear = _orig
+
+    A = captured["A"]
+    b = captured["b"]
+    # row 0: unit diagonal, single nonzero
+    row0 = A.getrow(0)
+    assert row0.nnz == 1
+    assert row0[0, 0] == 1.0
+    assert b[0] == 0.0
+
+
+def test_outflow_pin_applies_dirichlet_rows(device):
+    """pressure_outflow_nodes=[i,j] makes the PPE Kp rows i,j unit-diagonal and
+    the corresponding rhs entries zero (Dirichlet p=0 applied), and does NOT
+    pin node 0 (unless 0 is one of i,j)."""
+    import diffsim.solvers.linsolve as linsolve_mod
+
+    dm = _make_dm(device, level=3)
+    outflow = [5, 9]
+    st = LerayProjectionStepper(
+        dm, nu=0.01, dt=0.05,
+        f_fn=lambda x, t: np.zeros((len(x), 2)),
+        g_fn=_lid_g,
+        order=2, picard_iters=2, solver="splu",
+        pressure_update="standard", ppe_fine_scale=False,
+        pressure_outflow_nodes=outflow)
+    assert list(st.pressure_outflow_nodes) == [5, 9]
+    assert tuple(st._pin_rows()) == (5, 9)
+
+    ic = lambda c: 0.1 * np.stack([c[:, 1], -c[:, 0]], axis=1)
+    st.set_initial(ic)
+
+    captured = {}
+    _orig = linsolve_mod.solve_linear
+
+    def _patched(A, b, **kwargs):
+        # outflow pin path uses cache_key=None for the PPE; capture the sym
+        # solve that is not a mass solve. Key on the operator being K_p-sized.
+        if kwargs.get("sym") and kwargs.get("cache_key") != "mass":
+            captured.setdefault("A", A.tocsr().copy())
+            captured.setdefault("b", b.copy())
+        return _orig(A, b, **kwargs)
+
+    linsolve_mod.solve_linear = _patched
+    try:
+        st.step()
+    finally:
+        linsolve_mod.solve_linear = _orig
+
+    A = captured["A"]
+    b = captured["b"]
+    for r in outflow:
+        row = A.getrow(r)
+        assert row.nnz == 1, f"row {r} not unit-diagonal (nnz={row.nnz})"
+        assert row[0, r] == 1.0, f"row {r} diagonal != 1.0"
+        assert b[r] == 0.0, f"rhs[{r}] != 0 (Dirichlet not applied)"
+    # node 0 is NOT in the outflow set -> it should NOT be pinned to unit diag
+    assert A.getrow(0).nnz != 1, "node 0 was pinned even though outflow lever set"
+
+
+def test_outflow_pin_threads_through_sbm(device):
+    """LeraySBMStepper accepts pressure_outflow_nodes and threads it to base."""
+    from diffsim.geometry.csg import Sphere
+
+    R = 0.07
+    CTR = (0.3, 0.5)
+    oracle = Sphere(CTR, R)
+    dm = _make_dm(device, level=4)
+    dim = 2
+
+    coords = dm.mesh.node_coords[dm.constraints.free_nodes]
+    strong = np.where(
+        (np.abs(coords[:, 0]) < 1e-12) |
+        (np.abs(coords[:, 1]) < 1e-12) |
+        (np.abs(coords[:, 1] - 1.0) < 1e-12))[0]
+    strong_mask = np.zeros(len(coords), dtype=bool)
+    strong_mask[strong] = True
+    u_inf = np.zeros((len(coords), dim))
+    inflow = strong[np.abs(coords[strong, 0]) < 1e-12]
+    u_inf[inflow, 0] = 1.0
+    outflow = np.where(np.abs(coords[:, 0] - 1.0) < 1e-12)[0]
+
+    st = LeraySBMStepper(
+        oracle, dm, nu=0.02, dt=0.05,
+        f_fn=lambda x, t: np.zeros((len(x), dim)),
+        u_inf=u_inf, strong_mask=strong_mask,
+        lam=0.5, domain="outside", order=1, picard_iters=1,
+        solver="splu", pressure_outflow_nodes=outflow)
+
+    assert st.base.pressure_outflow_nodes is not None
+    assert list(st.base.pressure_outflow_nodes) == sorted(outflow.tolist())
+
+
+# ---------------------------------------------------------------------------
 # LeraySBMStepper threading test (Step 6 verification)
 # ---------------------------------------------------------------------------
 
