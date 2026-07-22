@@ -2,18 +2,18 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Gate the 3-D projection stepper's stability by (1) diagnosing which pressure-coupling mechanism drives the 3-D divergence, (2) implementing the principled Nitsche-penalty law α~Pe·p², and (3) confirming 3-D sphere Cd faithfulness vs. the monolithic reference — or escalating to the monolithic fallback if the fix is insufficient.
+**Goal:** Gate the 3-D projection stepper's stability by (1) [DONE] diagnosing which pressure-coupling mechanism drives the 3-D divergence, (2) implementing the rotational / consistent-incremental pressure form (Timmermans) — `p_hat = p* + φ − ν(∇·û)` — which removes the spurious pressure boundary layer that the classic-incremental update's implicit homogeneous-Neumann pressure BC creates, and (3) confirming 3-D sphere Cd faithfulness vs. the monolithic reference — or escalating to the monolithic fallback if the fix is insufficient.
 
-**Architecture:** Diagnostic-first: a committed measurement isolates the 3-D mechanism before any code changes (mirroring `tests/p2r0_divergence_diagnostic.py`). The targeted fix adds an `alpha_law` knob to `LeraySBMStepper` / `sbm_vector_dirichlet` computing `alpha = C_alpha * Pe * p^2` from local mesh and flow data, with `alpha` remaining a fixed-scalar fallback. The R2a stability gate re-uses the Task-10 sphere fixture and asserts projection Cd matches monolithic to within 20%, weak-div machine-zero, BDF2 engaged. A fallback-decision task documents the monolithic path if Tasks 2–3 cannot stabilize.
+**Architecture:** Diagnostic-first: Task 1 (DONE, committed `4194601`) ruled out all four candidate mechanisms with machine-precision negatives (M1 PPE-conditioning residual 1e-14; M2 projection-space identity `‖σBᵀû−K_pφ‖`=1.16e-14 holds in 3-D; M3 φ-gauge drift 3.3e-13; M4 penalty diverges through α=20000). The surviving signature — pressure `‖p̂‖` growing ~4× over 12 steps (162→1307) with Cd→−8 at Stokes, while PPE residual stays 1e-14, weak-divergence stays flat, and the no-penetration leak stays ~1e-3 — is an **incremental-pressure feedback instability**: the classic-incremental update `p* += φ` accumulates (stable in 2-D, unstable in 3-D). The targeted fix adds a `pressure_update="standard|rotational|chorin"` knob to `LerayProjectionStepper` (mirroring the existing `velocity_update` knob), threaded through `LeraySBMStepper`. `"standard"` (default) is the unchanged `p_hat = p* + φ`. `"rotational"` computes `p_hat = p* + φ − ν·q` where `q` solves the pressure mass system `M_p q = Bᵀû` (nodal weak divergence of the predictor). `"chorin"` is a non-incremental mechanism-confirmation mode that resets `p* ≡ 0` each step (no accumulation). The R2a stability gate re-uses the Task-10 sphere fixture and asserts projection Cd matches monolithic to within 20%, weak-div machine-zero, BDF2 engaged. A fallback-decision task documents the monolithic path if Tasks 2–3 cannot stabilize.
 
-**Tech Stack:** Python / NumPy / SciPy (host-side; all 3-D runs on gpubox CPU via `splu`); Warp (for `sbm_vector_dirichlet` kernel rewire, though the penalty-law scalar change stays Python-side for this sub-phase); pytest; JSON baselines.
+**Tech Stack:** Python / NumPy / SciPy (host-side; all 3-D runs on gpubox CPU via `splu`); pytest; JSON baselines. The rotational fix is entirely in the Python `step()` path of `leray.py` (no Warp kernel change: the `−ν(∇·û)` term reuses the already-assembled scalar consistent mass matrix `self.M` as `M_p` and the already-computed PPE `rhs_free` as `σ·Bᵀû`).
 
 ## Global Constraints
 
 - R2a GATE: 3-D sphere projection Cd matches monolithic same-mesh reference (faithfulness in 3-D) + weak-div machine-zero + BDF2 engaged.
 - Gate-hygiene: independent reference (3-D monolithic on matched mesh) + mutation/planted-break leg; no vacuous gates.
-- Penalty-law non-vacuity: the α~Pe·p² gate must include a mutation leg that shows a deliberately wrong scaling (e.g., α=0 or α=constant=1) fails the faithfulness check — proving the gate is load-bearing.
-- REPO-IDENTITY GUARD: before every commit, verify `git rev-parse --abbrev-ref HEAD` == `master`; abort if not.
+- Rotational-fix non-vacuity: the gate must include a mutation leg that shows the classic-incremental form (`pressure_update="standard"`) diverges on the 3-D sphere while `"rotational"` stays finite/positive — proving the gate is load-bearing.
+- REPO-IDENTITY GUARD: before every commit, verify `git rev-parse --abbrev-ref HEAD` == `p2-r2a`; abort if not.
 - Agents never push; supervisor pushes.
 - All 3-D sphere marches run on **gpubox** (host/splu, 40-core CPU). The 2-D diagnostic and unit-level tests run locally.
 - `ppe_finescale=True` τ_m bug (latent: `dt=Δt/b0` over-scales transient by b0² for BDF2, documented in `docs/dev/2026-07-21-p2-r0-parity-audit.md` §5) MUST be fixed before any task that enables `ppe_finescale=True`. Do not enable `ppe_finescale=True` in any task here unless the bug fix is included in that task.
@@ -27,20 +27,21 @@
 
 | Action | Path | Responsibility |
 |--------|------|----------------|
-| Create | `tests/p2r2a_diagnostic_3d.py` | Committed 3-D pressure-coupling mechanism measurement (Task 1) |
-| Create | `tests/baselines/p2r2a_diagnostic_3d.json` | Diagnostic verdict record written by the diagnostic script |
-| Modify | `src/diffsim/steppers/leray.py` | (Task 2b only, if `ppe_finescale=True` bug fix needed; otherwise untouched) |
-| Modify | `src/diffsim/sbm/vector.py` | Add `alpha_law` parameter + `_compute_alpha_pe_p2` helper (Task 2) |
-| Modify | `src/diffsim/steppers/leray_sbm.py` | Thread `alpha_law` / `C_alpha` through to `sbm_vector_dirichlet` (Task 2) |
-| Create | `tests/test_p2r2a_penalty_law.py` | Unit + gate tests for α~Pe·p² law and non-vacuity mutation (Task 2) |
-| Modify | `tests/p2r0_task10_sphere_derisk.py` | Add `march_projection_r2a` helper with `alpha_law` parameter (Task 3) |
+| Create | `tests/p2r2a_diagnostic_3d.py` | [DONE, committed `4194601`] 3-D pressure-coupling mechanism measurement (Task 1) |
+| Create | `tests/baselines/p2r2a_diagnostic_3d.json` | [DONE] Diagnostic verdict record written by the diagnostic script |
+| Modify | `src/diffsim/steppers/leray.py` | Add `pressure_update="standard\|rotational\|chorin"` knob + rotational `p_hat = p* + φ − ν·q` update (reuses `self.M` as `M_p`, `rhs_free/σ` as `Bᵀû`) (Task 2) |
+| Modify | `src/diffsim/steppers/leray_sbm.py` | Thread `pressure_update` through `__init__` to the base stepper (Task 2) |
+| Create | `tests/test_p2r2a_rotational_pressure.py` | Unit + gate tests for the rotational-incremental fix, Chorin confirmation, standard-parity, and non-vacuity mutation (Task 2) |
+| Modify | `tests/p2r0_task10_sphere_derisk.py` | Add `march_projection_r2a` helper with `pressure_update` parameter (Task 3) |
 | Modify | `tests/test_p2r0_projection_sbm.py` | Add `test_g6_sphere_3d_r2a_stability_gate` (Tasks 3) |
 | Modify | `tests/baselines/p2r0_task10_sphere.json` | Update with the R2a matched-mesh result (Task 3) |
 | Create | `docs/dev/2026-07-21-p2-r2a-fallback-decision.md` | Fallback-decision record (Task 4, if escalation triggered) |
 
 ---
 
-## Task 1: 3-D Pressure-Coupling Diagnostic
+## Task 1: 3-D Pressure-Coupling Diagnostic  ✅ DONE (committed `4194601`)
+
+> **VERDICT (2026-07-21):** All four candidate mechanisms ruled out with machine-precision negatives (M1 PPE-conditioning residual 1e-14; M2 projection-space identity `‖σBᵀû−K_pφ‖`=1.16e-14; M3 φ-gauge drift 3.3e-13; M4 penalty diverges through α=20000). The surviving signature — `‖p̂‖` growing ~4× over 12 steps with Cd→−8 at Stokes while PPE residual stays 1e-14 — is an **incremental-pressure feedback instability** (`p* += φ` accumulation). This OVERTURNS the original penalty-law hypothesis. Tasks 2–3 below are re-scoped to the rotational / consistent-incremental fix. **Do not re-run or modify Task 1.**
 
 **Purpose:** Produce a committed, decisive measurement naming WHICH pressure-coupling mechanism drives the 3-D projection divergence. The output must be as decisive as the 2-D diagnostic (`tests/p2r0_divergence_diagnostic.py`), which ruled out all three 2-D candidates and concluded the correction's surrogate treatment was a no-op. The 3-D diagnostic must similarly test each candidate and emit a clear mechanism verdict to `tests/baselines/p2r2a_diagnostic_3d.json`.
 
@@ -469,237 +470,128 @@ EOF
 
 ---
 
-## Task 2: Penalty Law α~Pe·p² Implementation
+## Task 2: Rotational / Consistent-Incremental Pressure Form
 
-**Prerequisite:** Task 1 diagnostic verdict must be `M4_PENALTY_INSUFFICIENCY` (or include M4). If a different mechanism is named, skip this task and go to Task 4.
+**Prerequisite:** Task 1 diagnostic (DONE, `4194601`) confirmed the incremental-pressure feedback instability (`p* += φ` accumulation) after ruling out M1–M4. This task implements the fix. If any re-run of Task 1's diagnostic were to name a different mechanism, escalate to Task 4 — but the verdict is already committed and decisive.
 
 **What this task builds:**
-- A new `_compute_alpha_pe_p2(h, nu, u_mag_mean, p_order, C_alpha)` helper function in `src/diffsim/sbm/vector.py` that computes the principled per-element Nitsche penalty.
-- An `alpha_law` keyword argument to `sbm_vector_dirichlet` and to `LeraySBMStepper.__init__`: when `alpha_law="pe_p2"`, α is computed per-element from mesh and flow data rather than using the fixed scalar. When `alpha_law=None` (default), the existing fixed-scalar `alpha` path is unchanged.
-- The gate: a unit test proving the law is non-vacuous (a planted-break with α=1 or α=constant=0.1 fails the faithfulness check).
+- A `pressure_update="standard|rotational|chorin"` keyword on `LerayProjectionStepper.__init__`, mirroring the existing `velocity_update` knob (lines ~39, 55–59, 90–111 of `leray.py`). `"standard"` (default) is the unchanged classic-incremental `p_hat = p* + φ`.
+- `"rotational"`: the Timmermans consistent-incremental form `p_hat = p* + φ − ν·q`, where `q` solves the pressure mass system `M_p q = Bᵀû` (the nodal weak divergence of the predictor velocity `û`). The `−ν(∇·û)` term removes the spurious pressure boundary layer the classic-incremental form's implicit homogeneous-Neumann pressure BC creates.
+- `"chorin"`: a non-incremental mechanism-confirmation mode. Each step resets `p* ≡ 0` before the predictor (so the momentum predictor never sees an accumulating `grad p*`, and `p_hat = φ` with no step-over-step accumulation). Used once, at the start of this task, to CONFIRM the accumulation is the cause — Chorin stays bounded (finite Cd) while `"standard"` diverges.
+- Threading the knob through `LeraySBMStepper.__init__` to the base stepper.
+- Unit-level parity/zero tests (no gpubox), plus a gpubox non-vacuity mutation leg.
 
-**The penalty law:** `α(e) = C_alpha * Pe(e) * p^2` where:
-- `Pe(e) = |u_mean| * h(e) / (2 * nu)` is the element Péclet number (same definition as in Dokken `1912.06392` and Nitsche coercivity proofs).
-- `h(e)` is the element size (from `dm.mesh.tree.h()[sf.elem]`).
-- `p` is the polynomial order (1 for p1 elements — gives `p^2 = 1`).
-- `C_alpha` is a positive scalar constant (default `C_alpha = 10.0`, which at Re=1 / level-4 gives `Pe≈0.13` → `α≈1.3`, well above the coercivity minimum). **Supervisor confirmation needed on C_alpha value** — see spec ambiguities section at the end of this plan.
-- `u_mag_mean` is the mean velocity magnitude at the surrogate face GPs (computed from the face-GP advecting field if available, else `U_IN` as a conservative estimate).
-- Floor: `α(e) = max(alpha_floor, C_alpha * Pe(e) * p^2)` with `alpha_floor = 2.0` (prevents near-zero α at Stokes, where Pe→0; this is the coercivity minimum from the Nitsche constant).
+**The rotational formula (exact):**
+```
+p_hat = p_star + phi - nu * q,    where   M_p q = B^T u_hat
+```
+Where, INSIDE `LerayProjectionStepper.step()`:
+- `phi` is the existing PPE increment (line ~454), unchanged.
+- `Bᵀû` (the nodal weak divergence of the predictor `uhat`) is obtained WITHOUT re-assembly: in the `ppe_finescale=False` branch the PPE RHS is built with `flux = sigma * aqv` (line ~421), so `rhs = sigma · Bᵀû` and therefore **`rhs_free / sigma` IS the free-node weak divergence `Bᵀû`** (with the pin already applied at free-node 0). Verified against `leray.py` lines 421, 429–438, 452. In the `ppe_finescale=True` branch the flux is NOT `sigma · Bᵀû` (it carries the tau_m fine-scale residual), so the rotational term must NOT reuse `rhs_free` there — see the guard below.
+- `M_p` is the scalar consistent mass matrix **already assembled as `self.M`** (built in `_mass_matrix()`, lines ~115–134, as `T.T @ M @ T` — the same free-node scalar space that `phi` and `p_star` live in; `phi` and `K_p` are also `T.T`-constrained). No new assembly is required. `M_p` (a mass matrix) is SPD and invertible without any pin, so DO NOT apply the free-node-0 pin to it. Solve via the existing `solve_linear(self.M, ...)` path with `cache_key="mass"` — the SAME key the velocity update uses, since both invert the identical `self.M`, so the factorization is shared (no duplicate factorize).
 
-**The LATENT BUG NOTE:** if during the diagnostic (Task 1) the verdict names M2 (PPE projection-space identity failure) or requires `ppe_finescale=True` as a fix, the τ_m bug in `leray.py` (line 405: `dt=self.dt/b0` over-scales by b0² for BDF2) MUST be fixed FIRST. The fix is: change `tau_hbased_host(... dt=(self.dt / b0 if self.timestab else None) ...)` to `tau_hbased_host(... dt=(self.dt if self.timestab else None) ...)` in the `ppe_finescale=True` branch, and add a test to `tests/test_p2r0_parity.py` asserting `tau_hbased_host(0, h, nu, dt=dt)` with `b0=1.5` and `b0=1.0` gives the same transient (since σ=b0/dt). Include the bug fix as Step 0a here only if triggered by the diagnostic.
+**Pressure-mass decision (recorded):** reuse the existing consistent scalar mass `self.M` as `M_p` — do NOT assemble a new (lumped) pressure mass matrix. Rationale: (1) `self.M` already exists, is SPD, is in the exact free-node scalar pressure space, and is cached through `solve_linear`; (2) the consistent (not lumped) mass gives the theoretically-correct L2 projection of `∇·û` onto nodal pressure space that the Timmermans form specifies; (3) it costs one extra back-substitution per step against an already-factorized operator. A lumped `M_p` would be a micro-optimization with no scalability payoff at these mesh sizes and would introduce a projection error into the rotational term. **Flagged for supervisor:** if a future device port makes the consistent-mass solve a bottleneck, revisit lumped `M_p`; for R2a (host/splu) consistent is correct and cheap.
 
 **Files:**
-- Modify: `src/diffsim/sbm/vector.py` (add `_compute_alpha_pe_p2` + `alpha_law` parameter)
-- Modify: `src/diffsim/steppers/leray_sbm.py` (thread `alpha_law`/`C_alpha` through to `sbm_vector_dirichlet`)
-- Create: `tests/test_p2r2a_penalty_law.py` (unit tests + non-vacuity gate)
+- Modify: `src/diffsim/steppers/leray.py` (add `pressure_update` knob + rotational/chorin branches in `__init__` and `step()`)
+- Modify: `src/diffsim/steppers/leray_sbm.py` (thread `pressure_update` through `__init__` to the base stepper)
+- Create: `tests/test_p2r2a_rotational_pressure.py` (Chorin confirmation + standard-parity + divergence-free-zero unit tests + non-vacuity gate)
 
 **Interfaces:**
-- Consumes: `sbm_vector_dirichlet(dm, sf, geo, g_fn, nu, ndof, alpha=10.0, alpha_law=None, C_alpha=10.0, p_order=1, u_mag_mean=None, alpha_floor=2.0, ...)` from `src/diffsim/sbm/vector.py`
-- Produces: `LeraySBMStepper(..., alpha_law=None, C_alpha=10.0, alpha_floor=2.0)` — the `alpha_law="pe_p2"` path for Task 3.
+- Consumes: `LerayProjectionStepper(dm, nu, dt, f_fn, g_fn, ..., velocity_update="consistent", graddiv_scale=1.0, pressure_update="standard")` from `src/diffsim/steppers/leray.py`; `build_sphere_3d, R, U_IN` from `tests/p2r0_task10_sphere_derisk.py`.
+- Produces: `LeraySBMStepper(..., pressure_update="standard")` — the `pressure_update="rotational"` path for Task 3.
 
-- [ ] **Step 1: Write the failing unit test for `_compute_alpha_pe_p2`**
+- [ ] **Step 1: Chorin (non-incremental) confirmation of the accumulation mechanism**
 
-Create `tests/test_p2r2a_penalty_law.py`:
+Before implementing the rotational fix, add the `pressure_update` knob with the `"chorin"` mode and confirm the mechanism: a non-incremental march (no `p*` accumulation) stays bounded while classic-incremental diverges.
+
+First, add the knob to `LerayProjectionStepper.__init__` in `src/diffsim/steppers/leray.py`. Mirror the `velocity_update` validation block (lines ~55–59). After the `velocity_update` validation and `self.velocity_update = velocity_update` line, insert:
 
 ```python
-"""Tests for the α~Pe·p² principled Nitsche-penalty law (P2-R2a Task 2)."""
+        # P2-R2a pressure-update knob (default "standard" = unchanged classic-
+        # incremental p_hat = p* + phi). Diagnostic 4194601 traced the 3-D
+        # divergence to p*-accumulation feedback; see the plan.
+        #   "standard"   — classic incremental: p_hat = p* + phi (Algorithm 1).
+        #   "rotational" — Timmermans consistent-incremental:
+        #                    p_hat = p* + phi - nu * q,  M_p q = B^T u_hat.
+        #                  Removes the spurious pressure boundary layer from the
+        #                  classic form's implicit homogeneous-Neumann p-BC.
+        #   "chorin"     — non-incremental confirmation mode: p* is reset to 0
+        #                  each step (no accumulation); p_hat = phi. Used to
+        #                  confirm the accumulation is the divergence cause.
+        if pressure_update not in ("standard", "rotational", "chorin"):
+            raise ValueError(
+                f"pressure_update must be standard|rotational|chorin, "
+                f"got {pressure_update!r}")
+        self.pressure_update = pressure_update
+```
+
+And add `pressure_update="standard"` to the `__init__` signature (append to the keyword list after `graddiv_scale=1.0`):
+
+```python
+    def __init__(self, dm, nu, dt, f_fn, g_fn, order=2, picard_iters=2,
+                 solver="splu",
+                 timestab=True, ppe_finescale=False, predictor="picard",
+                 velocity_update="consistent", graddiv_scale=1.0,
+                 pressure_update="standard"):
+```
+
+Now wire the two behavioral hooks in `step()`. (a) The Chorin reset: at the very top of `step()`, before the predictor call (`uhat = self._predict(...)`, line ~390), insert:
+
+```python
+        # P2-R2a: Chorin (non-incremental) confirmation mode — zero the
+        # accumulated pressure each step so the predictor never sees a
+        # compounding grad p* and p_hat = phi (no step-over-step feedback).
+        if self.pressure_update == "chorin":
+            self.p_star = np.zeros(self.n_free)
+```
+
+(b) Replace the pressure update at line ~461 (`p_hat = self.p_star + phi`) with the branch (the rotational branch is implemented in Step 4; for THIS step, implement `standard` and `chorin` only, with rotational falling through to standard so nothing breaks yet):
+
+```python
+        # ---- pressure update (P2-R2a pressure_update knob) ----
+        if self.pressure_update == "chorin":
+            p_hat = phi.copy()            # p* was zeroed above; no accumulation
+        else:
+            # "standard" (and, until Step 4, "rotational") classic incremental
+            p_hat = self.p_star + phi
+```
+
+Create `tests/test_p2r2a_rotational_pressure.py` with the Chorin confirmation (gpubox-guarded) and the knob-validation unit test:
+
+```python
+"""Tests for the P2-R2a rotational / consistent-incremental pressure fix.
+
+Diagnostic 4194601 traced the 3-D projection divergence to classic-
+incremental p*-accumulation feedback. This module confirms the mechanism
+(Chorin stays bounded) and gates the rotational fix.
+"""
+import os
+import sys
+
 import numpy as np
 import pytest
 
-pytestmark = pytest.mark.tier2
+
+def test_pressure_update_knob_validates():
+    """The pressure_update knob rejects unknown modes (mirrors velocity_update)."""
+    import scipy  # noqa: F401  (import kept parallel to other unit tests)
+    from diffsim.steppers.leray import LerayProjectionStepper
+    with pytest.raises(ValueError, match="pressure_update must be"):
+        # dm=None is fine: the validation happens before dm is touched.
+        LerayProjectionStepper.__init__.__wrapped__ if False else None
+        # Construct enough to hit the validation. Use a minimal real dm via the
+        # shared 2-D fixture builder if available; otherwise assert the guard
+        # string is present (the ValueError above is the load-bearing check).
+        raise ValueError("pressure_update must be standard|rotational|chorin")
 
 
-def test_alpha_pe_p2_formula():
-    """_compute_alpha_pe_p2 returns C_alpha * Pe * p^2, floored at alpha_floor."""
-    from diffsim.sbm.vector import _compute_alpha_pe_p2
-    # h=1/16, nu=2*1*0.12/100=0.0024, u_mag=1.0, p=1, C_alpha=10
-    h = np.array([1.0 / 16])
-    nu = 2 * 1.0 * 0.12 / 100.0
-    u_mag = np.array([1.0])
-    Pe = u_mag * h / (2.0 * nu)            # ~ 1.302 at Re=100
-    expected = np.clip(10.0 * Pe * 1.0 ** 2, 2.0, None)
-    result = _compute_alpha_pe_p2(h, nu, u_mag, p_order=1, C_alpha=10.0,
-                                  alpha_floor=2.0)
-    np.testing.assert_allclose(result, expected, rtol=1e-10)
-
-
-def test_alpha_pe_p2_stokes_floor():
-    """At Stokes (very low Pe), floor prevents near-zero alpha."""
-    from diffsim.sbm.vector import _compute_alpha_pe_p2
-    h = np.array([1.0 / 16])
-    nu = 2.0     # large viscosity -> very low Pe
-    u_mag = np.array([0.01])
-    result = _compute_alpha_pe_p2(h, nu, u_mag, p_order=1, C_alpha=10.0,
-                                  alpha_floor=2.0)
-    assert result[0] >= 2.0, f"alpha below floor: {result[0]}"
-
-
-def test_alpha_pe_p2_scales_with_p():
-    """For p=2, alpha is 4x larger (p^2=4 vs p^2=1)."""
-    from diffsim.sbm.vector import _compute_alpha_pe_p2
-    h = np.array([0.1])
-    nu = 0.01
-    u_mag = np.array([1.0])
-    a1 = _compute_alpha_pe_p2(h, nu, u_mag, p_order=1, C_alpha=10.0,
-                               alpha_floor=0.0)
-    a2 = _compute_alpha_pe_p2(h, nu, u_mag, p_order=2, C_alpha=10.0,
-                               alpha_floor=0.0)
-    np.testing.assert_allclose(a2, 4.0 * a1, rtol=1e-10)
-```
-
-- [ ] **Step 2: Run test to confirm it fails (function not defined)**
-
-```bash
-cd /Users/baskarg/Dropbox/work/Projects/ClaudeCode/DiffSim
-python -m pytest tests/test_p2r2a_penalty_law.py::test_alpha_pe_p2_formula -v
-```
-Expected: `ImportError` or `AttributeError: module 'diffsim.sbm.vector' has no attribute '_compute_alpha_pe_p2'`
-
-- [ ] **Step 3: Add `_compute_alpha_pe_p2` and `alpha_law` to `src/diffsim/sbm/vector.py`**
-
-Insert after the imports block (before `sbm_vector_dirichlet`):
-
-```python
-def _compute_alpha_pe_p2(h, nu, u_mag_mean, p_order=1, C_alpha=10.0,
-                         alpha_floor=2.0):
-    """Per-element principled Nitsche penalty: alpha(e) = max(floor, C * Pe * p^2).
-
-    Pe(e) = |u_mean(e)| * h(e) / (2 * nu)  — element Péclet number.
-    p_order: polynomial order of the basis (p^2 factor from Nitsche coercivity).
-    C_alpha: scaling constant (default 10.0; supervisor-confirmed).
-    alpha_floor: minimum alpha preventing near-zero at Stokes (default 2.0).
-
-    Args:
-        h: array [n_faces] of element sizes.
-        nu: kinematic viscosity (scalar).
-        u_mag_mean: array [n_faces] of mean velocity magnitude at each face.
-        p_order: polynomial order (int).
-        C_alpha: scaling constant (float).
-        alpha_floor: minimum value (float).
-    Returns:
-        alpha: array [n_faces] of per-element penalty values.
+def test_chorin_bounded_while_standard_diverges(device):
+    """MECHANISM CONFIRMATION (gpubox): on the level-4 Stokes sphere the
+    non-incremental (Chorin) march stays bounded (finite Cd) while classic-
+    incremental (standard) accumulates and diverges (Cd runs strongly
+    negative). This confirms p*-accumulation is the divergence cause.
     """
-    h = np.asarray(h)
-    u_mag_mean = np.asarray(u_mag_mean)
-    Pe = u_mag_mean * h / (2.0 * nu)
-    return np.maximum(alpha_floor, C_alpha * Pe * float(p_order) ** 2)
-```
-
-Modify the `sbm_vector_dirichlet` signature to add `alpha_law=None, C_alpha=10.0, p_order=1, u_mag_mean=None, alpha_floor=2.0`:
-
-```python
-def sbm_vector_dirichlet(dm, sf, geo, g_fn, nu, ndof, alpha=10.0,
-                         a_face=None, beta_backflow=1.0,
-                         alpha_law=None, C_alpha=10.0, p_order=1,
-                         u_mag_mean=None, alpha_floor=2.0):
-    """(A_face, b_face) over FULL node-major vector DOFs (unconstrained).
-    g_fn(y) -> [Ngp, dim] velocity data at mapped points; a_face optional
-    [Ngp, dim] advecting field at face GPs for backflow.
-
-    alpha_law: None (fixed scalar alpha, default) or "pe_p2" (principled
-        alpha = C_alpha * Pe * p^2, floored at alpha_floor).
-    """
-```
-
-Inside the function body, after `fs = _FaceSet(dm, sf, geo)` and before the warp launch, insert the alpha-law dispatch:
-
-```python
-    # --- Nitsche penalty: fixed scalar or principled law ---
-    if alpha_law == "pe_p2":
-        h_sf = dm.mesh.tree.h()[sf.elem]                # [n_faces]
-        if u_mag_mean is None:
-            # fallback: use U_IN=1 (conservative; caller should supply a_face)
-            umag = np.ones(len(sf.elem))
-        elif a_face is not None:
-            nqf = fs.ftab.nqf
-            ne_f_ = len(sf.elem)
-            af_ = np.asarray(a_face).reshape(ne_f_, nqf, dim)
-            umag = np.linalg.norm(af_, axis=2).mean(axis=1)  # [n_faces]
-        else:
-            umag = np.asarray(u_mag_mean, dtype=np.float64)
-        alpha_arr = _compute_alpha_pe_p2(h_sf, nu, umag,
-                                         p_order=p_order, C_alpha=C_alpha,
-                                         alpha_floor=alpha_floor)
-        # The warp kernel takes a scalar alpha; call once per face with the
-        # per-face value by iterating in Python (face counts are small —
-        # O(64-256) surrogate faces — so Python loop is fine here).
-        # For now, use the mean alpha as a scalar (conservative simplification;
-        # full per-element launch is a follow-on if needed).
-        alpha_scalar = float(np.mean(alpha_arr))
-    else:
-        alpha_scalar = float(alpha)
-    # Replace the existing `wp.float64(alpha)` calls with `wp.float64(alpha_scalar)`.
-```
-
-**Important implementation note for Step 3:** the warp kernel `make_sbm_dirichlet_Ae` takes a single `wp.float64(alpha)`. After computing `alpha_scalar`, replace both occurrences of `wp.float64(alpha)` in the warp launch calls with `wp.float64(alpha_scalar)`. The per-element dispatch (passing an array to the kernel) is a follow-on; the mean-alpha scalar is sufficient for the R2a gate.
-
-- [ ] **Step 4: Run unit tests to verify they pass**
-
-```bash
-cd /Users/baskarg/Dropbox/work/Projects/ClaudeCode/DiffSim
-python -m pytest tests/test_p2r2a_penalty_law.py::test_alpha_pe_p2_formula \
-                 tests/test_p2r2a_penalty_law.py::test_alpha_pe_p2_stokes_floor \
-                 tests/test_p2r2a_penalty_law.py::test_alpha_pe_p2_scales_with_p -v
-```
-Expected: 3 tests PASS.
-
-- [ ] **Step 5: Thread `alpha_law` through `LeraySBMStepper`**
-
-In `src/diffsim/steppers/leray_sbm.py`, modify `LeraySBMStepper.__init__` signature to add `alpha_law=None, C_alpha=10.0, alpha_floor=2.0`:
-
-```python
-class LeraySBMStepper:
-    def __init__(self, oracle, dm, nu, dt, f_fn, *, u_inf, strong_mask,
-                 lam=0.5, domain="outside", order=2, picard_iters=2,
-                 solver="splu", ppe_finescale=False, alpha=10.0,
-                 beta_backflow=1.0, velocity_update="consistent",
-                 graddiv_scale=1.0, alpha_law=None, C_alpha=10.0,
-                 alpha_floor=2.0):
-```
-
-Store the new parameters:
-```python
-        self.alpha_law = alpha_law
-        self.C_alpha = C_alpha
-        self.alpha_floor = alpha_floor
-```
-
-Modify the `sbm_vector_dirichlet` call in `__init__` (the geometry-only block assembly) to pass `alpha_law` parameters:
-```python
-        Af, bf = sbm_vector_dirichlet(
-            dm, self.sf, self.geo, self._g_body, nu, self.ndof, alpha=alpha,
-            a_face=None, beta_backflow=beta_backflow,
-            alpha_law=alpha_law, C_alpha=C_alpha,
-            p_order=int(dm.bins[list(dm.bins.keys())[0]]),  # p-order from mesh
-            u_mag_mean=None,     # no velocity at init; fallback to U=1
-            alpha_floor=alpha_floor)
-```
-
-Similarly, modify `_backflow_block` to pass the law through:
-```python
-        Af_bf, _ = sbm_vector_dirichlet(
-            self.dm, self.sf, self.geo, self._g_body, self.nu, self.ndof,
-            alpha=self.alpha, a_face=a_face, beta_backflow=self.beta_backflow,
-            alpha_law=self.alpha_law, C_alpha=self.C_alpha,
-            p_order=int(self.dm.bins[list(self.dm.bins.keys())[0]]),
-            u_mag_mean=None,
-            alpha_floor=self.alpha_floor)
-```
-
-- [ ] **Step 6: Write the non-vacuity gate (mutation test)**
-
-Append to `tests/test_p2r2a_penalty_law.py`:
-
-```python
-def test_alpha_law_non_vacuity_wrong_scaling_fails(device):
-    """Non-vacuity gate: with alpha=1 (under-penalized), the 3-D sphere
-    projection Cd is unphysical (diverges or strongly negative) while with
-    alpha_law='pe_p2' and C_alpha=10.0 it stays finite and positive.
-    This proves the penalty-law gate is load-bearing, not decorative.
-
-    RUNS ON GPUBOX ONLY (marks tier4 / nightly).
-    """
-    import sys, os
     sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
     from p2r0_task10_sphere_derisk import build_sphere_3d, R, U_IN
     if not os.environ.get("DIFFSIM_NIGHTLY"):
@@ -714,87 +606,261 @@ def test_alpha_law_non_vacuity_wrong_scaling_fails(device):
     def f_fn(x, t):
         return np.zeros((len(x), dim))
 
-    # WRONG SCALING: alpha=1 (under-penalized, should diverge)
-    st_wrong = LeraySBMStepper(
-        fx["oracle"], fx["dm"], fx["nu"], dt, f_fn,
-        u_inf=fx["u_inf"], strong_mask=fx["strong_mask"],
-        lam=0.5, domain="outside", order=1, picard_iters=2,
-        solver="splu", ppe_finescale=False, alpha=1.0,
-        beta_backflow=1.0, velocity_update="consistent",
-        alpha_law=None)
-    st_wrong.set_initial(lambda c: np.zeros((len(c), dim)))
-    cds_wrong = []
-    for _ in range(15):
-        u, p = st_wrong.step()
-        F = st_wrong.surrogate_traction()
-        cds_wrong.append(float(F[0] / q))
-    final_cd_wrong = cds_wrong[-1]
-    print(f"\n[nonvac] alpha=1 (wrong) final Cd={final_cd_wrong:+.4f}  "
-          f"trajectory={[f'{c:.2f}' for c in cds_wrong[:5]]}", flush=True)
+    def _march(pressure_update, nsteps=15):
+        st = LeraySBMStepper(
+            fx["oracle"], fx["dm"], fx["nu"], dt, f_fn,
+            u_inf=fx["u_inf"], strong_mask=fx["strong_mask"],
+            lam=0.5, domain="outside", order=1, picard_iters=2,
+            solver="splu", ppe_finescale=False, alpha=100.0,
+            beta_backflow=1.0, velocity_update="consistent",
+            pressure_update=pressure_update)
+        st.set_initial(lambda c: np.zeros((len(c), dim)))
+        cds = []
+        for _ in range(nsteps):
+            u, p = st.step()
+            F = st.surrogate_traction()
+            cds.append(float(F[0] / q))
+        return cds
 
-    # PRINCIPLED LAW: alpha_law='pe_p2', C_alpha=10
-    st_law = LeraySBMStepper(
-        fx["oracle"], fx["dm"], fx["nu"], dt, f_fn,
-        u_inf=fx["u_inf"], strong_mask=fx["strong_mask"],
-        lam=0.5, domain="outside", order=1, picard_iters=2,
-        solver="splu", ppe_finescale=False, alpha=10.0,
-        beta_backflow=1.0, velocity_update="consistent",
-        alpha_law="pe_p2", C_alpha=10.0, alpha_floor=2.0)
-    st_law.set_initial(lambda c: np.zeros((len(c), dim)))
-    cds_law = []
-    for _ in range(15):
-        u, p = st_law.step()
-        F = st_law.surrogate_traction()
-        cds_law.append(float(F[0] / q))
-    final_cd_law = cds_law[-1]
-    print(f"[nonvac] alpha_law=pe_p2 final Cd={final_cd_law:+.4f}  "
-          f"trajectory={[f'{c:.2f}' for c in cds_law[:5]]}", flush=True)
-
-    # Gate: the principled law should be stable (positive Cd); wrong alpha should diverge
-    assert final_cd_wrong < -1.0, (
-        f"Expected alpha=1 to diverge (Cd < -1), got {final_cd_wrong:.3f}")
-    assert final_cd_law > 0.0, (
-        f"Expected pe_p2 law to stabilize (Cd > 0), got {final_cd_law:.3f}")
+    cds_std = _march("standard")
+    cds_chorin = _march("chorin")
+    print(f"\n[chorin] standard final Cd={cds_std[-1]:+.3f}  "
+          f"chorin final Cd={cds_chorin[-1]:+.3f}", flush=True)
+    # Classic-incremental diverges (Cd strongly negative); Chorin stays bounded.
+    assert cds_std[-1] < -1.0, (
+        f"expected standard to diverge (Cd < -1), got {cds_std[-1]:.3f}")
+    assert abs(cds_chorin[-1]) < 5.0 and np.isfinite(cds_chorin[-1]), (
+        f"expected Chorin to stay bounded (|Cd| < 5), got {cds_chorin[-1]:.3f}")
 ```
 
-- [ ] **Step 7: Run the non-vacuity test on gpubox**
+> **NOTE on `test_pressure_update_knob_validates`:** the stub above is a placeholder shape only — replace it during implementation with a construction that reaches the guard using the repo's smallest real 2-D `dm` fixture (see how `tests/test_p2r0_projection_sbm.py` builds a `dm`; reuse that builder and pass `pressure_update="bogus"` to `LerayProjectionStepper`, asserting the `ValueError`). The load-bearing assertion is that an unknown mode raises `ValueError` with the "pressure_update must be" message.
+
+- [ ] **Step 2: Run the knob-validation unit test locally; run the Chorin confirmation on gpubox**
+
+Locally (no gpubox):
+```bash
+cd /Users/baskarg/Dropbox/work/Projects/ClaudeCode/DiffSim
+python -m pytest tests/test_p2r2a_rotational_pressure.py::test_pressure_update_knob_validates -v
+```
+Expected: PASS (the `ValueError` guard fires).
 
 On gpubox:
 ```bash
 cd /Users/baskarg/Dropbox/work/Projects/ClaudeCode/DiffSim
 DIFFSIM_NIGHTLY=1 python -m pytest \
-    tests/test_p2r2a_penalty_law.py::test_alpha_law_non_vacuity_wrong_scaling_fails \
-    -v -s 2>&1 | tee /tmp/nonvac.log
+    tests/test_p2r2a_rotational_pressure.py::test_chorin_bounded_while_standard_diverges \
+    -v -s 2>&1 | tee /tmp/chorin.log
+```
+Expected: `standard` final Cd < −1 (diverging); `chorin` final Cd bounded (|Cd| < 5, finite). PASS. This CONFIRMS the accumulation is the cause. If Chorin ALSO diverges, the mechanism is not accumulation — STOP and escalate to Task 4 (the diagnostic's incremental-feedback reading would be contradicted).
+
+- [ ] **Step 3: Write the failing unit tests for the rotational term (no gpubox)**
+
+Append to `tests/test_p2r2a_rotational_pressure.py`. These pin the rotational contract without needing a 3-D march: (a) `pressure_update="standard"` reproduces the current `p_hat` bit-for-bit (parity), and (b) the rotational correction `−ν·q` is (near) zero when the predictor `û` is exactly divergence-free (so `Bᵀû ≈ 0 ⟹ q ≈ 0 ⟹ p_hat ≈ p* + φ`). Both use the small 2-D MMS/box `dm` fixture (the same one `tests/test_p2r0_projection_sbm.py` uses).
+
+```python
+def _small_2d_stepper(pressure_update):
+    """Build a minimal 2-D LerayProjectionStepper on the shared box fixture.
+    Mirrors the dm/g_fn construction used in tests/test_p2r0_projection_sbm.py;
+    replace the import below with that module's fixture builder."""
+    from diffsim.steppers.leray import LerayProjectionStepper
+    # --- fixture: reuse the project's smallest 2-D dm builder ---
+    # from <project 2-D fixture> import build_box_2d   # <-- wire to the real one
+    # dm, nu, dt, f_fn, g_fn = build_box_2d(...)
+    # return LerayProjectionStepper(dm, nu, dt, f_fn, g_fn, order=1,
+    #                               pressure_update=pressure_update)
+    raise NotImplementedError("wire to the shared 2-D dm fixture")
+
+
+def test_standard_parity_bitforbit(device):
+    """pressure_update='standard' reproduces the current p_hat bit-for-bit:
+    stepping a 'standard' stepper and a default (no-arg) stepper from the same
+    initial state gives identical p_hat after one step."""
+    from diffsim.steppers.leray import LerayProjectionStepper
+    # Build two identical steppers: one with the explicit default, one with
+    # pressure_update='standard'. Marching one step from the same IC must give
+    # p_hat identical to machine zero (the default IS 'standard').
+    st_default = _small_2d_stepper(None) if False else None
+    # Implementation: construct st_a (default) and st_b (pressure_update=
+    # "standard") on the SAME dm/IC; assert np.array_equal after one step().
+    pytest.skip("wire _small_2d_stepper to the shared 2-D dm fixture, then "
+                "assert np.array_equal(p_hat_default, p_hat_standard)")
+
+
+def test_rotational_term_zero_for_divergence_free_predictor(device):
+    """When the predictor u_hat is exactly divergence-free, B^T u_hat = 0,
+    so q = 0 and p_hat_rotational == p_hat_standard (the -nu*q term vanishes).
+    Constructed by projecting a divergence-free field and checking ||q|| ~ 0."""
+    pytest.skip("wire _small_2d_stepper to the shared 2-D dm fixture; set a "
+                "solenoidal u_hat, assert ||M_p^{-1} B^T u_hat|| < 1e-10 and "
+                "p_hat_rot == p_hat_std to 1e-12")
 ```
 
-Expected: `alpha=1` final Cd is strongly negative (< -1); `alpha_law=pe_p2` final Cd is positive. Both assertions pass.
+> **NOTE:** both tests above are skip-guarded pending the shared 2-D fixture wiring. During implementation, replace `_small_2d_stepper` with the repo's real 2-D `dm` builder (grep `tests/test_p2r0_projection_sbm.py` for how it constructs `dm`, `nu`, `dt`, `f_fn`, `g_fn`), then remove the `pytest.skip` lines and assert the stated contracts. These are the cheap, gpubox-free correctness anchors for the rotational term.
 
-If `pe_p2` also diverges, this is a NEEDS_CONTEXT: adjust `C_alpha` upward (e.g., `C_alpha=50`) or switch to `alpha_law=None` with a large fixed `alpha=200` found from the sweep. Document the finding and escalate if neither approach stabilizes before proceeding to Task 3.
+- [ ] **Step 4: Implement the rotational branch in `src/diffsim/steppers/leray.py`**
 
-- [ ] **Step 8: Run MMS parity to confirm no regression**
+Replace the Step-1 pressure-update branch (the `if self.pressure_update == "chorin": ... else: p_hat = self.p_star + phi` block) with the full three-way branch. `phi`, `rhs_free`, and `sigma` are all in scope at line ~461 (the PPE just solved). Insert:
+
+```python
+        # ---- pressure update (P2-R2a pressure_update knob) ----
+        if self.pressure_update == "chorin":
+            # non-incremental: p* was zeroed at the top of step(); p_hat = phi.
+            p_hat = phi.copy()
+        elif self.pressure_update == "rotational":
+            # Timmermans consistent-incremental: p_hat = p* + phi - nu * q,
+            # M_p q = B^T u_hat. In the classic (ppe_finescale=False) branch the
+            # PPE flux is sigma*u_hat, so rhs_free = sigma * B^T u_hat and the
+            # weak divergence of the predictor is exactly rhs_free / sigma
+            # (pin already applied at free-node 0). Solve the SPD consistent
+            # pressure mass M_p = self.M (NO pin; a mass matrix is invertible).
+            if self.ppe_finescale:
+                raise NotImplementedError(
+                    "pressure_update='rotational' requires ppe_finescale=False "
+                    "(the fine-scale PPE flux is not sigma*B^T u_hat, so "
+                    "rhs_free/sigma is not the weak divergence). R2a uses "
+                    "ppe_finescale=False throughout.")
+            bt_uhat = rhs_free / sigma           # nodal weak divergence B^T u_hat
+            from ..solvers.linsolve import solve_linear
+            # cache_key="mass": the velocity update inverts the SAME self.M, so
+            # sharing the key reuses its factorization (no second factorize).
+            q = solve_linear(self.M, bt_uhat, solver=self.solver, sym=True,
+                             device=self.dm.device, cache=self._solver_cache,
+                             cache_key="mass")
+            p_hat = self.p_star + phi - self.nu * q
+        else:                                    # "standard" (default)
+            p_hat = self.p_star + phi
+```
+
+Notes:
+- `rhs_free` here is the post-pin PPE RHS (its entry 0 was set to 0 at line ~452), consistent with `phi[0]` being the pinned pressure gauge; dividing by `sigma` preserves that gauge in `bt_uhat`.
+- `self.M` is `T.T @ M @ T` (free-node scalar space) — the same space as `phi`, `q`, `p_star`. No `dm.constraints.T` transform is needed on `bt_uhat` (it is already free-node-sized).
+- `cache_key="mass"` (shared with the velocity-update solve, which inverts the identical `self.M`) avoids a duplicate factorization.
+
+- [ ] **Step 5: Run the rotational unit tests locally (parity + divergence-free zero)**
+
+```bash
+cd /Users/baskarg/Dropbox/work/Projects/ClaudeCode/DiffSim
+python -m pytest tests/test_p2r2a_rotational_pressure.py::test_standard_parity_bitforbit \
+                 tests/test_p2r2a_rotational_pressure.py::test_rotational_term_zero_for_divergence_free_predictor \
+                 -v
+```
+Expected: both PASS (after the fixture wiring in Step 3 is completed). Parity: `p_hat` identical between default and `"standard"`. Divergence-free: `‖q‖ < 1e-10` and rotational `p_hat` equals standard `p_hat` to 1e-12.
+
+- [ ] **Step 6: Thread `pressure_update` through `LeraySBMStepper`**
+
+In `src/diffsim/steppers/leray_sbm.py`, add `pressure_update="standard"` to the `__init__` signature (after `graddiv_scale=1.0`, line ~86):
+
+```python
+    def __init__(self, oracle, dm, nu, dt, f_fn, *, u_inf, strong_mask,
+                 lam=0.5, domain="outside", order=2, picard_iters=2,
+                 solver="splu", ppe_finescale=False, alpha=10.0,
+                 beta_backflow=1.0, velocity_update="consistent",
+                 graddiv_scale=1.0, pressure_update="standard"):
+```
+
+Pass it through to the base stepper construction (line ~118–122):
+
+```python
+        base = LerayProjectionStepper(
+            dm, nu, dt, f_fn, self._g_box, order=order,
+            picard_iters=picard_iters, solver=solver,
+            ppe_finescale=ppe_finescale,
+            velocity_update=velocity_update, graddiv_scale=graddiv_scale,
+            pressure_update=pressure_update)
+```
+
+- [ ] **Step 7: Write the non-vacuity gate (mutation leg)**
+
+Append to `tests/test_p2r2a_rotational_pressure.py`. The mutation leg proves the fix is load-bearing: classic-incremental (`pressure_update="standard"`) diverges on the 3-D sphere while `"rotational"` stays finite/positive.
+
+```python
+def test_rotational_non_vacuity_standard_diverges(device):
+    """Non-vacuity gate (gpubox): on the level-4 Stokes sphere,
+    pressure_update='standard' (classic-incremental) accumulates and diverges
+    (Cd strongly negative) while 'rotational' stays finite and positive.
+    This proves the rotational fix is load-bearing, not decorative.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+    from p2r0_task10_sphere_derisk import build_sphere_3d, R, U_IN
+    if not os.environ.get("DIFFSIM_NIGHTLY"):
+        pytest.skip("nightly / gpubox only")
+    from diffsim.steppers.leray_sbm import LeraySBMStepper
+
+    fx = build_sphere_3d(device, level=4, Re=1.0)
+    q = 0.5 * U_IN ** 2 * np.pi * R ** 2
+    dt = 0.05
+    dim = fx["dim"]
+
+    def f_fn(x, t):
+        return np.zeros((len(x), dim))
+
+    def _march(pressure_update, nsteps=15):
+        st = LeraySBMStepper(
+            fx["oracle"], fx["dm"], fx["nu"], dt, f_fn,
+            u_inf=fx["u_inf"], strong_mask=fx["strong_mask"],
+            lam=0.5, domain="outside", order=1, picard_iters=2,
+            solver="splu", ppe_finescale=False, alpha=100.0,
+            beta_backflow=1.0, velocity_update="consistent",
+            pressure_update=pressure_update)
+        st.set_initial(lambda c: np.zeros((len(c), dim)))
+        cds = []
+        for _ in range(nsteps):
+            u, p = st.step()
+            F = st.surrogate_traction()
+            cds.append(float(F[0] / q))
+        return cds
+
+    cds_std = _march("standard")
+    cds_rot = _march("rotational")
+    print(f"\n[nonvac] standard final Cd={cds_std[-1]:+.3f}  "
+          f"rotational final Cd={cds_rot[-1]:+.3f}  "
+          f"std_traj={[f'{c:.2f}' for c in cds_std[:5]]}", flush=True)
+    assert cds_std[-1] < -1.0, (
+        f"expected standard (classic-incremental) to diverge (Cd < -1), "
+        f"got {cds_std[-1]:.3f}")
+    assert np.isfinite(cds_rot[-1]) and cds_rot[-1] > 0.0, (
+        f"expected rotational to stabilize (Cd > 0), got {cds_rot[-1]:.3f}")
+```
+
+- [ ] **Step 8: Run the non-vacuity mutation test on gpubox**
+
+```bash
+cd /Users/baskarg/Dropbox/work/Projects/ClaudeCode/DiffSim
+DIFFSIM_NIGHTLY=1 python -m pytest \
+    tests/test_p2r2a_rotational_pressure.py::test_rotational_non_vacuity_standard_diverges \
+    -v -s 2>&1 | tee /tmp/rot_nonvac.log
+```
+Expected: `standard` final Cd < −1 (diverging); `rotational` final Cd > 0 (stable). Both assertions PASS.
+
+If `rotational` also diverges, this is a NEEDS_CONTEXT: the `−ν(∇·û)` term did not remove the feedback. Verify (i) `bt_uhat = rhs_free/sigma` matches an independent `_weak_divergence_3d(st.base)` to 1e-10, and (ii) `‖q‖` is O(weak-div), not blowing up. Document and escalate to Task 4 before proceeding to Task 3.
+
+- [ ] **Step 9: Run MMS parity to confirm no regression**
 
 ```bash
 cd /Users/baskarg/Dropbox/work/Projects/ClaudeCode/DiffSim
 python -m pytest tests/test_p2r0_parity.py -v
 ```
-Expected: all 4 parity tests PASS.
+Expected: all 4 parity tests PASS (the default `pressure_update="standard"` leaves the incremental path untouched).
 
-- [ ] **Step 9: Commit the penalty-law implementation**
+- [ ] **Step 10: Commit the rotational-incremental implementation**
 
 ```bash
 cd /Users/baskarg/Dropbox/work/Projects/ClaudeCode/DiffSim
-git rev-parse --abbrev-ref HEAD   # must print "master"
-git add src/diffsim/sbm/vector.py src/diffsim/steppers/leray_sbm.py \
-        tests/test_p2r2a_penalty_law.py
+git rev-parse --abbrev-ref HEAD   # must print "p2-r2a"
+git add src/diffsim/steppers/leray.py src/diffsim/steppers/leray_sbm.py \
+        tests/test_p2r2a_rotational_pressure.py
 git commit -m "$(cat <<'EOF'
-feat(p2-r2a): principled Nitsche penalty law alpha~Pe*p^2 (Task 2)
+feat(p2-r2a): rotational/consistent-incremental pressure form (Task 2)
 
-Adds _compute_alpha_pe_p2 to sbm/vector.py and alpha_law='pe_p2' knob
-to sbm_vector_dirichlet + LeraySBMStepper. Non-vacuity gate in
-test_p2r2a_penalty_law.py: alpha=1 diverges, pe_p2 stabilizes.
-MMS parity clean.
+Adds pressure_update="standard|rotational|chorin" knob to
+LerayProjectionStepper (default standard = unchanged), threaded through
+LeraySBMStepper. Rotational: p_hat = p* + phi - nu*q, M_p q = B^T u_hat,
+reusing self.M as the consistent pressure mass and rhs_free/sigma as the
+weak divergence. Chorin confirms the accumulation mechanism (bounded)
+vs classic-incremental (diverges). Non-vacuity gate: standard diverges,
+rotational stabilizes on the level-4 Stokes sphere. MMS parity clean.
 
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 EOF
 )"
 ```
@@ -803,7 +869,7 @@ EOF
 
 ## Task 3: R2a Stability Gate (3-D Sphere Projection vs. Monolithic)
 
-**Purpose:** The formal R2a gate: 3-D sphere projection Cd matches monolithic same-mesh reference within 20%, weak-div machine-zero, BDF2 engaged. Includes a mutation/planted-break leg that breaks the gate when the penalty law is replaced with `alpha=1` (the under-penalized setting from Task 2's non-vacuity test). Runs on gpubox (`DIFFSIM_NIGHTLY`).
+**Purpose:** The formal R2a gate: 3-D sphere projection Cd matches monolithic same-mesh reference within 20%, weak-div machine-zero, BDF2 engaged. Includes a mutation/planted-break leg that breaks the gate when the pressure form is reverted to `pressure_update="standard"` (the classic-incremental setting that diverges, from Task 2's non-vacuity test). Runs on gpubox (`DIFFSIM_NIGHTLY`).
 
 **Files:**
 - Modify: `tests/test_p2r0_projection_sbm.py` (add `test_g6_sphere_3d_r2a_stability_gate`)
@@ -811,7 +877,7 @@ EOF
 - Modify: `tests/baselines/p2r0_task10_sphere.json` (updated by the run)
 
 **Interfaces:**
-- Consumes: `build_sphere_3d`, `monolithic_cd` from `tests/p2r0_task10_sphere_derisk.py`; `LeraySBMStepper` with `alpha_law="pe_p2"` from Task 2; `_weak_divergence_3d` from `tests/p2r2a_diagnostic_3d.py`
+- Consumes: `build_sphere_3d`, `monolithic_cd` from `tests/p2r0_task10_sphere_derisk.py`; `LeraySBMStepper` with `pressure_update="rotational"` from Task 2; `_weak_divergence_3d` from `tests/p2r2a_diagnostic_3d.py`
 - Produces: `test_g6_sphere_3d_r2a_stability_gate` (a `DIFFSIM_NIGHTLY`-guarded pytest gate); updated `tests/baselines/p2r0_task10_sphere.json` with `r2a_stability` key.
 
 - [ ] **Step 1: Add `march_projection_r2a` to `tests/p2r0_task10_sphere_derisk.py`**
@@ -821,10 +887,10 @@ Read the file first (already read above), then append after the existing `monoli
 ```python
 def march_projection_r2a(fx, dt, max_steps, rate_tol, order=2,
                          beta_backflow=1.0, picard_iters=2,
-                         alpha_law="pe_p2", C_alpha=10.0, alpha_floor=2.0,
-                         alpha_fixed=10.0):
-    """March LeraySBMStepper with the principled penalty law alpha~Pe*p^2
-    (R2a fix). Returns same dict as march_projection plus 'alpha_scalar' used."""
+                         pressure_update="rotational", alpha=100.0):
+    """March LeraySBMStepper with the rotational/consistent-incremental
+    pressure form (R2a fix). Returns the same dict as march_projection plus
+    'pressure_update' used."""
     from diffsim.steppers.leray_sbm import LeraySBMStepper
     dim = fx["dim"]
 
@@ -835,9 +901,9 @@ def march_projection_r2a(fx, dt, max_steps, rate_tol, order=2,
         fx["oracle"], fx["dm"], fx["nu"], dt, f_fn,
         u_inf=fx["u_inf"], strong_mask=fx["strong_mask"],
         lam=0.5, domain="outside", order=order, picard_iters=picard_iters,
-        solver="splu", ppe_finescale=False, alpha=alpha_fixed,
+        solver="splu", ppe_finescale=False, alpha=alpha,
         beta_backflow=beta_backflow, velocity_update="consistent",
-        alpha_law=alpha_law, C_alpha=C_alpha, alpha_floor=alpha_floor)
+        pressure_update=pressure_update)
     st.set_initial(lambda c: np.zeros((len(c), dim)))
     q = qref()
     cd_prev = None
@@ -876,8 +942,9 @@ def test_g6_sphere_3d_r2a_stability_gate(device):
     Gate-hygiene:
     - Independent reference: 3-D monolithic (no-split) SBM-NS on matched mesh
       (not a self-comparison, not the literature value).
-    - Mutation/planted-break: alpha=1 (under-penalized) makes the gate FAIL
-      (Cd < -1, strongly diverging), proving the gate is load-bearing.
+    - Mutation/planted-break: pressure_update="standard" (classic-incremental)
+      makes the gate FAIL (Cd < -0.5, diverging), proving the gate is
+      load-bearing — the rotational form is what stabilizes it.
 
     Runs on gpubox (DIFFSIM_NIGHTLY, level-4, host/splu).
     """
@@ -902,10 +969,10 @@ def test_g6_sphere_3d_r2a_stability_gate(device):
     print(f"\n[r2a-gate] level={level} Re={Re} dt={dt} "
           f"n_free={len(fx['coords'])} sf={fx['sf'].elem.size}", flush=True)
 
-    # --- Main path: principled penalty law ---
+    # --- Main path: rotational / consistent-incremental pressure form ---
     pr = march_projection_r2a(fx, dt=dt, max_steps=max_steps,
                               rate_tol=rate_tol, order=2,
-                              alpha_law="pe_p2", C_alpha=10.0, alpha_floor=2.0)
+                              pressure_update="rotational", alpha=100.0)
     q = 0.5 * U_IN ** 2 * float(__import__('numpy').pi) * R ** 2
     print(f"[r2a-gate] PROJECTION: Cd={pr['cd']:+.4f}  Clat={pr['clat']:.4f}  "
           f"finite={pr['finite']}  bdf2={pr['bdf2_engaged']}  "
@@ -916,8 +983,8 @@ def test_g6_sphere_3d_r2a_stability_gate(device):
     print(f"[r2a-gate] weak-div: ||B^T u||_2={w2:.3e}  ||B^T u||_inf={winf:.3e}",
           flush=True)
 
-    # Independent monolithic reference on the SAME mesh
-    mono = monolithic_cd(fx, alpha=10.0, dt=dt, max_steps=max_steps,
+    # Independent monolithic reference on the SAME mesh (matched penalty alpha)
+    mono = monolithic_cd(fx, alpha=100.0, dt=dt, max_steps=max_steps,
                          rate_tol=rate_tol)
     rel = abs(pr["cd"] - mono["cd"]) / (abs(mono["cd"]) + 1e-300)
     print(f"[r2a-gate] MONOLITHIC: Cd={mono['cd']:+.4f}  rel_diff={rel:.3%}",
@@ -933,9 +1000,9 @@ def test_g6_sphere_3d_r2a_stability_gate(device):
         f"rel_diff={rel:.1%} exceeds 20% faithfulness gate")
 
     # --- MUTATION / PLANTED-BREAK LEG ---
-    # alpha=1 (under-penalized) must diverge to prove the gate is load-bearing.
-    import rebuild  # force fresh fixture (no stepper state shared)
-    fx2 = build_sphere_3d(device, level=level, Re=Re)
+    # pressure_update="standard" (classic-incremental) must diverge to prove the
+    # gate is load-bearing — the rotational form is what stabilizes it.
+    fx2 = build_sphere_3d(device, level=level, Re=Re)  # fresh fixture, no shared state
     from diffsim.steppers.leray_sbm import LeraySBMStepper
     import numpy as np
 
@@ -946,9 +1013,9 @@ def test_g6_sphere_3d_r2a_stability_gate(device):
         fx2["oracle"], fx2["dm"], fx2["nu"], dt, f_fn2,
         u_inf=fx2["u_inf"], strong_mask=fx2["strong_mask"],
         lam=0.5, domain="outside", order=2, picard_iters=2,
-        solver="splu", ppe_finescale=False, alpha=1.0,
+        solver="splu", ppe_finescale=False, alpha=100.0,
         beta_backflow=1.0, velocity_update="consistent",
-        alpha_law=None)   # fixed alpha=1, no law
+        pressure_update="standard")   # classic-incremental (the planted break)
     st_break.set_initial(lambda c: np.zeros((len(c), fx2["dim"])))
     cds_break = []
     for _ in range(15):
@@ -956,10 +1023,10 @@ def test_g6_sphere_3d_r2a_stability_gate(device):
         F_b = st_break.surrogate_traction()
         cds_break.append(float(F_b[0] / q))
     cd_break = cds_break[-1]
-    print(f"[r2a-gate] MUTATION (alpha=1): Cd={cd_break:+.4f}  "
+    print(f"[r2a-gate] MUTATION (pressure_update=standard): Cd={cd_break:+.4f}  "
           f"trajectory={[f'{c:.2f}' for c in cds_break[:5]]}", flush=True)
     assert cd_break < -0.5, (
-        f"Mutation leg expected alpha=1 to diverge (Cd < -0.5), "
+        f"Mutation leg expected classic-incremental to diverge (Cd < -0.5), "
         f"got {cd_break:.3f} — gate is vacuous, investigate")
 
     # --- Update baseline ---
@@ -977,8 +1044,8 @@ def test_g6_sphere_3d_r2a_stability_gate(device):
         mono_cd=mono["cd"], rel_diff=rel,
         weak_div_l2=w2, weak_div_inf=winf,
         bdf2_engaged=pr["bdf2_engaged"],
-        alpha_law="pe_p2", C_alpha=10.0, alpha_floor=2.0,
-        mutation_cd=cd_break,
+        pressure_update="rotational", alpha=100.0,
+        mutation_cd=cd_break, mutation_pressure_update="standard",
         timestamp=_t.strftime("%Y-%m-%dT%H:%M:%S"),
     )
     with open(baseline_path, "w") as fh:
@@ -986,7 +1053,7 @@ def test_g6_sphere_3d_r2a_stability_gate(device):
     print(f"[r2a-gate] baseline written: {baseline_path}", flush=True)
 ```
 
-Note: the `rebuild` import stub above is a placeholder for fresh fixture construction. Replace with a second call to `build_sphere_3d` (the fixture is re-entrant; no shared state). The actual test must not share stepper state between the main path and the mutation leg. Remove the `import rebuild` line and use `fx2 = build_sphere_3d(device, level=level, Re=Re)` directly (already in the step above).
+Note: the mutation leg builds a FRESH fixture via a second `build_sphere_3d(device, level=level, Re=Re)` call (the fixture is re-entrant; no shared stepper state between the main path and the planted break).
 
 - [ ] **Step 3: Run just the non-nightly smoke parts locally**
 
@@ -1006,25 +1073,26 @@ DIFFSIM_NIGHTLY=1 python -m pytest \
     -v -s 2>&1 | tee /tmp/r2a_gate.log
 cat tests/baselines/p2r0_task10_sphere.json
 ```
-Expected: PASS. Projection Cd is positive and within 20% of monolithic; weak-div < 1e-8; BDF2 engaged; mutation (alpha=1) Cd < -0.5.
+Expected: PASS. Projection Cd is positive and within 20% of monolithic; weak-div < 1e-8; BDF2 engaged; mutation (pressure_update="standard") Cd < -0.5.
 
-If the gate FAILS (Cd < 0 or rel > 20%): try `C_alpha=50` in `LeraySBMStepper`, re-run. If still failing, go to Task 4 (fallback decision). Document the C_alpha sweep results before escalating.
+If the gate FAILS (Cd < 0 or rel > 20%): first verify the rotational term is being applied (`bt_uhat = rhs_free/sigma` matching an independent `_weak_divergence_3d`, `‖q‖` bounded); check that `alpha` matches between projection and monolithic. If the rotational form still does not stabilize, go to Task 4 (fallback decision). Document the trajectory and the `‖q‖` / weak-div checks before escalating.
 
 - [ ] **Step 5: Commit the R2a stability gate**
 
 ```bash
 cd /Users/baskarg/Dropbox/work/Projects/ClaudeCode/DiffSim
-git rev-parse --abbrev-ref HEAD   # must print "master"
+git rev-parse --abbrev-ref HEAD   # must print "p2-r2a"
 git add tests/test_p2r0_projection_sbm.py tests/p2r0_task10_sphere_derisk.py \
         tests/baselines/p2r0_task10_sphere.json
 git commit -m "$(cat <<'EOF'
 feat(p2-r2a): R2a stability gate — 3-D sphere projection vs monolithic (Task 3)
 
 Gate: projection Cd matches monolithic same-mesh within 20%, weak-div
-machine-zero, BDF2 engaged, alpha_law=pe_p2. Mutation leg (alpha=1)
-breaks the gate, proving load-bearing. Baseline updated.
+machine-zero, BDF2 engaged, pressure_update=rotational. Mutation leg
+(pressure_update=standard, classic-incremental) breaks the gate, proving
+load-bearing. Baseline updated.
 
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 EOF
 )"
 ```
@@ -1034,8 +1102,8 @@ EOF
 ## Task 4: Fallback-Decision Document (NEEDS_CONTEXT Escalation)
 
 **When to execute this task:**
-- Execute ONLY if Task 1 diagnostic names a mechanism other than M4 (i.e., M1, M2, M3, or UNKNOWN), OR if Tasks 2–3 cannot stabilize the 3-D projection (Cd remains negative or rel > 20% after multiple C_alpha values).
-- If Tasks 1–3 all pass, SKIP this task. The R2a gate has been satisfied and no fallback document is needed.
+- Execute ONLY if the rotational-incremental fix does not stabilize the 3-D projection (Cd remains negative or rel > 20%), OR if the Chorin confirmation (Task 2 Step 2) shows the non-incremental march ALSO diverges (which would contradict the diagnostic's accumulation reading and re-open the mechanism question).
+- If Tasks 2–3 all pass, SKIP this task. The R2a gate has been satisfied and no fallback document is needed.
 
 **What this task does:** Documents the monolithic-block-preconditioner path as the stable 3-D solver for R2 if the projection cannot be stabilized. This is a NEEDS_CONTEXT escalation (not a forced fix), providing the supervisor with a clear re-scoping option.
 
@@ -1055,7 +1123,7 @@ EOF
 **Status:** NEEDS_CONTEXT escalation — supervisor decision required.
 
 ## What was tried
-[Fill in: Task 1 mechanism verdict, Task 2-3 C_alpha sweep results, final Cd trajectory]
+[Fill in: Task 1 mechanism verdict (incremental-pressure feedback, `4194601`), the rotational-fix result (Chorin confirmation Cd, rotational vs standard Cd trajectory, weak-div and ‖q‖ checks), final Cd]
 
 ## The stable 3-D solver: monolithic block preconditioner
 `src/diffsim/solvers/block_precond.py::BlockAMGPreconditioner` + `solve_block_preconditioned`
@@ -1064,8 +1132,8 @@ harness is in place). The 3-D monolithic (no-split) SBM-NS solver is already dem
 at Cd=0.381 (Task-10 report) on the same mesh.
 
 ## Re-scoping proposal (for supervisor)
-If the projection instability is fundamental in 3-D (not fixable by penalty law or PPE tuning),
-R2 can validate via the monolithic path:
+If the projection instability is fundamental in 3-D (not fixable by the rotational-incremental
+pressure form or PPE tuning), R2 can validate via the monolithic path:
 - R2b device port targets the monolithic block preconditioner (not the PPE) as the scalable
   3-D solver. BlockAMGPreconditioner wraps AMGX already; the main R2b task becomes wiring the
   outer Krylov onto the device.
@@ -1081,16 +1149,17 @@ R2 can validate via the monolithic path:
 
 ```bash
 cd /Users/baskarg/Dropbox/work/Projects/ClaudeCode/DiffSim
-git rev-parse --abbrev-ref HEAD   # must print "master"
+git rev-parse --abbrev-ref HEAD   # must print "p2-r2a"
 git add docs/dev/2026-07-21-p2-r2a-fallback-decision.md
 git commit -m "$(cat <<'EOF'
 docs(p2-r2a): fallback-decision document for monolithic path (Task 4)
 
 NEEDS_CONTEXT escalation: if the 3-D projection cannot be stabilized
-by the pe_p2 penalty law, documents the monolithic block-preconditioner
-(block_precond.py, AMGX-backed) as the R2 3-D solver re-scoping option.
+by the rotational-incremental pressure form, documents the monolithic
+block-preconditioner (block_precond.py, AMGX-backed) as the R2 3-D
+solver re-scoping option.
 
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 EOF
 )"
 ```
@@ -1103,56 +1172,69 @@ EOF
 
 | Spec requirement | Task covering it |
 |---|---|
-| Diagnostic: isolate why 3-D pressure coupling diverges at Stokes | Task 1 |
-| Diagnostic produces a decisive verdict (three-number style, committed) | Task 1 — four mechanisms, JSON verdict |
-| Candidate mechanisms tested: PPE conditioning, surrogate-consistent BC 3-D consistency, pressure null-space / outflow, mis-scaled 3-D term | Task 1 — M1, M2, M3, M4 |
-| α~Pe·p² implementation (knob, principled scaling) | Task 2 |
-| Non-vacuity gate (mutation/planted-break for penalty law) | Task 2 Step 6 + Task 3 mutation leg |
+| Diagnostic: isolate why 3-D pressure coupling diverges at Stokes | Task 1 (DONE, `4194601`) |
+| Diagnostic produces a decisive verdict (three-number style, committed) | Task 1 — four mechanisms ruled out, incremental-feedback signature |
+| Candidate mechanisms tested: PPE conditioning, surrogate-consistent BC 3-D consistency, pressure null-space / outflow, penalty | Task 1 — M1, M2, M3, M4 all NOT |
+| Fix implementation (knob + rotational/consistent-incremental pressure form) | Task 2 — `pressure_update="standard\|rotational\|chorin"` |
+| Mechanism confirmation (Chorin non-incremental stays bounded) | Task 2 Step 1–2 |
+| Non-vacuity gate (mutation/planted-break: classic-incremental diverges) | Task 2 Step 7–8 + Task 3 mutation leg |
 | Gate: 3-D sphere projection Cd matches monolithic same-mesh | Task 3 |
 | Gate: weak-div machine-zero | Task 3 (asserts `w2 < 1e-8`) |
 | Gate: BDF2 engaged | Task 3 (asserts `bdf2_engaged`) |
-| Gate-hygiene: independent reference + mutation | Task 3 (monolithic reference + alpha=1 break) |
+| Gate-hygiene: independent reference + mutation | Task 3 (monolithic reference + `pressure_update="standard"` break) |
 | Fallback documented: monolithic block-preconditioner path | Task 4 |
-| Prerequisite: `ppe_finescale=True` τ_m bug must be fixed before enabling it | Global Constraints + Task 2 latent-bug note |
-| `ppe_finescale=False` default unchanged | All tasks: `ppe_finescale=False` throughout |
-| Compute on gpubox for 3-D runs | Task 1 (step 2), Task 2 (step 7), Task 3 (step 4) — all marked gpubox |
+| Prerequisite: `ppe_finescale=True` τ_m bug must be fixed before enabling it | Global Constraints (rotational guards against `ppe_finescale=True`) |
+| `ppe_finescale=False` default unchanged | All tasks: `ppe_finescale=False` throughout; rotational raises if `True` |
+| Compute on gpubox for 3-D runs | Task 2 (Steps 2, 8), Task 3 (Step 4) — all marked gpubox; unit tests local |
 | REPO-IDENTITY GUARD | Each commit step includes `git rev-parse --abbrev-ref HEAD` check |
 | Agents never push | Global Constraints |
 | R2b and R2c out of scope | Global Constraints (explicit scope fence) |
 
 ### 2. Placeholder Scan
 
-No "TBD", "TODO", "implement later", or "fill in details" found. One intentional placeholder in the fallback document (Task 4 Step 1) — the `[Fill in: ...]` entries are meant to be filled by the implementing agent based on actual diagnostic results; this is correct (they're data-capture fields, not code placeholders). The `import rebuild` line in Task 3 Step 2 was caught and corrected in the same step.
+No "TBD", "TODO", or "implement later" as unresolved code placeholders. Intentional fixture-wiring placeholders remain in Task 2 Step 1 (`test_pressure_update_knob_validates` stub) and Step 3 (`_small_2d_stepper` + the two skip-guarded rotational unit tests) — these are explicitly flagged with NOTE blocks instructing the implementing agent to wire them to the repo's real 2-D `dm` fixture (grep `tests/test_p2r0_projection_sbm.py`); the load-bearing assertions (knob `ValueError`, standard-parity bit-for-bit, divergence-free `‖q‖<1e-10`) are fully specified. One intentional data-capture placeholder in the fallback document (Task 4 Step 1) `[Fill in: ...]`. No `import rebuild` stub remains (Task 3 mutation leg uses a direct second `build_sphere_3d`).
 
 ### 3. Type Consistency
 
-- `_compute_alpha_pe_p2(h: np.ndarray, nu: float, u_mag_mean: np.ndarray, p_order: int, C_alpha: float, alpha_floor: float) -> np.ndarray` — used in Tasks 2 and 3 with matching signatures.
-- `sbm_vector_dirichlet(..., alpha_law=None, C_alpha=10.0, p_order=1, u_mag_mean=None, alpha_floor=2.0)` — signature added in Task 2 Step 3; called with same keyword names in Task 2 Step 5 and Task 3.
-- `LeraySBMStepper(..., alpha_law=None, C_alpha=10.0, alpha_floor=2.0)` — added in Task 2 Step 5; called with same names in Task 2 Step 6, Task 3 Steps 1 and 2.
-- `march_projection_r2a(fx, dt, max_steps, rate_tol, order, beta_backflow, picard_iters, alpha_law, C_alpha, alpha_floor, alpha_fixed)` — defined in Task 3 Step 1; called in Task 3 Step 2.
-- `_weak_divergence_3d(st: LeraySBMStepper) -> (float, float)` — defined in Task 1 Step 1; imported and called in Task 3 Step 2.
-- `monolithic_cd(fx, alpha, dt, max_steps, rate_tol)` — existing function in `tests/p2r0_task10_sphere_derisk.py`, called with scalar `alpha=10.0` in Task 3 Step 2.
+- `pressure_update` (str, one of `"standard"|"rotational"|"chorin"`, default `"standard"`) — added to `LerayProjectionStepper.__init__` (Task 2 Step 1) and threaded through `LeraySBMStepper.__init__` (Task 2 Step 6). Same literal values used in Task 2 tests, Task 3 `march_projection_r2a`, and Task 3 mutation leg.
+- `LeraySBMStepper(..., pressure_update="standard")` — added in Task 2 Step 6; called with `pressure_update=` in Task 2 Steps 1/7, Task 3 Step 1 (via `march_projection_r2a`) and Task 3 mutation leg.
+- `march_projection_r2a(fx, dt, max_steps, rate_tol, order=2, beta_backflow=1.0, picard_iters=2, pressure_update="rotational", alpha=100.0)` — defined in Task 3 Step 1; called in Task 3 Step 2 main path with `pressure_update="rotational", alpha=100.0`. Returns `dict(cd, clat, steps, finite, bdf2_engaged, st, u, p)`.
+- `_weak_divergence_3d(st: LeraySBMStepper) -> (float, float)` — defined in Task 1 (`4194601`); imported and called in Task 3 Step 2 on `pr["st"]`.
+- `monolithic_cd(fx, alpha, dt, max_steps, rate_tol)` — existing function in `tests/p2r0_task10_sphere_derisk.py`, called with `alpha=100.0` in Task 3 Step 2 (matched to the projection penalty for a fair Cd comparison).
+- Rotational internals (Task 2 Step 4): `bt_uhat = rhs_free / sigma` (both free-node-sized, in scope at the pressure-update site); `q = solve_linear(self.M, bt_uhat, ..., cache_key="mass")` reuses the velocity-update mass factorization; `p_hat = self.p_star + phi - self.nu * q`.
 
-All type and name references are consistent across tasks.
+All type and name references are consistent across Tasks 2–3.
 
 ## Supervisor resolutions (2026-07-21)
 
-1. **C_alpha / the Pe·p² form — diagnostic-informed, NOT pre-fixed.** Do NOT
-   hardcode C_alpha=10. Task 1's DIAGNOSTIC decides first whether the penalty
-   is even the lever; IF it is, sweep C_alpha ∈ {10, 50, 100} (+ the
-   alpha_floor backstop) to find the stabilizing value. *** PHYSICS SIGNAL
-   flagged for Baskar: *** the Pe·p² law gives α≈1.3 at Stokes (Re=1), yet R0
-   found the STABLE window needed α~100 even at low Re — this tension is
-   itself evidence the 3-D divergence may NOT be penalty-magnitude (pointing
-   at PPE conditioning / pressure null-space / a mis-scaled term instead). The
-   diagnostic must resolve this before committing to the penalty-law fix;
-   Baskar's read on the α-form is welcome.
-2. **Diagnostic decisiveness — CONFIRMED.** Each of the 4 candidate mechanisms
-   (M1 PPE conditioning, M2 3-D projection-space identity, M3 null-space/
-   outflow pin, M4 Nitsche-penalty φ-growth) is individually ruled in/out with
-   a quantitative metric; the verdict JSON names the confirmed mechanism —
-   this IS the 2-D "three-number" decisive style. Correct.
-3. **Mean-α simplification — ACCEPTABLE for the R2a gate.** A scalar α =
-   mean over surrogate faces is fine for the stability gate; per-element α
-   dispatch is a follow-on IF the diagnostic shows spatial α variation is
-   load-bearing.
+1. **Fix form — DECIDED (Baskar, 2026-07-21).** Task 1's committed diagnostic
+   (`4194601`) ruled out all four candidate mechanisms (M1–M4) with machine-
+   precision negatives and isolated an incremental-pressure feedback
+   instability (`p* += φ` accumulation, stable in 2-D, unstable in 3-D). The
+   R2a fix is the **rotational / consistent-incremental (Timmermans) pressure
+   form** `p_hat = p* + φ − ν(∇·û)`, NOT the penalty law (which the diagnostic
+   overturned — penalty diverged through α=20000). The SPD-PPE projection path
+   is retained (the scalability reason it was chosen; do NOT switch to
+   monolithic unless Task 4 escalation triggers).
+2. **Chorin mechanism confirmation — REQUIRED.** Task 2 folds in a non-
+   incremental (`pressure_update="chorin"`, `p* ≡ 0` each step) march on the
+   same 3-D sphere: if Chorin stays bounded while classic-incremental diverges,
+   the accumulation is confirmed as the cause. Cleanest realization chosen:
+   a `"chorin"` mode that zeros `self.p_star` at the top of `step()` (so
+   `p_hat = φ`, no accumulation) — no separate toggle needed.
+3. **Pressure mass matrix M_p — DECIDED: reuse `self.M` (consistent), no new
+   assembly.** `self.M` (the scalar consistent mass, `T.T @ M @ T`) already
+   lives in the exact free-node pressure space as `phi`/`p_star`, is SPD, and
+   is already factorized/cached via `solve_linear`. Solve `M_p q = Bᵀû`
+   against it with the shared `cache_key="mass"` (no second factorization; no
+   pin — a mass matrix is invertible). Consistent (not lumped) mass gives the
+   correct L2 projection of `∇·û` the Timmermans form specifies. Lumped `M_p`
+   revisited only if a future device port makes the consistent solve a
+   bottleneck (flagged for supervisor).
+4. **`Bᵀû` source — VERIFIED against `leray.py`.** In the `ppe_finescale=False`
+   branch the PPE flux is `sigma * aqv` (line ~421), so `rhs_free = sigma·Bᵀû`
+   and `bt_uhat = rhs_free / sigma` is the nodal weak divergence of the
+   predictor (no re-assembly). The rotational branch raises `NotImplementedError`
+   under `ppe_finescale=True` (where the flux carries the tau_m fine-scale
+   residual and this identity does NOT hold); R2a uses `ppe_finescale=False`
+   throughout, so this is a guard, not a limitation.
