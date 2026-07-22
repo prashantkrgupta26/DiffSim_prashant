@@ -37,12 +37,19 @@ from scipy.sparse.linalg import LinearOperator, gmres
 
 class BlockAMGPreconditioner:
     def __init__(self, A, n_nodes, ndof, Kp, Mp_diag, sigma, nu,
-                 dir_rows=None):
+                 dir_rows=None, f_iters=2, f_tol=1e-2, kp_iters=8,
+                 kp_tol=1e-3, f_cycles=1, kp_cycles=3):
         """A: assembled monolithic CSR (interleaved node-major DOFs).
         n_nodes: FREE nodes; ndof = dim+1. Kp: pressure stiffness on the
         same free nodes (with its own pinned row handled by caller);
         Mp_diag: pressure mass diagonal. dir_rows: strong-Dirichlet row ids
-        of the monolithic system (identity rows — kept in F)."""
+        of the monolithic system (identity rows — kept in F).
+
+        Inner-solve STRENGTHS are tunable (defaults reproduce the original
+        hardcoded behavior bit-for-bit): `f_iters`/`f_tol` govern the AMG
+        solve of the velocity block F in apply(); `kp_iters`/`kp_tol` govern
+        the Schur pressure-stiffness solve; `f_cycles`/`kp_cycles` set the
+        AMGX max_iters (V-cycle count) of the persistent F / Kp cycles."""
         self.n, self.ndof = n_nodes, ndof
         dim = ndof - 1
         # interleaved -> blocked permutation
@@ -71,18 +78,23 @@ class BlockAMGPreconditioner:
                 self._u_dir = loc[loc >= 0]
         self.Kp = Kp.tocsr()
         self.Mp_diag = np.asarray(Mp_diag)
-        self._amg_F = _AMGXCycle(self.F, sym=False, cycles=1)
-        self._amg_Kp = _AMGXCycle(self.Kp, sym=True, cycles=3)
+        # inner-solve tuning knobs (defaults == original hardcoded behavior)
+        self.f_iters, self.f_tol = int(f_iters), float(f_tol)
+        self.kp_iters, self.kp_tol = int(kp_iters), float(kp_tol)
+        self.f_cycles, self.kp_cycles = int(f_cycles), int(kp_cycles)
+        self._amg_F = _AMGXCycle(self.F, sym=False, cycles=self.f_cycles)
+        self._amg_Kp = _AMGXCycle(self.Kp, sym=True, cycles=self.kp_cycles)
 
     def apply(self, r):
         r = np.asarray(r)
         r_u, r_p = r[self.u_ids], r[self.p_ids]
         # Schur: Cahouet-Chabard
-        z_p = (self.sigma * self._amg_Kp.solve(r_p, tol=1e-3, iters=8)
+        z_p = (self.sigma * self._amg_Kp.solve(r_p, tol=self.kp_tol,
+                                               iters=self.kp_iters)
                + self.nu * (r_p / self.Mp_diag))
-        # velocity: one AMG cycle on the corrected residual
+        # velocity: AMG cycle(s) on the corrected residual
         r_u_corr = r_u - self.G @ z_p
-        z_u = self._amg_F.solve(r_u_corr, tol=1e-2, iters=2)
+        z_u = self._amg_F.solve(r_u_corr, tol=self.f_tol, iters=self.f_iters)
         if self._u_dir is not None:
             # identity action on strong-Dirichlet rows (F rows are identity)
             z_u[self._u_dir] = r_u_corr[self._u_dir]
@@ -141,15 +153,16 @@ class _AMGXCycle:
 
 
 def solve_block_preconditioned(A, b, pre: BlockAMGPreconditioner,
-                               tol=1e-9, maxiter=200):
+                               tol=1e-9, maxiter=200, restart=50):
     """Right-preconditioned GMRES on the monolithic system. Returns
-    (x, iters). Raises on non-convergence."""
+    (x, iters). Raises on non-convergence. `maxiter`/`restart` are tunable
+    (defaults reproduce the original behavior)."""
     it_count = [0]
 
     def _cb(_):
         it_count[0] += 1
     x, info = gmres(A.tocsr(), b, M=pre.as_linear_operator(),
-                    rtol=tol, atol=1e-13, maxiter=maxiter, restart=50,
+                    rtol=tol, atol=1e-13, maxiter=maxiter, restart=restart,
                     callback=_cb, callback_type="pr_norm")
     if info != 0:
         raise RuntimeError(f"block-preconditioned GMRES failed: info={info} "

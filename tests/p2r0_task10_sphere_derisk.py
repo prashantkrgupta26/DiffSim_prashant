@@ -210,9 +210,25 @@ def monolithic_cd(fx, alpha, dt, max_steps, rate_tol, solver="splu"):
             [int(i) * ndof + c for i in strong for c in range(dim)],
             dtype=np.int64)
         cache_key = "monolithic_cd"
-        solve_cache = {("blockamgx_meta", cache_key): dict(
+        _meta = dict(
             n_nodes=nfree, ndof=ndof, Kp=Kp, Mp_diag=Mp_diag,
-            sigma=sigma, nu=nu, dir_rows=dir_rows)}
+            sigma=sigma, nu=nu, dir_rows=dir_rows)
+        # Optional inner-solve tuning knobs from the ENVIRONMENT so the
+        # controller can sweep toward mesh-independent convergence without
+        # code edits. Only set a meta key when the env var is present; else
+        # omit it so the preconditioner default (== current behavior) holds.
+        for _env, _key, _cast in (
+                ("F_ITERS", "f_iters", int),
+                ("F_TOL", "f_tol", float),
+                ("KP_ITERS", "kp_iters", int),
+                ("KP_TOL", "kp_tol", float),
+                ("F_CYCLES", "f_cycles", int),
+                ("KP_CYCLES", "kp_cycles", int),
+                ("GMRES_RESTART", "gmres_restart", int),
+                ("GMRES_MAXITER", "gmres_maxiter", int)):
+            if os.environ.get(_env):
+                _meta[_key] = _cast(os.environ[_env])
+        solve_cache = {("blockamgx_meta", cache_key): _meta}
 
     for step in range(max_steps):
         u_node = x.reshape(nfree, ndof)[:, :dim]

@@ -1380,11 +1380,24 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
             raise ValueError("blockamgx requires ('blockamgx_meta', "
                              "cache_key) = {'n_nodes','ndof','Kp',"
                              "'Mp_diag','sigma','nu','dir_rows'} in cache")
+        # optional inner-solve tuning knobs (absent -> current defaults):
+        #   f_iters/f_tol   -> velocity-block AMG solve strength
+        #   kp_iters/kp_tol -> Schur pressure-stiffness solve strength
+        #   f_cycles/kp_cycles -> persistent AMGX V-cycle counts
+        #   gmres_restart/gmres_maxiter -> outer FGMRES restart/maxiter
+        _pre_kw = {}
+        for _k in ("f_iters", "f_tol", "kp_iters", "kp_tol",
+                   "f_cycles", "kp_cycles"):
+            if _k in meta:
+                _pre_kw[_k] = meta[_k]
         pre = BlockAMGPreconditioner(
             A, meta["n_nodes"], meta["ndof"], meta["Kp"], meta["Mp_diag"],
-            meta["sigma"], meta["nu"], dir_rows=meta.get("dir_rows"))
-        x, iters = solve_block_preconditioned(A, b, pre, tol=tol,
-                                              maxiter=200)
+            meta["sigma"], meta["nu"], dir_rows=meta.get("dir_rows"),
+            **_pre_kw)
+        x, iters = solve_block_preconditioned(
+            A, b, pre, tol=tol,
+            maxiter=meta.get("gmres_maxiter", 200),
+            restart=meta.get("gmres_restart", 50))
         if cache is not None and cache_key is not None:
             cache[("blockamgx_iters", cache_key)] = (iters,)
         return x

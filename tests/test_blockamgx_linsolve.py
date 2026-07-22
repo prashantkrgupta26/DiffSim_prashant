@@ -275,3 +275,159 @@ def test_monolithic_cd_splu_path_takes_no_meta(monkeypatch):
     monolithic_cd(fx, alpha=20.0, dt=0.05, max_steps=1, rate_tol=1e-9,
                   solver="splu")
     assert calls["cache_seen"] is False
+
+
+# --------------------------------------------------------------------------
+# Task 6 LOCAL tests — tunable inner-solve strengths plumb through the meta
+# into the preconditioner (attributes) and defaults reproduce current values.
+# All exercised via the exact stub (no AMGX).
+# --------------------------------------------------------------------------
+def test_blockprecond_default_knobs_match_current_behavior():
+    """With NO tuning args, the preconditioner attributes must equal the
+    original hardcoded values (bit-for-bit current behavior)."""
+    from diffsim.solvers.block_precond import BlockAMGPreconditioner
+    import diffsim.solvers.block_precond as bp
+    orig = bp._AMGXCycle
+    bp._AMGXCycle = _ExactCycleStub
+    try:
+        s = _small_saddle(n_nodes=10)
+        pre = BlockAMGPreconditioner(
+            s["A"], s["n_nodes"], s["ndof"], s["Kp"], s["Mp_diag"],
+            s["sigma"], s["nu"])
+    finally:
+        bp._AMGXCycle = orig
+    assert pre.f_iters == 2 and pre.f_tol == 1e-2
+    assert pre.kp_iters == 8 and pre.kp_tol == 1e-3
+    assert pre.f_cycles == 1 and pre.kp_cycles == 3
+
+
+def test_blockprecond_tuning_knobs_stored():
+    """Explicit tuning args must land on the preconditioner attributes."""
+    from diffsim.solvers.block_precond import BlockAMGPreconditioner
+    import diffsim.solvers.block_precond as bp
+    orig = bp._AMGXCycle
+    bp._AMGXCycle = _ExactCycleStub
+    try:
+        s = _small_saddle(n_nodes=10)
+        pre = BlockAMGPreconditioner(
+            s["A"], s["n_nodes"], s["ndof"], s["Kp"], s["Mp_diag"],
+            s["sigma"], s["nu"], f_iters=6, f_tol=5e-2, kp_iters=20,
+            kp_tol=1e-4, f_cycles=2, kp_cycles=5)
+    finally:
+        bp._AMGXCycle = orig
+    assert pre.f_iters == 6 and pre.f_tol == 5e-2
+    assert pre.kp_iters == 20 and pre.kp_tol == 1e-4
+    assert pre.f_cycles == 2 and pre.kp_cycles == 5
+
+
+def test_blockamgx_meta_tuning_threads_to_preconditioner(_stub_amgx,
+                                                          monkeypatch):
+    """meta keys f_iters/f_tol/kp_iters/kp_tol/f_cycles/kp_cycles +
+    gmres_restart/gmres_maxiter must be read from the meta and passed into
+    the preconditioner ctor / solve_block_preconditioned."""
+    import diffsim.solvers.block_precond as bp
+    from diffsim.solvers.linsolve import solve_linear
+    captured = {}
+    orig_ctor = bp.BlockAMGPreconditioner.__init__
+
+    def _spy_ctor(self, *a, **kw):
+        captured["ctor_kw"] = dict(kw)
+        return orig_ctor(self, *a, **kw)
+    monkeypatch.setattr(bp.BlockAMGPreconditioner, "__init__", _spy_ctor)
+
+    orig_solve = bp.solve_block_preconditioned
+
+    def _spy_solve(A, b, pre, **kw):
+        captured["solve_kw"] = dict(kw)
+        return orig_solve(A, b, pre, **kw)
+    # the branch does `from .block_precond import ...` at call time, so
+    # patching the module attribute is what takes effect.
+    monkeypatch.setattr(bp, "solve_block_preconditioned", _spy_solve)
+
+    s = _small_saddle(n_nodes=16)
+    cache, key = {}, "tune"
+    cache[("blockamgx_meta", key)] = dict(
+        n_nodes=s["n_nodes"], ndof=s["ndof"], Kp=s["Kp"],
+        Mp_diag=s["Mp_diag"], sigma=s["sigma"], nu=s["nu"], dir_rows=None,
+        f_iters=4, f_tol=3e-2, kp_iters=12, kp_tol=2e-4,
+        f_cycles=2, kp_cycles=4, gmres_restart=30, gmres_maxiter=77)
+    solve_linear(s["A"], s["b"], solver="blockamgx", tol=1e-8,
+                 cache=cache, cache_key=key)
+    ck = captured["ctor_kw"]
+    assert ck["f_iters"] == 4 and ck["f_tol"] == 3e-2
+    assert ck["kp_iters"] == 12 and ck["kp_tol"] == 2e-4
+    assert ck["f_cycles"] == 2 and ck["kp_cycles"] == 4
+    sk = captured["solve_kw"]
+    assert sk["restart"] == 30 and sk["maxiter"] == 77
+
+
+def test_blockamgx_meta_absent_tuning_uses_defaults(_stub_amgx, monkeypatch):
+    """No tuning meta keys -> ctor gets no tuning kwargs and the outer solve
+    uses restart=50/maxiter=200 (current behavior)."""
+    import diffsim.solvers.block_precond as bp
+    from diffsim.solvers.linsolve import solve_linear
+    captured = {}
+    orig_ctor = bp.BlockAMGPreconditioner.__init__
+
+    def _spy_ctor(self, *a, **kw):
+        captured["ctor_kw"] = dict(kw)
+        return orig_ctor(self, *a, **kw)
+    monkeypatch.setattr(bp.BlockAMGPreconditioner, "__init__", _spy_ctor)
+
+    orig_solve = bp.solve_block_preconditioned
+
+    def _spy_solve(A, b, pre, **kw):
+        captured["solve_kw"] = dict(kw)
+        return orig_solve(A, b, pre, **kw)
+    monkeypatch.setattr(bp, "solve_block_preconditioned", _spy_solve)
+
+    s = _small_saddle(n_nodes=16)
+    cache, key = {}, "def"
+    cache[("blockamgx_meta", key)] = dict(
+        n_nodes=s["n_nodes"], ndof=s["ndof"], Kp=s["Kp"],
+        Mp_diag=s["Mp_diag"], sigma=s["sigma"], nu=s["nu"], dir_rows=None)
+    solve_linear(s["A"], s["b"], solver="blockamgx", tol=1e-8,
+                 cache=cache, cache_key=key)
+    # no tuning keys leaked into the ctor kwargs (only dir_rows present)
+    assert set(captured["ctor_kw"]) == {"dir_rows"}
+    # outer solve falls back to the current restart/maxiter defaults
+    assert captured["solve_kw"]["restart"] == 50
+    assert captured["solve_kw"]["maxiter"] == 200
+
+
+def test_sphere_derisk_env_vars_populate_meta(monkeypatch):
+    """The monolithic_cd blockamgx branch reads F_ITERS/... env vars into the
+    meta dict; absent env => key omitted (default holds)."""
+    import diffsim.solvers.block_precond as bp
+    monkeypatch.setattr(bp, "_AMGXCycle", _ExactCycleStub)
+    from p2r0_task10_sphere_derisk import build_sphere_3d, monolithic_cd
+    import diffsim.solvers.linsolve as ls
+    fx = build_sphere_3d("cpu", 3, 100.0)
+    seen = {}
+    orig = ls.solve_linear
+
+    def _spy(A, b, **kw):
+        c = kw.get("cache")
+        if c is not None:
+            for (tag, _), v in c.items():
+                if tag == "blockamgx_meta":
+                    seen["meta"] = v
+        return orig(A, b, **kw)
+    monkeypatch.setattr(
+        "p2r0_task10_sphere_derisk.solve_linear", _spy, raising=True)
+
+    for e in ("F_ITERS", "F_TOL", "KP_ITERS", "KP_TOL", "F_CYCLES",
+              "KP_CYCLES", "GMRES_RESTART", "GMRES_MAXITER"):
+        monkeypatch.delenv(e, raising=False)
+    monkeypatch.setenv("F_ITERS", "5")
+    monkeypatch.setenv("F_TOL", "0.05")
+    monkeypatch.setenv("GMRES_RESTART", "40")
+
+    monolithic_cd(fx, alpha=20.0, dt=0.05, max_steps=1, rate_tol=1e-9,
+                  solver="blockamgx")
+    m = seen["meta"]
+    assert m["f_iters"] == 5 and m["f_tol"] == 0.05
+    assert m["gmres_restart"] == 40
+    # unset env vars must NOT create meta keys (defaults must hold)
+    for k in ("kp_iters", "kp_tol", "f_cycles", "kp_cycles", "gmres_maxiter"):
+        assert k not in m
