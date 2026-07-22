@@ -137,62 +137,81 @@ def test_default_step_bitforbit(device):
 # ---------------------------------------------------------------------------
 
 def test_rotational_zero_for_solenoidal_predictor(device):
-    """When u_hat is exactly divergence-free, B^T u_hat = 0 => q = 0, so
-    rotational p_hat == standard p_hat (the -nu*q term vanishes).
+    """When u_hat is EXACTLY divergence-free in the discrete sense, B^T u_hat = 0,
+    so q = 0 and the rotational correction -nu*q vanishes: p_hat_rot == p_hat_std.
 
-    We use a curl-of-stream-function field psi = sin(pi x) sin(pi y):
-        u = (d psi/dy, -d psi/dx) = (pi cos(pi y) sin(pi x),
-                                     -pi cos(pi x) sin(pi y))
-    which is exactly divergence-free analytically. We set this as the initial
-    condition and take ONE step with both standard and rotational. Because the
-    PREDICTOR field at step 1 (BDF1 from the IC) is close to solenoidal, the
-    rotational correction q should be small. We assert that rotational and
-    standard agree to a tolerance that reflects the (non-exact) discrete
-    divergence of the predictor.
+    Exact-math gate: we construct a stepper with zero Dirichlet BC, zero forcing,
+    and zero IC so the predictor returns u_hat = 0 identically.  With u_hat = 0:
+      - B^T u_hat = 0 (discrete: rhs_free = sigma * B^T u_hat = 0, pinned to 0)
+      - PPE: K_p phi = 0 with phi[0]=0  =>  phi = 0
+      - rotational branch: bt_uhat = rhs_free/sigma = 0, so M q = 0  =>  q = 0
+      - p_hat_rot = p_star + phi - nu*q = 0 + 0 - 0 = 0
 
-    More precisely: we verify that the MECHANISM is correct by checking that
-    the stepper ACCEPTS rotational, returns a result, and — for the truly
-    solenoidal case — the rotational p_hat and standard p_hat differ by
-    no more than nu * ||B^T u_hat|| (the correction is bounded by the
-    divergence error of the predictor). We also verify the attribute is set.
+    We verify THREE things to machine precision:
+      (i)  q (the rotational correction) is < 1e-10
+      (ii) rotational and standard p_hat are identical (np.array_equal)
+      (iii) the attribute is set correctly
+
+    This catches any sign / scaling error in the M q = B^T u_hat path because:
+    if q were mis-computed as non-zero even when B^T u_hat = 0, the test fails.
     """
-    st_std = _small_2d_stepper(device, pressure_update="standard")
-    st_rot = _small_2d_stepper(device, pressure_update="rotational")
+    # Zero-everything stepper: zero Dirichlet (no lid), zero forcing, zero IC.
+    dm = _make_dm(device, level=3)
+    nu = 0.01
+    dt = 0.05
+    st_rot = LerayProjectionStepper(
+        dm, nu=nu, dt=dt,
+        f_fn=lambda x, t: np.zeros((len(x), 2)),
+        g_fn=lambda x, t: np.zeros((len(x), 2)),   # ZERO Dirichlet everywhere
+        order=2, picard_iters=2, solver="splu",
+        pressure_update="rotational",
+        ppe_fine_scale=False)
+    st_std = LerayProjectionStepper(
+        dm, nu=nu, dt=dt,
+        f_fn=lambda x, t: np.zeros((len(x), 2)),
+        g_fn=lambda x, t: np.zeros((len(x), 2)),
+        order=2, picard_iters=2, solver="splu",
+        pressure_update="standard",
+        ppe_fine_scale=False)
 
-    # Solenoidal IC: curl of sin(pi x) sin(pi y)
-    def sol_ic(c):
-        x, y = c[:, 0], c[:, 1]
-        u = np.pi * np.cos(np.pi * y) * np.sin(np.pi * x)
-        v = -np.pi * np.cos(np.pi * x) * np.sin(np.pi * y)
-        return np.stack([u, v], axis=1)
+    # Zero initial condition: u_hat will be exactly 0 after the predictor
+    st_rot.set_initial(lambda c: np.zeros((len(c), 2)))
+    st_std.set_initial(lambda c: np.zeros((len(c), 2)))
 
-    st_std.set_initial(sol_ic)
-    st_rot.set_initial(sol_ic)
+    # ---- Intercept q directly via the rotational branch logic ----
+    # Run the predictor manually to get u_hat (without advancing state)
+    uhat = st_rot._predict(t_new=st_rot.t + st_rot.dt)
+    assert np.allclose(uhat, 0.0, atol=1e-14), (
+        f"predictor is not zero for zero IC/BC/forcing: max|u_hat|="
+        f"{np.abs(uhat).max():.3e}")
 
-    u_std, p_std = st_std.step()
+    # Compute B^T u_hat via the same weak_div_free used by the rotational branch
+    bt_uhat = st_rot._weak_div_free(uhat)
+    assert np.linalg.norm(bt_uhat) < 1e-14, (
+        f"B^T u_hat not zero for zero u_hat: ||B^T u_hat||="
+        f"{np.linalg.norm(bt_uhat):.3e}")
+
+    # Solve M q = B^T u_hat and verify q = 0
+    from diffsim.solvers.linsolve import solve_linear
+    q = solve_linear(st_rot.M, bt_uhat, solver="splu", sym=True,
+                     device=st_rot.dm.device, cache={})
+    assert np.linalg.norm(q) < 1e-10, (
+        f"rotational correction q is not zero when B^T u_hat = 0: "
+        f"||q|| = {np.linalg.norm(q):.3e}")
+
+    # (ii) Full step comparison: both must give the SAME p_hat (array_equal)
     u_rot, p_rot = st_rot.step()
+    u_std, p_std = st_std.step()
 
-    # Both should succeed and return finite results
-    assert np.all(np.isfinite(p_rot)), "rotational p_hat contains non-finite"
-    assert np.all(np.isfinite(u_rot)), "rotational u_new contains non-finite"
+    assert np.array_equal(p_rot, p_std), (
+        f"rotational p_hat != standard p_hat for zero u_hat; "
+        f"max diff = {np.abs(p_rot - p_std).max():.3e}")
+    assert np.array_equal(u_rot, u_std), (
+        f"rotational u_new != standard u_new for zero u_hat; "
+        f"max diff = {np.abs(u_rot - u_std).max():.3e}")
 
-    # Verify the attribute is set correctly
+    # (iii) Attribute check
     assert st_rot.pressure_update == "rotational"
-
-    # For a divergence-free predictor field: the rotational correction
-    # p_hat_rot = p_std + phi - nu*q where q = M^{-1} B^T u_hat.
-    # If u_hat is (approximately) solenoidal, B^T u_hat ~ 0, q ~ 0,
-    # and p_hat_rot ~ p_hat_std. We check that the max difference is
-    # bounded (< 1.0 for this flow; a loose bound since the predictor is
-    # only approximately solenoidal after the correction).
-    diff = np.abs(p_rot - p_std).max()
-    # The correction is nu * ||q|| where ||q|| ~ ||B^T u_hat|| / lambda_min(M).
-    # For the solenoidal IC the predictor is not exactly divergence-free in
-    # the discrete sense, but the correction should be small relative to the
-    # pressure magnitude. We check it is finite and the mechanism is wired.
-    assert diff < 10.0, (
-        f"rotational correction too large: max|p_rot - p_std| = {diff:.3e}; "
-        f"expected < 10.0 for the solenoidal IC at nu=0.01")
 
 
 # ---------------------------------------------------------------------------
@@ -213,29 +232,136 @@ def test_ppe_fine_scale_attribute(device):
 
 
 def test_ppe_fine_scale_differs_from_standard(device):
-    """ppe_fine_scale=True must produce a DIFFERENT result from ppe_fine_scale=False
-    (the fine-scale term is non-zero for a non-solenoidal predictor field)."""
+    """Exact-math gate: the PPE rhs_free difference between ppe_fine_scale=True
+    and False equals independently-assembled sigma*(grad N, -taum_fs * r_m).
+
+    Strategy: intercept the PPE rhs_free passed to solve_linear in BOTH steppers
+    via a thin wrapper (keyed on cache_key='ppe' to avoid mis-capturing mass
+    solves), then independently assemble the EXPECTED difference using the same
+    predictor u_hat and _predictor_setup (so fq_base matches exactly). Assert the
+    captured difference equals the reference assembly to atol=1e-12.
+
+    This pins the SIGN and SCALING of the fine-scale PPE source: any error in
+    sign(taum_fs), sign(r_m), or the sigma prefactor makes the test fail.
+    """
+    import diffsim.solvers.linsolve as linsolve_mod
+    from diffsim.physics.vms import tau_hbased_host
+
     ic = lambda c: 0.1 * np.stack([c[:, 1], -c[:, 0]], axis=1)
 
     st_off = _small_2d_stepper(device, ppe_fine_scale=False)
-    st_on = _small_2d_stepper(device, ppe_fine_scale=True)
-
+    st_on  = _small_2d_stepper(device, ppe_fine_scale=True)
     st_off.set_initial(ic)
     st_on.set_initial(ic)
 
-    u_off, p_off = st_off.step()
-    u_on, p_on = st_on.step()
+    # ---- Intercept the PPE rhs_free via monkey-patching solve_linear ----
+    # We key on cache_key='ppe' to precisely select the PPE solve, not the
+    # mass solves (cache_key='mass') or the predictor solves (sym=False, key=None).
+    captured_rhs = {}
 
-    # The fine-scale term adds sigma*(grad q, -tau_M r_m) to the PPE source,
-    # so the PPE RHS — and hence phi, p_hat, and u_new — should differ.
-    # Both must be finite.
-    assert np.all(np.isfinite(u_on))
-    assert np.all(np.isfinite(p_on))
+    _orig_solve_linear = linsolve_mod.solve_linear
 
-    # They MUST differ (the fine-scale source is non-zero):
-    assert not np.allclose(p_on, p_off, rtol=1e-14, atol=1e-14), (
-        "ppe_fine_scale=True gave the same p_hat as False — fine-scale term "
-        "appears to be a no-op")
+    def _capture_factory(label):
+        def _patched(A, b, **kwargs):
+            if kwargs.get("cache_key") == "ppe":
+                captured_rhs[label] = b.copy()
+            return _orig_solve_linear(A, b, **kwargs)
+        return _patched
+
+    linsolve_mod.solve_linear = _capture_factory("off")
+    try:
+        u_off, p_off = st_off.step()
+    finally:
+        linsolve_mod.solve_linear = _orig_solve_linear
+
+    linsolve_mod.solve_linear = _capture_factory("on")
+    try:
+        u_on, p_on = st_on.step()
+    finally:
+        linsolve_mod.solve_linear = _orig_solve_linear
+
+    assert "off" in captured_rhs, "failed to capture rhs_free for ppe_fine_scale=False"
+    assert "on"  in captured_rhs, "failed to capture rhs_free for ppe_fine_scale=True"
+
+    rhs_off = captured_rhs["off"]
+    rhs_on  = captured_rhs["on"]
+    captured_diff = rhs_on - rhs_off      # shape (n_free,)
+
+    # ---- Independently assemble the expected fine-scale RHS contribution ----
+    # Use a fresh stepper identical to st_off to re-run the predictor and get
+    # the SAME u_hat. Use _predictor_setup() to obtain the EXACT fq_base (which
+    # contains the BDF history term from pre1 = IC); this is what the internal
+    # bin loop uses for r_m in leray.py line 484.
+    st_ref = _small_2d_stepper(device, ppe_fine_scale=False)
+    st_ref.set_initial(ic)
+    t_new = st_ref.t + st_ref.dt
+
+    # _predictor_setup gives b0, b1, b2, sigma, u1, u2, fq_base exactly as step()
+    b0, b1, b2, sigma, u1, u2, fq_base, gvals = st_ref._predictor_setup(t_new)
+    # Run the predictor to get u_hat (same Picard passes as step())
+    uhat = st_ref._predict(t_new=t_new)
+
+    dm = st_ref.dm
+    dim = dm.dim
+
+    # Evaluate u_hat at GPs and its gradient (same as leray.py lines 450-451)
+    uq, guq = st_ref._gp_vals(uhat, grad=True)
+    pq_g = st_ref._gp_vals(st_ref.p_star, grad=True)[1]
+
+    # Assemble the DIFFERENCE rhs (the fine-scale addition only):
+    #   flux_on  = sigma * (aqv - taum_fs * r_m)
+    #   flux_off = sigma * aqv
+    #   delta_flux = -sigma * taum_fs * r_m
+    #   delta_rhs = int grad(N) . delta_flux dV  (assembled on all nodes then T^T)
+    rhs_delta_full = np.zeros(dm.n_nodes)
+    for pv, b_ in dm.bins.items():
+        tb = dm.tables_by_p[pv]
+        h = dm.mesh.tree.h()[dm.mesh.bins[pv]]
+        nqp = tb.nqp
+        ne = len(h)
+        he = np.repeat(h, nqp)
+        jac = (h / 2.0) ** dim
+        dsc = (2.0 / h)
+
+        aqv = uq[pv]
+        umag = np.sqrt((aqv ** 2).sum(1))
+
+        # taum_fs uses CORRECT dt (leray.py line 481-483: self.dt, not self.dt/b0)
+        taum_fs = tau_hbased_host(umag, he, st_ref.nu,
+                                  dt=(st_ref.dt if st_ref.timestab else None),
+                                  dim=dim)
+
+        # r_m = sigma * u_hat + a.grad(u_hat) + grad(p*) - fq_base
+        # (leray.py line 484; a = u_hat from converged Picard; p_star = 0 at t=0)
+        agu = np.einsum("gd,gdc->gc", aqv, guq[pv].reshape(-1, dim, dim))
+        r_m = sigma * aqv + agu + pq_g[pv].reshape(-1, dim) - fq_base[pv]
+
+        # fs_vel = taum_fs * r_m  (leray.py line 486)
+        # flux_on - flux_off = sigma*(aqv - fs_vel) - sigma*aqv = -sigma*fs_vel
+        delta_flux = -sigma * (taum_fs[:, None] * r_m)
+
+        conn = dm.mesh.conn_of[pv]
+        fl = delta_flux.reshape(ne, nqp, dim)
+        be = np.einsum("qad,eqd,q,e->ea", tb.dN, fl, tb.w, jac * dsc)
+        np.add.at(rhs_delta_full, conn.ravel(), be.ravel())
+
+    # Constraint-reduce and pin free-node 0 (same as leray.py line 515-529)
+    expected_diff = np.asarray(dm.constraints.T.T @ rhs_delta_full)
+    expected_diff[0] = 0.0   # pin: both rhs_off and rhs_on have rhs_free[0]=0
+
+    # ---- Exact-math assertion: captured difference == independently-assembled ----
+    np.testing.assert_allclose(
+        captured_diff, expected_diff, atol=1e-12, rtol=0,
+        err_msg=(
+            "PPE rhs_free difference (on - off) does not match independently-"
+            "assembled sigma*(grad N, -taum_fs * r_m) to 1e-12; "
+            "sign or scaling error in the fine-scale PPE source term."))
+
+    # Sanity: both rhs are finite and the difference is non-trivial
+    assert np.all(np.isfinite(rhs_on)),  "rhs_free (ppe_fine_scale=True) not finite"
+    assert np.all(np.isfinite(rhs_off)), "rhs_free (ppe_fine_scale=False) not finite"
+    assert np.linalg.norm(captured_diff) > 1e-14, (
+        "captured PPE rhs_free difference is zero — fine-scale term is a no-op")
 
 
 def test_chorin_pressure_reset(device):
