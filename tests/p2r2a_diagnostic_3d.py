@@ -96,6 +96,24 @@ def _bt_full(dm, u_free):
     return rhs
 
 
+def _weak_divergence_3d(st):
+    """Independent B^T u assembly in 3-D (matches the 2-D diagnostic pattern).
+
+    Assembles the weak divergence of the most-recently-corrected velocity field
+    (``st.base.hist.pre1`` after a ``step()`` call) using the same GP loop as
+    ``_bt_full``.  Returns ``(‖B^T u‖₂, ‖B^T u‖_∞)`` in the pinned free space
+    (row-0 zeroed to remove the pressure pin gauge artefact).
+
+    Imported by ``tests/p2r2a_bakeoff_3d.py`` (Task 3).
+    """
+    dm = st.dm
+    u_free = st.base._uvec(st.base.hist.pre1)
+    rhs = _bt_full(dm, u_free)
+    bt_free = np.asarray(dm.constraints.T.T @ rhs)
+    bt_free[0] = 0.0
+    return float(np.linalg.norm(bt_free)), float(np.abs(bt_free).max())
+
+
 def _sigma_now(st):
     """The BDF sigma = b0/dt used by the PPE at the step ABOUT to be taken."""
     o = bdf_order_now(st.base.t + st.base.dt, st.base.dt, st.base.order,
