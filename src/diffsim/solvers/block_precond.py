@@ -53,6 +53,22 @@ class BlockAMGPreconditioner:
         self.F = Ac[self.u_ids][:, self.u_ids].tocsr()
         self.G = Ac[self.u_ids][:, self.p_ids].tocsr()
         self.sigma, self.nu = sigma, nu
+        # dir_rows: strong-Dirichlet monolithic row ids (identity rows). They
+        # live in the velocity block; a single AMG V-cycle on F does NOT
+        # reproduce their exact identity action, so we enforce z_u = r_u on
+        # these rows AFTER the cycle (the preconditioner must respect the
+        # BC exactly, else the outer FGMRES sees a spurious BC residual).
+        self._u_dir = None
+        if dir_rows is not None:
+            dir_rows = np.asarray(dir_rows).ravel()
+            if dir_rows.size:
+                # map monolithic dir rows -> position within u_ids (velocity
+                # block). rows that are pressure DOFs are ignored (pins are
+                # handled by the Schur block / caller).
+                pos = np.full(n_nodes * ndof, -1, dtype=np.int64)
+                pos[self.u_ids] = np.arange(self.u_ids.size)
+                loc = pos[dir_rows]
+                self._u_dir = loc[loc >= 0]
         self.Kp = Kp.tocsr()
         self.Mp_diag = np.asarray(Mp_diag)
         self._amg_F = _AMGXCycle(self.F, sym=False, cycles=1)
@@ -65,7 +81,11 @@ class BlockAMGPreconditioner:
         z_p = (self.sigma * self._amg_Kp.solve(r_p, tol=1e-3, iters=8)
                + self.nu * (r_p / self.Mp_diag))
         # velocity: one AMG cycle on the corrected residual
-        z_u = self._amg_F.solve(r_u - self.G @ z_p, tol=1e-2, iters=2)
+        r_u_corr = r_u - self.G @ z_p
+        z_u = self._amg_F.solve(r_u_corr, tol=1e-2, iters=2)
+        if self._u_dir is not None:
+            # identity action on strong-Dirichlet rows (F rows are identity)
+            z_u[self._u_dir] = r_u_corr[self._u_dir]
         z = np.empty_like(r)
         z[self.u_ids], z[self.p_ids] = z_u, z_p
         return z

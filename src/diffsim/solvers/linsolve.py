@@ -1059,7 +1059,7 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                                  backend=solver, reason="converged")
     A = A.tocsr()
     if cache is not None and cache_key is not None \
-            and solver not in ("blockch",):
+            and solver not in ("blockch", "blockamgx"):
         # cheap staleness guard (evaluation solver-review item): cached
         # factorizations are for CONSTANT matrices — catch reuse of a key
         # after the matrix changed shape/pattern (values are the caller's
@@ -1364,6 +1364,30 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         return np.asarray(direct_solver(
             A, np.ascontiguousarray(b, np.float64),
             options=_opts))
+
+    if solver == "blockamgx":
+        # P2-R2b.1: host-orchestrated block-preconditioned FGMRES for the
+        # monolithic SBM-NS saddle. The Cahouet-Chabard Schur + AMG-on-F
+        # preconditioner (block_precond.BlockAMGPreconditioner) runs AMGX
+        # inner V-cycles on the GPU; the outer flexible GMRES is on the
+        # host (few 10s of iterations, so the per-iter sync amortizes).
+        # meta via cache: ("blockamgx_meta", cache_key) =
+        #   {"n_nodes","ndof","Kp","Mp_diag","sigma","nu","dir_rows"}.
+        from .block_precond import (BlockAMGPreconditioner,
+                                    solve_block_preconditioned)
+        meta = (cache or {}).get(("blockamgx_meta", cache_key))
+        if meta is None:
+            raise ValueError("blockamgx requires ('blockamgx_meta', "
+                             "cache_key) = {'n_nodes','ndof','Kp',"
+                             "'Mp_diag','sigma','nu','dir_rows'} in cache")
+        pre = BlockAMGPreconditioner(
+            A, meta["n_nodes"], meta["ndof"], meta["Kp"], meta["Mp_diag"],
+            meta["sigma"], meta["nu"], dir_rows=meta.get("dir_rows"))
+        x, iters = solve_block_preconditioned(A, b, pre, tol=tol,
+                                              maxiter=200)
+        if cache is not None and cache_key is not None:
+            cache[("blockamgx_iters", cache_key)] = (iters,)
+        return x
 
     from ..errors import ConfigError
     raise ConfigError(f"unknown solver '{solver}'")
