@@ -34,6 +34,8 @@ LEVELS = [int(x) for x in os.environ.get("LEVELS", "4,5").split(",")]
 RE = float(os.environ.get("RE", "100"))
 STEPS = int(os.environ.get("STEPS", "80"))
 ALPHA = float(os.environ.get("ALPHA", "100"))
+SOLVER = os.environ.get("SOLVER", "splu")   # "cudss" (GPU direct) reaches past the CPU-splu wall
+DEVICE = os.environ.get("DEVICE", "cpu" if SOLVER == "splu" else "cuda:0")
 DT = 0.05
 RATE_TOL = 1e-4
 
@@ -53,7 +55,7 @@ def main():
     for level in LEVELS:
         t0 = time.time()
         try:
-            fx = build_sphere_3d("cpu", level=level, Re=RE)
+            fx = build_sphere_3d(DEVICE, level=level, Re=RE)
         except Exception as e:  # noqa: BLE001
             print(f"[r2c] level {level}: fixture build FAILED: {e}", flush=True)
             rows.append(dict(level=level, status="build_failed", error=str(e)))
@@ -64,7 +66,7 @@ def main():
         print(f"\n[r2c] level {level}: n_free={n_free} n_dof={n_dof} "
               f"D/h={dh:.2f} sf_faces={int(fx['sf'].elem.size)}", flush=True)
         try:
-            res = monolithic_cd(fx, ALPHA, DT, STEPS, RATE_TOL)
+            res = monolithic_cd(fx, ALPHA, DT, STEPS, RATE_TOL, solver=SOLVER)
         except MemoryError as e:
             print(f"[r2c] level {level}: splu OOM ({e}) — stop refining here",
                   flush=True)

@@ -42,6 +42,7 @@ from diffsim.sbm.surrogate import (classify_lambda, extract_surrogate,
                                     GeometryData)
 from diffsim.sbm.vector import sbm_vector_dirichlet, surrogate_traction
 from diffsim.api.ns_bricks import assemble_linear_ns
+from diffsim.solvers.linsolve import solve_linear
 from diffsim.physics.poisson import gauss_points
 from diffsim.steppers.leray_sbm import LeraySBMStepper
 
@@ -135,9 +136,13 @@ def march_projection(fx, alpha, dt, max_steps, rate_tol, order=2,
                 bdf2_engaged=bdf2_engaged, st=st, u=u, p=p)
 
 
-def monolithic_cd(fx, alpha, dt, max_steps, rate_tol):
+def monolithic_cd(fx, alpha, dt, max_steps, rate_tol, solver="splu"):
     """3-D monolithic (NO projection split) SBM-NS steady Cd on the SAME mesh —
-    the apples-to-apples de-risk reference. Mirrors tests/test_sphere.py."""
+    the apples-to-apples de-risk reference. Mirrors tests/test_sphere.py.
+
+    ``solver`` routes the per-step saddle solve through ``solve_linear`` — use
+    ``"cudss"`` (GPU direct) on a cuda-device fixture to reach meshes past the
+    host-``splu`` wall (splu stalls ~level-5/143k DOF)."""
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
     sf, geo = fx["sf"], fx["geo"]
     nu, ndof, dim = fx["nu"], fx["ndof"], fx["dim"]
@@ -187,7 +192,11 @@ def monolithic_cd(fx, alpha, dt, max_steps, rate_tol):
         A.rows[pin] = [pin]
         A.data[pin] = [1.0]
         b[pin] = 0.0
-        x = splu(A.tocsr().tocsc()).solve(b)
+        if solver == "splu":
+            x = splu(A.tocsr().tocsc()).solve(b)
+        else:
+            x = solve_linear(A.tocsr(), b, solver=solver, sym=False,
+                             device=dm.device)
         u_new = x.reshape(nfree, ndof)[:, :dim]
         F = surrogate_traction(dm, sf, geo, np.asarray(T_vec @ x), nu, ndof)
         cd = float(F[0] / qref())
