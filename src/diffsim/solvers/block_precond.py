@@ -38,7 +38,8 @@ from scipy.sparse.linalg import LinearOperator, gmres
 class BlockAMGPreconditioner:
     def __init__(self, A, n_nodes, ndof, Kp, Mp_diag, sigma, nu,
                  dir_rows=None, f_iters=2, f_tol=1e-2, kp_iters=8,
-                 kp_tol=1e-3, f_cycles=1, kp_cycles=3):
+                 kp_tol=1e-3, f_cycles=1, kp_cycles=3,
+                 schur_mode="cahouet_chabard"):
         """A: assembled monolithic CSR (interleaved node-major DOFs).
         n_nodes: FREE nodes; ndof = dim+1. Kp: pressure stiffness on the
         same free nodes (with its own pinned row handled by caller);
@@ -49,7 +50,18 @@ class BlockAMGPreconditioner:
         hardcoded behavior bit-for-bit): `f_iters`/`f_tol` govern the AMG
         solve of the velocity block F in apply(); `kp_iters`/`kp_tol` govern
         the Schur pressure-stiffness solve; `f_cycles`/`kp_cycles` set the
-        AMGX max_iters (V-cycle count) of the persistent F / Kp cycles."""
+        AMGX max_iters (V-cycle count) of the persistent F / Kp cycles.
+
+        `schur_mode` selects the Schur-complement approximation S~^{-1}:
+        - "cahouet_chabard" (DEFAULT, bit-for-bit unchanged): the time-
+          dependent Cahouet-Chabard S~^{-1} = sigma*Kp^{-1} + nu*Mp^{-1}.
+          Assumes an inf-sup-STABLE saddle (no pressure-pressure block).
+        - "pspg_c": S~^{-1} ≈ C^{-1}, where C = A[p_ids][:, p_ids] is the
+          assembled pressure-pressure block of the monolithic matrix. For a
+          PSPG-stabilized EQUAL-ORDER (P1-P1) discretization this block is
+          real and nonzero (∫ τ ∇q·∇p + pressure/PSPG terms) and DOMINATES
+          the true Schur S = C - D F^{-1} G — Cahouet-Chabard is WRONG here.
+          Reuses the kp_iters/kp_tol/kp_cycles knobs for the C-AMG solve."""
         self.n, self.ndof = n_nodes, ndof
         dim = ndof - 1
         # interleaved -> blocked permutation
@@ -82,16 +94,41 @@ class BlockAMGPreconditioner:
         self.f_iters, self.f_tol = int(f_iters), float(f_tol)
         self.kp_iters, self.kp_tol = int(kp_iters), float(kp_tol)
         self.f_cycles, self.kp_cycles = int(f_cycles), int(kp_cycles)
+        self.schur_mode = str(schur_mode)
         self._amg_F = _AMGXCycle(self.F, sym=False, cycles=self.f_cycles)
-        self._amg_Kp = _AMGXCycle(self.Kp, sym=True, cycles=self.kp_cycles)
+        # Build ONLY the Schur operator the chosen mode needs, so pspg_c and
+        # cahouet_chabard each use exactly 2 AMGX Resources (F + one Schur):
+        # no extra Resource -> no new segfault risk.
+        self._amg_Kp = None
+        self._amg_C = None
+        if self.schur_mode == "cahouet_chabard":
+            self._amg_Kp = _AMGXCycle(self.Kp, sym=True, cycles=self.kp_cycles)
+        elif self.schur_mode == "pspg_c":
+            # C is the pressure-pressure block of the monolithic A — the
+            # assembled PSPG pressure operator (∫ τ ∇q·∇p + PSPG/mass terms)
+            # whose inverse approximates the Schur for equal-order P1-P1.
+            # NOTE: A carries one PINNED pressure row/col (identity). C
+            # inherits that identity row — KEEP it; a single identity row is
+            # fine for AMG and it fixes the pressure nullspace. C is SPD-like,
+            # so use the symmetric (PCG) AMGX cycle.
+            self.C = Ac[self.p_ids][:, self.p_ids].tocsr()
+            self._amg_C = _AMGXCycle(self.C, sym=True, cycles=self.kp_cycles)
+        else:
+            raise ValueError(
+                f"unknown schur_mode {self.schur_mode!r}; expected "
+                "'cahouet_chabard' or 'pspg_c'")
 
     def apply(self, r):
         r = np.asarray(r)
         r_u, r_p = r[self.u_ids], r[self.p_ids]
-        # Schur: Cahouet-Chabard
-        z_p = (self.sigma * self._amg_Kp.solve(r_p, tol=self.kp_tol,
-                                               iters=self.kp_iters)
-               + self.nu * (r_p / self.Mp_diag))
+        if self.schur_mode == "pspg_c":
+            # Schur: S~^{-1} ≈ C^{-1} (PSPG pressure block of monolithic A).
+            z_p = self._amg_C.solve(r_p, tol=self.kp_tol, iters=self.kp_iters)
+        else:
+            # Schur: Cahouet-Chabard
+            z_p = (self.sigma * self._amg_Kp.solve(r_p, tol=self.kp_tol,
+                                                   iters=self.kp_iters)
+                   + self.nu * (r_p / self.Mp_diag))
         # velocity: AMG cycle(s) on the corrected residual
         r_u_corr = r_u - self.G @ z_p
         z_u = self._amg_F.solve(r_u_corr, tol=self.f_tol, iters=self.f_iters)

@@ -228,6 +228,10 @@ def monolithic_cd(fx, alpha, dt, max_steps, rate_tol, solver="splu"):
                 ("GMRES_MAXITER", "gmres_maxiter", int)):
             if os.environ.get(_env):
                 _meta[_key] = _cast(os.environ[_env])
+        # Schur approximation mode (string, no cast). Only set when present;
+        # absent -> preconditioner default "cahouet_chabard" (== current).
+        if os.environ.get("SCHUR_MODE"):
+            _meta["schur_mode"] = os.environ["SCHUR_MODE"]
         solve_cache = {("blockamgx_meta", cache_key): _meta}
 
     for step in range(max_steps):

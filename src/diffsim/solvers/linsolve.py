@@ -1385,9 +1385,11 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         #   kp_iters/kp_tol -> Schur pressure-stiffness solve strength
         #   f_cycles/kp_cycles -> persistent AMGX V-cycle counts
         #   gmres_restart/gmres_maxiter -> outer FGMRES restart/maxiter
+        #   schur_mode -> Schur approximation ("cahouet_chabard" default, or
+        #                 "pspg_c" = C^-1 with C the monolithic p-p block).
         _pre_kw = {}
         for _k in ("f_iters", "f_tol", "kp_iters", "kp_tol",
-                   "f_cycles", "kp_cycles"):
+                   "f_cycles", "kp_cycles", "schur_mode"):
             if _k in meta:
                 _pre_kw[_k] = meta[_k]
         pre = BlockAMGPreconditioner(

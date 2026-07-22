@@ -431,3 +431,173 @@ def test_sphere_derisk_env_vars_populate_meta(monkeypatch):
     # unset env vars must NOT create meta keys (defaults must hold)
     for k in ("kp_iters", "kp_tol", "f_cycles", "kp_cycles", "gmres_maxiter"):
         assert k not in m
+
+
+# --------------------------------------------------------------------------
+# Task 7 LOCAL tests — the PSPG C-block Schur mode (schur_mode="pspg_c").
+# The diagnostic proved Cahouet-Chabard is WRONG for equal-order PSPG (a real
+# pressure-pressure block C dominates the Schur), so the new mode approximates
+# S^-1 ≈ C^-1 with C = A[p_ids][:, p_ids]. All exercised via a capturing stub
+# for _AMGXCycle (no AMGX): assert C is extracted at the right shape/values,
+# that the C-AMG cycle is built (and Kp is NOT), and that default/CC is
+# bit-for-bit unchanged.
+# --------------------------------------------------------------------------
+class _CaptureCycleStub:
+    """Drop-in for `_AMGXCycle` that RECORDS every matrix + (sym, cycles) it is
+    built on into a shared registry, and solves via a dense LU so the
+    preconditioner still runs on the CPU."""
+    registry = []
+
+    def __init__(self, A, sym, cycles=1):
+        from scipy.sparse.linalg import splu
+        A = sp.csr_matrix(A)
+        _CaptureCycleStub.registry.append(
+            dict(A=A, sym=sym, cycles=cycles, shape=A.shape))
+        self._lu = splu(sp.csc_matrix(A))
+
+    def solve(self, b, **_ignored):
+        return self._lu.solve(np.ascontiguousarray(b, np.float64))
+
+
+def _build_pre(schur_mode=None, **kw):
+    """Build a BlockAMGPreconditioner on the small saddle with _AMGXCycle
+    swapped for the capturing stub; returns (pre, registry_snapshot)."""
+    from diffsim.solvers.block_precond import BlockAMGPreconditioner
+    import diffsim.solvers.block_precond as bp
+    s = _small_saddle(n_nodes=12)
+    _CaptureCycleStub.registry = []
+    orig = bp._AMGXCycle
+    bp._AMGXCycle = _CaptureCycleStub
+    try:
+        extra = {} if schur_mode is None else dict(schur_mode=schur_mode)
+        pre = BlockAMGPreconditioner(
+            s["A"], s["n_nodes"], s["ndof"], s["Kp"], s["Mp_diag"],
+            s["sigma"], s["nu"], **extra, **kw)
+    finally:
+        bp._AMGXCycle = orig
+    return pre, list(_CaptureCycleStub.registry), s
+
+
+def test_schur_mode_default_is_cahouet_chabard_unchanged():
+    """No schur_mode arg -> "cahouet_chabard": builds F + Kp cycles (Kp on the
+    provided pressure stiffness), NO C block, no C attribute."""
+    pre, reg, s = _build_pre(schur_mode=None)
+    assert pre.schur_mode == "cahouet_chabard"
+    assert pre._amg_Kp is not None and pre._amg_C is None
+    assert not hasattr(pre, "C")
+    # exactly two cycles built: F (nonsym) and Kp (sym) — same as before.
+    assert len(reg) == 2
+    kp_built = [r for r in reg if r["sym"]]
+    assert len(kp_built) == 1
+    # the sym cycle is Kp (the pressure stiffness), NOT the p-p block of A.
+    Kp = s["Kp"].tocsr()
+    assert kp_built[0]["shape"] == Kp.shape
+    assert np.allclose(kp_built[0]["A"].toarray(), Kp.toarray())
+
+
+def test_schur_mode_pspg_c_extracts_C_block():
+    """schur_mode="pspg_c": extracts C = A[p_ids][:, p_ids] at shape
+    (len(p_ids), len(p_ids)), builds a sym C-cycle on it, and does NOT build
+    the Cahouet-Chabard Kp cycle (2 Resources total, not 3)."""
+    pre, reg, s = _build_pre(schur_mode="pspg_c")
+    assert pre.schur_mode == "pspg_c"
+    assert pre._amg_C is not None and pre._amg_Kp is None
+    np_ids = len(pre.p_ids)
+    assert pre.C.shape == (np_ids, np_ids)
+    # C must equal the pressure-pressure block of the monolithic A exactly.
+    A = s["A"].tocsr()
+    C_ref = A[pre.p_ids][:, pre.p_ids].toarray()
+    assert np.allclose(pre.C.toarray(), C_ref)
+    # in _small_saddle the p-p block is nu*diag(Mp_diag).
+    assert np.allclose(pre.C.toarray(),
+                       s["nu"] * np.diag(s["Mp_diag"]))
+    # exactly two cycles built: F (nonsym) and C (sym) — 2 Resources, and the
+    # sym cycle is C (not Kp).
+    assert len(reg) == 2
+    sym_built = [r for r in reg if r["sym"]]
+    assert len(sym_built) == 1
+    assert sym_built[0]["shape"] == (np_ids, np_ids)
+    assert np.allclose(sym_built[0]["A"].toarray(), C_ref)
+
+
+def test_schur_mode_pspg_c_apply_uses_C_only():
+    """In pspg_c mode apply() sets z_p = C^-1 r_p (no sigma*Kp^-1 + nu*Mp^-1
+    terms). With the exact-LU stub, z_p must equal solve(C, r_p)."""
+    from scipy.sparse.linalg import splu
+    pre, reg, s = _build_pre(schur_mode="pspg_c")
+    rng = np.random.default_rng(1)
+    r = rng.standard_normal(s["n_nodes"] * s["ndof"])
+    z = pre.apply(r)
+    r_p = r[pre.p_ids]
+    z_p_ref = splu(sp.csc_matrix(pre.C)).solve(r_p)
+    assert np.allclose(z[pre.p_ids], z_p_ref)
+
+
+def test_schur_mode_unknown_raises():
+    """An unrecognized schur_mode must raise a clear ValueError."""
+    with pytest.raises(ValueError, match="schur_mode"):
+        _build_pre(schur_mode="bogus")
+
+
+def test_schur_mode_threads_through_linsolve_meta(monkeypatch):
+    """linsolve's blockamgx branch forwards meta['schur_mode'] into the
+    preconditioner ctor; absent -> not passed (default holds)."""
+    import diffsim.solvers.block_precond as bp
+    from diffsim.solvers.linsolve import solve_linear
+    captured = {}
+
+    class _CtorSpy:
+        def __init__(self, *a, **kw):
+            captured["ctor_kw"] = kw
+
+        def as_linear_operator(self):
+            from scipy.sparse.linalg import LinearOperator
+            n = _small_saddle(n_nodes=8)["A"].shape[0]
+            return LinearOperator((n, n), matvec=lambda x: x)
+    s = _small_saddle(n_nodes=8)
+    # linsolve does a LOCAL `from .block_precond import ...`, so patch the
+    # source module (that import pulls the current attribute at call time).
+    monkeypatch.setattr(bp, "BlockAMGPreconditioner", _CtorSpy, raising=False)
+    monkeypatch.setattr(bp, "solve_block_preconditioned",
+                        lambda A, b, pre, **kw: (b, 1), raising=False)
+    cache, key = {}, "sm"
+    cache[("blockamgx_meta", key)] = dict(
+        n_nodes=s["n_nodes"], ndof=s["ndof"], Kp=s["Kp"],
+        Mp_diag=s["Mp_diag"], sigma=s["sigma"], nu=s["nu"], dir_rows=None,
+        schur_mode="pspg_c")
+    solve_linear(s["A"], s["b"], solver="blockamgx", cache=cache,
+                 cache_key=key)
+    assert captured["ctor_kw"].get("schur_mode") == "pspg_c"
+
+
+def test_sphere_derisk_schur_mode_env_populates_meta(monkeypatch):
+    """monolithic_cd reads SCHUR_MODE env into the meta; absent -> key omitted
+    (default cahouet_chabard holds)."""
+    import diffsim.solvers.block_precond as bp
+    monkeypatch.setattr(bp, "_AMGXCycle", _ExactCycleStub)
+    from p2r0_task10_sphere_derisk import build_sphere_3d, monolithic_cd
+    import diffsim.solvers.linsolve as ls
+    fx = build_sphere_3d("cpu", 3, 100.0)
+    seen = {}
+    orig = ls.solve_linear
+
+    def _spy(A, b, **kw):
+        c = kw.get("cache")
+        if c is not None:
+            for (tag, _), v in c.items():
+                if tag == "blockamgx_meta":
+                    seen["meta"] = v
+        return orig(A, b, **kw)
+    monkeypatch.setattr(
+        "p2r0_task10_sphere_derisk.solve_linear", _spy, raising=True)
+    monkeypatch.setenv("SCHUR_MODE", "pspg_c")
+    monolithic_cd(fx, alpha=20.0, dt=0.05, max_steps=1, rate_tol=1e-9,
+                  solver="blockamgx")
+    assert seen["meta"]["schur_mode"] == "pspg_c"
+
+    # absent SCHUR_MODE -> key omitted
+    monkeypatch.delenv("SCHUR_MODE", raising=False)
+    seen.clear()
+    monolithic_cd(fx, alpha=20.0, dt=0.05, max_steps=1, rate_tol=1e-9,
+                  solver="blockamgx")
+    assert "schur_mode" not in seen["meta"]
