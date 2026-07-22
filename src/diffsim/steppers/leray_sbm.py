@@ -84,7 +84,8 @@ class LeraySBMStepper:
                  solver="splu", ppe_finescale=False, alpha=10.0,
                  beta_backflow=1.0, velocity_update="consistent",
                  graddiv_scale=1.0, pressure_update="standard",
-                 ppe_fine_scale=False, pressure_outflow_nodes=None):
+                 ppe_fine_scale=False, pressure_outflow_nodes=None,
+                 sbm_pressure_coupling=False):
         self.oracle = oracle
         self.dm = dm
         self.nu = nu
@@ -95,6 +96,9 @@ class LeraySBMStepper:
         self.lam = lam
         self.alpha = alpha
         self.beta_backflow = beta_backflow
+        # P2-R2a stage 1: SBM velocity<->pressure coupling (T3 + T6). Default
+        # False reproduces the R0 velocity-velocity-diagonal path bit-for-bit.
+        self.sbm_pressure_coupling = bool(sbm_pressure_coupling)
 
         # --- box strong Dirichlet (inflow/walls), driver-supplied ---
         u_inf = np.asarray(u_inf, dtype=np.float64)
@@ -183,6 +187,115 @@ class LeraySBMStepper:
         self._bf_conn = mesh.conn_of[self._bf_pv][
             np.searchsorted(mesh.bins[self._bf_pv], sf.elem)]     # [Nf, nbf]
 
+    def _t3_pressure_rhs(self):
+        """T3 pressure-consistency, lagged, on the PREDICTOR RHS.
+
+        Monolithic ([Mono] NSEquation.h:237-238) is the LHS block
+        ``Ae(vel_j, pres) += N_a N_b normal(j)`` -> weak form
+        ``+int_Gamma~ p N_a normal_j`` with ``normal = geo.n`` (domain-outward,
+        INTO the body). In the projection factoring the pressure is LAGGED to
+        the known ``p*`` and moved to the RHS. Following the task spec's
+        surrogate convention ``n_tilde = -geo.n`` (matching
+        ``surrogate_traction``'s ``+p*geo.n`` drag integrand, which is the
+        SAME sign as the monolithic ``+p normal`` momentum loading), the
+        predictor RHS force per velocity component c and test node a is
+
+            b[node_a, c] += sum_gp w_gp * p*_gp * n_tilde_c(gp) * N_a(gp),
+            n_tilde = -geo.n,  w_gp = ftab.w[q] * jacS * geo.corr.
+
+        This lands in the FULL node-major (unconstrained) RHS; the caller
+        constraint-reduces it with ``_T_vec.T``. Returns a full node-major
+        [n_nodes*ndof] vector (velocity rows only; pressure rows zero).
+        Assembled EACH STEP because it depends on the lagged p*.
+        """
+        dm = self.dm
+        mesh = dm.mesh
+        dim = self.dim
+        sf, geo = self.sf, self.geo
+        ftab = self._bf_ftab
+        nqf = ftab.nqf
+        conn = self._bf_conn
+        h = mesh.tree.h()[sf.elem]
+        jacS = (h / 2.0) ** (dim - 1)
+        # lagged pressure p* (free-node scalar) -> full node-major scalar
+        p_full = np.asarray(dm.constraints.T @ self.base.p_star)   # [n_nodes]
+        b = np.zeros(dm.n_nodes * self.ndof)
+        bv = b.reshape(dm.n_nodes, self.ndof)
+        for fi in range(len(sf.elem)):
+            f = int(sf.face[fi])
+            pn = p_full[conn[fi]]                                  # [nbf]
+            for q in range(nqf):
+                w = ftab.w[q] * jacS[fi] * geo.corr[fi * nqf + q]
+                n_hat = -geo.n[fi * nqf + q]                       # n_tilde
+                Nq = ftab.N[f][q]                                  # [nbf]
+                pq = Nq @ pn                                       # p*_gp
+                # b[node_a, c] += w * pq * n_hat_c * N_a
+                for c in range(dim):
+                    bv[conn[fi], c] += w * pq * n_hat[c] * Nq
+        return b
+
+    def _t6_nopenetration_flux(self, uhat):
+        """T6 shifted no-penetration flux for the PPE RHS.
+
+        Monolithic ([Mono] NSEquation.h:222-223) is the continuity-row block
+        ``Ae(pres, vel_j) += -N_a (N_b + gradDELUdotd(j)) normal(j)`` -> weak
+        form ``-int_Gamma~ q (n . Su)`` with ``normal = geo.n`` and the shifted
+        trial ``Su = u + grad(u).d`` (first-order shift; p1 faces). In the
+        PROJECTION factoring this continuity constraint is enforced through the
+        PPE surrogate-flux hook: the PPE source must SUBTRACT the surrogate
+        shifted-normal velocity of the predictor so the corrected field carries
+        no penetration through the body.
+
+        The base PPE builds its source as ``int grad(N).flux`` with
+        ``flux = sigma u_hat`` (divergence form). Its natural (homogeneous
+        Neumann) surrogate BC leaves ``n.u_tilde`` untouched. The R0
+        planted-break ``_ppe_break_flux`` ADDS ``+N_a sigma (u_hat.geo.n) corr``
+        (pushing mass THROUGH the body). T6 is the opposite sign of that: it
+        REMOVES the shifted-normal flux so the PPE enforces no-penetration.
+        Using ``n_tilde = -geo.n`` and the shifted normal velocity
+        ``n_tilde . u_tilde``, ``u_tilde = u_hat + grad(u_hat).d``:
+
+            rhs[node_a] += sum_gp N_a(gp) * sigma * (n_tilde . u_tilde)(gp)
+                           * w_gp,   w_gp = ftab.w[q] * jacS * geo.corr.
+
+        (Sign: this is the negative of the R0 break-flux with the same
+        ``n_tilde = -geo.n``, i.e. it drives ``n.u -> 0`` at the surrogate
+        rather than pushing flow through it — the continuity-row role of T6.)
+        Returns a FULL node-major [n_nodes] scalar; the base ``step`` adds it
+        to the PPE RHS before the constraint reduction.
+        """
+        dm = self.dm
+        mesh = dm.mesh
+        dim = self.dim
+        sf, geo = self.sf, self.geo
+        ftab = self._bf_ftab
+        nqf = ftab.nqf
+        conn = self._bf_conn
+        h = mesh.tree.h()[sf.elem]
+        jacS = (h / 2.0) ** (dim - 1)
+        dscale = 2.0 / h
+        b0, _b1, _b2 = bdf_coeffs(
+            bdf_order_now(self.base.t + self.dt, self.dt, self.base.order,
+                          have_history=self.base.hist.have(2)), self.dt)
+        sigma = b0 / self.dt
+        u_full = np.asarray(dm.constraints.T @ uhat)              # [n_nodes, dim]
+        dvec = geo.d.reshape(len(sf.elem), nqf, dim)
+        rhs = np.zeros(dm.n_nodes)
+        for fi in range(len(sf.elem)):
+            f = int(sf.face[fi])
+            un = u_full[conn[fi]]                                 # [nbf, dim]
+            for q in range(nqf):
+                w = ftab.w[q] * jacS[fi] * geo.corr[fi * nqf + q]
+                n_hat = -geo.n[fi * nqf + q]                      # n_tilde
+                Nq = ftab.N[f][q]                                 # [nbf]
+                # shifted trial velocity u_tilde = u_hat + grad(u_hat).d
+                gradu = (ftab.dN[f][q] * dscale[fi]).T @ un       # [dim, dim]
+                u_gp = Nq @ un                                    # [dim]
+                u_tilde = u_gp + gradu @ dvec[fi, q]              # grad(u).d
+                un_tilde = u_tilde @ n_hat                        # n_tilde . u_tilde
+                rhs[conn[fi]] += Nq * (sigma * w * un_tilde)
+        return rhs
+
     def _a_face(self, u_free):
         """Advecting field at the surrogate-face GPs from a free-node velocity
         ``u_free`` [n_free, dim], flattened ``(fi, q)`` -> [ne_f*nqf, dim]."""
@@ -223,11 +336,16 @@ class LeraySBMStepper:
 
     def _extra_block(self, u_free):
         """Predictor SBM extra-block = cached geometry block + per-step
-        backflow increment."""
+        backflow increment (+ per-step T3 pressure-consistency RHS when
+        ``sbm_pressure_coupling`` is on)."""
         Ab = self._backflow_block(u_free)
-        if Ab is None:
-            return (self.Af_c, self.bf_c)
-        return ((self.Af_c + Ab).tocsr(), self.bf_c)
+        A = self.Af_c if Ab is None else (self.Af_c + Ab).tocsr()
+        b = self.bf_c
+        if self.sbm_pressure_coupling:
+            # T3: +int_Gamma~ p* n_tilde N_a on the momentum RHS (lagged p*).
+            # Full node-major -> constrained free-node-major via _T_vec.T.
+            b = b + np.asarray(self._T_vec.T @ self._t3_pressure_rhs())
+        return (A, b)
 
     # ---- public ergonomics (delegate to the base) ----
     def set_initial(self, u0_fn):
@@ -274,7 +392,16 @@ class LeraySBMStepper:
         body, so the no-penetration metric degrades — proving the
         homogeneous-Neumann BC is load-bearing, not decorative.
         """
-        flux = None if surrogate_consistent else self._ppe_break_flux
+        if not surrogate_consistent:
+            flux = self._ppe_break_flux          # planted-break (R0)
+        elif self.sbm_pressure_coupling:
+            # T6 shifted no-penetration: the surrogate-consistent PPE flux is
+            # NOT homogeneous (zero) — it removes the predictor's shifted
+            # normal velocity n_tilde . u_tilde so the corrected field carries
+            # no penetration through the body.
+            flux = self._t6_nopenetration_flux
+        else:
+            flux = None                          # R0 homogeneous-Neumann
         return self.base.step(
             extra_block=self._extra_block(self._current_a_free()),
             sbm_nodes=self._sbm_nodes, ppe_surrogate_flux=flux)

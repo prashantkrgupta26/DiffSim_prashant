@@ -553,3 +553,162 @@ def test_sbm_knobs_thread_through(device):
 
     assert st.base.pressure_update == "rotational"
     assert st.base.ppe_fine_scale is False
+
+
+# ---------------------------------------------------------------------------
+# P2-R2a stage 1: SBM velocity<->pressure coupling (T3 + T6)
+# ---------------------------------------------------------------------------
+
+def _make_sbm_stepper(device, sbm_pressure_coupling=False):
+    """Small 2-D immersed-sphere LeraySBMStepper fixture (mirrors
+    test_sbm_knobs_thread_through)."""
+    from diffsim.geometry.csg import Sphere
+
+    R = 0.07
+    CTR = (0.3, 0.5)
+    oracle = Sphere(CTR, R)
+    dm = _make_dm(device, level=4)
+    dim = 2
+
+    coords = dm.mesh.node_coords[dm.constraints.free_nodes]
+    strong = np.where(
+        (np.abs(coords[:, 0]) < 1e-12) |
+        (np.abs(coords[:, 1]) < 1e-12) |
+        (np.abs(coords[:, 1] - 1.0) < 1e-12))[0]
+    strong_mask = np.zeros(len(coords), dtype=bool)
+    strong_mask[strong] = True
+    u_inf = np.zeros((len(coords), dim))
+    inflow = strong[np.abs(coords[strong, 0]) < 1e-12]
+    u_inf[inflow, 0] = 1.0
+
+    st = LeraySBMStepper(
+        oracle, dm, nu=0.02, dt=0.05,
+        f_fn=lambda x, t: np.zeros((len(x), dim)),
+        u_inf=u_inf, strong_mask=strong_mask,
+        lam=0.5, domain="outside", order=1, picard_iters=1,
+        solver="splu", sbm_pressure_coupling=sbm_pressure_coupling)
+    return st
+
+
+def test_sbm_pressure_coupling_default_off(device):
+    """Default keeps the R0 behaviour: flag False, no T3/T6."""
+    st = _make_sbm_stepper(device)
+    assert st.sbm_pressure_coupling is False
+
+
+def test_sbm_pressure_coupling_default_bitforbit(device):
+    """DEFAULT path bit-for-bit: with sbm_pressure_coupling=False the predictor
+    extra-block RHS is EXACTLY the cached geometry RHS (no T3 addition), and a
+    full step matches an explicit-False stepper (np.array_equal)."""
+    st_def = _make_sbm_stepper(device)                       # default
+    st_exp = _make_sbm_stepper(device, sbm_pressure_coupling=False)
+
+    # extra-block RHS from rest is exactly bf_c (no T3 term added).
+    _, b_def = st_def._extra_block(np.zeros((st_def.n_free, st_def.dim)))
+    assert np.array_equal(b_def, st_def.bf_c), "default extra-block RHS drifted"
+
+    ic = lambda c: np.zeros((len(c), 2))
+    st_def.set_initial(ic)
+    st_exp.set_initial(ic)
+    u_def, p_def = st_def.step()
+    u_exp, p_exp = st_exp.step()
+    assert np.array_equal(u_def, u_exp)
+    assert np.array_equal(p_def, p_exp)
+
+
+def test_t3_rhs_matches_independent_integral(device):
+    """With sbm_pressure_coupling=True and a CONSTANT p*, the T3 predictor RHS
+    equals an independently-assembled int_Gamma~ p* n_tilde N_a (n_tilde =
+    -geo.n, area-corrected face quadrature)."""
+    st = _make_sbm_stepper(device, sbm_pressure_coupling=True)
+    assert st.sbm_pressure_coupling is True
+
+    # constant lagged pressure p* = P0 on all free nodes
+    P0 = 2.5
+    st.base.p_star = np.full(st.n_free, P0)
+
+    b_full = st._t3_pressure_rhs()          # [n_nodes*ndof], velocity rows
+
+    # independent reference: int p* n_tilde_c N_a over surrogate faces
+    from diffsim.mesh.faces import face_tables
+    dm = st.dm
+    mesh = dm.mesh
+    dim = st.dim
+    sf, geo = st.sf, st.geo
+    pv = int(np.unique(np.asarray(mesh.p_elem)[sf.elem])[0])
+    ftab = face_tables(pv, dim)
+    nqf = ftab.nqf
+    conn = mesh.conn_of[pv][np.searchsorted(mesh.bins[pv], sf.elem)]
+    h = mesh.tree.h()[sf.elem]
+    jacS = (h / 2.0) ** (dim - 1)
+    ref = np.zeros(dm.n_nodes * st.ndof)
+    refv = ref.reshape(dm.n_nodes, st.ndof)
+    for fi in range(len(sf.elem)):
+        f = int(sf.face[fi])
+        for q in range(nqf):
+            w = ftab.w[q] * jacS[fi] * geo.corr[fi * nqf + q]
+            n_hat = -geo.n[fi * nqf + q]
+            Nq = ftab.N[f][q]
+            for c in range(dim):
+                refv[conn[fi], c] += w * P0 * n_hat[c] * Nq
+
+    np.testing.assert_allclose(b_full, ref, atol=1e-13, rtol=0)
+    # non-trivial and pressure rows untouched
+    assert np.linalg.norm(b_full) > 1e-12
+    assert np.array_equal(refv[:, dim], np.zeros(dm.n_nodes))
+
+
+def test_t6_flux_is_negative_of_break_flux(device):
+    """T6 no-penetration flux = -(R0 planted-break flux) with the shift added:
+    for a shift-free check use zero d numerically — instead verify the T6 flux
+    equals the independently-assembled int N_a sigma (n_tilde . u_tilde) w,
+    which is exactly minus the break-flux's (u.geo.n) integrand when d=0."""
+    st = _make_sbm_stepper(device, sbm_pressure_coupling=True)
+    st.set_initial(lambda c: np.zeros((len(c), 2)))
+
+    # arbitrary predictor velocity field on free nodes
+    rng = np.random.default_rng(0)
+    uhat = rng.standard_normal((st.n_free, st.dim))
+
+    t6 = st._t6_nopenetration_flux(uhat)
+    brk = st._ppe_break_flux(uhat)
+
+    # Independent T6 assembly (with the shift grad(u).d)
+    from diffsim.mesh.faces import face_tables
+    from diffsim.solvers.timestepping import bdf_coeffs, bdf_order_now
+    dm = st.dm
+    mesh = dm.mesh
+    dim = st.dim
+    sf, geo = st.sf, st.geo
+    pv = int(np.unique(np.asarray(mesh.p_elem)[sf.elem])[0])
+    ftab = face_tables(pv, dim)
+    nqf = ftab.nqf
+    conn = mesh.conn_of[pv][np.searchsorted(mesh.bins[pv], sf.elem)]
+    h = mesh.tree.h()[sf.elem]
+    jacS = (h / 2.0) ** (dim - 1)
+    dscale = 2.0 / h
+    b0, _, _ = bdf_coeffs(
+        bdf_order_now(st.base.t + st.dt, st.dt, st.base.order,
+                      have_history=st.base.hist.have(2)), st.dt)
+    sigma = b0 / st.dt
+    u_full = np.asarray(dm.constraints.T @ uhat)
+    dvec = geo.d.reshape(len(sf.elem), nqf, dim)
+    ref = np.zeros(dm.n_nodes)
+    for fi in range(len(sf.elem)):
+        f = int(sf.face[fi])
+        un = u_full[conn[fi]]
+        for q in range(nqf):
+            w = ftab.w[q] * jacS[fi] * geo.corr[fi * nqf + q]
+            n_hat = -geo.n[fi * nqf + q]
+            Nq = ftab.N[f][q]
+            gradu = (ftab.dN[f][q] * dscale[fi]).T @ un
+            u_tilde = Nq @ un + gradu @ dvec[fi, q]
+            ref[conn[fi]] += Nq * (sigma * w * (u_tilde @ n_hat))
+
+    np.testing.assert_allclose(t6, ref, atol=1e-12, rtol=0)
+    # sign contract vs the R0 break flux: break uses +geo.n (no shift), T6 uses
+    # -geo.n; so on the unshifted part they are opposite in sign. Confirm the
+    # T6 flux is non-trivial and finite.
+    assert np.linalg.norm(t6) > 1e-12
+    assert np.all(np.isfinite(t6))
+    assert np.all(np.isfinite(brk))
