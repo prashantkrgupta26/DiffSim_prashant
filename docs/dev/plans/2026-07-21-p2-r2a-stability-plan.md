@@ -1134,3 +1134,25 @@ No "TBD", "TODO", "implement later", or "fill in details" found. One intentional
 - `monolithic_cd(fx, alpha, dt, max_steps, rate_tol)` — existing function in `tests/p2r0_task10_sphere_derisk.py`, called with scalar `alpha=10.0` in Task 3 Step 2.
 
 All type and name references are consistent across tasks.
+
+## Supervisor resolutions (2026-07-21)
+
+1. **C_alpha / the Pe·p² form — diagnostic-informed, NOT pre-fixed.** Do NOT
+   hardcode C_alpha=10. Task 1's DIAGNOSTIC decides first whether the penalty
+   is even the lever; IF it is, sweep C_alpha ∈ {10, 50, 100} (+ the
+   alpha_floor backstop) to find the stabilizing value. *** PHYSICS SIGNAL
+   flagged for Baskar: *** the Pe·p² law gives α≈1.3 at Stokes (Re=1), yet R0
+   found the STABLE window needed α~100 even at low Re — this tension is
+   itself evidence the 3-D divergence may NOT be penalty-magnitude (pointing
+   at PPE conditioning / pressure null-space / a mis-scaled term instead). The
+   diagnostic must resolve this before committing to the penalty-law fix;
+   Baskar's read on the α-form is welcome.
+2. **Diagnostic decisiveness — CONFIRMED.** Each of the 4 candidate mechanisms
+   (M1 PPE conditioning, M2 3-D projection-space identity, M3 null-space/
+   outflow pin, M4 Nitsche-penalty φ-growth) is individually ruled in/out with
+   a quantitative metric; the verdict JSON names the confirmed mechanism —
+   this IS the 2-D "three-number" decisive style. Correct.
+3. **Mean-α simplification — ACCEPTABLE for the R2a gate.** A scalar α =
+   mean over surrogate faces is fine for the stability gate; per-element α
+   dispatch is a follow-on IF the diagnostic shows spatial α variation is
+   load-bearing.
