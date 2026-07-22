@@ -221,6 +221,7 @@ def _march_projection(fx, pressure_outflow_nodes, nsteps):
         beta_backflow=1.0, velocity_update="consistent",
         pressure_update="standard", ppe_fine_scale=True,
         pressure_outflow_nodes=pressure_outflow_nodes,
+        sbm_pressure_coupling=bool(os.environ.get("SBM_PCOUPLE")),
     )
     st.set_initial(lambda c: np.zeros((len(c), dim)))
 
