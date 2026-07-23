@@ -83,7 +83,7 @@ def mean_speed(u_node):
 # PROJECTION march (base LerayProjectionStepper, strong obstacle)
 # --------------------------------------------------------------------------
 def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
-                     log_every=0, consistent_projection=False):
+                     log_every=0, consistent_projection=False, solver="splu"):
     """March the base projection stepper (single-pass) with STRONG no-slip on
     the obstacle. Returns dict(cd, cl, mean_u, div, steps, cd_hist, cl_hist).
 
@@ -112,7 +112,7 @@ def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
 
     st = LerayProjectionStepper(
         dm, nu, dt, f_fn=f_fn, g_fn=g_fn, order=order, picard_iters=1,
-        solver="splu", pressure_outflow_nodes=fx["outflow_nodes"],
+        solver=solver, pressure_outflow_nodes=fx["outflow_nodes"],
         consistent_projection=consistent_projection)
     st.dir_nodes = strong_nodes                    # override: box + obstacle strong
     st.set_initial(lambda c: np.zeros((len(c), dim)))
@@ -315,7 +315,7 @@ WEAK_PLATEAU_FRAC = 0.5  # mean|u| below this fraction of monolithic == weak pin
 
 def run_rungA(level=5, half=0.125, res=(40, 100), device="cpu",
               dt40=0.02, nsteps40=600, dt100=0.01, nsteps100=2000,
-              log_every=25, consistent_projection=False):
+              log_every=25, consistent_projection=False, solver="splu"):
     """Full rung-A driver. Re=40 steady (PRIMARY, decisive): projection vs
     monolithic steady Cd + mean|u| development. Re=100 shedding: mean Cd over a
     period + Strouhal from Cl, both solvers. Prints PASS/FAIL vs the same-mesh
@@ -358,7 +358,8 @@ def run_rungA(level=5, half=0.125, res=(40, 100), device="cpu",
         mono_beta = 0.5 if consistent_projection else 0.0
         pr = march_projection(fx, dt=dt, nsteps=nsteps, rate_tol=rate_tol_p,
                               log_every=log_every,
-                              consistent_projection=consistent_projection)
+                              consistent_projection=consistent_projection,
+                              solver=solver)
         mo = march_monolithic(fx, dt=dt, nsteps=nsteps, rate_tol=rate_tol_m,
                               log_every=log_every, backflow_beta=mono_beta)
 
@@ -444,10 +445,18 @@ def run_rungA(level=5, half=0.125, res=(40, 100), device="cpu",
 
 if __name__ == "__main__":
     import json
+    import os
     import sys
     lvl = int(sys.argv[1]) if len(sys.argv) > 1 else 5
     # 2nd arg: "consistent" turns on the 2026-07-23 fix; default base split.
     cons = (len(sys.argv) > 2 and sys.argv[2] == "consistent")
     res = (40,) if (len(sys.argv) > 3 and sys.argv[3] == "re40") else (40, 100)
-    out = run_rungA(level=lvl, consistent_projection=cons, res=res)
+    # Compute-path knobs (config only; CPU/splu is the bit-for-bit default):
+    #   PROJ_SOLVER=cudss  -> route the projection stepper's solves to the GPU
+    #                         direct sparse solver (needs DEVICE=cuda:0).
+    #   DEVICE=cuda:0      -> build the fixture on the GPU.
+    solver = os.environ.get("PROJ_SOLVER", "splu")
+    device = os.environ.get("DEVICE", "cpu" if solver == "splu" else "cuda:0")
+    out = run_rungA(level=lvl, consistent_projection=cons, res=res,
+                    solver=solver, device=device)
     print("\n[json]", json.dumps(out, default=lambda o: None))
