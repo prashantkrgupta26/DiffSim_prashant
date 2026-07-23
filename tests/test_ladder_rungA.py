@@ -69,20 +69,23 @@ DT = 0.02
 NSTEPS_BASE = 250     # base split already visibly diverging by here (cheap).
 NSTEPS_FIX = 400      # consistent projection converges to the monolithic state.
 
-# Re=100 backflow-stabilization (change #6) regression. On this coarse/confined
-# mesh the monolithic finds a STEADY symmetric solution (no shedding); the base
-# consistent-projection predictor tracked it for ~700 steps then BLEW UP when
-# reverse flow appeared at the open outflow (‖div‖ -> 1e5) — the do-nothing outlet
-# left the convective energy flux unbounded. The velocity-based directional-do-
-# nothing term (Bazilevs 2009 / Esmaily-Moghadam 2011), applied to BOTH the
-# projection predictor AND the monolithic outflow traction, restores a coercive
-# outlet and keeps the projection bounded and tracking the monolithic well past
-# step 700. A residual slow long-tail drift remains (a separate lagged-p*/from-
-# rest development effect targeted by changes #5/#7, out of scope here), so this
-# test locks the near-term STABLE+TRACKING window, not the infinite-horizon state.
+# Re=100 backflow-stabilization (change #6) + long-horizon drift cure (F3b)
+# regression. On this coarse/confined mesh the monolithic finds a STEADY symmetric
+# solution (no shedding); the base consistent-projection predictor tracked it for
+# ~700 steps then BLEW UP when reverse flow appeared at the open outflow
+# (‖div‖ -> 1e5) — the do-nothing outlet left the convective energy flux unbounded.
+# The velocity-based directional-do-nothing term (Bazilevs 2009 /
+# Esmaily-Moghadam 2011), applied to BOTH the projection predictor AND the
+# monolithic outflow traction, restores a coercive outlet (#6). After the blow-up
+# was fixed, a SLOW SECULAR DRIFT was visible past step ~600-900 without F3b's
+# rotational_pin_outflow: ‖div‖ climbed toward ~51.6 and mean|u| toward ~1.746 by
+# step 2600. F3b's rotational_pin_outflow=True CURES this drift — the long-horizon
+# locks to ‖div‖≈1.61, mean|u|≈1.043 (measured step-2000 cured values). The drift
+# returns ONLY if rotational_pin_outflow is disabled; with it ON the long-horizon is
+# fully arrested.
 RE100 = 100
 DT100 = 0.01
-NSTEPS_100 = 800      # well past the old step-~700 blow-up.
+NSTEPS_100 = 2000     # well past step ~700 blow-up AND into the long-horizon drift
 
 
 @pytest.fixture(scope="module")
@@ -174,15 +177,20 @@ def rungA_re100():
 
 
 def test_re100_backflow_no_blowup_and_tracks(rungA_re100):
-    """Change #6 gate — Re=100 reverse-flow blow-up is FIXED. Before backflow
-    stabilization the consistent-projection predictor tracked the monolithic for
-    ~700 steps then diverged (‖div‖ -> 1e5) when reverse flow hit the open
-    outlet. With the directional-do-nothing term the projection stays BOUNDED and
-    TRACKS the monolithic well past step 700 (here to step 800):
+    """Change #6 + F3b — Re=100 reverse-flow blow-up FIXED and long-horizon drift
+    ARRESTED. Before backflow stabilization the consistent-projection predictor
+    tracked the monolithic for ~700 steps then diverged (‖div‖ -> 1e5) when reverse
+    flow hit the open outlet. With the directional-do-nothing term the projection
+    stays BOUNDED (#6). F3b's rotational_pin_outflow then CURES the residual secular
+    drift (without it ‖div‖ climbed to ~51.6 and mean|u| to ~1.746 by step 2600;
+    cured long-horizon: ‖div‖≈1.61, mean|u|≈1.043). This test runs to step 2000 so
+    a returning drift cannot hide:
       * no blow-up (finite, max|u| O(1), ‖div‖ controlled to the monolithic's
         level — NOT the 1e5 runaway);
       * Cd matches the same-mesh oracle within the R0 15% tol;
-      * mean|u| stays at the monolithic magnitude (no drift-away yet in-window)."""
+      * LONG-HORIZON DRIFT LOCKED: ‖div‖ < 3.0 AND mean|u| within 15% of the
+        monolithic (cured ≈1.043 vs mono ≈1.037; a drifter would push mean|u|
+        toward 1.5+)."""
     prc, mo = rungA_re100["prc"], rungA_re100["mo"]
     assert not prc.get("blew_up", False), "Re=100 projection blew up (backflow " \
         "term failed to stabilize the reverse-flow outlet)"
@@ -196,11 +204,19 @@ def test_re100_backflow_no_blowup_and_tracks(rungA_re100):
     assert cd_rel < 0.15, (
         f"Re=100 projection Cd={prc['cd']:+.4f} does not track monolithic "
         f"Cd={mo['cd']:+.4f} (rel {cd_rel:.3%})")
-    # mean|u| at the monolithic magnitude in the stable window.
+    # LONG-HORIZON DRIFT LOCKED (F3b — rotational_pin_outflow cure).
+    # Cured steady ‖div‖≈1.61; the drifter reached ≫3 by step 2000.
+    # If this assertion fails, F3b's rotational_pin_outflow is broken or disabled.
+    assert prc["div"] < 3.0, (
+        f"Re=100 long-horizon DRIFT DETECTED at step {NSTEPS_100}: "
+        f"‖div‖={prc['div']:.3f} >= 3.0 (cured expected ≈1.61). "
+        f"F3b rotational_pin_outflow cure has regressed — secular drift is back.")
+    # mean|u| locked at the cured steady value (≈1.043); a drift pushes it to 1.5+.
     mu_frac = prc["mean_u"] / mo["mean_u"]
-    assert 0.8 < mu_frac < 1.2, (
-        f"Re=100 projection mean|u|={prc['mean_u']:.4f} off the monolithic "
-        f"magnitude {mo['mean_u']:.4f} (frac {mu_frac:.3f}) in the stable window")
+    assert 0.85 < mu_frac < 1.15, (
+        f"Re=100 long-horizon mean|u| DRIFT DETECTED at step {NSTEPS_100}: "
+        f"projection mean|u|={prc['mean_u']:.4f}, monolithic {mo['mean_u']:.4f} "
+        f"(frac {mu_frac:.3f}). F3b rotational_pin_outflow cure has regressed.")
 
 
 def test_re100_monolithic_oracle_intact(rungA_re100):
