@@ -256,9 +256,15 @@ def monolithic_cd(fx, alpha, dt, max_steps, rate_tol, solver="splu"):
         if solver == "splu":
             x = splu(A.tocsr().tocsc()).solve(b)
         elif solver == "blockamgx":
+            # per-step linear tolerance: a pseudo-transient Picard step does
+            # NOT need 1e-10 — 1e-8 matches what the direct solvers deliver
+            # in practice and keeps the outer FGMRES budget bounded once the
+            # Schur weakens under developed convection. Env-tunable; default
+            # holds the original 1e-10.
+            _blk_tol = float(os.environ.get("GMRES_TOL", "1e-10"))
             x = solve_linear(A.tocsr(), b, solver=solver, sym=False,
-                             device=dm.device, cache=solve_cache,
-                             cache_key=cache_key)
+                             tol=_blk_tol, device=dm.device,
+                             cache=solve_cache, cache_key=cache_key)
         else:
             x = solve_linear(A.tocsr(), b, solver=solver, sym=False,
                              device=dm.device)
