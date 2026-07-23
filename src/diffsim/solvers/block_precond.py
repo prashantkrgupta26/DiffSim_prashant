@@ -82,8 +82,14 @@ class BlockAMGPreconditioner:
         - "cudss": EXACT F via a cuDSS factorization (nvmath DirectSolver).
           Reproduces the exact-F outer counts (diag_f: 9-20 at L5). Memory
           is the F factorization only (~3/4 of the monolithic direct solve
-          that OOMs at L6 — so this is an L5-class option; at L6 try amgx
-          with a better F config first)."""
+          that OOMs at L6 — so this is an L5-class option; at L6 try
+          "cudss_split" first).
+        - "cudss_split": per-COMPONENT cuDSS factors of the diagonal blocks
+          F_cc (3 scalar systems of n_nodes each). Under Picard (newton=0)
+          the only cross-component u-u coupling is the SBM Nitsche block,
+          so F ~ blockdiag(F00,F11,F22) + sparse near-surface coupling; the
+          dropped coupling is left to the outer FGMRES. ~9x less fill than
+          the coupled F factor — the L6-class direct option."""
         self.n, self.ndof = n_nodes, ndof
         dim = ndof - 1
         # interleaved -> blocked permutation
@@ -128,6 +134,7 @@ class BlockAMGPreconditioner:
         self.f_solver = str(f_solver)
         self._amg_F = None
         self._f_direct = None
+        self._f_split = None
         if self.f_solver == "cudss":
             # EXACT F: cuDSS factorization, persistent for this matrix.
             from nvmath.sparse.advanced import DirectSolver
@@ -136,13 +143,27 @@ class BlockAMGPreconditioner:
                 self.F, np.zeros(self.F.shape[0]), options=cudss_options())
             self._f_direct.plan()
             self._f_direct.factorize()
+        elif self.f_solver == "cudss_split":
+            # per-component cuDSS factors of the diagonal blocks F_cc.
+            from nvmath.sparse.advanced import DirectSolver
+            from .linsolve import cudss_options
+            idxu = np.arange(n_nodes * dim).reshape(n_nodes, dim)
+            self._f_split = []
+            for c in range(dim):
+                ids = idxu[:, c].ravel()
+                Fc = self.F[ids][:, ids].tocsr()
+                slv = DirectSolver(Fc, np.zeros(Fc.shape[0]),
+                                   options=cudss_options())
+                slv.plan()
+                slv.factorize()
+                self._f_split.append((ids, slv))
         elif self.f_solver == "amgx":
             self._amg_F = _AMGXCycle(self.F, sym=False, cycles=self.f_iters,
                                      tol=self.f_tol,
                                      pre_cycles=self.f_cycles)
         else:
             raise ValueError(f"unknown f_solver {self.f_solver!r}; "
-                             "expected 'amgx' or 'cudss'")
+                             "expected 'amgx', 'cudss' or 'cudss_split'")
         # Build ONLY the Schur operator the chosen mode needs, so pspg_c and
         # cahouet_chabard each use exactly 2 AMGX Resources (F + one Schur):
         # no extra Resource -> no new segfault risk.
@@ -202,6 +223,12 @@ class BlockAMGPreconditioner:
             self._f_direct.reset_operands(
                 b=np.ascontiguousarray(r_u_corr, np.float64))
             z_u = np.asarray(self._f_direct.solve())
+        elif self._f_split is not None:
+            z_u = np.empty_like(r_u_corr)
+            for ids, slv in self._f_split:
+                slv.reset_operands(
+                    b=np.ascontiguousarray(r_u_corr[ids], np.float64))
+                z_u[ids] = np.asarray(slv.solve())
         else:
             z_u = self._amg_F.solve(r_u_corr)
         if self._u_dir is not None:
@@ -233,6 +260,13 @@ class BlockAMGPreconditioner:
             except Exception:  # noqa: BLE001 — teardown is best-effort
                 pass
             self._f_direct = None
+        if self._f_split is not None:
+            for _ids, slv in self._f_split:
+                try:
+                    slv.free()
+                except Exception:  # noqa: BLE001 — teardown is best-effort
+                    pass
+            self._f_split = None
 
 
 class _AMGXCycle:
