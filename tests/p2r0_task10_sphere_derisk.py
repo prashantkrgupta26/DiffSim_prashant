@@ -232,6 +232,8 @@ def monolithic_cd(fx, alpha, dt, max_steps, rate_tol, solver="splu"):
         # absent -> preconditioner default "cahouet_chabard" (== current).
         if os.environ.get("SCHUR_MODE"):
             _meta["schur_mode"] = os.environ["SCHUR_MODE"]
+        if os.environ.get("F_SOLVER"):
+            _meta["f_solver"] = os.environ["F_SOLVER"]
         solve_cache = {("blockamgx_meta", cache_key): _meta}
 
     for step in range(max_steps):

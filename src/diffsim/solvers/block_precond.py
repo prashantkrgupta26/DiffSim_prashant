@@ -41,7 +41,7 @@ class BlockAMGPreconditioner:
     def __init__(self, A, n_nodes, ndof, Kp, Mp_diag, sigma, nu,
                  dir_rows=None, f_iters=2, f_tol=1e-2, kp_iters=8,
                  kp_tol=1e-3, f_cycles=1, kp_cycles=3,
-                 schur_mode="cahouet_chabard"):
+                 schur_mode="cahouet_chabard", f_solver="amgx"):
         """A: assembled monolithic CSR (interleaved node-major DOFs).
         n_nodes: FREE nodes; ndof = dim+1. Kp: pressure stiffness on the
         same free nodes (with its own pinned row handled by caller);
@@ -72,7 +72,18 @@ class BlockAMGPreconditioner:
           formula is locally wrong — a subspace that GROWS ~h^-2 with
           refinement, i.e. exactly a scale-onset failure). Measured on the
           real L3/L4 sphere saddles with exact-F: diag_f 11-18 outer iters
-          vs cc 17-28, and mesh-stable. Reuses the kp knobs."""
+          vs cc 17-28, and mesh-stable. Reuses the kp knobs.
+
+        `f_solver` selects the velocity-block solve:
+        - "amgx" (default): AMGX Krylov+AMG cycle (knobs above). MEASURED
+          CAVEAT (L5): scalar classical AMG on the interleaved 3-dof F
+          reaches only ~6.6e-2 in 100 BiCGStab iterations — the reason the
+          march ground even after the FGMRES fix.
+        - "cudss": EXACT F via a cuDSS factorization (nvmath DirectSolver).
+          Reproduces the exact-F outer counts (diag_f: 9-20 at L5). Memory
+          is the F factorization only (~3/4 of the monolithic direct solve
+          that OOMs at L6 — so this is an L5-class option; at L6 try amgx
+          with a better F config first)."""
         self.n, self.ndof = n_nodes, ndof
         dim = ndof - 1
         # interleaved -> blocked permutation
@@ -114,8 +125,24 @@ class BlockAMGPreconditioner:
         # solve" experiment was a no-op. Inner solves are inexact/nonlinear,
         # which is exactly why the outer Krylov must be FGMRES (see
         # `solve_block_preconditioned`).
-        self._amg_F = _AMGXCycle(self.F, sym=False, cycles=self.f_iters,
-                                 tol=self.f_tol, pre_cycles=self.f_cycles)
+        self.f_solver = str(f_solver)
+        self._amg_F = None
+        self._f_direct = None
+        if self.f_solver == "cudss":
+            # EXACT F: cuDSS factorization, persistent for this matrix.
+            from nvmath.sparse.advanced import DirectSolver
+            from .linsolve import cudss_options
+            self._f_direct = DirectSolver(
+                self.F, np.zeros(self.F.shape[0]), options=cudss_options())
+            self._f_direct.plan()
+            self._f_direct.factorize()
+        elif self.f_solver == "amgx":
+            self._amg_F = _AMGXCycle(self.F, sym=False, cycles=self.f_iters,
+                                     tol=self.f_tol,
+                                     pre_cycles=self.f_cycles)
+        else:
+            raise ValueError(f"unknown f_solver {self.f_solver!r}; "
+                             "expected 'amgx' or 'cudss'")
         # Build ONLY the Schur operator the chosen mode needs, so pspg_c and
         # cahouet_chabard each use exactly 2 AMGX Resources (F + one Schur):
         # no extra Resource -> no new segfault risk.
@@ -169,9 +196,14 @@ class BlockAMGPreconditioner:
             # Schur: Cahouet-Chabard
             z_p = (self.sigma * self._amg_Kp.solve(r_p)
                    + self.nu * (r_p / self.Mp_diag))
-        # velocity: AMG-preconditioned inner solve on the corrected residual
+        # velocity: inner solve on the corrected residual
         r_u_corr = r_u - self.G @ z_p
-        z_u = self._amg_F.solve(r_u_corr)
+        if self._f_direct is not None:
+            self._f_direct.reset_operands(
+                b=np.ascontiguousarray(r_u_corr, np.float64))
+            z_u = np.asarray(self._f_direct.solve())
+        else:
+            z_u = self._amg_F.solve(r_u_corr)
         if self._u_dir is not None:
             # identity action on strong-Dirichlet rows (F rows are identity)
             z_u[self._u_dir] = r_u_corr[self._u_dir]
@@ -182,6 +214,25 @@ class BlockAMGPreconditioner:
     def as_linear_operator(self):
         n = self.n * self.ndof
         return LinearOperator((n, n), matvec=self.apply)
+
+    def destroy(self):
+        """Free GPU-side state (AMGX objects + cuDSS factorization). The
+        march rebuilds the preconditioner EVERY Picard step (A changes);
+        without an explicit teardown 80 steps would leak 80 AMGX Resources
+        + cuDSS factors. linsolve's blockamgx branch calls this on the
+        previous instance before building the new one."""
+        for cyc in (self._amg_F, self._amg_Kp, self._amg_C, self._amg_S):
+            # getattr-guarded: test stubs (_ExactCycleStub) have no destroy
+            _d = getattr(cyc, "destroy", None)
+            if _d is not None:
+                _d()
+        self._amg_F = self._amg_Kp = self._amg_C = self._amg_S = None
+        if self._f_direct is not None:
+            try:
+                self._f_direct.free()
+            except Exception:  # noqa: BLE001 — teardown is best-effort
+                pass
+            self._f_direct = None
 
 
 class _AMGXCycle:

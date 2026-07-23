@@ -1389,13 +1389,20 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         #                 "pspg_c" = C^-1 with C the monolithic p-p block).
         _pre_kw = {}
         for _k in ("f_iters", "f_tol", "kp_iters", "kp_tol",
-                   "f_cycles", "kp_cycles", "schur_mode"):
+                   "f_cycles", "kp_cycles", "schur_mode", "f_solver"):
             if _k in meta:
                 _pre_kw[_k] = meta[_k]
+        # per-step rebuild: free the previous step's GPU state first (AMGX
+        # Resources + cuDSS F factor) — an 80-step march must not leak 80x.
+        _old = (cache or {}).get(("blockamgx_pre", cache_key))
+        if _old is not None:
+            _old.destroy()
         pre = BlockAMGPreconditioner(
             A, meta["n_nodes"], meta["ndof"], meta["Kp"], meta["Mp_diag"],
             meta["sigma"], meta["nu"], dir_rows=meta.get("dir_rows"),
             **_pre_kw)
+        if cache is not None and cache_key is not None:
+            cache[("blockamgx_pre", cache_key)] = pre
         x, iters = solve_block_preconditioned(
             A, b, pre, tol=tol,
             maxiter=meta.get("gmres_maxiter", 200),
