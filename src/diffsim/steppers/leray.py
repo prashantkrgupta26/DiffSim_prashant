@@ -38,7 +38,10 @@ class LerayProjectionStepper:
                  timestab=True, ppe_finescale=False, predictor="picard",
                  velocity_update="consistent", graddiv_scale=1.0,
                  pressure_update="standard", ppe_fine_scale=False,
-                 pressure_outflow_nodes=None):
+                 pressure_outflow_nodes=None,
+                 inner_iterate=False, inner_max=8, inner_tol=1e-6,
+                 inner_relax=1.0, inner_accel="none", inner_anderson_m=3,
+                 consistent_ppe=False):
         self.dm, self.nu, self.dt, self.order = dm, nu, dt, order
         self.picard_iters = picard_iters
         # P2-R0 velocity-update EXPERIMENT knob (default "consistent" =
@@ -102,6 +105,36 @@ class LerayProjectionStepper:
         else:
             pon = np.unique(np.asarray(pressure_outflow_nodes, dtype=np.int64))
             self.pressure_outflow_nodes = pon if pon.size else None
+        # ---- STABILIZED INNER predictor<->PPE iteration (ladder Task 4) ----
+        # Default OFF: single-pass (one predictor -> PPE -> correct), BIT-FOR-BIT
+        # identical to the classic incremental projection. When on, the within-
+        # step lagged-pressure split is driven to its predictor<->PPE fixed point
+        # BEFORE the velocity correction, so p* is self-consistent with u_hat at
+        # the end of the step (the from-rest weak-fixed-point remedy of
+        # docs/dev/2026-07-23-projection-sbm-weak-fixed-point-verdict.md, path a).
+        # The naive nu-loop is an unstable accelerant (verdict exp. 2, rho climbs
+        # past 1); this iteration is STABILIZED by:
+        #   inner_relax (omega in (0,1]): damped update p* <- p* + omega*(p_hat-p*)
+        #   inner_accel ("none"|"anderson"): Anderson mixing (history m) of the
+        #                fixed-point map g(p*) = p_hat(p*) on the residual r=p_hat-p*
+        #   divergence guard: if the inner residual ||p_hat - p*|| rises for 2
+        #                consecutive iters, break to the LAST BOUNDED iterate.
+        self.inner_iterate = bool(inner_iterate)
+        self.inner_max = int(inner_max)
+        self.inner_tol = float(inner_tol)
+        omega = float(inner_relax)
+        if not (0.0 < omega <= 1.0):
+            raise ValueError(
+                f"inner_relax must be in (0, 1], got {inner_relax!r}")
+        self.inner_relax = omega
+        if inner_accel not in ("none", "anderson"):
+            raise ValueError(
+                f"inner_accel must be none|anderson, got {inner_accel!r}")
+        self.inner_accel = inner_accel
+        self.inner_anderson_m = int(inner_anderson_m)
+        # per-step inner diagnostics (populated by step() when inner_iterate)
+        self.inner_iters = 0
+        self.inner_res_hist = []
         # 'picard' (v1) or 'newton' (the draft's Algorithm 1): Newton adds
         # the (du.grad)a cross-block in the momentum operator and folds the
         # (a.grad)a RHS partner into f_eff (which hands it SUPG/PSPG
@@ -138,6 +171,21 @@ class LerayProjectionStepper:
         self._K_p_lu = None
         self.M = self._mass_matrix()
         self._M_lu = None            # mass solves go through solve_linear
+        # ---- CONSISTENT PPE operator L = G^T M^-1 G (ladder Task 4, Part 2) ----
+        # Default False keeps the FE-Laplacian K_p (unchanged). The classic
+        # incremental projection solves the PPE with K_p, but the velocity
+        # correction u = u_hat - (1/sigma) M^-1 G phi projects with the DISCRETE
+        # operator G^T M^-1 G. K_p != G^T M^-1 G (measured ~67% relative
+        # difference on the rung-A mesh), so the PPE does NOT map the corrected
+        # field onto the discretely divergence-free space (B^T u -> 0): a seeded
+        # monolithic field is NOT preserved and the split fixed point differs
+        # from the monolithic (docs/dev/2026-07-23 verdict exp. 4). When True,
+        # the PPE uses the CONSISTENT L so the projection is a true discrete
+        # projection (idempotent: B^T u_corr -> machine zero). This is the
+        # operator-consistency test the rung-A Part-2 diagnosis calls for.
+        self.consistent_ppe = bool(consistent_ppe)
+        self._L_ppe = self._consistent_ppe_operator() if self.consistent_ppe \
+            else None
         # Step-3 update operator: consistent M (default), or the row-sum
         # (lumped) diagonal of M — a diagonal solve that nodally collocates
         # u = u_hat - (1/sigma) grad(phi) (P2-R0 velocity-update experiment).
@@ -232,6 +280,62 @@ class LerayProjectionStepper:
         T = dm.constraints.T.tocsr()
         T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
         return (T_vec.T @ G @ T_vec).tocsr()
+
+    def _gradient_operator(self):
+        """Discrete gradient G: scalar free-node pressure -> per-component
+        free-node vectors, with block c the CSR of
+            G_c[a, b] = int N_a (dN_b/dx_c) dV
+        (the (test N, trial grad-N) coupling). Returns a list of ``dim`` CSR
+        blocks in the CONSTRAINED scalar free-node space (n_free x n_free).
+
+        This is the SAME operator the velocity correction applies: the
+        correction RHS is int N (u_hat - (1/sigma) grad(phi)) so the phi-part is
+        -(1/sigma) G phi. Building it explicitly lets the PPE use the CONSISTENT
+        L = G^T M^-1 G (see _consistent_ppe_operator)."""
+        dm = self.dm
+        dim = dm.dim
+        blocks = []
+        T = dm.constraints.T.tocsr()
+        for c in range(dim):
+            rows, cols, vals = [], [], []
+            for pv, b in dm.bins.items():
+                tb = dm.tables_by_p[pv]
+                h = dm.mesh.tree.h()[dm.mesh.bins[pv]]
+                jac = (h / 2.0) ** dim
+                dsc = (2.0 / h)
+                # Ge[e, a, b] = int N_a (dN_b/dx_c) = sum_q N_a dN_b_c w * jac*dsc
+                Ge = np.einsum("qa,qbc,q->abc", tb.N, tb.dN, tb.w)[:, :, c]
+                conn = dm.mesh.conn_of[pv].astype(np.int64)
+                nbf = conn.shape[1]
+                Gee = Ge[None, :, :] * (jac * dsc)[:, None, None]
+                rows.append(np.repeat(conn, nbf, axis=1).ravel())
+                cols.append(np.tile(conn, (1, nbf)).ravel())
+                vals.append(Gee.ravel())
+            Nn = dm.n_nodes
+            Gc = sp.coo_matrix((np.concatenate(vals),
+                                (np.concatenate(rows), np.concatenate(cols))),
+                               shape=(Nn, Nn)).tocsr()
+            blocks.append((T.T @ Gc @ T).tocsr())
+        return blocks
+
+    def _consistent_ppe_operator(self):
+        """L = sum_c G_c^T M^-1 G_c — the CONSISTENT PPE operator (Part 2).
+
+        G_c^T[a,b] = int (dN_a/dx_c) N_b = the discrete divergence B^T's c-block;
+        M the scalar consistent mass. L is the operator for which the classic
+        consistent-mass velocity correction is a TRUE discrete projection
+        (B^T u_corr = 0 at the fixed point). Assembled once (factorize M, apply
+        M^-1 to each G_c column). Small 2-D rung-A meshes only."""
+        from scipy.sparse.linalg import splu as _splu
+        G = self._gradient_operator()          # dim blocks, each G_c
+        Minv = _splu(self.M.tocsc())
+        L = None
+        for Gc in G:
+            Gd = Gc.toarray()
+            MiG = Minv.solve(Gd)               # M^-1 G_c (dense n_free x n_free)
+            Lc = Gc.T @ MiG                     # G_c^T M^-1 G_c
+            L = Lc if L is None else L + Lc
+        return sp.csr_matrix(L)
 
     def _weighted_stiffness(self, w_gp_by_bin):
         """K_w[a,b] = int w(x) grad N_a . grad N_b — per-GP weights (the
@@ -488,6 +592,35 @@ class LerayProjectionStepper:
         b0, b1, b2, sigma, u1, u2, fq_base, gvals = \
             self._predictor_setup(t_new)
 
+        # ---- Steps 1-2 (+ pressure update): the predictor<->PPE PASS ----
+        # Single-pass (default) runs this exactly once against the lagged p*;
+        # the STABILIZED inner iteration (Task 4) drives p* to the within-step
+        # predictor<->PPE fixed point before the correction (see _inner_solve).
+        if not self.inner_iterate:
+            self.inner_iters = 1
+            self.inner_res_hist = []
+            uhat, phi, p_hat, uq, fs_vel, sigma = self._projection_pass(
+                t_new, extra_block, sbm_nodes, ppe_surrogate_flux)
+        else:
+            uhat, phi, p_hat, uq, fs_vel, sigma = self._inner_solve(
+                t_new, extra_block, sbm_nodes, ppe_surrogate_flux)
+        # ---- Step 3: velocity correction (uses the final pass) ----
+        return self._correct_and_finish(
+            uhat, phi, p_hat, uq, fs_vel, sigma, dim, gvals, sbm_nodes, t_new)
+
+    def _projection_pass(self, t_new, extra_block, sbm_nodes,
+                         ppe_surrogate_flux):
+        """One predictor -> PPE -> pressure-update PASS against the CURRENT
+        ``self.p_star``. Returns ``(uhat, phi, p_hat, uq, fs_vel, sigma)``: the
+        predicted velocity, the pressure increment ``phi``, the updated
+        pressure ``p_hat = p* + phi`` (per ``pressure_update``), the GP velocity
+        values + cached fine-scale velocity for the correction, and ``sigma``.
+
+        Does NOT mutate ``self.p_star`` or the history — pure w.r.t. the working
+        pressure, so the inner iteration can call it repeatedly. Single-pass
+        default: called once, bit-for-bit identical to the classic split."""
+        dm = self.dm
+        dim = dm.dim
         # ---- Step 1: nonlinear predictor (Picard over the full block with
         # pressure DOFS PINNED to p*) ----
         uhat = self._predict(t_new=t_new, extra_block=extra_block,
@@ -495,6 +628,8 @@ class LerayProjectionStepper:
         # ---- Step 2: PPE with tau_m fine-scale RHS ----
         uq, guq = self._gp_vals(uhat, grad=True)
         pq_g = self._gp_vals(self.p_star, grad=True)[1]
+        b0, _b1, _b2, sigma, _u1, _u2, fq_base, _gvals = \
+            self._predictor_setup(t_new)
         w_gp = {}
         fs_vel = {}   # P2-R2a: cached -tau_M r_m per bin for velocity update
         rhs = np.zeros(dm.n_nodes)
@@ -568,14 +703,18 @@ class LerayProjectionStepper:
                                sym=True, device=self.dm.device,
                                cache=self._solver_cache)
         else:
-            Kp = self.K_p.tolil()
+            # CONSISTENT PPE (Part 2): L = G^T M^-1 G instead of the FE
+            # Laplacian K_p, so the classic consistent-mass correction is a true
+            # discrete projection. Default: K_p (unchanged).
+            Kp = (self._L_ppe if self.consistent_ppe else self.K_p).tolil()
             # pin (enclosed flow: node 0) OR the outflow Dirichlet nodes.
             Kp, rhs_free = self._apply_pin_lil(Kp, rhs_free)
             from ..solvers.linsolve import solve_linear
             # NOTE: the "ppe" cache_key must NOT be reused across different pin
             # patterns; the outflow pin changes the factorized operator, so key
             # it only for the default node-0 pin (unchanged fast path).
-            cache_key = "ppe" if self.pressure_outflow_nodes is None else None
+            cache_key = ("ppe" if (self.pressure_outflow_nodes is None
+                                   and not self.consistent_ppe) else None)
             phi = solve_linear(Kp.tocsr(), rhs_free, solver=self.solver,
                                sym=True, device=self.dm.device,
                                cache=self._solver_cache, cache_key=cache_key)
@@ -601,6 +740,119 @@ class LerayProjectionStepper:
             p_hat = self.p_star + phi - self.nu * q
         else:                                    # "standard" (default)
             p_hat = self.p_star + phi
+        return uhat, phi, p_hat, uq, fs_vel, sigma
+
+    def _inner_solve(self, t_new, extra_block, sbm_nodes, ppe_surrogate_flux):
+        """STABILIZED inner predictor<->PPE iteration (Task 4).
+
+        Drives ``self.p_star`` to the within-step fixed point of the map
+        ``g(p*) = p_hat(p*)`` (predict u_hat at p*, PPE -> phi -> p_hat) BEFORE
+        the velocity correction, so p* is self-consistent with u_hat at the end
+        of the step. The naive fixed-point recursion (``p* <- g(p*)``) is the
+        unstable nu-loop (verdict exp. 2); this is stabilized by damped
+        relaxation and optional Anderson mixing on the residual r = g(p*) - p*,
+        plus a divergence guard that returns the LAST BOUNDED iterate if the
+        residual rises for two consecutive iterations.
+
+        Returns the final ``(uhat, phi, p_hat, uq, fs_vel, sigma)`` bundle for
+        the correction (using the LAST pass's phi = p_hat - p*, so at the fixed
+        point phi -> 0 and the corrected field -> the divergence-free predictor).
+        """
+        p0 = self.p_star.copy()
+        res_hist = []
+        gk_list = []          # g(p*) iterates (for Anderson)
+        pk_list = []          # p* iterates    (for Anderson)
+        last_bundle = None
+        best = None           # (res, p_star_in, bundle) — last bounded iterate
+        rise = 0
+        prev_res = np.inf
+        m = max(1, self.inner_anderson_m)
+        for it in range(self.inner_max):
+            bundle = self._projection_pass(
+                t_new, extra_block, sbm_nodes, ppe_surrogate_flux)
+            p_hat = bundle[2]
+            r = p_hat - self.p_star                       # fixed-point residual
+            res = float(np.linalg.norm(r))
+            res_hist.append(res)
+            bounded = np.isfinite(res)
+            if bounded and (best is None or res <= best[0]):
+                best = (res, self.p_star.copy(), bundle)
+            last_bundle = bundle
+            self.inner_iters = it + 1
+            if bounded and res < self.inner_tol:
+                break
+            # divergence guard: residual rose two iters in a row -> bail to the
+            # last bounded (best) iterate; the split is locally non-contractive.
+            if (not bounded) or res > prev_res:
+                rise += 1
+            else:
+                rise = 0
+            if rise >= 2 or not bounded:
+                if best is not None:
+                    # recompute the pass AT the best p* so phi/uhat are the
+                    # bounded ones handed to the correction.
+                    self.p_star = best[1]
+                    last_bundle = best[2]
+                break
+            prev_res = res
+            # ---- pressure update: relaxation, optionally Anderson-mixed ----
+            if self.inner_accel == "anderson":
+                gk_list.append(p_hat.copy())
+                pk_list.append(self.p_star.copy())
+                p_next = self._anderson_step(pk_list, gk_list, m,
+                                             self.inner_relax)
+            else:
+                # damped relaxation: p* <- p* + omega (p_hat - p*)
+                p_next = self.p_star + self.inner_relax * r
+            self.p_star = p_next
+        else:
+            # exhausted inner_max without hitting tol — keep the best bounded.
+            if best is not None and not np.isfinite(res_hist[-1]):
+                self.p_star = best[1]
+                last_bundle = best[2]
+        self.inner_res_hist = res_hist
+        # restore p_star to p0 so _correct_and_finish sets it to p_hat cleanly
+        # (the returned p_hat is the fixed-point pressure; the correction's phi
+        # is that pass's increment relative to the p* it was solved at).
+        return last_bundle
+
+    @staticmethod
+    def _anderson_step(pk_list, gk_list, m, beta):
+        """Anderson-accelerated update for the fixed-point map g. Given the
+        histories of iterates p_k and their images g_k = g(p_k), builds the
+        residuals f_k = g_k - p_k and returns the type-II Anderson mixing
+
+            p_{k+1} = (1-beta) * (sum alpha_i p_i) + beta * (sum alpha_i g_i)
+
+        over the last ``m+1`` samples, alpha the least-squares coefficients
+        minimizing ||sum alpha_i f_i|| with sum alpha_i = 1 (solved via the
+        differenced-residual normal equations). Falls back to damped relaxation
+        when the history is too short or the LS system is singular."""
+        p = np.asarray(pk_list)
+        g = np.asarray(gk_list)
+        f = g - p                                    # residuals
+        k = len(f)
+        if k < 2:
+            # not enough history: plain damped relaxation.
+            return p[-1] + beta * f[-1]
+        mm = min(m, k - 1)
+        F = f[-1] - f[-(mm + 1):-1]                  # [mm, n] differences
+        F = F.T                                      # [n, mm]
+        fk = f[-1]                                   # [n]
+        try:
+            gamma, *_ = np.linalg.lstsq(F, fk, rcond=None)
+        except np.linalg.LinAlgError:
+            return p[-1] + beta * f[-1]
+        if not np.all(np.isfinite(gamma)):
+            return p[-1] + beta * f[-1]
+        pw = p[-1] - (p[-(mm + 1):-1] - p[-1]).T @ gamma
+        gw = g[-1] - (g[-(mm + 1):-1] - g[-1]).T @ gamma
+        return (1.0 - beta) * pw + beta * gw
+
+    def _correct_and_finish(self, uhat, phi, p_hat, uq, fs_vel, sigma,
+                            dim, gvals, sbm_nodes, t_new):
+        """Step 3 (velocity correction) + Step 4 (commit p* and history)."""
+        dm = self.dm
         # ---- Step 3: velocity update u = u_hat - (1/sigma) grad(phi) ----
         dphi_g = self._gp_vals(phi, grad=True)[1]
         u_new = np.empty_like(uhat)
