@@ -41,7 +41,7 @@ from scipy.sparse.linalg import splu
 
 from diffsim.steppers.leray import LerayProjectionStepper
 from diffsim.api.ns_bricks import (assemble_linear_ns, assemble_backflow_block,
-                                   outflow_faces)
+                                   assemble_bvs_block, outflow_faces)
 from diffsim.physics.poisson import gauss_points
 from diffsim.sbm.vector import surrogate_traction
 
@@ -171,7 +171,7 @@ def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
 # MONOLITHIC march (inline saddle, same mesh, strong obstacle, NO SBM block)
 # --------------------------------------------------------------------------
 def march_monolithic(fx, dt=0.02, nsteps=400, rate_tol=2e-4, log_every=0,
-                     backflow_beta=0.0):
+                     backflow_beta=0.0, boundary_vorticity=False):
     """March the same-mesh monolithic saddle NS (inline; mirrors
     p2r0_task10_sphere_derisk::monolithic_cd) with STRONG no-slip on the
     obstacle and NO SBM Nitsche block. Returns dict(cd, cl, mean_u, div, steps,
@@ -216,7 +216,8 @@ def march_monolithic(fx, dt=0.02, nsteps=400, rate_tol=2e-4, log_every=0,
     sigma = 1.0 / dt
     # backflow-stabilization outflow faces (change #6) — discovered once; the
     # block is re-linearized each Newton/Picard step at the current velocity.
-    bf_faces = outflow_faces(mesh) if backflow_beta != 0.0 else None
+    bf_faces = (outflow_faces(mesh)
+                if (backflow_beta != 0.0 or boundary_vorticity) else None)
     prev_u = None
     steps = 0
     cd = cl = np.nan
@@ -233,6 +234,11 @@ def march_monolithic(fx, dt=0.02, nsteps=400, rate_tol=2e-4, log_every=0,
         if backflow_beta != 0.0:
             A = A + assemble_backflow_block(dm, u_node, backflow_beta, ndof,
                                             faces=bf_faces)
+        # P1 boundary-vorticity C-block (#5): same outflow term the projection
+        # PPE carries (bvs_ppe_source), so the same-mesh oracle stays exact.
+        # OFF by default (structural no-op); on under consistent_projection.
+        if boundary_vorticity:
+            A = A + assemble_bvs_block(dm, u_node, nu, dt, ndof, faces=bf_faces)
         A = A.tolil()
         for k, i in enumerate(strong_nodes):
             for c in range(dim):
@@ -356,12 +362,19 @@ def run_rungA(level=5, half=0.125, res=(40, 100), device="cpu",
         # so the same-mesh oracle stays matched when reverse flow appears at the
         # Re=100 outlet (the term is ~0 at the steady state -> benign for Cd).
         mono_beta = 0.5 if consistent_projection else 0.0
+        # change #5: the consistent-projection scheme carries the P1
+        # boundary-vorticity outflow term in BOTH the projection PPE and the
+        # monolithic PSPG continuity row (assemble_bvs_block) so the same-mesh
+        # oracle stays exact; it is on the outflow only, so interior Cd is
+        # unaffected.
+        mono_bvs = bool(consistent_projection)
         pr = march_projection(fx, dt=dt, nsteps=nsteps, rate_tol=rate_tol_p,
                               log_every=log_every,
                               consistent_projection=consistent_projection,
                               solver=solver)
         mo = march_monolithic(fx, dt=dt, nsteps=nsteps, rate_tol=rate_tol_m,
-                              log_every=log_every, backflow_beta=mono_beta)
+                              log_every=log_every, backflow_beta=mono_beta,
+                              boundary_vorticity=mono_bvs)
 
         cd_rel = (abs(pr["cd"] - mo["cd"]) / abs(mo["cd"])
                   if mo["cd"] != 0 else float("inf"))

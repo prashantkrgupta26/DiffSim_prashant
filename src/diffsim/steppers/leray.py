@@ -92,6 +92,22 @@ class LerayProjectionStepper:
         else:
             self.backflow_beta = float(backflow_beta)
         self._backflow_faces = None       # lazily discovered outflow face set
+        # ---- P1 BOUNDARY-VORTICITY STABILIZATION (change #5, 2026-07-23) ----
+        # Pacheco, Schussnig, Steinbach, Fries (IJNME 2021, nme.6615;
+        # arXiv:2411.02100). For P1 the PSPG viscous residual nu*lap u vanishes
+        # elementwise and standard PSPG DROPS the boundary integral a
+        # whole-domain integration-by-parts of the viscous term would produce,
+        # fabricating a spurious dp/dn ~ 0 at the open outflow. Retaining
+        #     delta * (grad q x n, nu curl u)_Gamma      (delta = tau_m)
+        # on the outflow induces the correct normal pseudo-traction, arresting
+        # the secular divergence drift the split otherwise shows over long
+        # marches. In the PPE u = u_hat is KNOWN, so the term is a pure RHS
+        # source (bvs_ppe_source). Same term added to the monolithic PSPG
+        # continuity row (assemble_bvs_block) so the same-mesh oracle stays
+        # exact. Knob default OFF (bit-for-bit); consistent_projection turns it
+        # on. 2-D only (curl u scalar) — the rung-A path.
+        self.boundary_vorticity = bool(consistent_projection)
+        self._bvs_faces = None            # lazily discovered outflow face set
         self.consistent_projection = bool(consistent_projection)
         if self.consistent_projection:
             ppe_fine_scale = True
@@ -799,6 +815,16 @@ class LerayProjectionStepper:
         # choice, used only as a planted-break to prove the BC is load-bearing.
         if ppe_surrogate_flux is not None:
             rhs = rhs + np.asarray(ppe_surrogate_flux(uhat))
+        # P1 boundary-vorticity source (#5): the outflow term
+        # delta*(grad q x n, nu curl u_hat)_Gamma standard PSPG drops for P1.
+        # Pure RHS source (u_hat known); default OFF (bit-for-bit) — only on
+        # under consistent_projection. Same term rides the monolithic C-block.
+        if self.boundary_vorticity:
+            from ..api.ns_bricks import bvs_ppe_source, outflow_faces
+            if self._bvs_faces is None:
+                self._bvs_faces = outflow_faces(self.dm.mesh)
+            rhs = rhs + bvs_ppe_source(
+                self.dm, uhat, self.nu, self.dt, faces=self._bvs_faces)
         rhs_free = np.asarray(dm.constraints.T.T @ rhs)
         if self.ppe_finescale:
             Kp = self._weighted_stiffness(w_gp).tolil()   # per-step tau_m
