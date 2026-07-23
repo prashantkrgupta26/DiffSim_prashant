@@ -534,6 +534,39 @@ def test_schur_mode_pspg_c_apply_uses_C_only():
     assert np.allclose(z[pre.p_ids], z_p_ref)
 
 
+def test_schur_mode_diag_f_builds_algebraic_schur():
+    """schur_mode="diag_f": S = C - D diag(F)^-1 G assembled from the
+    monolithic blocks; a NONSYM cycle is built on it (D != -G^T in general);
+    no Kp/C cycles (2 Resources total)."""
+    pre, reg, s = _build_pre(schur_mode="diag_f")
+    assert pre.schur_mode == "diag_f"
+    assert pre._amg_S is not None
+    assert pre._amg_Kp is None and pre._amg_C is None
+    A = s["A"].tocsr()
+    C = A[pre.p_ids][:, pre.p_ids]
+    D = A[pre.p_ids][:, pre.u_ids]
+    G = A[pre.u_ids][:, pre.p_ids]
+    F = A[pre.u_ids][:, pre.u_ids]
+    S_ref = (C - D @ sp.diags(1.0 / F.diagonal()) @ G).toarray()
+    assert np.allclose(pre.S.toarray(), S_ref)
+    # exactly two cycles built: F and S, BOTH nonsym.
+    assert len(reg) == 2
+    assert all(not r["sym"] for r in reg)
+    assert reg[1]["shape"] == (len(pre.p_ids), len(pre.p_ids))
+    assert np.allclose(reg[1]["A"].toarray(), S_ref)
+
+
+def test_schur_mode_diag_f_apply_uses_S():
+    """In diag_f mode apply() sets z_p = S^-1 r_p (exact via the LU stub)."""
+    from scipy.sparse.linalg import splu
+    pre, reg, s = _build_pre(schur_mode="diag_f")
+    rng = np.random.default_rng(2)
+    r = rng.standard_normal(s["n_nodes"] * s["ndof"])
+    z = pre.apply(r)
+    z_p_ref = splu(sp.csc_matrix(pre.S)).solve(r[pre.p_ids])
+    assert np.allclose(z[pre.p_ids], z_p_ref)
+
+
 def test_schur_mode_unknown_raises():
     """An unrecognized schur_mode must raise a clear ValueError."""
     with pytest.raises(ValueError, match="schur_mode"):

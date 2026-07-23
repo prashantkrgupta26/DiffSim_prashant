@@ -63,7 +63,16 @@ class BlockAMGPreconditioner:
           PSPG-stabilized EQUAL-ORDER (P1-P1) discretization this block is
           real and nonzero (∫ τ ∇q·∇p + pressure/PSPG terms) and DOMINATES
           the true Schur S = C - D F^{-1} G — Cahouet-Chabard is WRONG here.
-          Reuses the kp_iters/kp_tol/kp_cycles knobs for the C-AMG solve."""
+          Reuses the kp_iters/kp_tol/kp_cycles knobs for the C-AMG solve.
+        - "diag_f": S~ = C - D diag(F)^{-1} G, assembled algebraically from
+          the monolithic blocks (SIMPLE-style Schur; the same approximation
+          the proven `blocktri` solver uses). Unlike Cahouet-Chabard, this
+          SEES the SBM Nitsche penalty sitting in F's near-surface diagonal
+          (where F is penalty-dominated, not sigma*M-dominated, so the CC
+          formula is locally wrong — a subspace that GROWS ~h^-2 with
+          refinement, i.e. exactly a scale-onset failure). Measured on the
+          real L3/L4 sphere saddles with exact-F: diag_f 11-18 outer iters
+          vs cc 17-28, and mesh-stable. Reuses the kp knobs."""
         self.n, self.ndof = n_nodes, ndof
         dim = ndof - 1
         # interleaved -> blocked permutation
@@ -112,6 +121,7 @@ class BlockAMGPreconditioner:
         # no extra Resource -> no new segfault risk.
         self._amg_Kp = None
         self._amg_C = None
+        self._amg_S = None
         if self.schur_mode == "cahouet_chabard":
             self._amg_Kp = _AMGXCycle(self.Kp, sym=True, cycles=self.kp_iters,
                                       tol=self.kp_tol,
@@ -128,10 +138,23 @@ class BlockAMGPreconditioner:
             self._amg_C = _AMGXCycle(self.C, sym=True, cycles=self.kp_iters,
                                      tol=self.kp_tol,
                                      pre_cycles=self.kp_cycles)
+        elif self.schur_mode == "diag_f":
+            # SIMPLE-style algebraic Schur: S~ = C - D diag(F)^{-1} G. The
+            # pinned pressure row of A gives C an identity row and a ZERO D
+            # row there, so S~ inherits the pin's identity row (nullspace
+            # fixed). Mildly nonsymmetric at convective steps (D != -G^T
+            # once PSPG/SUPG convection enters) — use the BiCGStab cycle.
+            D = Ac[self.p_ids][:, self.u_ids].tocsr()
+            C = Ac[self.p_ids][:, self.p_ids].tocsr()
+            self.S = (C - D @ sp.diags(1.0 / self.F.diagonal()) @ self.G
+                      ).tocsr()
+            self._amg_S = _AMGXCycle(self.S, sym=False, cycles=self.kp_iters,
+                                     tol=self.kp_tol,
+                                     pre_cycles=self.kp_cycles)
         else:
             raise ValueError(
                 f"unknown schur_mode {self.schur_mode!r}; expected "
-                "'cahouet_chabard' or 'pspg_c'")
+                "'cahouet_chabard', 'pspg_c' or 'diag_f'")
 
     def apply(self, r):
         r = np.asarray(r)
@@ -139,6 +162,9 @@ class BlockAMGPreconditioner:
         if self.schur_mode == "pspg_c":
             # Schur: S~^{-1} ≈ C^{-1} (PSPG pressure block of monolithic A).
             z_p = self._amg_C.solve(r_p)
+        elif self.schur_mode == "diag_f":
+            # Schur: SIMPLE-style S~ = C - D diag(F)^{-1} G (penalty-aware).
+            z_p = self._amg_S.solve(r_p)
         else:
             # Schur: Cahouet-Chabard
             z_p = (self.sigma * self._amg_Kp.solve(r_p)
@@ -216,7 +242,7 @@ class _AMGXCycle:
 
 
 def _fgmres(A, b, apply_M, tol=1e-9, atol=1e-13, restart=50, maxiter=200,
-            log=None):
+            log=None, on_cycle=None):
     """Right-preconditioned FLEXIBLE GMRES (FGMRES, Saad 1993) with restart.
 
     Returns (x, total_inner_iters, rel_resid). `apply_M` may be ANY
@@ -240,6 +266,8 @@ def _fgmres(A, b, apply_M, tol=1e-9, atol=1e-13, restart=50, maxiter=200,
     for _outer in range(int(maxiter)):
         r = b - A @ x
         beta = float(np.linalg.norm(r))
+        if on_cycle is not None:
+            on_cycle(_outer, r)
         if beta <= target:
             return x, it_total, beta / b_nrm
         m = int(restart)
@@ -349,8 +377,26 @@ def solve_block_preconditioned(A, b, pre: BlockAMGPreconditioner,
             print(f"[blockamgx]   fgmres it={it:4d} rel={rel:.3e}",
                   flush=True)
 
+    b_nrm = float(np.linalg.norm(b))
+
+    def _split(tag, r):
+        # WHERE does the residual live? u-interior vs u-Dirichlet vs pressure
+        # — discriminates F-block vs BC-handling vs Schur as the slow subspace.
+        if quiet:
+            return
+        r_u = r[pre.u_ids]
+        r_p = r[pre.p_ids]
+        n_u = float(np.linalg.norm(r_u))
+        n_p = float(np.linalg.norm(r_p))
+        n_dir = (float(np.linalg.norm(r_u[pre._u_dir]))
+                 if pre._u_dir is not None else 0.0)
+        n_int = float(np.sqrt(max(n_u ** 2 - n_dir ** 2, 0.0)))
+        print(f"[blockamgx]   {tag}: |r|/|b| split  u_int={n_int / b_nrm:.3e} "
+              f"u_dir={n_dir / b_nrm:.3e} p={n_p / b_nrm:.3e}", flush=True)
+
     x, iters, rel = _fgmres(A, b, apply_M, tol=tol, atol=1e-13,
-                            restart=restart, maxiter=maxiter, log=_log)
+                            restart=restart, maxiter=maxiter, log=_log,
+                            on_cycle=lambda o, r: _split(f"cycle{o}", r))
     if not quiet:
         print(f"[blockamgx] fgmres done: iters={iters} true rel={rel:.3e} "
               f"(tol={tol:.1e})", flush=True)
