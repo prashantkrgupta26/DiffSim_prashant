@@ -42,6 +42,7 @@ from diffsim.sbm.surrogate import (classify_lambda, extract_surrogate,
                                     GeometryData)
 from diffsim.sbm.vector import sbm_vector_dirichlet, surrogate_traction
 from diffsim.api.ns_bricks import assemble_linear_ns
+from diffsim.solvers.linsolve import solve_linear
 from diffsim.physics.poisson import gauss_points
 from diffsim.steppers.leray_sbm import LeraySBMStepper
 
@@ -135,9 +136,13 @@ def march_projection(fx, alpha, dt, max_steps, rate_tol, order=2,
                 bdf2_engaged=bdf2_engaged, st=st, u=u, p=p)
 
 
-def monolithic_cd(fx, alpha, dt, max_steps, rate_tol):
+def monolithic_cd(fx, alpha, dt, max_steps, rate_tol, solver="splu"):
     """3-D monolithic (NO projection split) SBM-NS steady Cd on the SAME mesh —
-    the apples-to-apples de-risk reference. Mirrors tests/test_sphere.py."""
+    the apples-to-apples de-risk reference. Mirrors tests/test_sphere.py.
+
+    ``solver`` routes the per-step saddle solve through ``solve_linear`` — use
+    ``"cudss"`` (GPU direct) on a cuda-device fixture to reach meshes past the
+    host-``splu`` wall (splu stalls ~level-5/143k DOF)."""
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
     sf, geo = fx["sf"], fx["geo"]
     nu, ndof, dim = fx["nu"], fx["ndof"], fx["dim"]
@@ -170,6 +175,67 @@ def monolithic_cd(fx, alpha, dt, max_steps, rate_tol):
     prev_u = None
     cd = None
     steps = 0
+
+    # ---- blockamgx meta (geometry-static; assembled ONCE) ----------------
+    # For solver="blockamgx" the monolithic saddle is solved by the
+    # host-orchestrated block-preconditioned FGMRES (Cahouet-Chabard Schur +
+    # AMG-on-F, block_precond.BlockAMGPreconditioner). It needs the pressure
+    # stiffness Kp and mass-diagonal Mp_diag on the SAME free-node pressure
+    # space, pinned at the SAME node the monolithic march pins the pressure
+    # DOF, plus the strong-Dirichlet velocity row ids. All are geometry-
+    # static (sigma=1/dt is constant here), so we build them ONCE before the
+    # Picard loop and reuse the cache every step. This mirrors the R2b.1
+    # de-risk build_saddle contract exactly (tests/p2r2b1_blockamgx_derisk.py).
+    solve_cache = None
+    cache_key = None
+    if solver == "blockamgx":
+        from diffsim.steppers.leray import LerayProjectionStepper
+        # reuse the Leray scalar pressure stiffness K_p = T^T K T and
+        # consistent mass M = T^T M T (both free-node scalar pressure space).
+        stp = LerayProjectionStepper(
+            dm, nu, dt,
+            lambda xx, t: np.zeros((len(xx), dim)),   # f_fn (body force)
+            lambda xx, t: np.zeros((len(xx), dim)),   # g_fn (Dirichlet data)
+            solver="splu")
+        p_pin = int(np.argmax(coords.sum(1)))         # scalar pressure node
+        Kp = stp.K_p.tolil()
+        Kp.rows[p_pin] = [p_pin]                       # pin consistently with
+        Kp.data[p_pin] = [1.0]                         # the monolithic p pin
+        Kp = Kp.tocsr()
+        Mp_diag = np.asarray(stp.M.diagonal()).copy()
+        Mp_diag[p_pin] = 1.0
+        # strong-Dirichlet velocity row ids (the SAME identity rows the march
+        # overwrites below): free-node i x ndof + component c, c in [0, dim).
+        dir_rows = np.asarray(
+            [int(i) * ndof + c for i in strong for c in range(dim)],
+            dtype=np.int64)
+        cache_key = "monolithic_cd"
+        _meta = dict(
+            n_nodes=nfree, ndof=ndof, Kp=Kp, Mp_diag=Mp_diag,
+            sigma=sigma, nu=nu, dir_rows=dir_rows)
+        # Optional inner-solve tuning knobs from the ENVIRONMENT so the
+        # controller can sweep toward mesh-independent convergence without
+        # code edits. Only set a meta key when the env var is present; else
+        # omit it so the preconditioner default (== current behavior) holds.
+        for _env, _key, _cast in (
+                ("F_ITERS", "f_iters", int),
+                ("F_TOL", "f_tol", float),
+                ("KP_ITERS", "kp_iters", int),
+                ("KP_TOL", "kp_tol", float),
+                ("F_CYCLES", "f_cycles", int),
+                ("KP_CYCLES", "kp_cycles", int),
+                ("GMRES_RESTART", "gmres_restart", int),
+                ("GMRES_MAXITER", "gmres_maxiter", int)):
+            if os.environ.get(_env):
+                _meta[_key] = _cast(os.environ[_env])
+        # Schur approximation mode (string, no cast). Only set when present;
+        # absent -> preconditioner default "cahouet_chabard" (== current).
+        if os.environ.get("SCHUR_MODE"):
+            _meta["schur_mode"] = os.environ["SCHUR_MODE"]
+        if os.environ.get("F_SOLVER"):
+            _meta["f_solver"] = os.environ["F_SOLVER"]
+        solve_cache = {("blockamgx_meta", cache_key): _meta}
+
     for step in range(max_steps):
         u_node = x.reshape(nfree, ndof)[:, :dim]
         aq, dq = gp_field(u_node)
@@ -187,7 +253,21 @@ def monolithic_cd(fx, alpha, dt, max_steps, rate_tol):
         A.rows[pin] = [pin]
         A.data[pin] = [1.0]
         b[pin] = 0.0
-        x = splu(A.tocsr().tocsc()).solve(b)
+        if solver == "splu":
+            x = splu(A.tocsr().tocsc()).solve(b)
+        elif solver == "blockamgx":
+            # per-step linear tolerance: a pseudo-transient Picard step does
+            # NOT need 1e-10 — 1e-8 matches what the direct solvers deliver
+            # in practice and keeps the outer FGMRES budget bounded once the
+            # Schur weakens under developed convection. Env-tunable; default
+            # holds the original 1e-10.
+            _blk_tol = float(os.environ.get("GMRES_TOL", "1e-10"))
+            x = solve_linear(A.tocsr(), b, solver=solver, sym=False,
+                             tol=_blk_tol, device=dm.device,
+                             cache=solve_cache, cache_key=cache_key)
+        else:
+            x = solve_linear(A.tocsr(), b, solver=solver, sym=False,
+                             device=dm.device)
         u_new = x.reshape(nfree, ndof)[:, :dim]
         F = surrogate_traction(dm, sf, geo, np.asarray(T_vec @ x), nu, ndof)
         cd = float(F[0] / qref())
