@@ -231,6 +231,12 @@ class _AMGXCycle:
         self.M.upload_CSR(A)
         self.slv.setup(self.M)
         self._x = np.zeros(A.shape[0])
+        self._tag = "sym" if sym else "nonsym"
+        self._calls = 0
+        # BLOCKAMGX_INNER_LOG=N -> log the achieved inner iterations/status
+        # every N-th call (0/absent = off). The H3 diagnostic: is AMGX
+        # actually reaching its tolerance on the SBM-structured blocks?
+        self._log_every = int(os.environ.get("BLOCKAMGX_INNER_LOG", "0"))
 
     def solve(self, b, **_ignored):
         self.B.upload(np.ascontiguousarray(b, np.float64))
@@ -238,6 +244,19 @@ class _AMGXCycle:
         self.X.upload(self._x)
         self.slv.solve(self.B, self.X, zero_initial_guess=True)
         self.X.download(self._x)
+        self._calls += 1
+        if self._log_every and self._calls % self._log_every == 1:
+            try:
+                it = self.slv.iterations_number
+                res = self.slv.get_residual()
+                st = self.slv.status
+                print(f"[blockamgx]     inner[{self._tag} n={len(b)}] "
+                      f"call={self._calls} iters={it} resid={res:.3e} "
+                      f"status={st}", flush=True)
+            except Exception as e:  # noqa: BLE001 — telemetry must not kill
+                print(f"[blockamgx]     inner[{self._tag}] telemetry "
+                      f"unavailable: {e}", flush=True)
+                self._log_every = 0
         return self._x.copy()
 
 
