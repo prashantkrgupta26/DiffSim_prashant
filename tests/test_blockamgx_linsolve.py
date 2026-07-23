@@ -80,7 +80,7 @@ class _ExactCycleStub:
     preconditioner run on the CPU so the OUTER FGMRES converges in one step —
     which makes the plumbing testable off-box."""
 
-    def __init__(self, A, sym, cycles=1):
+    def __init__(self, A, sym, cycles=1, tol=0.0, pre_cycles=1):
         from scipy.sparse.linalg import splu
         self._lu = splu(sp.csc_matrix(A))
 
@@ -448,11 +448,12 @@ class _CaptureCycleStub:
     preconditioner still runs on the CPU."""
     registry = []
 
-    def __init__(self, A, sym, cycles=1):
+    def __init__(self, A, sym, cycles=1, tol=0.0, pre_cycles=1):
         from scipy.sparse.linalg import splu
         A = sp.csr_matrix(A)
         _CaptureCycleStub.registry.append(
-            dict(A=A, sym=sym, cycles=cycles, shape=A.shape))
+            dict(A=A, sym=sym, cycles=cycles, tol=tol,
+                 pre_cycles=pre_cycles, shape=A.shape))
         self._lu = splu(sp.csc_matrix(A))
 
     def solve(self, b, **_ignored):
