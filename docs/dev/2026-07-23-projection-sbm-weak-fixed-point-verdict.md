@@ -79,10 +79,50 @@ structurally incapable of reaching the strong branch on this external flow.**
     from-rest Stokes propagation is present in the first solve. More robust; partially
     reintroduces coupling (weakens the pure-projection scalability argument).
 
+## Task-4 addendum (2026-07-23, ladder Rung A) — the fix was implemented; the
+## split is OPERATOR-INCONSISTENT (Lane 1c); neither path (a) nor a consistent
+## operator flips Rung A.
+
+Rung A (body-fitted square, STRONG Dirichlet, `dmax==0`, OPEN outflow, Re=40,
+level 5) is the clean 2-D restatement of the sphere defect: same-mesh monolithic
+oracle Cd = **+4.18**, mean|u| = **1.04**, ‖div‖ = 1.2 (steady, physical). The
+stabilized inner predictor<->PPE iteration (path (a)) and the consistent PPE
+operator were both implemented in `leray.py` (default-OFF, bit-for-bit) and run
+head-to-head:
+
+- **Inner iteration (`inner_iterate` + `inner_relax` ω + `inner_accel="anderson"`
+  + divergence guard).** The within-step predictor<->PPE map is NON-CONTRACTIVE
+  on this open-outflow external flow: the inner residual ‖p_hat − p*‖ never
+  converges at any ω (1.0 / 0.3 / 0.1) or with Anderson — it plateaus/grows
+  (~2 → 130). It DOES break the from-rest weak pin (mean|u| develops off the ~5%
+  plateau) but Cd runs strongly NEGATIVE (−9 … −63) and ‖div‖ grows (30 → 68).
+- **Consistent PPE `L = GᵀM⁻¹G` (`consistent_ppe`).** DECISIVE seeded-fixed-point
+  diagnostic: seed the projection with the EXACT monolithic (u, p) and take ONE
+  step. The predictor REPRODUCES it (‖u_hat − u_mono‖ = 3.6e-6, ‖div‖ = 1.22 —
+  faithful). The PPE+correction then DESTROYS it: with the shipped `K_p`, Cd
+  +4.18 → **−55** and ‖div‖ **1.22 → 6.0** (the "projection" RAISES divergence).
+  Root: `K_p` ≠ `L`; measured ‖L − K_p‖/‖K_p‖ = **0.67** on this mesh. With the
+  consistent `L`, a STATIC seeded projection is idempotent (‖Bᵀu_corr‖ 0.175 →
+  8e-15), but LIVE it diverges FASTER (mean|u| overshoots to 2.5, Cd → −19),
+  even paired with the damped/Anderson inner iteration (Cd → −7.6, mean|u| 1.66,
+  ‖div‖ 54) — **idempotency ≠ coupled-loop stability** (confirms exp. 4).
+
+**Verdict:** the monolithic steady state is NOT a fixed point of the lagged-p*
+split on Rung A; the split is operator-inconsistent. Neither the stabilized
+inner iteration nor the consistent PPE operator (alone or together) makes the
+projection faithful to the same-mesh monolithic. This is the reportable Lane-1c
+result and validates the R2a monolithic pivot at the 2-D body-fitted level. The
+knobs ship default-OFF; the base single-pass Rung-A regression is unchanged.
+Experiments: `tests/rungA_inner_experiment.py`, `tests/rungA_outflow_diag.py`;
+regression `tests/test_ladder_rungA.py`; unit gates `tests/test_leray_inner_stab.py`.
+
 ## Artifacts
 - Knobs + probes on branch `projection-sbm` (unmerged, default-off, tests green):
   `viscous_form` (`1b418ec`), `consistent_ppe` + Leray/idempotency probes (`3f836d4`),
   `sbm_no_penetration`, `inner_iterate`, `pressure_update`, `ppe_fine_scale`,
   `pressure_outflow_nodes`. Kept as reproducible measured proofs.
+- Ladder branch `projection-ladder` (Task 4): `inner_iterate`/`inner_relax`/
+  `inner_accel`/divergence-guard + `consistent_ppe` re-implemented on the CURRENT
+  base stepper with unit gates and the Rung-A head-to-head (this addendum).
 - Predecessor: `2026-07-22-p2-r2a-projection-3d-findings.md`; spec
   `docs/dev/specs/2026-07-22-projection-sbm-formulation-research-design.md`.

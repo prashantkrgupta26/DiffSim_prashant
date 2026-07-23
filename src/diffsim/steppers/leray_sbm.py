@@ -85,7 +85,10 @@ class LeraySBMStepper:
                  beta_backflow=1.0, velocity_update="consistent",
                  graddiv_scale=1.0, pressure_update="standard",
                  ppe_fine_scale=False, pressure_outflow_nodes=None,
-                 sbm_pressure_coupling=False):
+                 sbm_pressure_coupling=False,
+                 inner_iterate=False, inner_max=8, inner_tol=1e-6,
+                 inner_relax=1.0, inner_accel="none", inner_anderson_m=3,
+                 consistent_ppe=False):
         self.oracle = oracle
         self.dm = dm
         self.nu = nu
@@ -126,7 +129,11 @@ class LeraySBMStepper:
             ppe_finescale=ppe_finescale,
             velocity_update=velocity_update, graddiv_scale=graddiv_scale,
             pressure_update=pressure_update, ppe_fine_scale=ppe_fine_scale,
-            pressure_outflow_nodes=pressure_outflow_nodes)
+            pressure_outflow_nodes=pressure_outflow_nodes,
+            inner_iterate=inner_iterate, inner_max=inner_max,
+            inner_tol=inner_tol, inner_relax=inner_relax,
+            inner_accel=inner_accel, inner_anderson_m=inner_anderson_m,
+            consistent_ppe=consistent_ppe)
         base.dir_nodes = self._strong_nodes
         self.base = base
         self.n_free = base.n_free

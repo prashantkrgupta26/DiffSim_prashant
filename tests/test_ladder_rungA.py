@@ -19,13 +19,38 @@ MEASURED RUNG-A VERDICT (this test locks it in as a regression):
     verdict.md).
 
 So single-pass base projection is UNFAITHFUL to the same-mesh monolithic on this
-external flow. This is the EXPECTED-and-important rung-A result (contract): the
-fix is the stabilized inner predictor<->PPE iteration (Task 4), which re-runs
-this rung and is what will FLIP these asserts to a match. The `dmax==0`
+external flow. This is the EXPECTED-and-important rung-A result. The `dmax==0`
 body-fitted guard is the anti-vacuity check — ALWAYS asserted.
 
+TASK-4 UPDATE (2026-07-23) — the fix did NOT flip rung A; the split is
+OPERATOR-INCONSISTENT (Lane 1c). Both candidate fixes were implemented and run
+head-to-head against this same-mesh oracle:
+  * Stabilized inner predictor<->PPE iteration (inner_iterate + inner_relax +
+    inner_accel="anderson", divergence guard) — the intended vehicle. The
+    within-step predictor<->PPE map is NON-CONTRACTIVE on this open-outflow
+    external flow (inner residual never converges at any omega/Anderson); it
+    develops mean|u| but Cd runs strongly NEGATIVE and ‖div‖ grows.
+  * Consistent PPE operator L = G^T M^-1 G (consistent_ppe=True) in place of the
+    FE Laplacian K_p. K_p differs from the true projection operator L by ~67%
+    (measured on this mesh), so the classic PPE does NOT project the corrected
+    field onto the discretely divergence-free space. The DECISIVE diagnostic:
+    seeding the projection with the EXACT monolithic (u, p) — a would-be fixed
+    point — and taking ONE step throws Cd +4.18 -> -55 and RAISES ‖div‖
+    1.22 -> 6.0 (the correction corrupts a perfect field). With the consistent L
+    a static seeded projection IS idempotent (B^T u_corr -> 1e-15), but LIVE it
+    diverges FASTER (mean|u| overshoots, Cd -> -19..-63) — idempotency != coupled
+    -loop stability, even paired with the damped/Anderson inner iteration.
+
+VERDICT: the plain lagged-p* split fixed point is not the monolithic fixed
+point on rung A; neither the stabilized inner iteration nor the consistent PPE
+operator (alone or together) makes the projection faithful. Reportable per the
+Task-4 brief (Lane 1c operator-inconsistency). The knobs ship default-OFF and
+bit-for-bit; see docs/dev/2026-07-23-projection-sbm-weak-fixed-point-verdict.md
+(§Task-4 addendum) and .superpowers/sdd/task-4-report.md.
+
 Kept CHEAP (level 5, 250-step march). Full Re-40/100 numbers + Strouhal live in
-the driver (tests/ladder_rungA_square_strong.py).
+the driver (tests/ladder_rungA_square_strong.py); the fix experiments live in
+tests/rungA_inner_experiment.py and tests/rungA_outflow_diag.py.
 """
 import numpy as np
 import pytest
@@ -69,22 +94,29 @@ def test_monolithic_is_clean_same_mesh_oracle(rungA_results):
     assert 0.8 < mo["mean_u"] < 1.3             # flow developed to ~U_IN
 
 
-def test_single_pass_projection_does_not_match_monolithic(rungA_results):
-    """THE decisive rung-A read: single-pass base projection is UNFAITHFUL to
-    the same-mesh monolithic on this open-outflow external flow — its ‖div u‖
-    grows far past the monolithic's bounded value and its Cd does not reach the
-    monolithic steady Cd. (Task 4's stabilized inner iteration is what flips
-    this to a match; see the module docstring.)"""
+def test_projection_does_not_match_monolithic_operator_inconsistent(
+        rungA_results):
+    """THE decisive rung-A read, LOCKED as the Task-4 verdict: the projection
+    is UNFAITHFUL to the same-mesh monolithic on this open-outflow external flow
+    and NEITHER candidate fix flips it — the split is operator-inconsistent
+    (Lane 1c; see the module docstring for the full Task-4 investigation).
+
+    Single-pass base projection: ‖div u‖ grows far past the monolithic's
+    bounded value (~30 vs ~1.2) and its Cd does not reach the monolithic steady
+    Cd — the pressure-instability signature. This asserts the ESTABLISHED
+    unfaithfulness; the fix knobs (inner_iterate, consistent_ppe) ship
+    default-OFF so this base single-pass regression is unchanged."""
     pr, mo = rungA_results["pr"], rungA_results["mo"]
     # projection divergence is NOT controlled to the monolithic's bounded level
     # (measured ~30 vs ~1.2) — the pressure-instability signature.
     assert pr["div"] > 5.0 * mo["div"], (
         f"projection ‖div‖={pr['div']:.3f} unexpectedly close to monolithic "
-        f"‖div‖={mo['div']:.3f} — single-pass may have started matching "
-        f"(did Task-4 stabilization land? update this rung-A regression)")
+        f"‖div‖={mo['div']:.3f} — single-pass may have started matching; "
+        f"re-open the Task-4 operator-inconsistency verdict and update this "
+        f"rung-A regression")
     # and the projection Cd does NOT match the monolithic same-mesh Cd.
     cd_rel = abs(pr["cd"] - mo["cd"]) / abs(mo["cd"])
     assert cd_rel > 0.15, (
         f"projection Cd={pr['cd']:+.4f} unexpectedly matches monolithic "
-        f"Cd={mo['cd']:+.4f} (rel {cd_rel:.3%}) — single-pass may now be "
-        f"faithful; update this rung-A regression")
+        f"Cd={mo['cd']:+.4f} (rel {cd_rel:.3%}) — re-open the Task-4 verdict "
+        f"and update this rung-A regression")
