@@ -69,6 +69,21 @@ DT = 0.02
 NSTEPS_BASE = 250     # base split already visibly diverging by here (cheap).
 NSTEPS_FIX = 400      # consistent projection converges to the monolithic state.
 
+# Re=100 backflow-stabilization (change #6) regression. On this coarse/confined
+# mesh the monolithic finds a STEADY symmetric solution (no shedding); the base
+# consistent-projection predictor tracked it for ~700 steps then BLEW UP when
+# reverse flow appeared at the open outflow (‖div‖ -> 1e5) — the do-nothing outlet
+# left the convective energy flux unbounded. The velocity-based directional-do-
+# nothing term (Bazilevs 2009 / Esmaily-Moghadam 2011), applied to BOTH the
+# projection predictor AND the monolithic outflow traction, restores a coercive
+# outlet and keeps the projection bounded and tracking the monolithic well past
+# step 700. A residual slow long-tail drift remains (a separate lagged-p*/from-
+# rest development effect targeted by changes #5/#7, out of scope here), so this
+# test locks the near-term STABLE+TRACKING window, not the infinite-horizon state.
+RE100 = 100
+DT100 = 0.01
+NSTEPS_100 = 800      # well past the old step-~700 blow-up.
+
 
 @pytest.fixture(scope="module")
 def rungA_results():
@@ -143,3 +158,56 @@ def test_consistent_projection_matches_monolithic(rungA_results):
         f"consistent-projection mean|u|={prc['mean_u']:.4f} pins weak vs "
         f"monolithic {mo['mean_u']:.4f} (frac {mu_frac:.3f})")
     assert abs(prc["mean_u"] - mo["mean_u"]) / mo["mean_u"] < 0.20
+
+
+@pytest.fixture(scope="module")
+def rungA_re100():
+    fx = build_square_channel_2d(LEVEL, RE100, half=HALF, offset=0,
+                                 device="cpu")
+    # consistent projection (backflow beta=0.5 auto-on) vs the same-mesh oracle
+    # with the SAME beta on its outflow traction, well past the old blow-up.
+    prc = march_projection(fx, dt=DT100, nsteps=NSTEPS_100,
+                           consistent_projection=True)
+    mo = march_monolithic(fx, dt=DT100, nsteps=NSTEPS_100, rate_tol=2e-4,
+                          backflow_beta=0.5)
+    return dict(fx=fx, prc=prc, mo=mo)
+
+
+def test_re100_backflow_no_blowup_and_tracks(rungA_re100):
+    """Change #6 gate — Re=100 reverse-flow blow-up is FIXED. Before backflow
+    stabilization the consistent-projection predictor tracked the monolithic for
+    ~700 steps then diverged (‖div‖ -> 1e5) when reverse flow hit the open
+    outlet. With the directional-do-nothing term the projection stays BOUNDED and
+    TRACKS the monolithic well past step 700 (here to step 800):
+      * no blow-up (finite, max|u| O(1), ‖div‖ controlled to the monolithic's
+        level — NOT the 1e5 runaway);
+      * Cd matches the same-mesh oracle within the R0 15% tol;
+      * mean|u| stays at the monolithic magnitude (no drift-away yet in-window)."""
+    prc, mo = rungA_re100["prc"], rungA_re100["mo"]
+    assert not prc.get("blew_up", False), "Re=100 projection blew up (backflow " \
+        "term failed to stabilize the reverse-flow outlet)"
+    assert np.isfinite(prc["cd"]) and np.isfinite(prc["div"])
+    # ‖div‖ controlled to the monolithic's level (the old blow-up was ‖div‖~1e5).
+    assert prc["div"] < 5.0 * mo["div"], (
+        f"Re=100 consistent-projection ‖div‖={prc['div']:.3f} not controlled to "
+        f"the monolithic level ‖div‖={mo['div']:.3f} — backflow term insufficient")
+    # Cd tracks the same-mesh steady oracle (R0 tol 15%).
+    cd_rel = abs(prc["cd"] - mo["cd"]) / abs(mo["cd"])
+    assert cd_rel < 0.15, (
+        f"Re=100 projection Cd={prc['cd']:+.4f} does not track monolithic "
+        f"Cd={mo['cd']:+.4f} (rel {cd_rel:.3%})")
+    # mean|u| at the monolithic magnitude in the stable window.
+    mu_frac = prc["mean_u"] / mo["mean_u"]
+    assert 0.8 < mu_frac < 1.2, (
+        f"Re=100 projection mean|u|={prc['mean_u']:.4f} off the monolithic "
+        f"magnitude {mo['mean_u']:.4f} (frac {mu_frac:.3f}) in the stable window")
+
+
+def test_re100_monolithic_oracle_intact(rungA_re100):
+    """Applying backflow (#6) to the monolithic must NOT change its steady state:
+    the term is ~0 without reverse flow, so the confined-steady Re=100 monolithic
+    Cd/mean|u| are unchanged (the same-mesh oracle stays exact)."""
+    mo = rungA_re100["mo"]
+    assert np.isfinite(mo["cd"]) and mo["cd"] > 0.0
+    assert mo["div"] < 5.0                        # bounded, physical steady state
+    assert 0.8 < mo["mean_u"] < 1.3

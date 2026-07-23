@@ -41,7 +41,8 @@ class LerayProjectionStepper:
                  pressure_outflow_nodes=None,
                  inner_iterate=False, inner_max=8, inner_tol=1e-6,
                  inner_relax=1.0, inner_accel="none", inner_anderson_m=3,
-                 consistent_ppe=False, consistent_projection=False):
+                 consistent_ppe=False, consistent_projection=False,
+                 backflow_beta=None):
         # ---- CONSISTENT-PROJECTION MODE (the 2026-07-23 fix, changes #1-#4) ----
         # ONE mode that turns on the coherent VMS-stabilized Helmholtz-Leray set
         # (ns_projection_vms_paper Eq 44a-c / Algorithm 1, exact discrete forms):
@@ -67,6 +68,30 @@ class LerayProjectionStepper:
         # Default False => bit-for-bit unchanged. When True it OVERRIDES
         # ppe_fine_scale and pressure_update to the coherent set (a later explicit
         # kwarg cannot silently half-enable it).
+        # ---- BACKFLOW STABILIZATION (change #6, 2026-07-23) ----
+        # Velocity-based directional-do-nothing outflow stabilization
+        # (Bazilevs et al. CMAME 2009; Esmaily-Moghadam et al. Comput. Mech.
+        # 2011; = Braack-Mucha directional-do-nothing). Adds
+        #     - beta * rho * int_{Gamma_out} (u.n)_- (u . v) dGamma
+        # to the momentum predictor's outflow traction, ACTIVE ONLY where the
+        # flow reverses through the open outlet (u.n < 0). The open "do-nothing"
+        # outflow leaves the convective energy flux unbounded when the wake
+        # pushes fluid back in (Re=100 blows up ~step 700); this term restores a
+        # coercive (positive-definite) contribution exactly there and is ~0
+        # (benign) with no backflow. ``backflow_beta`` is the knob:
+        #   None (default) -> 0.0 in the base scheme (OFF, bit-for-bit),
+        #                     0.5 in the consistent-projection scheme (the
+        #                     analysis-backed value; beta=1 is the robust upper
+        #                     choice). An explicit float overrides either.
+        # The predictor's outflow-face set is discovered from the mesh the first
+        # time step() runs (cached), so ``pressure_outflow_nodes`` (the disjoint
+        # PPE Dirichlet) and this velocity-side term stay on the SAME open
+        # outlet without new caller wiring.
+        if backflow_beta is None:
+            self.backflow_beta = 0.5 if consistent_projection else 0.0
+        else:
+            self.backflow_beta = float(backflow_beta)
+        self._backflow_faces = None       # lazily discovered outflow face set
         self.consistent_projection = bool(consistent_projection)
         if self.consistent_projection:
             ppe_fine_scale = True
@@ -316,6 +341,18 @@ class LerayProjectionStepper:
         T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
         return (T_vec.T @ G @ T_vec).tocsr()
 
+    def _backflow_block(self, a_node):
+        """Constrained node-major outflow backflow block (#6) at advecting
+        field ``a_node`` [n_free, dim]. Discovers the outflow face set once
+        (cached) and delegates to ns_bricks.assemble_backflow_block. Returns a
+        zero CSR when ``backflow_beta == 0`` (never called in that case)."""
+        from ..api.ns_bricks import assemble_backflow_block, outflow_faces
+        if self._backflow_faces is None:
+            self._backflow_faces = outflow_faces(self.dm.mesh)
+        return assemble_backflow_block(
+            self.dm, a_node, self.backflow_beta, self.ndof,
+            faces=self._backflow_faces)
+
     def _gradient_operator(self):
         """Discrete gradient G: scalar free-node pressure -> per-component
         free-node vectors, with block c the CSR of
@@ -563,6 +600,11 @@ class LerayProjectionStepper:
             # penalty). No-op for the other variants (block is None).
             if self._graddiv_block is not None:
                 A = (A + self._graddiv_block)
+            # Backflow stabilization (#6): add the outflow directional-do-nothing
+            # block, linearized (Picard) at the current advecting iterate
+            # ``a_node``. beta=0 => a structural zero (bit-for-bit OFF).
+            if self.backflow_beta != 0.0:
+                A = (A + self._backflow_block(a_node))
             A = A.tolil()
             for k, i in enumerate(self.dir_nodes):
                 if int(i) in strong_skip:      # SBM-governed: stays weak

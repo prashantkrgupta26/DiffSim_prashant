@@ -62,6 +62,116 @@ from ..assembly.operators import _kernel_cache
 from ..physics.vms import tau_m_metric, tau_c_metric
 
 
+# --------------------------------------------------------------------------
+# Outflow backflow stabilization (change #6 of the consistent-projection fix)
+# --------------------------------------------------------------------------
+def outflow_faces(mesh, axis=0, side=1, coord=1.0, tol=1e-9):
+    r"""Enumerate the OUTER-BOUNDARY faces on the outflow plane ``x_axis=coord``.
+
+    Returns ``(elem, face, ntilde)``: ``elem`` [Nf] element ids (into the tree),
+    ``face`` [Nf] local face ids ``2*axis+side``, and ``ntilde`` [dim] the constant
+    domain-outward unit normal on that plane (e.g. ``(+1,0)`` for the x=1 face).
+
+    A face qualifies when it is a mesh boundary face (no neighbour across it) of
+    the requested orientation AND its face centre lies on the plane. For the unit
+    cube channel the default (``axis=0, side=1, coord=1.0``) is the free x=1
+    outflow. Host-side; the outflow-face count is O(mesh side), so a small loop is
+    fine (mirrors the SBM surrogate-face path)."""
+    from ..octree.lookup import face_neighbors, face_offsets
+    from ..octree import morton
+    dim = mesh.dim
+    tree = mesh.tree
+    f = 2 * axis + side
+    nbr = face_neighbors(tree)[f]                       # -1 == boundary face
+    scale = 2.0 ** -morton.lmax(dim)
+    lo = tree.anchors() * scale
+    h = tree.h()
+    face_coord = lo[:, axis] + (h if side == 1 else 0.0)
+    keep = np.where((nbr < 0) & (np.abs(face_coord - coord) < tol))[0]
+    ntilde = face_offsets(dim).astype(np.float64)[f]    # unit outward normal
+    return keep.astype(np.int64), np.full(len(keep), f, np.int8), ntilde
+
+
+def assemble_backflow_block(dm, u_free, beta, ndof, faces=None,
+                            axis=0, side=1, coord=1.0, rho=1.0):
+    r"""Velocity-based backflow stabilization on the outflow face (Bazilevs et al.
+    CMAME 2009; Esmaily-Moghadam et al. Comput. Mech. 2011; directional-do-nothing,
+    Braack-Mucha). Adds the weak-form term
+
+        - beta * rho * \int_{Gamma_out} (u . n)_-  (u . v) dGamma ,
+          (u . n)_- = min(u . n, 0)
+
+    to the momentum block, ACTIVE ONLY where there is reverse flow (u.n < 0). The
+    open "do-nothing" outflow leaves the convective energy flux unbounded when the
+    wake pushes fluid back in through the outlet; this term restores a dissipative
+    (negative-definite) contribution exactly there, and is ~0 (benign) with no
+    backflow. Picard-linearized: (u.n)_- is frozen at the supplied advecting field
+    ``u_free`` and the trial/test pair is the remaining (u . v).
+
+    ``u_free`` [n_free, dim] is the advecting velocity in CONSTRAINED free-node
+    space (the current Picard iterate for the predictor, the current Newton state
+    for the monolithic). ``beta`` = 0 returns a zero matrix (bit-for-bit OFF).
+    Returns a CSR of shape (n_free*ndof, n_free*ndof), constrained & node-major —
+    add it to the assembled momentum block BEFORE the strong-row overwrite."""
+    dim = dm.dim
+    mesh = dm.mesh
+    if beta == 0.0:
+        Nn = dm.n_nodes * ndof
+        Z = sp.csr_matrix((Nn, Nn))
+        T = dm.constraints.T.tocsr()
+        T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
+        return (T_vec.T @ Z @ T_vec).tocsr()
+    if faces is None:
+        elem, face, ntilde = outflow_faces(mesh, axis=axis, side=side,
+                                            coord=coord)
+    else:
+        elem, face, ntilde = faces
+    # uniform p on the outflow face (channel is p1; matches surrogate_traction).
+    from ..mesh.faces import face_tables
+    p_face = np.unique(np.asarray(mesh.p_elem)[elem]) if len(elem) else \
+        np.array([1])
+    if len(p_face) != 1:
+        from ..errors import ConfigError
+        raise ConfigError(
+            f"outflow backflow assumes uniform p on the face, got "
+            f"orders {p_face.tolist()}")
+    pv = int(p_face[0])
+    ftab = face_tables(pv, dim)
+    nqf, nbf = ftab.nqf, ftab.nbf
+    conn = mesh.conn_of[pv][np.searchsorted(mesh.bins[pv], elem)]  # [Nf, nbf]
+    u_full = np.asarray(dm.constraints.T @ u_free)                # node-major
+    h = mesh.tree.h()[elem]
+    jacS = (h / 2.0) ** (dim - 1)
+    Nn = dm.n_nodes * ndof
+    rows, cols, vals = [], [], []
+    for fi in range(len(elem)):
+        f = int(face[fi])
+        N = ftab.N[f]                                             # [nqf, nbf]
+        un = u_full[conn[fi], :dim]                               # [nbf, dim]
+        # face-GP advecting velocity and its outward-normal component
+        uq = N @ un                                               # [nqf, dim]
+        un_dot_n = uq @ ntilde                                    # [nqf]
+        un_neg = np.minimum(un_dot_n, 0.0)                        # (u.n)_-
+        # Ab[a,b] = -beta*rho * int (u.n)_- N_a N_b dGamma  (per component)
+        Ab = -beta * rho * np.einsum(
+            "qa,qb,q,q->ab", N, N, un_neg, ftab.w) * jacS[fi]
+        gnodes = conn[fi]
+        for c in range(dim):
+            gdof = gnodes * ndof + c
+            rows.append(np.repeat(gdof, nbf))
+            cols.append(np.tile(gdof, nbf))
+            vals.append(Ab.ravel())
+    if rows:
+        A = sp.coo_matrix((np.concatenate(vals),
+                           (np.concatenate(rows), np.concatenate(cols))),
+                          shape=(Nn, Nn)).tocsr()
+    else:
+        A = sp.csr_matrix((Nn, Nn))
+    T = dm.constraints.T.tocsr()
+    T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
+    return (T_vec.T @ A @ T_vec).tocsr()
+
+
 def make_linear_ns_Ae(nbf: int, nqp: int, dim: int):
     """Element-matrix kernel: inputs aq [ne*nqp, dim] advecting field at GPs,
     div_aq [ne*nqp], scalars nu, sigma, sig2tau; writes Ae node-major."""

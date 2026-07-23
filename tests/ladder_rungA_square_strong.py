@@ -40,7 +40,8 @@ import scipy.sparse as sp
 from scipy.sparse.linalg import splu
 
 from diffsim.steppers.leray import LerayProjectionStepper
-from diffsim.api.ns_bricks import assemble_linear_ns
+from diffsim.api.ns_bricks import (assemble_linear_ns, assemble_backflow_block,
+                                   outflow_faces)
 from diffsim.physics.poisson import gauss_points
 from diffsim.sbm.vector import surrogate_traction
 
@@ -169,11 +170,18 @@ def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
 # --------------------------------------------------------------------------
 # MONOLITHIC march (inline saddle, same mesh, strong obstacle, NO SBM block)
 # --------------------------------------------------------------------------
-def march_monolithic(fx, dt=0.02, nsteps=400, rate_tol=2e-4, log_every=0):
+def march_monolithic(fx, dt=0.02, nsteps=400, rate_tol=2e-4, log_every=0,
+                     backflow_beta=0.0):
     """March the same-mesh monolithic saddle NS (inline; mirrors
     p2r0_task10_sphere_derisk::monolithic_cd) with STRONG no-slip on the
     obstacle and NO SBM Nitsche block. Returns dict(cd, cl, mean_u, div, steps,
-    cd_hist, cl_hist)."""
+    cd_hist, cl_hist).
+
+    ``backflow_beta`` (default 0.0 = OFF, unchanged) adds the SAME outflow
+    directional-do-nothing stabilization (change #6) to the monolithic outflow
+    traction that the consistent-projection predictor uses, so the same-mesh
+    oracle stays matched at Re=100 when reverse flow appears. The term is ~0
+    without backflow, so the currently-steady monolithic Cd is unchanged."""
     dim = fx["dim"]
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
     sf, geo = fx["sf"], fx["geo"]
@@ -206,6 +214,9 @@ def march_monolithic(fx, dt=0.02, nsteps=400, rate_tol=2e-4, log_every=0):
     q = qref(fx)
     x = np.zeros(nfree * ndof)
     sigma = 1.0 / dt
+    # backflow-stabilization outflow faces (change #6) — discovered once; the
+    # block is re-linearized each Newton/Picard step at the current velocity.
+    bf_faces = outflow_faces(mesh) if backflow_beta != 0.0 else None
     prev_u = None
     steps = 0
     cd = cl = np.nan
@@ -216,6 +227,12 @@ def march_monolithic(fx, dt=0.02, nsteps=400, rate_tol=2e-4, log_every=0):
         aq, dq = gp_field(u_node)
         fq = {pv: aq[pv] / dt for pv in xq}
         A, b = assemble_linear_ns(dm, aq, dq, fq, nu, sigma=sigma)
+        # backflow stabilization (#6): add the outflow directional-do-nothing
+        # block at the current velocity iterate ``u_node`` (Picard). beta=0 =>
+        # no-op (structural zero), so the default monolithic is bit-for-bit.
+        if backflow_beta != 0.0:
+            A = A + assemble_backflow_block(dm, u_node, backflow_beta, ndof,
+                                            faces=bf_faces)
         A = A.tolil()
         for k, i in enumerate(strong_nodes):
             for c in range(dim):
@@ -334,11 +351,16 @@ def run_rungA(level=5, half=0.125, res=(40, 100), device="cpu",
               f"n_obstacle_nodes={int(fx['obstacle_node_mask'].sum())}",
               flush=True)
 
+        # change #6: the consistent-projection scheme turns on beta=0.5 backflow
+        # stabilization; apply the SAME beta to the monolithic outflow traction
+        # so the same-mesh oracle stays matched when reverse flow appears at the
+        # Re=100 outlet (the term is ~0 at the steady state -> benign for Cd).
+        mono_beta = 0.5 if consistent_projection else 0.0
         pr = march_projection(fx, dt=dt, nsteps=nsteps, rate_tol=rate_tol_p,
                               log_every=log_every,
                               consistent_projection=consistent_projection)
         mo = march_monolithic(fx, dt=dt, nsteps=nsteps, rate_tol=rate_tol_m,
-                              log_every=log_every)
+                              log_every=log_every, backflow_beta=mono_beta)
 
         cd_rel = (abs(pr["cd"] - mo["cd"]) / abs(mo["cd"])
                   if mo["cd"] != 0 else float("inf"))
