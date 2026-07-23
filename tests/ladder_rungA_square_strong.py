@@ -82,14 +82,19 @@ def mean_speed(u_node):
 # PROJECTION march (base LerayProjectionStepper, strong obstacle)
 # --------------------------------------------------------------------------
 def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
-                     log_every=0):
+                     log_every=0, consistent_projection=False):
     """March the base projection stepper (single-pass) with STRONG no-slip on
     the obstacle. Returns dict(cd, cl, mean_u, div, steps, cd_hist, cl_hist).
 
     Obstacle strong Dirichlet is imposed by overriding `base.dir_nodes` to the
     combined strong set and returning the combined trace from `g_fn`. Outflow
     pressure is pinned (physical outlet BC) so the incremental p* does not drift
-    on this external flow."""
+    on this external flow.
+
+    ``consistent_projection=True`` engages the 2026-07-23 consistent-projection
+    fix (PSPG-consistent PPE with a COLLOCATED coarse divergence, fine-scale in
+    both PPE + correction, disjoint outflow BCs via `pressure_outflow_nodes`,
+    rotational pressure update). Default False = the base single-pass split."""
     dim = fx["dim"]
     dm, mesh = fx["dm"], fx["mesh"]
     sf, geo = fx["sf"], fx["geo"]
@@ -106,7 +111,8 @@ def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
 
     st = LerayProjectionStepper(
         dm, nu, dt, f_fn=f_fn, g_fn=g_fn, order=order, picard_iters=1,
-        solver="splu", pressure_outflow_nodes=fx["outflow_nodes"])
+        solver="splu", pressure_outflow_nodes=fx["outflow_nodes"],
+        consistent_projection=consistent_projection)
     st.dir_nodes = strong_nodes                    # override: box + obstacle strong
     st.set_initial(lambda c: np.zeros((len(c), dim)))
 
@@ -292,7 +298,7 @@ WEAK_PLATEAU_FRAC = 0.5  # mean|u| below this fraction of monolithic == weak pin
 
 def run_rungA(level=5, half=0.125, res=(40, 100), device="cpu",
               dt40=0.02, nsteps40=600, dt100=0.01, nsteps100=2000,
-              log_every=25):
+              log_every=25, consistent_projection=False):
     """Full rung-A driver. Re=40 steady (PRIMARY, decisive): projection vs
     monolithic steady Cd + mean|u| development. Re=100 shedding: mean Cd over a
     period + Strouhal from Cl, both solvers. Prints PASS/FAIL vs the same-mesh
@@ -329,7 +335,8 @@ def run_rungA(level=5, half=0.125, res=(40, 100), device="cpu",
               flush=True)
 
         pr = march_projection(fx, dt=dt, nsteps=nsteps, rate_tol=rate_tol_p,
-                              log_every=log_every)
+                              log_every=log_every,
+                              consistent_projection=consistent_projection)
         mo = march_monolithic(fx, dt=dt, nsteps=nsteps, rate_tol=rate_tol_m,
                               log_every=log_every)
 
@@ -417,5 +424,8 @@ if __name__ == "__main__":
     import json
     import sys
     lvl = int(sys.argv[1]) if len(sys.argv) > 1 else 5
-    out = run_rungA(level=lvl)
+    # 2nd arg: "consistent" turns on the 2026-07-23 fix; default base split.
+    cons = (len(sys.argv) > 2 and sys.argv[2] == "consistent")
+    res = (40,) if (len(sys.argv) > 3 and sys.argv[3] == "re40") else (40, 100)
+    out = run_rungA(level=lvl, consistent_projection=cons, res=res)
     print("\n[json]", json.dumps(out, default=lambda o: None))

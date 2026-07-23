@@ -88,7 +88,7 @@ class LeraySBMStepper:
                  sbm_pressure_coupling=False,
                  inner_iterate=False, inner_max=8, inner_tol=1e-6,
                  inner_relax=1.0, inner_accel="none", inner_anderson_m=3,
-                 consistent_ppe=False):
+                 consistent_ppe=False, consistent_projection=False):
         self.oracle = oracle
         self.dm = dm
         self.nu = nu
@@ -133,7 +133,8 @@ class LeraySBMStepper:
             inner_iterate=inner_iterate, inner_max=inner_max,
             inner_tol=inner_tol, inner_relax=inner_relax,
             inner_accel=inner_accel, inner_anderson_m=inner_anderson_m,
-            consistent_ppe=consistent_ppe)
+            consistent_ppe=consistent_ppe,
+            consistent_projection=consistent_projection)
         base.dir_nodes = self._strong_nodes
         self.base = base
         self.n_free = base.n_free

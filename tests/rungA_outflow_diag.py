@@ -83,7 +83,8 @@ def solve_monolithic_steady(fx, dt, nsteps=400, rate_tol=2e-4):
 
 
 def one_projection_step_from_seed(fx, dt, u_seed, p_seed, *, inner_iterate,
-                                  inner_relax, inner_max, outflow_pin="face"):
+                                  inner_relax, inner_max, outflow_pin="face",
+                                  consistent_projection=False):
     dim = fx["dim"]
     dm = fx["dm"]
     sf, geo = fx["sf"], fx["geo"]
@@ -110,16 +111,20 @@ def one_projection_step_from_seed(fx, dt, u_seed, p_seed, *, inner_iterate,
         dm, nu, dt, f_fn=f_fn, g_fn=g_fn, order=1, picard_iters=1,
         solver="splu", pressure_outflow_nodes=pon,
         inner_iterate=inner_iterate, inner_relax=inner_relax,
-        inner_accel="none", inner_max=inner_max)
+        inner_accel="none", inner_max=inner_max,
+        consistent_projection=consistent_projection)
     st.dir_nodes = strong_nodes
     # seed history with u_seed (BDF1 needs one slot), and p_star = p_seed
     st.hist.rotate(u_seed.ravel())
     st.p_star = p_seed.copy()
+    # weak divergence of the SEEDED field (before the step), the fixed-point bar.
+    div_seed = float(st.divergence_l2())
 
     T = dm.constraints.T.tocsr()
     T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
     q = qref(fx)
     u, p = st.step()
+    div_after = float(st.divergence_l2())
     xfree = np.zeros(st.n_free * ndof)
     xv = xfree.reshape(st.n_free, ndof)
     xv[:, :dim] = u
@@ -128,7 +133,8 @@ def one_projection_step_from_seed(fx, dt, u_seed, p_seed, *, inner_iterate,
     cd = float(F[0] / q)
     du = float(np.abs(u - u_seed).max())
     return dict(cd=cd, mean_u=mean_speed(u), du=du,
-                pnorm=float(np.linalg.norm(p)), res=st.inner_res_hist)
+                pnorm=float(np.linalg.norm(p)), res=st.inner_res_hist,
+                div_seed=div_seed, div_after=div_after)
 
 
 if __name__ == "__main__":
@@ -138,6 +144,8 @@ if __name__ == "__main__":
     print(f"MONOLITHIC steady: Cd={cd_m:+.4f}  mean|u|={mean_speed(u_m):.4f}  "
           f"‖p‖={np.linalg.norm(p_m):.3e}", flush=True)
 
+    print("\n--- BASE projection (pre-fix): seed corrupts the fixed point ---",
+          flush=True)
     for pin in ("face", "single"):
         for ii, om, im in ((False, 1.0, 1), (True, 0.5, 20)):
             r = one_projection_step_from_seed(
@@ -146,6 +154,18 @@ if __name__ == "__main__":
             tag = f"pin={pin:6s} inner={ii} om={om}"
             print(f"  [{tag}]  Cd={r['cd']:+.4f}  mean|u|={r['mean_u']:.4f}  "
                   f"du_from_seed={r['du']:.3e}  "
+                  f"div {r['div_seed']:.3f}->{r['div_after']:.3f}  "
                   f"res[0..2]={[f'{x:.2e}' for x in r['res'][:3]]}"
                   f"{'...' if len(r['res'])>3 else ''} "
                   f"res_last={r['res'][-1] if r['res'] else 0:.2e}", flush=True)
+
+    print("\n--- CONSISTENT projection (the fix, #1-#4): seed is a fixed "
+          "point ---", flush=True)
+    for pin in ("face", "single"):
+        r = one_projection_step_from_seed(
+            fx, DT, u_m, p_m, inner_iterate=False, inner_relax=1.0,
+            inner_max=1, outflow_pin=pin, consistent_projection=True)
+        tag = f"pin={pin:6s} consistent_projection=True"
+        print(f"  [{tag}]  Cd={r['cd']:+.4f} (seed +{cd_m:.4f})  "
+              f"mean|u|={r['mean_u']:.4f}  du_from_seed={r['du']:.3e}  "
+              f"div {r['div_seed']:.3f}->{r['div_after']:.3f}", flush=True)

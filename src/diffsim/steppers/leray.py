@@ -41,7 +41,42 @@ class LerayProjectionStepper:
                  pressure_outflow_nodes=None,
                  inner_iterate=False, inner_max=8, inner_tol=1e-6,
                  inner_relax=1.0, inner_accel="none", inner_anderson_m=3,
-                 consistent_ppe=False):
+                 consistent_ppe=False, consistent_projection=False):
+        # ---- CONSISTENT-PROJECTION MODE (the 2026-07-23 fix, changes #1-#4) ----
+        # ONE mode that turns on the coherent VMS-stabilized Helmholtz-Leray set
+        # (ns_projection_vms_paper Eq 44a-c / Algorithm 1, exact discrete forms):
+        #   #1 PSPG-consistent PPE operator — the elementwise -sigma(tau_m r_m,
+        #      grad q) term makes the split's discrete incompressibility identical
+        #      to the monolithic PSPG continuity block (Eq 47-49), so the
+        #      monolithic steady state is a FIXED POINT of the split.
+        #   #2 fine-scale u' = -tau_m r_m in BOTH the PPE source AND the L2
+        #      correction, with the CONSISTENT mass (D = G^T) — Eq 44b/44c.
+        #   BOTH #1 and #2 are exactly the PRE-EXISTING ``ppe_fine_scale=True``
+        #      path (flux = sigma(u_hat + u'), correction subtracts the SAME u'),
+        #      so the mode turns that flag on (NOT the divergent GᵀM⁻¹G
+        #      ``consistent_ppe`` path — Task 4 found that diverges).
+        #   #4 rotational-incremental pressure update p = p* + phi - nu div(u_hat)
+        #      (Timmermans 1996; valid for constant nu) — the mode's default.
+        #   #3 disjoint outflow BCs (Baskar's rule / Eq 67d-67e) is imposed by the
+        #      CALLER supplying ``pressure_outflow_nodes`` (PPE Dirichlet p'=0 on
+        #      the pressure CORRECTION at outflow, removing the node-0 gauge) while
+        #      the predictor already leaves outflow velocity free (the natural
+        #      traction-free do-nothing, n.grad u = 0). The mode ASSERTS the caller
+        #      passed outflow nodes for an open flow (else it is the enclosed-cavity
+        #      path, node-0 pin, which is left intact for rung 0).
+        # Default False => bit-for-bit unchanged. When True it OVERRIDES
+        # ppe_fine_scale and pressure_update to the coherent set (a later explicit
+        # kwarg cannot silently half-enable it).
+        self.consistent_projection = bool(consistent_projection)
+        if self.consistent_projection:
+            ppe_fine_scale = True
+            if pressure_update == "standard":
+                pressure_update = "rotational"
+            if consistent_ppe:
+                raise ValueError(
+                    "consistent_projection uses the PSPG-stabilized PPE "
+                    "(ppe_fine_scale); do NOT combine with the divergent "
+                    "consistent_ppe=True (GᵀM⁻¹G) path.")
         self.dm, self.nu, self.dt, self.order = dm, nu, dt, order
         self.picard_iters = picard_iters
         # P2-R0 velocity-update EXPERIMENT knob (default "consistent" =
@@ -665,7 +700,36 @@ class LerayProjectionStepper:
                 r_m = (sigma * aqv + agu + pq_g[pv].reshape(-1, dim)
                        - fq_base[pv])
                 fs_vel[pv] = taum_fs[:, None] * r_m  # -tau_M r_m (stashed)
-                flux = sigma * (aqv - fs_vel[pv])
+                if self.consistent_projection:
+                    # CONSISTENT-PROJECTION PPE source (the 2026-07-23 fix, #1).
+                    # Per ns_projection Eq 44b + Remark 2.2/Eq 45, the coarse
+                    # divergence stays COLLOCATED with the test q (NOT integrated
+                    # by parts) so it matches the monolithic PSPG continuity row
+                    #   (q, div u_h) + tau_m (grad q, r_m) = 0
+                    # term-for-term; ONLY the fine scale u' = -tau_m r_m is taken
+                    # by parts:  -sigma(div u_h, q)_h - sigma(tau_m r_m, grad q)_h.
+                    # The by-parts of the WHOLE flux (old ppe_fine_scale path)
+                    # instead put the coarse part by parts too, fabricating a
+                    # boundary term sigma(u_h.n, q)_Gamma that is NONZERO at an
+                    # OPEN outflow -> a spurious phi that corrupts a seeded
+                    # monolithic field (div 1.22->6.0). Assembling the coarse
+                    # divergence collocated closes that gap: the monolithic steady
+                    # state becomes a fixed point (phi -> 0).  ``flux`` here is
+                    # the ONLY by-parts (grad-q) piece (the fine scale); the
+                    # coarse divergence is added collocated below.
+                    flux = -sigma * fs_vel[pv]            # -sigma tau_m r_m
+                    div_uh = np.einsum(
+                        "gdd->g", guq[pv].reshape(-1, dim, dim))
+                    conn0 = dm.mesh.conn_of[pv]
+                    jac0 = (h / 2.0) ** dim
+                    ne0 = len(h)
+                    # -sigma int N_a (div u_h) : collocated coarse divergence.
+                    be0 = np.einsum(
+                        "qa,eq,q,e->ea", tb.N,
+                        div_uh.reshape(ne0, nqp), tb.w, -sigma * jac0)
+                    np.add.at(rhs, conn0.ravel(), be0.ravel())
+                else:
+                    flux = sigma * (aqv - fs_vel[pv])
             elif self.ppe_finescale:      # PRE-EXISTING flag, untouched
                 # IMPLICIT fine scale (draft-faithful; findings 5b): the
                 # phi-part of r_m moves to the LHS -> weight (1/sigma+tau_m)
