@@ -43,22 +43,34 @@ centerline `x = 0.5` and `v` along the horizontal centerline `y = 0.5`.
 
 `u(y)` on the vertical centerline `x = 0.5` (Ghia Table I):
 
+> **Corrected 2026-07-23 (Task 2 / rung 0).** The earlier version of this table
+> paired the upper *u*-values with the WRONG y-stations — it listed
+> `0.9531 / 0.8516 / 0.7344` where Ghia Table I has the four closely-spaced
+> stations `0.9688 / 0.9609 / 0.9531` (two stations, `0.9688` and `0.9609`,
+> had been dropped), and the Re=400 column below `y ≈ 0.6` was mis-shifted.
+> The values below are the canonical Ghia (1982) Table I (cross-checked against
+> the long-standing `tests/test_cavity.py` Re=100 table and the rung-0 driver's
+> monolithic same-mesh oracle). The rung-0 driver `tests/ladder_rung0_cavity.py`
+> carries the same corrected values.
+
 | y | Re=100 | Re=400 |
 |---|---|---|
 | 1.0000 | 1.00000 | 1.00000 |
 | 0.9766 | 0.84123 | 0.75837 |
-| 0.9531 | 0.78871 | 0.68439 |
-| 0.8516 | 0.73722 | 0.61756 |
-| 0.7344 | 0.68717 | 0.55892 |
-| 0.6172 | 0.23151 | 0.29093 |
-| 0.5000 | 0.00332 | 0.16256 |
-| 0.4531 | −0.13641 | 0.02135 |
-| 0.2813 | −0.20581 | −0.31966 |
-| 0.1719 | −0.21090 | −0.42665 |
-| 0.1016 | −0.15662 | −0.31184 |
-| 0.0703 | −0.10150 | −0.22855 |
-| 0.0625 | −0.06434 | −0.20196 |
-| 0.0547 | −0.04775 | −0.17512 |
+| 0.9688 | 0.78871 | 0.68439 |
+| 0.9609 | 0.73722 | 0.61756 |
+| 0.9531 | 0.68717 | 0.55892 |
+| 0.8516 | 0.23151 | 0.29093 |
+| 0.7344 | 0.00332 | 0.16256 |
+| 0.6172 | −0.13641 | 0.02135 |
+| 0.5000 | −0.20581 | −0.11477 |
+| 0.4531 | −0.21090 | −0.17119 |
+| 0.2813 | −0.15662 | −0.32726 |
+| 0.1719 | −0.10150 | −0.24299 |
+| 0.1016 | −0.06434 | −0.14612 |
+| 0.0703 | −0.04775 | −0.10338 |
+| 0.0625 | −0.04192 | −0.09266 |
+| 0.0547 | −0.03717 | −0.08186 |
 | 0.0000 | 0.00000 | 0.00000 |
 
 `v(x)` on the horizontal centerline `y = 0.5` (Ghia Table II):
