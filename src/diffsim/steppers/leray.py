@@ -42,7 +42,8 @@ class LerayProjectionStepper:
                  inner_iterate=False, inner_max=8, inner_tol=1e-6,
                  inner_relax=1.0, inner_accel="none", inner_anderson_m=3,
                  consistent_ppe=False, consistent_projection=False,
-                 backflow_beta=None):
+                 backflow_beta=None, graddiv_gamma=None,
+                 rotational_pin_outflow=None):
         # ---- CONSISTENT-PROJECTION MODE (the 2026-07-23 fix, changes #1-#4) ----
         # ONE mode that turns on the coherent VMS-stabilized Helmholtz-Leray set
         # (ns_projection_vms_paper Eq 44a-c / Algorithm 1, exact discrete forms):
@@ -109,6 +110,41 @@ class LerayProjectionStepper:
         self.boundary_vorticity = bool(consistent_projection)
         self._bvs_faces = None            # lazily discovered outflow face set
         self.consistent_projection = bool(consistent_projection)
+        # ---- F3b SECULAR-DRIFT CURE (2026-07-23) ----
+        # DIAGNOSIS (task-F3b, instrumented): the Re=100 rung-A secular
+        # divergence drift (‖div‖ 1.6->51.6, mean|u|->1.75 over 2600 steps) is
+        # driven ENTIRELY by the ROTATIONAL pressure update
+        #     p_hat = p* + phi - nu * q ,   M_p q = B^T u_hat .
+        # The STANDARD update p_hat = p* + phi reaches a clean STEADY state
+        # (‖div‖=1.606 flat, mean|u|=1.043, net outflow flux ~+2e-4) that
+        # matches the monolithic; the ONLY difference is the -nu*q term.
+        # MECHANISM: phi is pinned to 0 on the outflow (the p'=0 Dirichlet BC),
+        # so the PPE removes no divergence there; but the consistent-mass solve
+        # M_p q = B^T u_hat gives q != 0 on those SAME outflow nodes (the mass
+        # matrix couples nodes even though the B^T u_hat rhs is pinned to 0), so
+        # p_hat picks up -nu*q at the outflow, VIOLATING the p'=0 outflow BC by a
+        # small amount EVERY step. That leaks into the next predictor's grad p*
+        # and compounds: div is 98%+ in the near-outflow band (div_out 126 vs
+        # div_in 2.7 at step 2600) and net flux drifts to -0.21 (domain filling).
+        #
+        # CURE (keeps the p'=0 Dirichlet outflow — the firm constraint):
+        #   rotational_pin_outflow=True — pin the rotational correction q to 0 on
+        #     the SAME outflow rows as phi, so p_hat = p* + phi - nu*q has BOTH
+        #     phi=0 AND q=0 at the outflow: the outflow total pressure stays
+        #     EXACTLY the imposed Dirichlet value and cannot drift. The rotational
+        #     term stays fully active in the interior (its accuracy benefit).
+        #   graddiv_gamma=g>0 — the classic robust cure: add the grad-div (LSIC)
+        #     penalty g*(div w, div u) to the momentum predictor, penalizing
+        #     interior divergence growth directly. Independent of the mechanism.
+        # BOTH default OFF (bit-for-bit). consistent_projection turns the
+        # q-pin ON (default True); grad-div stays off unless requested.
+        if rotational_pin_outflow is None:
+            self.rotational_pin_outflow = bool(consistent_projection)
+        else:
+            self.rotational_pin_outflow = bool(rotational_pin_outflow)
+        self.graddiv_gamma = (0.0 if graddiv_gamma is None
+                              else float(graddiv_gamma))
+        self._graddiv_gamma_block = None   # lazily built (needs dm; below)
         if self.consistent_projection:
             ppe_fine_scale = True
             if pressure_update == "standard":
@@ -278,6 +314,13 @@ class LerayProjectionStepper:
         self._graddiv_block = None
         if self.velocity_update == "graddiv" and self.graddiv_scale != 0.0:
             self._graddiv_block = self._graddiv_matrix()
+        # F3b constant-coefficient grad-div block: gamma * (div w, div u) added
+        # to the predictor (a robust, mechanism-independent divergence cure).
+        # Distinct from the tau_C "graddiv" velocity_update variant: this uses a
+        # user constant gamma (~O(nu) to O(1)), not tau_C. Built once.
+        if self.graddiv_gamma != 0.0:
+            self._graddiv_gamma_block = self._graddiv_gamma_matrix(
+                self.graddiv_gamma)
 
     # ---------------- helpers ----------------
     def _mass_matrix(self):
@@ -339,6 +382,47 @@ class LerayProjectionStepper:
             conn = dm.mesh.conn_of[pv].astype(np.int64)
             nbf = conn.shape[1]
             scale_e = coef * (dsc ** 2) * jac             # [ne]
+            for a in range(nbf):
+                for bcol in range(nbf):
+                    for i in range(dim):
+                        for j in range(dim):
+                            r = conn[:, a] * ndof + i
+                            c = conn[:, bcol] * ndof + j
+                            v = GdG[a, bcol, i, j] * scale_e
+                            rows.append(r)
+                            cols.append(c)
+                            vals.append(v)
+        Nn = dm.n_nodes * ndof
+        G = sp.coo_matrix((np.concatenate(vals),
+                           (np.concatenate(rows), np.concatenate(cols))),
+                          shape=(Nn, Nn)).tocsr()
+        T = dm.constraints.T.tocsr()
+        T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
+        return (T_vec.T @ G @ T_vec).tocsr()
+
+    def _graddiv_gamma_matrix(self, gamma):
+        """F3b constant-coefficient grad-div (LSIC) block: assembles the
+        CONSTRAINED, free-node-major VECTOR (ndof=dim+1) operator
+
+            G[a i, b j] = gamma * int (dN_a/dx_i)(dN_b/dx_j) dV
+
+        (a CONSTANT gamma, unlike ``_graddiv_matrix`` which scales by tau_C).
+        Added to the momentum predictor to penalize ||div u_hat|| directly.
+        Pressure rows/cols (component ``dim``) left zero. Returns CSR of shape
+        (n_free*ndof, n_free*ndof)."""
+        dm = self.dm
+        dim = dm.dim
+        ndof = self.ndof
+        rows, cols, vals = [], [], []
+        for pv, b in dm.bins.items():
+            tb = dm.tables_by_p[pv]
+            h = dm.mesh.tree.h()[dm.mesh.bins[pv]]
+            jac = (h / 2.0) ** dim
+            dsc = (2.0 / h)
+            GdG = np.einsum("qad,qbc,q->abdc", tb.dN, tb.dN, tb.w)  # ref
+            conn = dm.mesh.conn_of[pv].astype(np.int64)
+            nbf = conn.shape[1]
+            scale_e = gamma * (dsc ** 2) * jac              # [ne]
             for a in range(nbf):
                 for bcol in range(nbf):
                     for i in range(dim):
@@ -616,6 +700,10 @@ class LerayProjectionStepper:
             # penalty). No-op for the other variants (block is None).
             if self._graddiv_block is not None:
                 A = (A + self._graddiv_block)
+            # F3b constant-gamma grad-div penalty (robust divergence cure).
+            # RHS unchanged (homogeneous). No-op when block is None (default).
+            if self._graddiv_gamma_block is not None:
+                A = (A + self._graddiv_gamma_block)
             # Backflow stabilization (#6): add the outflow directional-do-nothing
             # block, linearized (Picard) at the current advecting iterate
             # ``a_node``. beta=0 => a structural zero (bit-for-bit OFF).
@@ -869,6 +957,16 @@ class LerayProjectionStepper:
             q = solve_linear(self.M, bt_uhat, solver=self.solver, sym=True,
                              device=self.dm.device, cache=self._solver_cache,
                              cache_key="mass")   # SAME key as velocity update
+            # F3b cure: pin the rotational correction q to 0 on the SAME outflow
+            # rows as phi (the p'=0 Dirichlet outflow). Otherwise the consistent-
+            # mass solve leaves q != 0 there and p_hat = p* + phi - nu*q drifts
+            # off the imposed outflow pressure every step (the secular-drift
+            # mechanism). Default ON under consistent_projection; a no-op when the
+            # pin set is the enclosed-flow node-0 (rung 0), keeping that path
+            # bit-for-bit (node 0 is already ~gauge). See the constructor note.
+            if self.rotational_pin_outflow:
+                for r in self._pin_rows():
+                    q[int(r)] = 0.0
             p_hat = self.p_star + phi - self.nu * q
         else:                                    # "standard" (default)
             p_hat = self.p_star + phi
