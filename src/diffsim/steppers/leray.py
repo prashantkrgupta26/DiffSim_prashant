@@ -638,7 +638,7 @@ class LerayProjectionStepper:
         return b0, b1, b2, sigma, u1, u2, fq_base, gvals
 
     def _predict(self, t_new=None, extra_block=None, sbm_nodes=None,
-                 return_matrix=False):
+                 return_matrix=False, wall_traction_rhs=None):
         """Momentum predictor (Algorithm 1 Step 1) as a standalone hook.
 
         The composed volumetric-SBM stepper injects the shifted-Nitsche
@@ -695,6 +695,13 @@ class LerayProjectionStepper:
                 A_sbm_c, b_sbm_c = extra_block
                 A = (A + A_sbm_c)
                 b = b + np.asarray(b_sbm_c)
+            # FN1 fix term (2): lagged wall pressure-traction <p* n, v>_Gamma on
+            # the surrogate faces (Dokken eq. 4.16). Constrained node-major RHS,
+            # precomputed by the caller from the CURRENT p*. Added to the
+            # predictor RHS before the strong-row overwrite. None => omitted
+            # (bit-for-bit).
+            if wall_traction_rhs is not None:
+                b = b + np.asarray(wall_traction_rhs)
             # P2-R0 "graddiv" variant: add the cached extra grad-div (LSIC)
             # penalty to the momentum system (RHS unchanged — homogeneous
             # penalty). No-op for the other variants (block is None).
@@ -738,8 +745,44 @@ class LerayProjectionStepper:
         return A_out if return_matrix else uhat
 
     # ---------------- the step ----------------
-    def step(self, extra_block=None, sbm_nodes=None, ppe_surrogate_flux=None):
+    def step(self, extra_block=None, sbm_nodes=None, ppe_surrogate_flux=None,
+             correction_penalty=None, wall_traction_rhs=None):
         """One projection step.
+
+        ``correction_penalty`` is the FN1 weak-Nitsche RE-PIN hook (2026-07-23).
+        The Nitsche no-slip on the immersed body is imposed on the PREDICTOR
+        only and is DESTROYED by the pressure correction (the corrected field
+        u = u_hat - (1/sigma) grad(phi) reintroduces a wall-velocity error the
+        predictor's penalty never sees again, and the homogeneous-Neumann-wall
+        PPE gives phi no wall coupling to fix it -> weak no-slip is half-imposed
+        and the monolithic is NOT a fixed point of the split). STRONG Dirichlet
+        (rung A) survives because line ~1129 hard-overwrites u_new[dir_nodes]=g
+        AFTER the correction; the WEAK obstacle nodes get no such re-imposition.
+
+        The fix (paper-faithful, the weak analog of that overwrite): re-impose
+        the viscous Nitsche PENALTY alpha(nu/h)<u_new - u_hat, v>_Gamma on the
+        obstacle surrogate faces INTO the velocity-update mass system, so the
+        update RE-PINS the surrogate wall trace to the PREDICTOR's WEAK trace
+        u_hat (NOT the strong value g: the weakly-imposed monolithic wall
+        velocity is NONZERO, so targeting g=0 would CORRUPT it). u_hat already
+        carries the weak no-slip (the predictor's Nitsche block), so holding
+        u_new -> u_hat at the wall absorbs exactly the correction's wall
+        perturbation, the true weak mirror of ``u_new[dir_nodes]=g`` (where
+        u_hat==g anyway for strong nodes). ``correction_penalty`` is
+        ``(N_scalar_c, g_pen)`` BOTH constrained (free-node-major): the
+        component-diagonal penalty matrix ``N_scalar_c`` (n_free x n_free, the
+        SAME scalar block for every velocity component) and the RHS
+        ``g_pen`` (n_free x dim, = alpha(nu/h)<S v, g>_Gamma, the wall DATA
+        target, zero for a no-slip body). The update then solves per component
+            (M + N_scalar_c) u_new[:,c] = M-rhs[:,c]
+                                          + N_scalar_c u_hat[:,c] + g_pen[:,c].
+        The penalty is satisfied by u_new == u_hat at the wall (the fixed
+        point), so at the seeded monolithic (base correction ~= identity) the
+        seed is PRESERVED, and off the fixed point the wall is held at the
+        correct weak trace instead of drifting with the correction. Default
+        ``None`` => the plain consistent-mass update (bit-for-bit; the
+        strong-Dirichlet rung-A path is untouched, still using the overwrite).
+        Only meaningful together with ``sbm_nodes`` (the weak body).
 
         ``ppe_surrogate_flux`` is the SURROGATE-CONSISTENT PPE boundary hook
         (P2-R0 Task 3). The surrogate-consistent boundary condition on the
@@ -781,16 +824,18 @@ class LerayProjectionStepper:
             self.inner_iters = 1
             self.inner_res_hist = []
             uhat, phi, p_hat, uq, fs_vel, sigma = self._projection_pass(
-                t_new, extra_block, sbm_nodes, ppe_surrogate_flux)
+                t_new, extra_block, sbm_nodes, ppe_surrogate_flux,
+                wall_traction_rhs=wall_traction_rhs)
         else:
             uhat, phi, p_hat, uq, fs_vel, sigma = self._inner_solve(
                 t_new, extra_block, sbm_nodes, ppe_surrogate_flux)
         # ---- Step 3: velocity correction (uses the final pass) ----
         return self._correct_and_finish(
-            uhat, phi, p_hat, uq, fs_vel, sigma, dim, gvals, sbm_nodes, t_new)
+            uhat, phi, p_hat, uq, fs_vel, sigma, dim, gvals, sbm_nodes, t_new,
+            correction_penalty=correction_penalty)
 
     def _projection_pass(self, t_new, extra_block, sbm_nodes,
-                         ppe_surrogate_flux):
+                         ppe_surrogate_flux, wall_traction_rhs=None):
         """One predictor -> PPE -> pressure-update PASS against the CURRENT
         ``self.p_star``. Returns ``(uhat, phi, p_hat, uq, fs_vel, sigma)``: the
         predicted velocity, the pressure increment ``phi``, the updated
@@ -805,7 +850,8 @@ class LerayProjectionStepper:
         # ---- Step 1: nonlinear predictor (Picard over the full block with
         # pressure DOFS PINNED to p*) ----
         uhat = self._predict(t_new=t_new, extra_block=extra_block,
-                             sbm_nodes=sbm_nodes)
+                             sbm_nodes=sbm_nodes,
+                             wall_traction_rhs=wall_traction_rhs)
         # ---- Step 2: PPE with tau_m fine-scale RHS ----
         uq, guq = self._gp_vals(uhat, grad=True)
         pq_g = self._gp_vals(self.p_star, grad=True)[1]
@@ -1080,9 +1126,24 @@ class LerayProjectionStepper:
         return (1.0 - beta) * pw + beta * gw
 
     def _correct_and_finish(self, uhat, phi, p_hat, uq, fs_vel, sigma,
-                            dim, gvals, sbm_nodes, t_new):
+                            dim, gvals, sbm_nodes, t_new,
+                            correction_penalty=None):
         """Step 3 (velocity correction) + Step 4 (commit p* and history)."""
         dm = self.dm
+        # ---- FN1 weak-Nitsche re-pin: fold the viscous penalty into the
+        # velocity-update mass system so the correction re-imposes u_new -> g on
+        # the obstacle surrogate faces (the weak analog of the strong overwrite
+        # at line ~1129). N_scalar_c is the component-diagonal penalty matrix
+        # (SAME for every velocity component); g_pen its RHS (n_free x dim). The
+        # solve operator (M + N_scalar_c) is cached/factorized once (penalty is
+        # geometry-static). Default None => plain consistent-mass update.
+        if correction_penalty is not None:
+            N_scalar_c, g_pen = correction_penalty
+            M_pen = (self.M + N_scalar_c).tocsr()
+            g_pen = np.asarray(g_pen)
+        else:
+            M_pen = None
+            g_pen = None
         # ---- Step 3: velocity update u = u_hat - (1/sigma) grad(phi) ----
         dphi_g = self._gp_vals(phi, grad=True)[1]
         u_new = np.empty_like(uhat)
@@ -1105,16 +1166,37 @@ class LerayProjectionStepper:
                 be = np.einsum("qa,eq,q,e->ea", tb.N, integ, tb.w, jac)
                 np.add.at(rhs_c, dm.mesh.conn_of[pv].ravel(), be.ravel())
             from ..solvers.linsolve import solve_linear
+            rhs_free = np.asarray(dm.constraints.T.T @ rhs_c)
             # P2-R0 velocity-update experiment: "lumped" uses the row-sum
             # diagonal mass (a nodal-collocation update); default consistent M.
             if self.velocity_update == "lumped":
-                rhs_free = np.asarray(dm.constraints.T.T @ rhs_c)
-                u_new[:, c] = rhs_free / self.M_lumped.diagonal()
+                if M_pen is not None:
+                    # lumped + penalty: diagonal mass + full penalty block,
+                    # re-pinned to the predictor trace u_hat (see the M_pen
+                    # branch below).
+                    rhs_free = rhs_free + N_scalar_c @ uhat[:, c] + g_pen[:, c]
+                    u_new[:, c] = solve_linear(
+                        (sp.diags(self.M_lumped.diagonal()) + N_scalar_c
+                         ).tocsr(), rhs_free, solver=self.solver, sym=True,
+                        device=dm.device, cache=self._solver_cache,
+                        cache_key="mass_pen")
+                else:
+                    u_new[:, c] = rhs_free / self.M_lumped.diagonal()
+            elif M_pen is not None:
+                # FN1: (M + N) u_new[:,c] = M-rhs[:,c] + N u_hat[:,c] + g_pen[:,c]
+                # — re-pin the wall to the predictor's WEAK trace u_hat (N u_hat)
+                # plus the wall data g (g_pen; 0 for no-slip). Satisfied by
+                # u_new==u_hat at the wall, so the seeded monolithic is a fixed
+                # point.
+                u_new[:, c] = solve_linear(
+                    M_pen, rhs_free + N_scalar_c @ uhat[:, c] + g_pen[:, c],
+                    solver=self.solver, sym=True, device=dm.device,
+                    cache=self._solver_cache, cache_key="mass_pen")
             else:
                 u_new[:, c] = solve_linear(
-                    self.M, np.asarray(dm.constraints.T.T @ rhs_c),
-                    solver=self.solver, sym=True, device=dm.device,
-                    cache=self._solver_cache, cache_key="mass")
+                    self.M, rhs_free, solver=self.solver, sym=True,
+                    device=dm.device, cache=self._solver_cache,
+                    cache_key="mass")
         # strong Dirichlet on the updated field (draft: trace preserved).
         # SURROGATE-CONSISTENT CORRECTION (Task 3): SBM-governed nodes (the
         # weak immersed body) are NOT strong-overwritten by the box trace —

@@ -52,7 +52,8 @@ import scipy.sparse as sp
 from scipy.sparse.linalg import splu
 
 from diffsim.steppers.leray import LerayProjectionStepper
-from diffsim.sbm.vector import sbm_vector_dirichlet, surrogate_traction
+from diffsim.sbm.vector import (sbm_vector_dirichlet, sbm_vector_penalty,
+                                surrogate_traction)
 from diffsim.mesh.faces import face_tables
 from diffsim.api.ns_bricks import (assemble_linear_ns, assemble_backflow_block,
                                    assemble_bvs_block, outflow_faces)
@@ -113,6 +114,37 @@ def build_sbm_block(fx, alpha=ALPHA, beta_backflow=0.0):
     return Af_c, bf_c, T_vec, sbm_nodes
 
 
+def build_correction_penalty(fx, alpha=ALPHA):
+    """FN1 velocity-update re-pin: the PENALTY-ONLY viscous Nitsche block on the
+    surrogate faces, reduced to the SCALAR constrained free-node space.
+
+    Returns ``(N_scalar_c, g_pen)`` for the stepper's ``correction_penalty``
+    hook: ``N_scalar_c`` is the component-diagonal penalty matrix (n_free x
+    n_free, the same for every velocity component — the block is
+    component-diagonal by construction) and ``g_pen`` is the RHS
+    ``alpha(nu/h)<S v, g>`` (n_free x dim; zero for a no-slip g=0 body). The
+    stepper adds ``N_scalar_c`` to the consistent mass and solves
+    ``(M + N_scalar_c) u_new[:,c] = M-rhs[:,c] + g_pen[:,c]`` per component,
+    RE-PINNING the surrogate wall trace AFTER the pressure correction (the weak
+    analog of the strong-node overwrite)."""
+    dm, sf, geo = fx["dm"], fx["sf"], fx["geo"]
+    ndof, nu, dim = fx["ndof"], fx["nu"], fx["dim"]
+    g_body = lambda y: np.zeros((len(y), dim))
+    Apen, bpen = sbm_vector_penalty(dm, sf, geo, g_body, nu, ndof, alpha=alpha)
+    T = dm.constraints.T.tocsr()
+    T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
+    Apen_c = (T_vec.T @ Apen @ T_vec).tocsr()
+    bpen_c = np.asarray(T_vec.T @ bpen)
+    nfree = T.shape[1]
+    bpen_v = bpen_c.reshape(nfree, ndof)
+    # component-diagonal: extract the c=0 scalar sub-block (every component
+    # carries the SAME scalar penalty), and the per-component RHS (velocity dofs).
+    idx0 = np.arange(nfree) * ndof + 0
+    N_scalar_c = Apen_c[np.ix_(idx0, idx0)].tocsr()
+    g_pen = bpen_v[:, :dim].copy()
+    return N_scalar_c, g_pen
+
+
 def _bf_conn(fx):
     """Cache the surrogate-face p-value / face-table / connectivity for the
     per-step backflow advecting field (mirrors LeraySBMStepper._bf_setup)."""
@@ -143,9 +175,30 @@ def _a_face(fx, u_free, ftab, conn):
 # --------------------------------------------------------------------------
 # PROJECTION march (base LerayProjectionStepper + SBM Nitsche extra-block)
 # --------------------------------------------------------------------------
+# FN1 fix: the grad-div (LSIC) penalty magnitude that stabilizes the growing
+# interior-divergence mode the WEAK wall excites in the projection split. The
+# seed-monolithic-one-step probe (ladder_rungB_seed_probe) localizes the rung-B
+# divergence to this mode (NOT wall penetration — the weak monolithic itself has
+# n.u~0.8 at the wall and is stable). grad-div makes the seeded monolithic a
+# BOUNDED fixed point (|p*| ~O(10) vs mono ~7, mean|u| within a few %) where the
+# bare split runs |p*| past 1e6 and blows up. The required gamma scales with Re:
+# ~20 stabilizes Re=40 (levels 4-5); Re=100 needs ~50 (at gamma=20 it reaches
+# only ~step 36). gamma=50 covers both Re=40 and Re=100 here. The correction
+# re-pin (correction_repin) holds the weak wall trace at u_hat (the weak analog
+# of the strong overwrite) and is ~neutral-to-slightly-helpful on top. RESIDUAL
+# (honest): the drag Cd (wall pressure-traction) is NOT recovered — the split's
+# steady wall pressure differs from the monolithic saddle, and MORE grad-div
+# drives Cd more negative. The lagged wall pressure-traction (fix 2) helps Cd
+# when SEEDED but destabilizes from rest; the PPE no-penetration coupling
+# (fix ii) was not the stabilizer. The constant gamma is Re/mesh-dependent (a
+# tau_C-scaled grad-div would be more robust). See task-FN1-report.md.
+FN1_GRADDIV_GAMMA = 50.0
+
+
 def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
                      log_every=0, consistent_projection=True, solver="splu",
-                     alpha=ALPHA, beta_backflow=0.5):
+                     alpha=ALPHA, beta_backflow=0.5, correction_repin=True,
+                     graddiv_gamma=FN1_GRADDIV_GAMMA):
     """March the base projection stepper (consistent mode) with WEAK Nitsche
     no-slip on the obstacle, injected via the extra_block/sbm_nodes hook.
     Returns dict(cd, cl, mean_u, div, steps, cd_hist, cl_hist, ...).
@@ -162,6 +215,11 @@ def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
     Af_c, bf_c, T_vec, sbm_nodes = build_sbm_block(fx, alpha=alpha,
                                                    beta_backflow=0.0)
     bf_pv, bf_ftab, bf_conn = _bf_conn(fx)
+    # FN1 velocity-update re-pin (the fix): the penalty-only Nitsche block folded
+    # into the correction mass solve so the surrogate wall trace is re-imposed
+    # AFTER the pressure correction. None => plain update (the old FAILING path).
+    correction_penalty = (build_correction_penalty(fx, alpha=alpha)
+                          if correction_repin else None)
 
     def f_fn(x, t):
         return np.zeros((len(x), dim))
@@ -172,7 +230,8 @@ def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
     st = LerayProjectionStepper(
         dm, nu, dt, f_fn=f_fn, g_fn=g_fn, order=order, picard_iters=1,
         solver=solver, pressure_outflow_nodes=fx["outflow_nodes"],
-        consistent_projection=consistent_projection)
+        consistent_projection=consistent_projection,
+        graddiv_gamma=(graddiv_gamma if graddiv_gamma else None))
     st.dir_nodes = strong_nodes                    # box strong; obstacle weak
     st.set_initial(lambda c: np.zeros((len(c), dim)))
 
@@ -207,7 +266,8 @@ def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
         # (ppe_surrogate_flux=None) — Suresh Remark 3.9; obstacle is a no-slip
         # wall so no through-flux is imposed on the pressure correction.
         u, p = st.step(extra_block=extra_block(cur_u_free()),
-                       sbm_nodes=sbm_nodes, ppe_surrogate_flux=None)
+                       sbm_nodes=sbm_nodes, ppe_surrogate_flux=None,
+                       correction_penalty=correction_penalty)
         if not np.isfinite(u).all() or not np.isfinite(p).all() \
                 or np.abs(u).max() > 1e4:
             blew_up = True
@@ -244,7 +304,7 @@ def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
 # --------------------------------------------------------------------------
 def march_monolithic(fx, dt=0.02, nsteps=400, rate_tol=2e-4, log_every=0,
                      backflow_beta=0.0, boundary_vorticity=False,
-                     alpha=ALPHA):
+                     alpha=ALPHA, graddiv_gamma=FN1_GRADDIV_GAMMA):
     """March the same-mesh monolithic saddle NS (inline; mirrors
     p2r0_task10_sphere_derisk::monolithic_cd) with the SBM Nitsche block for a
     no-slip obstacle. Box strong Dirichlet on inflow+walls; single outflow
@@ -272,6 +332,17 @@ def march_monolithic(fx, dt=0.02, nsteps=400, rate_tol=2e-4, log_every=0,
                                   nu, ndof, alpha=alpha)
     Af_c = (T_vec.T @ Af @ T_vec).tocsr()
     bf_c = np.asarray(T_vec.T @ bf)
+
+    # Same grad-div (LSIC) block as the projection predictor, so the same-mesh
+    # oracle carries the IDENTICAL consistent stabilization (it vanishes as
+    # div u -> 0, so it barely shifts the steady state but keeps the comparison
+    # term-for-term fair). Built via the stepper's cached assembler.
+    gd_block = None
+    if graddiv_gamma:
+        _st = LerayProjectionStepper(
+            dm, nu, dt, f_fn=lambda x, t: np.zeros((len(x), dim)),
+            g_fn=lambda c, t: None, order=1, graddiv_gamma=graddiv_gamma)
+        gd_block = _st._graddiv_gamma_block
 
     def gp_field(node_vec):
         full = np.asarray(T @ node_vec)
@@ -303,6 +374,8 @@ def march_monolithic(fx, dt=0.02, nsteps=400, rate_tol=2e-4, log_every=0,
         A, b = assemble_linear_ns(dm, aq, dq, fq, nu, sigma=sigma)
         A = (A + Af_c)                             # SBM Nitsche block
         b = b + bf_c
+        if gd_block is not None:                    # same grad-div as projection
+            A = A + gd_block
         if backflow_beta != 0.0:
             A = A + assemble_backflow_block(dm, u_node, backflow_beta, ndof,
                                             faces=bf_faces)

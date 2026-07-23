@@ -378,6 +378,99 @@ def make_sbm_dirichlet_be(nbf: int, nqf: int, dim: int):
     return sbm_dir_be
 
 
+def make_sbm_penalty_Ae(nbf: int, nqf: int, dim: int):
+    """Penalty-ONLY Nitsche boundary matrix: the third Dirichlet term alone,
+        A[a,b] += (alpha kappa / h) Sa Sb dS      (viscous penalty)
+    with NO consistency (-Na gnb) and NO adjoint-consistency (-gna Sb) terms.
+
+    This is the weak analog of the strong-node overwrite (leray.py line 307):
+    added to the velocity-update mass system it RE-PINS the surrogate wall
+    trace u_new -> g_Gamma weakly AFTER the pressure correction (the projection
+    split's FN1 fix, (1-i)). Symmetric & positive (a pure mass-like penalty),
+    so the update solve stays SPD."""
+    key = ("sbm_pen_Ae", nbf, nqf, dim)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    shift_fn = _shift_fn_for(nbf, dim)
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def sbm_pen_Ae(felem: wp.array(dtype=wp.int32),
+                   fface: wp.array(dtype=wp.int32),
+                   h: wp.array(dtype=wp.float64),
+                   Nf: wp.array3d(dtype=wp.float64),
+                   dNf: wp.array4d(dtype=wp.float64),
+                   d2Nf: wp.array4d(dtype=wp.float64),
+                   wf: wp.array(dtype=wp.float64),
+                   dvec: wp.array2d(dtype=wp.float64),
+                   alpha: wp.float64, kappa: wp.float64,
+                   Ae: wp.array3d(dtype=wp.float64)):
+        fi = wp.tid()
+        e = felem[fi]
+        f = fface[fi]
+        he = h[e]
+        half = he * wp.float64(0.5)
+        jacS = wp.float64(1.0)
+        for _ in range(dim - 1):
+            jacS = jacS * half
+        dscale = wp.float64(2.0) / he
+        for q in range(nqf):
+            dS = wf[q] * jacS
+            gp = fi * nqf + q
+            for a in range(nbf):
+                Sa = shift_fn(Nf, dNf, d2Nf, f, q, a, gp, dvec, dscale, dim)
+                for b in range(nbf):
+                    Sb = shift_fn(Nf, dNf, d2Nf, f, q, b, gp, dvec, dscale, dim)
+                    Ae[fi, a, b] += kappa * (alpha / he * Sa * Sb) * dS
+
+    _kernel_cache[key] = sbm_pen_Ae
+    return sbm_pen_Ae
+
+
+def make_sbm_penalty_be(nbf: int, nqf: int, dim: int):
+    """Penalty-ONLY Nitsche RHS: be_a += (alpha kappa / h) Sa gbar dS (the
+    penalty partner of make_sbm_penalty_Ae; NO -gna gbar adjoint term)."""
+    key = ("sbm_pen_be", nbf, nqf, dim)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    shift_fn = _shift_fn_for(nbf, dim)
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def sbm_pen_be(felem: wp.array(dtype=wp.int32),
+                   fface: wp.array(dtype=wp.int32),
+                   conn: wp.array2d(dtype=wp.int32),
+                   h: wp.array(dtype=wp.float64),
+                   Nf: wp.array3d(dtype=wp.float64),
+                   dNf: wp.array4d(dtype=wp.float64),
+                   d2Nf: wp.array4d(dtype=wp.float64),
+                   wf: wp.array(dtype=wp.float64),
+                   dvec: wp.array2d(dtype=wp.float64),
+                   gbar: wp.array(dtype=wp.float64),
+                   alpha: wp.float64, kappa: wp.float64,
+                   be: wp.array(dtype=wp.float64)):
+        fi = wp.tid()
+        e = felem[fi]
+        f = fface[fi]
+        he = h[e]
+        half = he * wp.float64(0.5)
+        jacS = wp.float64(1.0)
+        for _ in range(dim - 1):
+            jacS = jacS * half
+        dscale = wp.float64(2.0) / he
+        for q in range(nqf):
+            dS = wf[q] * jacS
+            gp = fi * nqf + q
+            gq = gbar[gp]
+            for a in range(nbf):
+                Sa = shift_fn(Nf, dNf, d2Nf, f, q, a, gp, dvec, dscale, dim)
+                wp.atomic_add(be, conn[e, a],
+                              kappa * (alpha / he * Sa) * gq * dS)
+
+    _kernel_cache[key] = sbm_pen_be
+    return sbm_pen_be
+
+
 def make_sbm_dirichlet_Ae_var(nbf: int, nqf: int, dim: int):
     """Var-kappa variant of sbm_dir_Ae: kq[fi*nqf + q] replaces the scalar
     (spatially-varying conductivity at the surrogate face GP — the local
