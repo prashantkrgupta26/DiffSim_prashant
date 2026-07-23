@@ -247,17 +247,32 @@ class _AMGXCycle:
         self._calls += 1
         if self._log_every and self._calls % self._log_every == 1:
             try:
-                it = self.slv.iterations_number
-                res = self.slv.get_residual()
+                it = int(self.slv.iterations_number)
                 st = self.slv.status
+                res = None
+                try:
+                    res = float(self.slv.get_residual(it - 1)) if it > 0 \
+                        else None
+                except Exception:  # noqa: BLE001 — optional
+                    pass
+                res_s = f"{res:.3e}" if res is not None else "n/a"
                 print(f"[blockamgx]     inner[{self._tag} n={len(b)}] "
-                      f"call={self._calls} iters={it} resid={res:.3e} "
+                      f"call={self._calls} iters={it} resid={res_s} "
                       f"status={st}", flush=True)
             except Exception as e:  # noqa: BLE001 — telemetry must not kill
                 print(f"[blockamgx]     inner[{self._tag}] telemetry "
                       f"unavailable: {e}", flush=True)
                 self._log_every = 0
         return self._x.copy()
+
+    def destroy(self):
+        """Tear down the AMGX objects (reverse creation order). Lets probe
+        scripts build cycles sequentially without accumulating Resources."""
+        for obj in (self.slv, self.B, self.X, self.M, self.rsc, self.cfg):
+            try:
+                obj.destroy()
+            except Exception:  # noqa: BLE001 — teardown is best-effort
+                pass
 
 
 def _fgmres(A, b, apply_M, tol=1e-9, atol=1e-13, restart=50, maxiter=200,
