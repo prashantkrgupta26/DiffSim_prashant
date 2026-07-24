@@ -17,6 +17,7 @@ import scipy.sparse as sp
 from scipy.sparse.linalg import splu
 
 sys.path.insert(0, "tests")
+from diffsim import default_device
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
@@ -68,7 +69,7 @@ def build_epoch(V, level):
     sf = extract_surrogate(ret)
     mesh = build_mesh(ret, p=1)
     cons = build_constraints(mesh)
-    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3), "cuda:0")
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3), default_device())
     _EPOCH.update(ret=ret, sf=sf, mesh=mesh, cons=cons, dm=dm, tree=tree)
 
 

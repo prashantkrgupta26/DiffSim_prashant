@@ -21,6 +21,7 @@ import sys
 import numpy as np
 from scipy.sparse.linalg import splu
 
+from diffsim import default_device
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
@@ -109,7 +110,8 @@ def advective_faces(dm, sf, geo, a_fn, g_fn):
     return (T.T @ K @ T).tocsr(), np.asarray(T.T @ b_full)
 
 
-def run(level=6, kappa=0.05, device="cuda:0"):
+def run(level=6, kappa=0.05, device=None):
+    device = default_device() if device is None else device
     tree = build_uniform(level, dim=2)
     oracle = Sphere(CTR, R)
     ret, _ = classify_lambda(tree, oracle, 1.0, domain="outside")

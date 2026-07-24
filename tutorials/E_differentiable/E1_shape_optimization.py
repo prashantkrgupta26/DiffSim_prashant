@@ -46,8 +46,9 @@ from diffsim.geometry.csg import Sphere
 from diffsim.sbm.surrogate import classify_lambda, extract_surrogate, GeometryData
 from diffsim.sbm.poisson import SBMPoisson
 from diffsim.sbm.adjoint import solve_adjoint, shape_gradient, probe_qoi
+from diffsim import default_device
 
-DEVICE = "cuda:0"
+DEVICE = default_device()
 LEVEL = 4
 
 u_star = lambda x: np.sin(np.pi * x[:, 0]) * np.sin(np.pi * x[:, 1])

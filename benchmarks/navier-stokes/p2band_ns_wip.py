@@ -10,6 +10,7 @@ import scipy.sparse as sp
 from scipy.sparse.linalg import splu
 sys.path.insert(0, "tests")
 import test_cylinder as tc
+from diffsim import default_device
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
@@ -32,7 +33,7 @@ p_elem = p2_band(ret, sf, n_layers=3)
 mesh = build_mesh(ret, p=p_elem)
 cons = build_constraints(mesh)
 tables = {1: basis_tables(1, dim=2), 2: basis_tables(2, dim=2)}
-dm = DeviceMesh.from_mesh(mesh, cons, tables, "cuda:0")
+dm = DeviceMesh.from_mesh(mesh, cons, tables, default_device())
 geo = GeometryData.evaluate(oracle, ret, sf, face_tables(2, 2),
                             domain="outside")
 n2 = int((np.asarray(p_elem) == 2).sum())

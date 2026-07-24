@@ -17,6 +17,7 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.linalg import splu
 
+from diffsim import default_device
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
@@ -35,7 +36,7 @@ def main(Ra=1e3, level=6, max_steps=600, dt=0.05):
     mesh = build_mesh(tree, p=1)
     cons = build_constraints(mesh)
     dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2),
-                              "cuda:0")
+                              default_device())
     Tc = cons.T.tocsr()
     T_vec = sp.kron(Tc, sp.identity(ndof, format="csr"), format="csr")
     nfree = Tc.shape[1]

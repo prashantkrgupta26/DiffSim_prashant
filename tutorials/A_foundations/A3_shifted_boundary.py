@@ -43,8 +43,9 @@ from diffsim.geometry.csg import Sphere
 from diffsim.sbm.surrogate import classify_lambda, extract_surrogate, GeometryData
 from diffsim.sbm.poisson import SBMPoisson
 from diffsim.physics.poisson import l2_error_masked
+from diffsim import default_device
 
-DEVICE = "cuda:0"
+DEVICE = default_device()
 
 # The manufactured truth: a smooth field with nonzero curvature everywhere.
 u_star = lambda x: np.sin(np.pi * x[:, 0]) * np.cos(np.pi * x[:, 1])

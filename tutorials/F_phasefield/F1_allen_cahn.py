@@ -104,8 +104,9 @@ from diffsim.mesh.constraints import build_constraints
 from diffsim.mesh.basis import basis_tables
 from diffsim.assembly.operators import DeviceMesh
 from diffsim.physics.allen_cahn import AllenCahnStepper
+from diffsim import default_device
 
-DEVICE = "cuda:0" if wp.get_cuda_device_count() > 0 else "cpu"
+DEVICE = default_device()
 
 
 def make_problem(level, p=1):

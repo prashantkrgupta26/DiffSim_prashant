@@ -52,6 +52,7 @@ import time
 import numpy as np
 import warp as wp
 
+from diffsim import default_device
 from diffsim.octree.build import build_uniform, Octree
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
@@ -418,7 +419,7 @@ def main():
     args = ap.parse_args()
     logging.getLogger("nvmath").setLevel(logging.ERROR)
     wp.init()
-    device = "cuda:0" if wp.get_cuda_device_count() > 0 else "cpu"
+    device = default_device()
     sc = 2 ** (args.level - 7)
     mesh, cons, hc = build_strip(args.level, 96 * sc, 48 * sc)
     print(f"strip: {len(mesh.tree)} elements "

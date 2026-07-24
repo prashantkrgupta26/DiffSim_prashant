@@ -36,6 +36,7 @@ import _bench_bootstrap  # noqa
 import numpy as np
 import warp as wp
 
+from diffsim import default_device
 from diffsim.octree.build import build_uniform, Octree
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
@@ -196,7 +197,7 @@ def main():
     ap.add_argument("--assembly", required=True,
                     choices=["host", "device"])
     ap.add_argument("--steps", type=int, default=3)
-    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--device", default=default_device())
     ap.add_argument("--solver", default="cudss",
                     choices=["cudss", "splu", "blockch", "blockch_dev"])
     ap.add_argument("--block-sparse", action="store_true",

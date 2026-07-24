@@ -36,8 +36,9 @@ from diffsim.mesh.basis import basis_tables
 from diffsim.assembly.operators import DeviceMesh
 from diffsim.api.ns_bricks import assemble_linear_ns
 from diffsim.physics.poisson import gauss_points
+from diffsim import default_device
 
-DEVICE = "cuda:0"
+DEVICE = default_device()
 PI = np.pi
 
 

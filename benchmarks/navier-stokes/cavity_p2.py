@@ -7,6 +7,7 @@ _bsys.path.insert(0, _bos.path.dirname(_bos.path.dirname(_bos.path.abspath(__fil
 import _bench_bootstrap  # noqa: E402,F401
 import numpy as np
 from scipy.sparse.linalg import splu
+from diffsim import default_device
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
@@ -21,7 +22,7 @@ def cavity(p, level, nu=0.01, dt=0.05, steps=120):
     mesh = build_mesh(tree, p=p)
     cons = build_constraints(mesh)
     dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(p, dim=2),
-                              "cuda:0")
+                              default_device())
     Tc = cons.T.tocsr()
     nfree = Tc.shape[1]
     coords = mesh.node_coords[cons.free_nodes]

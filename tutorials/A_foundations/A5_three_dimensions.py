@@ -40,8 +40,9 @@ from diffsim.sbm.surrogate import classify_lambda, extract_surrogate, GeometryDa
 from diffsim.sbm.poisson import SBMPoisson
 from diffsim.physics.poisson import (gauss_points, make_load_kernel,
                                      l2_error_masked)
+from diffsim import default_device
 
-DEVICE = "cuda:0"
+DEVICE = default_device()
 u3 = lambda x: (np.sin(np.pi * x[:, 0]) * np.sin(np.pi * x[:, 1])
                 * np.sin(np.pi * x[:, 2]))
 f3 = lambda x: 3 * np.pi ** 2 * u3(x)

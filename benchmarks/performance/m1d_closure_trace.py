@@ -36,6 +36,7 @@ import numpy as np
 
 
 def run_case(dim, level, solver, warm_steps=3):
+    from diffsim import default_device
     from diffsim.octree.build import build_uniform
     from diffsim.mesh.nodes import build_mesh
     from diffsim.mesh.constraints import build_constraints
@@ -55,7 +56,7 @@ def run_case(dim, level, solver, warm_steps=3):
     mesh = build_mesh(tree, p=1)
     cons = build_constraints(mesh)
     dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=dim),
-                              "cuda:0")
+                              default_device())
     t_mesh = time.perf_counter() - t0
     ndofs = dm.n_free * (dim + 1)
     print(f"elements {len(tree)}  nodes {dm.n_nodes}  dofs {ndofs}",

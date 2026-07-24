@@ -95,8 +95,9 @@ from diffsim.mesh.basis import basis_tables
 from diffsim.assembly.operators import DeviceMesh
 from diffsim.physics.cahn_hilliard import CahnHilliardStepper
 from diffsim.adaptivity.transfer import transfer_operator
+from diffsim import default_device
 
-DEVICE = "cuda:0" if wp.get_cuda_device_count() > 0 else "cpu"
+DEVICE = default_device()
 M, KAPPA, DT = 1.0, 5e-4, 0.02
 
 

@@ -21,6 +21,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "tests"))
 from test_cavity import GHIA_Y, GHIA_U, GHIA_X, GHIA_V, _lid_g  # noqa: E402
 
+from diffsim import default_device                              # noqa: E402
 from diffsim.octree.build import build_uniform                   # noqa: E402
 from diffsim.mesh.nodes import build_mesh                        # noqa: E402
 from diffsim.mesh.constraints import build_constraints           # noqa: E402
@@ -29,8 +30,9 @@ from diffsim.assembly.operators import DeviceMesh                # noqa: E402
 from diffsim.mesh.pointeval import point_eval_weights            # noqa: E402
 
 
-def run(level, re, stepper_name, device="cuda:0", max_steps=2000, dt=0.05,
+def run(level, re, stepper_name, device=None, max_steps=2000, dt=0.05,
         solver="splu"):
+    device = default_device() if device is None else device
     tree = build_uniform(level, dim=2)
     mesh = build_mesh(tree, p=1)
     cons = build_constraints(mesh)

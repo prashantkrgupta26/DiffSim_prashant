@@ -9,6 +9,7 @@ import scipy.sparse as sp
 from scipy.sparse.linalg import splu
 sys.path.insert(0, "tests")
 import test_cylinder as tc
+from diffsim import default_device
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
@@ -29,7 +30,7 @@ ret, _ = classify_lambda(tree, oracle, 0.5, domain="outside")
 sf = extract_surrogate(ret)
 mesh = build_mesh(ret, p=P)
 cons = build_constraints(mesh)
-dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(P, dim=2), "cuda:0")
+dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(P, dim=2), default_device())
 geo = GeometryData.evaluate(oracle, ret, sf, face_tables(P, 2),
                             domain="outside")
 t0 = time.time()

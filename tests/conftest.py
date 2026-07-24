@@ -25,7 +25,8 @@ except ModuleNotFoundError:
 def device():
     if wp is None:
         pytest.skip("Warp not installed (Warp-free CI tier)")
-    return "cuda:0" if wp.get_cuda_device_count() > 0 else "cpu"
+    from diffsim import default_device
+    return default_device()
 
 @pytest.fixture(autouse=True)
 def _seed():

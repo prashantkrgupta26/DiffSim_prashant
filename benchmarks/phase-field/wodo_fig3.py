@@ -28,6 +28,7 @@ import time
 import numpy as np
 import warp as wp
 
+from diffsim import default_device
 from diffsim.octree.build import build_uniform, Octree
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
@@ -193,7 +194,7 @@ def main():
                          "+ zero-copy cuDSS; M4 v1.2)")
     args = ap.parse_args()
     wp.init()
-    device = "cuda:0" if wp.get_cuda_device_count() > 0 else "cpu"
+    device = default_device()
     mesh, cons = build_strip(level=args.level)
     print(f"strip: {len(mesh.tree)} elements, {len(mesh.node_coords)} "
           f"nodes, device={device}, M0={m0_from_params():.4f}, "

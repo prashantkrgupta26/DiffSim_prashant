@@ -20,6 +20,7 @@ import torch
 sys.path.insert(0, "tests")
 from test_ns_shape_gradient import _steady, NU, ALPHA, R, U_IN  # noqa: E402
 from diffsim.sbm.ns_shape import drag_shape_gradient  # noqa: E402
+from diffsim import default_device  # noqa: E402
 
 
 def main(n_steps=12, lr=0.02, level=5):
@@ -42,7 +43,7 @@ def main(n_steps=12, lr=0.02, level=5):
     print(f"{'step':>4} {'c_x':>8} {'c_y':>8} {'Cd':>8} "
           f"{'dCd/dcx':>10} {'dCd/dcy':>10}")
     for it in range(n_steps):
-        st = _steady(c, "cuda:0", level=level)
+        st = _steady(c, default_device(), level=level)
         F = drag_shape_gradient(st["dm"], st["sf"], st["geo"], st["oracle"],
                                 st["A"], st["x_full"], NU, ALPHA,
                                 st["strong_rows"], ndof=3, direction=0,

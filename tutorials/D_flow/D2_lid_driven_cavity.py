@@ -33,8 +33,9 @@ from diffsim.mesh.basis import basis_tables
 from diffsim.assembly.operators import DeviceMesh
 from diffsim.steppers.linearized import LinearizedMonolithicStepper
 from diffsim.mesh.pointeval import point_eval_weights
+from diffsim import default_device
 
-DEVICE = "cuda:0"
+DEVICE = default_device()
 
 # Ghia, Ghia & Shin (1982), Re = 100: u on the vertical centerline x = 0.5
 GHIA_Y = np.array([0.0000, 0.0547, 0.0625, 0.0703, 0.1016, 0.1719, 0.2813,
