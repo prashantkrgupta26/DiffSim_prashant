@@ -114,11 +114,13 @@ def pcg(
         ``spmv(p_local: np.ndarray) -> np.ndarray``
 
         **Contract (caller's responsibility):**
-        *p_local* has length ``n_owned + n_ghost``.  Before performing the
-        local matrix-vector product on owned rows, the caller MUST call
-        ``comm.exchange_halo(p_local)`` to refresh the ghost entries
-        (``p_local[n_owned:]``).  The return value is the local A*p
-        restricted to owned rows only (length ``n_owned``).
+        pcg() passes *p_local* as an owned-length vector (length ``n_owned``).
+        The spmv wrapper (Task 3) is responsible for maintaining its own
+        ghost-padded buffer of length ``n_owned + n_ghost``, copying the owned
+        entries in, calling ``comm.exchange_halo`` to refresh the ghost tail,
+        and then performing the local matrix-vector product.  The return value
+        is the local A*p restricted to owned rows only (length ``n_owned``).
+        pcg() never builds or sees a ghost-padded buffer.
 
         SerialComm (N=1) example::
 
@@ -232,6 +234,8 @@ def pcg(
     it = 0
     for it in range(1, maxit + 1):
         # Allreduce 2: pAp
+        # pcg passes p_owned (length n_owned) to spmv.  The spmv wrapper (Task 3)
+        # owns the ghost-padded buffer and calls comm.exchange_halo internally.
         Ap_owned = spmv(p_owned)            # spmv handles halo exchange internally
         pAp_local = float(np.dot(p_owned, Ap_owned))
         pAp = comm.allreduce_sum(pAp_local)

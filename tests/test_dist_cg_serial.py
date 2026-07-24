@@ -338,6 +338,33 @@ class TestPCGEdgeCases:
         assert isinstance(info["resid_history"], list)
         assert isinstance(info["converged"], bool)
 
+    def test_maxit_exhaustion_not_converged(self):
+        """PCG with maxit too small must report converged=False and iters==maxit."""
+        m = 16
+        A = laplacian_2d(m)
+        rng = np.random.default_rng(42)
+        x_true = rng.standard_normal(m * m)
+        b = np.asarray(A @ x_true, dtype=np.float64)
+
+        comm = SerialComm()
+        spmv = make_spmv_serial(A, comm)
+        precond = jacobi_precond(A)
+
+        # maxit=2 is far too few for the m=16 Laplacian to converge to rtol=1e-10
+        maxit = 2
+        _, info = pcg(spmv, precond, b, comm, rtol=1e-10, maxit=maxit)
+
+        assert info["converged"] is False, (
+            f"Expected converged=False with maxit={maxit}, "
+            f"got converged={info['converged']}"
+        )
+        assert info["iters"] == maxit, (
+            f"Expected iters=={maxit}, got iters={info['iters']}"
+        )
+        assert len(info["resid_history"]) >= 1, (
+            f"Expected resid_history to be populated, got {info['resid_history']}"
+        )
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
