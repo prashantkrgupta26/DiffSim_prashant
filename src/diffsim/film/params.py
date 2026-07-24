@@ -52,6 +52,8 @@ import json
 import math
 from dataclasses import dataclass, field
 
+from ..device import default_device
+
 R_GAS = 8.314462618          # J/(mol K)
 
 
@@ -185,7 +187,10 @@ class FilmParams:
     snap_h: tuple = (0.9, 0.7, 0.6, 0.5, 0.4)
     log_every: int = 25
     preflight: str = "strict"             # strict | warn
-    device: str = "cuda:0"
+    # device: resolved via diffsim.default_device() (arg > DIFFSIM_DEVICE env >
+    # auto-detect: cuda:0 if a CUDA device is visible, else cpu). Set explicitly
+    # (e.g. from a config file or --device) to override.
+    device: str = field(default_factory=default_device)
 
     # ------------------------------------------------------------------
     def validate(self):

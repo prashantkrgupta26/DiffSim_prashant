@@ -58,8 +58,13 @@ from .errors import (  # noqa: E402
     SolverError,
 )
 
+# device resolver is cheap (no eager Warp/Torch import) — expose eagerly
+from .device import default_device  # noqa: E402
+
 __all__ = [
     "__version__",
+    # device
+    "default_device",
     # solvers
     "solve_linear",
     "NonlinearSolver",

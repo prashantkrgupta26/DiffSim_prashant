@@ -23,6 +23,7 @@ operator caching by `cache` (a dict the caller owns): constant matrices
 """
 import numpy as np
 
+from ..device import default_device
 from ..errors import BackendError, ConvergenceError
 
 _CUDSS_OPTS = ...          # lazily built by cudss_options()
@@ -511,7 +512,7 @@ def _blockch_pair_fill_kernel_chunked():
 
 
 def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
-                         device="cuda:0", cache=None, cache_key=None,
+                         device=None, cache=None, cache_key=None,
                          idx_dev=None, jv=None):
     """G5: _blockch_pairs with a DEVICE-RESIDENT setup. A's values live
     on the GPU (warp array vals_d, e.g. DeviceNSAssembler.vals_d);
@@ -531,6 +532,7 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
     shared node pattern, device BiCGStab inners, lower-triangular
     within the (psi, theta) pair (_blockch_pairs docstring).
     Returns host x; records ('blockch_iters', cache_key)."""
+    device = default_device() if device is None else device
     import warp as wp
     from scipy.sparse.linalg import (LinearOperator, gmres as _gmres,
                                      lgmres as _lgmres)
@@ -1032,7 +1034,7 @@ def blockch_pairs_device(indptr, indices, vals_d, b, meta, tol=1e-10,
 
 
 def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
-                 device="cuda:0", cache=None, cache_key=None,
+                 device=None, cache=None, cache_key=None,
                  return_result=False):
     """Solve A x = b (scipy CSR A, host b). Returns host x.
 
@@ -1045,6 +1047,7 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
     (critical-eval P2.1).  A returned result always has ``converged=True``: the
     iterative/direct backends raise :class:`~diffsim.errors.ConvergenceError`
     on failure rather than returning an unconverged vector."""
+    device = default_device() if device is None else device
     if return_result:
         from .result import LinearSolveResult
         x = solve_linear(A, b, solver=solver, sym=sym, tol=tol,

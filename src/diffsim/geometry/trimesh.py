@@ -22,6 +22,7 @@ import warp as wp
 
 from .oracle import SDFOracle
 from ..assembly.operators import _kernel_cache
+from ..device import default_device
 
 
 def _make_query_kernel():
@@ -95,7 +96,8 @@ def _closest_point_on_triangle(p, a, b, c):
 class TriMeshOracle(SDFOracle):
     near_eikonal = False
 
-    def __init__(self, verts: np.ndarray, tris: np.ndarray, device="cuda:0"):
+    def __init__(self, verts: np.ndarray, tris: np.ndarray, device=None):
+        device = default_device() if device is None else device
         verts = np.asarray(verts, np.float64)
         tris = np.asarray(tris)
         if verts.ndim != 2 or verts.shape[1] != 3:
@@ -180,8 +182,9 @@ class TriMeshOracle(SDFOracle):
         return d, n, ok
 
 
-def icosphere(n_sub: int, center, radius: float, device="cuda:0"):
+def icosphere(n_sub: int, center, radius: float, device=None):
     """Subdivided icosahedron on a sphere — procedural STL stand-in."""
+    device = default_device() if device is None else device
     t = (1.0 + np.sqrt(5.0)) / 2.0
     verts = np.array([
         [-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0],
