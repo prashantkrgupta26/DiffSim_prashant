@@ -148,6 +148,38 @@ def run_level(level, solver, device, steps, dt, order):
     }
 
 
+def run_level_assembly(level, device, device_assembly):
+    """Isolate the K_p ASSEMBLY cost (the host COO->CSR wall vs the device
+    scatter).  Builds the mesh, then times assemble_csr(dm) [host] or
+    assemble_csr_device(dm) [device], and (device only) verifies the CSR
+    equals the host CSR to fp tolerance when small enough to afford it."""
+    t0 = time.perf_counter()
+    dm = build_dm(level, device)
+    t_mesh = time.perf_counter() - t0
+    from diffsim.assembly.operators import (assemble_csr,
+                                            DeviceScalarPoissonAssembler)
+    ta = time.perf_counter()
+    if device_assembly:
+        asm = DeviceScalarPoissonAssembler(dm)
+        t_sym = time.perf_counter() - ta
+        tf = time.perf_counter()
+        asm.fill()
+        Kp = asm.to_csr()
+        t_fill = time.perf_counter() - tf
+        t_assemble = time.perf_counter() - ta
+    else:
+        Kp = assemble_csr(dm)
+        t_assemble = time.perf_counter() - ta
+        t_sym = t_fill = float("nan")
+    mem = gpu_mem_mb(device)
+    return {
+        "level": level, "n_ppe": int(Kp.shape[0]), "nnz_ppe": int(Kp.nnz),
+        "t_mesh_s": t_mesh, "t_assemble_s": t_assemble,
+        "t_sym_s": t_sym, "t_fill_s": t_fill, "mem_mb": mem,
+        "device_assembly": device_assembly,
+    }
+
+
 def run_level_ppe_only(level, solver, device, steps, order):
     """Isolate the SPD PPE solve: build the stepper's CONSTANT K_p (the exact
     operator solver='amgx' routes through the PPE), then hammer solve_linear on
@@ -261,7 +293,61 @@ def main(argv=None):
     ap.add_argument("--ppe-only", action="store_true",
                     help="isolate the SPD PPE solve (skip the Python "
                     "momentum-predictor host-assembly wall)")
+    ap.add_argument("--assembly", action="store_true",
+                    help="isolate K_p assembly cost (host COO->CSR)")
+    ap.add_argument("--device-assembly", action="store_true",
+                    help="with --assembly: use the device-resident scalar "
+                    "Poisson assembler (device scatter, no host COO->CSR)")
+    ap.add_argument("--assembly-parity", action="store_true",
+                    help="verify device K_p == host K_p to fp tol per level")
     args = ap.parse_args(argv)
+
+    if args.assembly_parity:
+        from diffsim.assembly.operators import (assemble_csr,
+                                                assemble_csr_device)
+        ok = True
+        for L in args.levels:
+            dm = build_dm(L, args.device)
+            Kh = assemble_csr(dm).tocsr(); Kh.sort_indices()
+            Kd = assemble_csr_device(dm).tocsr(); Kd.sort_indices()
+            scale = max(np.abs(Kh.data).max(), 1e-30)
+            structok = (Kh.indptr.tolist() == Kd.indptr.tolist()
+                        and np.array_equal(Kh.indices, Kd.indices))
+            err = np.abs(Kh.data - Kd.data).max() / scale if structok \
+                else float("nan")
+            good = structok and err < 1e-12
+            ok = ok and good
+            print(f"  L{L}: n={Kh.shape[0]:,} nnz={Kh.nnz:,} "
+                  f"struct={'OK' if structok else 'MISMATCH'} "
+                  f"rel_err={err:.2e} -> {'PASS' if good else 'FAIL'}",
+                  flush=True)
+            del dm, Kh, Kd
+            gc.collect()
+        print(f"\nASSEMBLY PARITY: {'PASS' if ok else 'FAIL'}")
+        return 0 if ok else 1
+
+    if args.assembly:
+        mode = "DEVICE scatter" if args.device_assembly else "HOST COO->CSR"
+        print(f"# MODE: K_p ASSEMBLY ONLY ({mode})")
+        rows = []
+        for L in args.levels:
+            try:
+                r = run_level_assembly(L, args.device, args.device_assembly)
+                rows.append(r)
+                extra = (f" [sym={r['t_sym_s']:.2f}s fill={r['t_fill_s']:.2f}s]"
+                         if args.device_assembly else "")
+                print(f"  L{r['level']:<2d} n={r['n_ppe']:>12,d} "
+                      f"nnz={r['nnz_ppe']:>13,d} mesh={r['t_mesh_s']:7.2f}s "
+                      f"assemble={r['t_assemble_s']:9.2f}s{extra} "
+                      f"mem={r['mem_mb']:.0f}MiB", flush=True)
+                gc.collect()
+            except Exception as e:  # noqa: BLE001
+                import traceback
+                print(f"  L{L}: CEILING/ERROR: {type(e).__name__}: {e}",
+                      flush=True)
+                traceback.print_exc()
+                break
+        return 0
 
     print(f"# PPE/AMGX scaling — solver={args.solver} steps={args.steps} "
           f"dt={args.dt} order={args.order} device={args.device}")
