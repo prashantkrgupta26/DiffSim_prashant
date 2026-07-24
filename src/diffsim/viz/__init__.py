@@ -7,5 +7,14 @@ Requires: pyvista>=0.44, meshio>=5.3
 guarded inside the function body that needs it.
 """
 from .export import export_vtu, export_vtu_sbm, export_body_vtp
+from .renders import Style, lic, mesh_slice, contour
 
-__all__ = ["export_vtu", "export_vtu_sbm", "export_body_vtp"]
+__all__ = [
+    "export_vtu",
+    "export_vtu_sbm",
+    "export_body_vtp",
+    "Style",
+    "lic",
+    "mesh_slice",
+    "contour",
+]
