@@ -1,0 +1,51 @@
+\chapter{Differentiable structure (planned)}
+\label{ch:c8}
+
+\begin{keybox}\textbf{PLANNED --- not yet written.} This chapter and its
+module (\file{08\_differentiable\_structure/}) are a placeholder. The
+outline below is what a future session will build from; see
+\file{HANDOFF.md} for the full instructions.\end{keybox}
+
+\emph{Module: \file{08\_differentiable\_structure/} (stub). The NS-SBM
+engine as an instrument for design: gradients through the solve, and shape
+optimization of the immersed body.}
+
+\section*{What this chapter will teach}
+\begin{itemize}
+\item \textbf{The adjoint of the NS-SBM engine.} A gradient of a flow QoI
+  (drag, a wake observable) with respect to a control --- the SBM shift /
+  the body shape, the Reynolds number, a boundary trace. The steady adjoint
+  is a \emph{single transposed solve} (no trajectory), which is exactly what
+  makes it tractable at 100M DOF.
+\item \textbf{Three-way-verified gradients.} Following the sibling
+  differentiable track's discipline: custom adjoint $==$ autograd twin $==$
+  finite difference, on the \emph{same} operator the forward stepper
+  marches. The course's standing bar is that a gradient is not trusted
+  until all three agree.
+\item \textbf{Shape optimization on the shifted boundary.} Because the SBM
+  shift is fixture \emph{data} ($d$, $\text{corr}$; Ch.~\ref{ch:c4}),
+  differentiating with respect to the body geometry flows through the
+  distance field --- a natural, mesh-free shape-design surface.
+\end{itemize}
+
+\section*{Source material (for the author of this chapter)}
+\begin{itemize}
+\item The SBM adjoint / shape bricks already in the tree:
+  \file{src/diffsim/sbm/ns\_adjoint.py}, \file{leray\_adjoint.py},
+  \file{ns\_shape.py}, \file{transient\_adjoint.py}, \file{adjoint.py}.
+\item The SP-1 R1 XDD adjoint work (MERGED \code{fbfeed5}): the
+  three-way-verification pattern (adjoint vs torch-twin vs FD), the unified
+  \code{Control} interface, the exposed sensitivity rows --- the template
+  this chapter mirrors for the NS-SBM operator.
+\item The P2 milestone's ``steady adjoint = 1 transposed solve, tractable at
+  100M'' argument (deliverable C, the maize steady-differentiable design
+  engine).
+\item The sibling \file{orgelmorph-course/differentiable/} track for the
+  module template of a gradient chapter (core module, \code{run.py} printing
+  the three-way agreement, \code{EXPECTED.md}).
+\end{itemize}
+
+\section*{Status}
+Future. Ties into the E-differentiable track and the SP-1 R1 adjoint work;
+best built after the forward engine chapters (00--05) and the scaling
+chapter (06) are the students' shared baseline.

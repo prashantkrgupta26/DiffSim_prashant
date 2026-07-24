@@ -1,0 +1,156 @@
+% NS-SBM course bibliography. The chapters cite these informally in prose;
+% \nocite{*} in main.tex lists them all.
+
+@article{ghia1982,
+  author  = {Ghia, U. and Ghia, K. N. and Shin, C. T.},
+  title   = {High-{Re} Solutions for Incompressible Flow Using the
+             {Navier--Stokes} Equations and a Multigrid Method},
+  journal = {Journal of Computational Physics},
+  volume  = {48},
+  number  = {3},
+  pages   = {387--411},
+  year    = {1982},
+}
+
+@article{brooks1982supg,
+  author  = {Brooks, A. N. and Hughes, T. J. R.},
+  title   = {Streamline Upwind/{Petrov--Galerkin} Formulations for
+             Convection Dominated Flows with Particular Emphasis on the
+             Incompressible {Navier--Stokes} Equations},
+  journal = {Computer Methods in Applied Mechanics and Engineering},
+  volume  = {32},
+  pages   = {199--259},
+  year    = {1982},
+}
+
+@article{tezduyar1992,
+  author  = {Tezduyar, T. E.},
+  title   = {Stabilized Finite Element Formulations for Incompressible
+             Flow Computations},
+  journal = {Advances in Applied Mechanics},
+  volume  = {28},
+  pages   = {1--44},
+  year    = {1992},
+}
+
+@article{hughes1998vms,
+  author  = {Hughes, T. J. R. and Feij{\'o}o, G. R. and Mazzei, L. and
+             Quincy, J.-B.},
+  title   = {The Variational Multiscale Method---a Paradigm for
+             Computational Mechanics},
+  journal = {Computer Methods in Applied Mechanics and Engineering},
+  volume  = {166},
+  pages   = {3--24},
+  year    = {1998},
+}
+
+@article{bazilevs2007vmsturb,
+  author  = {Bazilevs, Y. and Calo, V. M. and Cottrell, J. A. and
+             Hughes, T. J. R. and Reali, A. and Scovazzi, G.},
+  title   = {Variational Multiscale Residual-Based Turbulence Modeling
+             for Large Eddy Simulation of Incompressible Flows},
+  journal = {Computer Methods in Applied Mechanics and Engineering},
+  volume  = {197},
+  pages   = {173--201},
+  year    = {2007},
+}
+
+@article{bazilevs2009backflow,
+  author  = {Bazilevs, Y. and Gohean, J. R. and Hughes, T. J. R. and
+             Moser, R. D. and Zhang, Y.},
+  title   = {Patient-Specific Isogeometric Fluid--Structure Interaction
+             Analysis of Thoracic Aortic Blood Flow due to Implantation
+             of the {Jarvik~2000} Left Ventricular Assist Device},
+  journal = {Computer Methods in Applied Mechanics and Engineering},
+  volume  = {198},
+  pages   = {3534--3550},
+  year    = {2009},
+}
+
+@article{esmaily2011backflow,
+  author  = {Esmaily-Moghadam, M. and Bazilevs, Y. and Hsia, T.-Y. and
+             Vignon-Clementel, I. E. and Marsden, A. L.},
+  title   = {A Comparison of Outlet Boundary Treatments for Prevention
+             of Backflow Divergence with Relevance to Blood Flow
+             Simulations},
+  journal = {Computational Mechanics},
+  volume  = {48},
+  pages   = {277--291},
+  year    = {2011},
+}
+
+@article{nitsche1971,
+  author  = {Nitsche, J.},
+  title   = {{\"U}ber ein Variationsprinzip zur L{\"o}sung von
+             {Dirichlet}-Problemen bei Verwendung von Teilr{\"a}umen,
+             die keinen Randbedingungen unterworfen sind},
+  journal = {Abhandlungen aus dem Mathematischen Seminar der
+             Universit{\"a}t Hamburg},
+  volume  = {36},
+  pages   = {9--15},
+  year    = {1971},
+}
+
+@article{main2018shifted,
+  author  = {Main, A. and Scovazzi, G.},
+  title   = {The Shifted Boundary Method for Embedded Domain
+             Computations. {Part} {I}: {Poisson} and {Stokes} Problems},
+  journal = {Journal of Computational Physics},
+  volume  = {372},
+  pages   = {972--995},
+  year    = {2018},
+}
+
+@article{atallah2020shifted,
+  author  = {Atallah, N. M. and Canuto, C. and Scovazzi, G.},
+  title   = {The Second-Generation Shifted Boundary Method and Its
+             Application to {Stokes} Flows},
+  journal = {Computer Methods in Applied Mechanics and Engineering},
+  volume  = {372},
+  pages   = {113341},
+  year    = {2020},
+}
+
+@article{timmermans1996,
+  author  = {Timmermans, L. J. P. and Minev, P. D. and Van De Vosse, F. N.},
+  title   = {An Approximate Projection Scheme for Incompressible Flow
+             Using Spectral Elements},
+  journal = {International Journal for Numerical Methods in Fluids},
+  volume  = {22},
+  pages   = {673--688},
+  year    = {1996},
+}
+
+@article{pacheco2021outflow,
+  author  = {Pacheco, D. R. Q. and Schussnig, R. and Steinbach, O. and
+             Fries, T.-P.},
+  title   = {A Global {Newton}-Type Scheme and Boundary-Vorticity
+             Outflow Treatment for Stabilized Incompressible Flow
+             Solvers},
+  journal = {International Journal for Numerical Methods in Engineering},
+  year    = {2021},
+  note    = {arXiv:2411.02100},
+}
+
+@article{chorin1968,
+  author  = {Chorin, A. J.},
+  title   = {Numerical Solution of the {Navier--Stokes} Equations},
+  journal = {Mathematics of Computation},
+  volume  = {22},
+  pages   = {745--762},
+  year    = {1968},
+}
+
+@techreport{diffsim_projection_ladder,
+  author = {{DiffSim project}},
+  title  = {Projection Validation Ladder --- Final Synthesis (rungs 0--C)},
+  note   = {docs/dev/2026-07-23-projection-ladder-FINAL-synthesis.md},
+  year   = {2026},
+}
+
+@techreport{diffsim_consistent_projection,
+  author = {{DiffSim project}},
+  title  = {The \texttt{consistent\_projection} Fix (\#1--\#6) --- Design},
+  note   = {docs/dev/specs/2026-07-23-consistent-projection-fix-design.md},
+  year   = {2026},
+}

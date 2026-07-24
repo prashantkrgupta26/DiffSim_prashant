@@ -1,0 +1,80 @@
+\chapter{Three dimensions --- the SBM sphere}
+\label{ch:c5}
+
+\emph{Module: \file{05\_three\_dimensions/}. The end-to-end SBM-NS engine in
+3-D; the shift $d\neq0$ is genuinely active; the cuDSS/AMGX solver path; an
+honest verdict on the two engines.}
+
+\section{Geometry}
+An immersed \code{Sphere(center=(0.35,0.5,0.5), R=0.12)} carved from a
+unit-box octree channel ($\lambda=0.5$), $\code{ndof}=4$, strong inflow
+($x=0$) $+$ lateral walls ($y,z$), free outflow ($x=1$), weak no-slip on the
+sphere. The sphere is not grid-aligned, so the SBM shift $d\neq0$ is
+genuinely active in 3-D. At level~4: $n_{\text{free}}=\SpNfree$,
+\SpFaces{} surrogate faces, $D/h=\SpDoverh$, $d_{\max}=\SpDmax$.
+
+\section{The honest 3-D verdict}
+The two engines part ways in 3-D, and the course is explicit about it
+(documented in \file{tests/baselines/p2r0\_task10\_sphere.json}):
+\begin{description}
+\item[MONOLITHIC 3-D SBM-NS --- the working drag path.] Stable and physical:
+  it recovers from the startup transient to a positive steady drag,
+  \[
+  \Cd = +\SpCdMono\quad(\Rey=100,\ \alpha=10,\ \text{level }4),
+  \]
+  reproducing the M1b sphere lock. This is the hero result for 3-D drag. It
+  scales via GPU direct (\code{solver="cudss"}) or block-preconditioned
+  FGMRES past the host-splu wall (${\sim}$level 5 / 143k DOF).
+\item[PROJECTION $+$ volumetric SBM (\code{LeraySBMStepper}) --- de-risked
+  but not yet a drag path.] The composition is de-risked (finite,
+  axisymmetric $|C_{\text{lat}}|\ll|\Cd|$, BDF2 engages, PPE-space weak
+  divergence machine-zero), \emph{but} its long-time drag transient is
+  unstable at feasible 3-D mesh (the coupled iteration's $\Cd$ diverges
+  monotonically while staying finite --- a documented R2 item). So in 3-D we
+  validate the pipeline invariants and take drag from the monolithic.
+\end{description}
+
+\begin{keybox}\textbf{Key idea.} The confined unit-box domain inflates
+$\Cd$ above the unconfined literature value; \emph{both} engines see the
+same confinement, so the bar is faithfulness (and, in 3-D, the
+monolithic's physical steady state), not the literature number.\end{keybox}
+
+\section{Solver path}
+Host \code{splu} is used for the small level-4 case here (${\sim}$seconds
+per step). To scale up, build the fixture on a CUDA device and route the
+monolithic solve through \code{solver="cudss"} (GPU direct) or
+\code{solver="blockamgx"} (block-preconditioned FGMRES: a Cahouet--Chabard
+Schur complement $+$ AMG-on-$F$), both wired in the sphere fixture's
+\code{monolithic_cd} (\file{p2r0\_task10\_sphere\_derisk.py:179--281}). The
+\emph{projection} engine's SPD PPE is the AMG-friendly one; that is the
+subject of Ch.~\ref{ch:c6}.
+
+\section{Verification}
+\begin{center}
+\begin{tabular}{@{}lc@{}}
+\toprule
+quantity & value (level 4, $\Rey=100$)\\
+\midrule
+$n_{\text{free}}$ & \SpNfree\\
+sphere surrogate faces & \SpFaces\\
+$D/h$ & \SpDoverh\\
+SBM $d_{\max}$ & \SpDmax\ ($>0$: genuine 3-D shift)\\
+MONOLITHIC steady $\Cd$ & $+\SpCdMono$ (positive, physical)\\
+$|C_{\text{lat}}|/|\Cd|$ (pipeline leg) & \SpClatRatio\ (axisymmetric)\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{runbox}\textbf{Run it.} \code{python run.py} in
+\file{05\_three\_dimensions/} marches the monolithic drag path (the hero
+number). Add \code{--pipeline} to additionally check the projection
+composition invariants over a short window (finite, BDF2 engaged,
+axisymmetric traction) --- NOT the unstable long march.\end{runbox}
+
+\question At level 5 the host-splu factorization runs out of time/memory.
+Estimate the DOF count and argue why \code{cudss} (GPU direct) buys you one
+more level but not many. What does that imply for the projection path?
+
+\question The projection composition is finite and axisymmetric yet its
+drag transient diverges. Is ``finite'' the same as ``stable''? What
+diagnostic distinguishes them here?

@@ -1,0 +1,113 @@
+\chapter{The Shifted Boundary Method}
+\label{ch:c4}
+
+\emph{Module: \file{04\_shifted\_boundary/}. Flow past a body whose
+boundary is OFF the grid; the Taylor shift $d\neq0$ does real work;
+surrogate-traction drag.}
+
+\section{Surrogate vs true boundary}
+The true immersed boundary $\Gamma$ (a level set of an oracle --- a
+\code{Box} or \code{Sphere}) generally cuts through octree cells. SBM does
+\emph{not} body-fit. Instead it classifies cells and keeps a
+\textbf{surrogate boundary} $\Gambar$ made of \emph{whole} element faces
+(\file{sbm/surrogate.py:14--21}):
+\begin{itemize}
+\item \code{classify_lambda(tree, oracle, lam, domain)} marks a cut cell as
+  \emph{retained} iff its domain-\emph{outside} volume fraction $\le\lambda$.
+  So $\lambda=0$ keeps only fully-interior cells (surrogate strictly inside
+  $\Omega$; if the body is cell-aligned the surrogate coincides with
+  $\Gamma$, $d=0$); $\lambda=0.5$ is the flow-past value.
+\item \code{extract_surrogate(tree)} returns the surrogate faces: faces of
+  retained cells with no retained neighbour across them and not on the outer
+  domain boundary (whole-face invariant).
+\end{itemize}
+
+\section{The Taylor shift $S = N + \grad N\cdot d$}
+Let $d$ be the vector from a surrogate Gauss point to its closest point on
+$\Gamma$. The shifted trial/test operator is a first-order Taylor
+extrapolation from the surrogate to the true boundary:
+\begin{equation}
+S\,N_a = N_a + (\grad N_a)\cdot d.
+\end{equation}
+The Dirichlet data is imposed at the mapped point $y=\text{xq}+d$, and the
+shifted trial value is $Su = u + (\grad u)\cdot d$. When $d=0$
+(cell-aligned body), $S N_a = N_a$ and SBM is exactly standard Nitsche ---
+the $d=0$ case of Ch.~\ref{ch:c3}.
+
+\begin{keybox}\textbf{Key idea.} SBM is Nitsche with the shape functions
+Taylor-extrapolated to the true boundary. No re-meshing, no cut-cell
+quadrature: the shift is fixture \emph{data} ($d$, $\text{corr}$), not
+solver code. The same predictor/PPE machinery runs
+unchanged.\end{keybox}
+
+\section{Surrogate normal, distance, area correction}
+\code{GeometryData.evaluate} (\file{sbm/surrogate.py:222--253}) produces the
+frozen FP64 per-epoch geometry cache at surrogate Gauss points:
+\begin{itemize}
+\item \textbf{$d$} --- the shift vector (surrogate GP $\to$ closest point on
+  $\Gamma$), from the oracle's \code{distance_vector}.
+\item \textbf{$n$} --- the \emph{true-boundary} outward normal
+  $n=\pm\grad\psi/|\grad\psi|$, always pointing \emph{out of} the
+  computational domain $\Omega$.
+\item \textbf{$\text{corr}$} --- the area correction
+  $\text{corr}=\tilde n\cdot n$, where $\tilde n$ is the surrogate face's
+  grid-aligned unit normal. It converts a surrogate-face measure to the true
+  boundary measure ($\text{corr}=1$ when $\Gambar=\Gamma$).
+\end{itemize}
+
+\section{Force / drag on the immersed body}
+The drag reads the traction on the surrogate faces, area-corrected to the
+true boundary. \code{surrogate_traction(dm, sf, geo, x_all, nu, ndof)}
+(\file{sbm/vector.py:562--605}) computes
+\begin{equation}
+F = \oint_{\Gambar}\big(p\,n - \nu\,(\grad u)^\top n\big)\,\text{corr}\,\mathrm{d}\Gambar,
+\end{equation}
+with the crucial \textbf{orientation contract}: \code{geo.n} is
+domain-outward (= \emph{into} the obstacle for exterior flow), so the
+obstacle-outward normal is $\hat n=-\code{geo.n}$ and the integrand is
+$+p\,\code{geo.n}-\nu(\grad u)^\top\code{geo.n}$. At $d=0$ this reduces to
+the raw body-fitted traction.
+
+\section{Verification: a genuine sub-cell shift}
+The same square as Ch.~\ref{ch:c3}, but its center is offset by a sub-cell
+fraction ($\text{offset}=0.05$), so the grid-aligned surrogate no longer
+coincides with the true \code{Box} face: $0<d_{\max}<h$. Now the Taylor
+$(\grad N_a)\cdot d$ term \emph{and} the area correction $\text{corr}$ do
+real work. The stepper setup is \emph{identical} to the weak path of
+Ch.~\ref{ch:c3} --- the shift is fixture data. The monolithic oracle carries
+the \emph{same} shifted geometry, so it is the same-mesh-with-shift oracle.
+
+At level~4, $\Rey=40$, $\text{offset}=0.05$:
+\[
+d_{\max}=\ShDmax\quad(0<d_{\max}<h=0.0625,\ d_{\max}/h=\ShDmaxRatio)
+\]
+\begin{center}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+ & projection & monolithic (true shift) & rel-diff\\
+\midrule
+$\Cd$ & $+$\ShCdProj & $+$\ShCdMono & \textbf{\ShCdRel}\\
+\bottomrule
+\end{tabular}
+\end{center}
+The consistent-projection split \emph{with the genuine SBM shift active}
+matches the same-mesh-with-shift monolithic to \ShCdRel{} in drag ---
+\textbf{projection $+$ SBM works end-to-end in 2-D}.
+
+\begin{keybox}\textbf{Anti-vacuity (the shift is load-bearing).} Run with
+\code{--zero-shift} to set $\code{geo.d}=0$, $\code{geo.corr}=1$ while
+keeping everything else fixed; the match against the TRUE shifted oracle
+breaks --- proof the Taylor term and area correction are doing real
+work.\end{keybox}
+
+\begin{runbox}\textbf{Run it.} \code{python run.py} in
+\file{04\_shifted\_boundary/} marches the shifted projection vs the shifted
+monolithic. \code{--zero-shift} demonstrates the anti-vacuity break;
+\code{--offset 0} returns to the body-fitted $d=0$ case.\end{runbox}
+
+\question At $\text{offset}=0.05$, $d_{\max}/h=0.80$: the shift is nearly a
+full cell. What happens to the Taylor approximation as $\text{offset}\to h$?
+Why must the offset stay $<h$?
+
+\question Only a handful of surrogate Gauss points are area-corrected
+($\text{corr}\neq1$). Which ones, geometrically, and why not all of them?
