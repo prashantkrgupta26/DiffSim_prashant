@@ -202,7 +202,11 @@ def sbm_wall_pressure_neumann(dm, sf, geo, u_node, pstar_node, nu, ndof,
     surrogate faces — the FN4 investigation record (2026-07-23). NOT the
     rung-B drag fix: that is the stepper's ``rotational_pin_wall`` (leray.py).
     Kept, default OFF everywhere, because its term-level switches DOCUMENT
-    the measured defect structure.
+    the measured defect structure. Verdict: docs/dev/2026-07-23-projection-
+    ladder-verdict.md. NOT dead code (P2harden prune check, 2026-07-23): still
+    imported+called by tests/ladder_rungB_square_nitsche.py and
+    tests/ladder_rungB_seed_probe.py, which feed the green test_ladder_rungB.py
+    regression — do NOT remove without first dropping those references.
 
     Karniadakis-Israeli-Orszag (JCP 1991) consistent pressure Neumann BC from
     the normal momentum balance at the immersed no-slip wall, rotational
@@ -337,7 +341,11 @@ def sbm_wall_pressure_kio_vms(dm, sf, geo, uhat, u1, u2, bdf, dt, nu, ndof,
     r"""REJECTED FN4 experiment (2026-07-23, kept as the investigation
     record; default OFF everywhere): the KIO wall-pressure source weighted by
     the PPE's OWN fine-scale channel. NOT the rung-B drag fix — that is the
-    stepper's ``rotational_pin_wall`` (leray.py).
+    stepper's ``rotational_pin_wall`` (leray.py). Verdict: docs/dev/2026-07-23-
+    projection-ladder-verdict.md. NOT dead code (P2harden prune check,
+    2026-07-23): still imported+called by tests/ladder_rungB_square_nitsche.py
+    and tests/ladder_rungB_seed_probe.py (feeding green test_ladder_rungB.py) —
+    do NOT remove without first dropping those references.
 
     THE IDEA: the consistent-projection PPE assembles
 
