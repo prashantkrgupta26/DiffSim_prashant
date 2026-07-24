@@ -457,12 +457,141 @@ def volume_triplets(dm, kq_by_bin=None):
 
 
 def assemble_csr(dm):
-    """Assemble global constrained stiffness matrix T^T K T."""
+    """Assemble global constrained scalar stiffness matrix T^T K T (host).
+
+    The host COO->CSR path: GPU element matrices Ke are pulled to host
+    (.numpy()), Python builds COO triplets, and scipy runs a single-
+    threaded coo_matrix(...).tocsr() + the T^T(.)T sparse triple product.
+    Measured wall: ~1011 s at 3-D L8 (17M dofs) vs a 2.6 s AMGX solve.
+    For the device-resident scatter path that eliminates this wall see
+    ``DeviceScalarPoissonAssembler`` / ``assemble_csr_device``."""
     rows, cols, vals = volume_triplets(dm)
     K = sp.coo_matrix((vals, (rows, cols)),
                       shape=(dm.n_nodes, dm.n_nodes)).tocsr()
     T = dm.constraints.T.tocsr()
     return (T.T @ K @ T).tocsr()
+
+
+class DeviceScalarPoissonAssembler:
+    """Device-resident scalar (1-dof/node) Poisson stiffness assembler —
+    the K_p analogue of DeviceNSAssembler, sized for the 100M PPE.
+
+    The host ``assemble_csr`` wall is the .numpy() pull of the element
+    matrices + the single-threaded scipy COO->CSR + the T^T(.)T sparse
+    triple product (~1011 s at 3-D L8).  This mirrors DeviceNSAssembler's
+    slot-map scatter with ndof=1:
+
+      * ONE-TIME symbolic sparsity + slot map (host, per epoch): the
+        constrained pattern of ``T^T K T`` and, per element pair, the CSR
+        value-index it lands in.  For a uniform mesh (no hanging nodes) T
+        is the identity, so ``T^T K T == K`` and the slot map is the plain
+        element->CSR scatter; for a mesh WITH hanging nodes the element
+        entries are expanded through the constraint weights host-once
+        (w_r*w_c at (master_r, master_c)) exactly as DeviceNSAssembler's
+        weighted path does — so ``T^T K T`` is built DIRECTLY in the free-
+        dof space with NO host triple product.
+
+      * PER-BUILD numeric fill (device): the Poisson element matrices Ke
+        are computed by the existing warp kernel and scatter-atomic-added
+        into the preallocated device CSR values buffer — NO host pull, NO
+        COO->CSR.
+
+    Correctness contract: the device CSR equals host ``assemble_csr(dm)``
+    to fp tolerance (gated ~1e-12).  Reuse across builds (var-kappa,
+    changing geometry on a fixed pattern) via ``fill()`` (device scatter
+    only) + ``to_csr()`` (one download) or the zero-copy ``device_op()``.
+    """
+
+    def __init__(self, dm, index_width="auto", chunking="auto",
+                 chunk_cap=None, node_pattern=None):
+        from .device_assembly import DeviceNSAssembler
+        self.dm = dm
+        # ndof=1 scalar system.  DeviceNSAssembler already builds T^T K T
+        # in the free-dof space (identity-T -> plain K; hanging-T ->
+        # weighted expansion), which is EXACTLY the scalar K_p pattern.
+        #
+        # node_pattern (the 100M-critical choice): the DEFAULT COO symbolic
+        # path still builds a HOST COO + the K2[rr,cc] fancy-index slot map
+        # — the SAME single-threaded host wall.  The node-graph pattern
+        # instead builds indptr/indices in CLOSED FORM on device and
+        # computes element slots IN-KERNEL, so NO host COO exists.  It
+        # requires identity constraints (uniform meshes — exactly the PPE
+        # scaling case), so we auto-select it there and fall back to the
+        # COO path (still device SCATTER, host symbolic) for hanging-node
+        # meshes.  node_pattern=None => auto by identity-T; True/False
+        # force.  Node pattern uses conn-order columns (unsorted), so
+        # to_csr() sorts before returning.
+        T = dm.constraints.T.tocsr()
+        identity_T = (T.shape[0] == T.shape[1]) and (
+            T != sp.identity(T.shape[0], format="csr")).nnz == 0
+        if node_pattern is None:
+            node_pattern = identity_T
+        self._node_pattern = bool(node_pattern)
+        self._asm = DeviceNSAssembler(
+            dm, ndof=1, coloring=False, index_width=index_width,
+            chunking=chunking, chunk_cap=chunk_cap,
+            node_pattern=node_pattern)
+        self.nnz = self._asm.nnz
+        self.Nfull = self._asm.Nfull
+
+    def fill(self, kq_by_bin=None):
+        """Device numeric fill: compute the Poisson element matrices Ke
+        and scatter them into the device CSR values (no host round-trip).
+        kq_by_bin (dict pv -> FP64 [ne*nqp]) opts a spatially-varying
+        coefficient (the var-kappa kernel); None => kappa=1."""
+        dm = self._asm.dm
+        self._asm.zero_fill()
+        for k_bin, (pv, b, ne, nbf, _g) in enumerate(self._asm._bins):
+            nqp = b["nqp"]
+            Ke = wp.zeros((ne, nbf, nbf), dtype=wp.float64, device=dm.device)
+            if kq_by_bin is None:
+                kK = make_poisson_element_matrices(nbf, nqp, dm.dim)
+                wp.launch(kK, dim=ne,
+                          inputs=[b["h"], b["dN"], b["w"], Ke],
+                          device=dm.device)
+            else:
+                kq = wp.array(np.ascontiguousarray(kq_by_bin[pv], np.float64),
+                              dtype=wp.float64, device=dm.device)
+                kK = make_poisson_element_matrices_var(nbf, nqp, dm.dim)
+                wp.launch(kK, dim=ne,
+                          inputs=[b["h"], b["dN"], b["w"], kq, Ke],
+                          device=dm.device)
+            # scalar has no rhs; feed a zero be so the shared scatter_bin
+            # (which also scatters be into F_d) is a harmless no-op there.
+            be = wp.zeros((ne, nbf), dtype=wp.float64, device=dm.device)
+            self._asm.scatter_bin(k_bin, Ke, be)
+        return self
+
+    def to_csr(self):
+        """Download the current device CSR to a scipy csr_matrix (the
+        single host pull — replaces the whole host COO->CSR + T^T(.)T
+        wall with one values copy).  The node-graph pattern stores columns
+        in conn (node) order within a row, so the CSR is sorted before
+        return to match the canonical host layout (cheap vs assembly)."""
+        a = self._asm
+        vals = a.vals_d.numpy()
+        K = sp.csr_matrix((vals, a.indices, a.indptr),
+                          shape=(a.Nfull, a.Nfull))
+        if self._node_pattern:
+            K.sort_indices()
+        return K
+
+    def device_op(self):
+        """Zero-copy CSROperator-protocol view over the device CSR (no
+        host round-trip) — for a device-resident solve."""
+        return self._asm.device_operator()
+
+
+def assemble_csr_device(dm, kq_by_bin=None, index_width="auto",
+                        chunking="auto"):
+    """Device-resident equivalent of ``assemble_csr(dm)`` (host COO->CSR
+    eliminated).  Returns a scipy csr_matrix equal to ``assemble_csr(dm)``
+    to fp tolerance.  For repeated fills on a fixed mesh build a
+    ``DeviceScalarPoissonAssembler`` once and reuse it."""
+    asm = DeviceScalarPoissonAssembler(dm, index_width=index_width,
+                                       chunking=chunking)
+    asm.fill(kq_by_bin)
+    return asm.to_csr()
 
 
 class CSROperator:

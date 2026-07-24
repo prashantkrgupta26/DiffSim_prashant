@@ -44,7 +44,7 @@ class LerayProjectionStepper:
                  consistent_ppe=False, consistent_projection=False,
                  backflow_beta=None, graddiv_gamma=None,
                  rotational_pin_outflow=None, graddiv_dynamic=False,
-                 rotational_pin_wall=False):
+                 rotational_pin_wall=False, device_assembly=False):
         # ---- CONSISTENT-PROJECTION MODE (the 2026-07-23 fix, changes #1-#4) ----
         # ONE mode that turns on the coherent VMS-stabilized Helmholtz-Leray set
         # (ns_projection_vms_paper Eq 44a-c / Algorithm 1, exact discrete forms):
@@ -291,8 +291,18 @@ class LerayProjectionStepper:
         self.dir_nodes = np.where(bdry)[0]
         self.p_star = np.zeros(self.n_free)
         self.xq = gauss_points(mesh, dm.tables_by_p)
-        # scalar stiffness (PPE) + scalar consistent mass (update solves)
-        self.K_p = assemble_csr(dm)
+        # scalar stiffness (PPE) + scalar consistent mass (update solves).
+        # device_assembly (default OFF, bit-for-bit): route K_p through the
+        # device-resident scalar Poisson assembler (device slot-map scatter,
+        # no host COO->CSR), the 100M-critical-path fix for the ~1011 s host
+        # assembly wall at L8.  The result equals assemble_csr(dm) to fp tol.
+        self.device_assembly = bool(device_assembly)
+        if self.device_assembly:
+            from ..assembly.operators import DeviceScalarPoissonAssembler
+            self._Kp_dev_asm = DeviceScalarPoissonAssembler(dm)
+            self.K_p = self._Kp_dev_asm.fill().to_csr()
+        else:
+            self.K_p = assemble_csr(dm)
         self._K_p_lu = None
         self.M = self._mass_matrix()
         self._M_lu = None            # mass solves go through solve_linear
