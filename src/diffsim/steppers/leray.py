@@ -107,8 +107,15 @@ class LerayProjectionStepper:
         # source (bvs_ppe_source). Same term added to the monolithic PSPG
         # continuity row (assemble_bvs_block) so the same-mesh oracle stays
         # exact. Knob default OFF (bit-for-bit); consistent_projection turns it
-        # on. 2-D only (curl u scalar) — the rung-A path.
-        self.boundary_vorticity = bool(consistent_projection)
+        # on. 2-D ONLY (curl u scalar): bvs_ppe_source/assemble_bvs_block are
+        # implemented for dim=2 and RAISE at dim=3 (the term is unimplemented
+        # in 3-D, not merely off). Gate the auto-enable on dim==2 so the
+        # consistent-projection scheme LIFTS to 3-D (Task 7 finding): 2-D is
+        # bit-for-bit unchanged; in 3-D the term is simply absent on BOTH the
+        # split (this source) AND the monolithic (assemble_bvs_block), so the
+        # same-mesh oracle stays exact. Dimension gate on an unimplemented
+        # term, not a numerics re-tune.
+        self.boundary_vorticity = bool(consistent_projection) and dm.dim == 2
         self._bvs_faces = None            # lazily discovered outflow face set
         self.consistent_projection = bool(consistent_projection)
         # ---- F3b SECULAR-DRIFT CURE (2026-07-23) ----
