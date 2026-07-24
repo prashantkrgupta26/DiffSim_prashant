@@ -9,12 +9,52 @@ Configs: classical AMG-preconditioned Krylov — PCG for SPD (the PPE),
 AMG-preconditioned BiCGStab for the nonsymmetric stabilized NS blocks.
 Solver objects are cached per (cache_key, config) and re-setup with new
 matrix values each step (AMGX's replace-coefficients path when the sparsity
-is unchanged)."""
+is unchanged).
+
+SETUP-REUSE (task W1, 2026-07-24): the AMG hierarchy (galerkin coarse
+operators + interpolators) is the expensive part of ``slv.setup(M)``. When the
+CSR SPARSITY is unchanged across solves — the standard projection PPE path,
+where ``K_p`` is a CONSTANT operator (only the RHS changes step to step) — we
+skip the re-upload + re-setup entirely and only push the new *values* via
+``M.replace_coefficients(data)``, reusing the already-built hierarchy. Guarded
+by a sparsity fingerprint (shape, nnz, indptr, indices); any change falls back
+to the full upload_CSR + setup path. Bit-for-bit for a truly constant matrix
+(same values -> identical solve); controlled by ``AMGX_SETUP_REUSE`` (default
+on). The last solve's iteration count / residual are exposed via
+``last_solve_stats()`` for the scaling harness."""
 import atexit
+import os
 
 import numpy as np
 
 _ctx = {"initialized": False}
+# Per-symmetry-class last-solve telemetry (iterations, residual, timings),
+# populated by amgx_solve for the scaling harness.
+_last_stats = {}
+
+# Default-on setup-reuse: skip slv.setup(M) when the CSR sparsity is unchanged
+# and only replace the coefficient VALUES. Set AMGX_SETUP_REUSE=0 to force the
+# legacy re-setup-every-call behaviour (A/B measurement).
+_SETUP_REUSE = os.environ.get("AMGX_SETUP_REUSE", "1") not in ("0", "false",
+                                                               "False", "")
+
+
+def last_solve_stats():
+    """Telemetry from the most recent amgx_solve, keyed by the singleton key.
+    Each value is a dict: iterations, residual, setup_reused (bool),
+    t_setup_s, t_solve_s, nnz, n."""
+    return dict(_last_stats)
+
+
+def _sparsity_fingerprint(A):
+    """Cheap-but-safe CSR sparsity fingerprint: shape, nnz, and hashes of the
+    indptr/indices arrays. Two matrices with the same fingerprint share a
+    sparsity pattern, so the AMG hierarchy can be reused via
+    replace_coefficients. Uses the raw array bytes' hash (fast, no allocation
+    beyond the digest) — collisions are astronomically unlikely and a false
+    match only reuses a valid hierarchy for a same-shape/nnz matrix."""
+    return (A.shape, int(A.nnz),
+            hash(A.indptr.tobytes()), hash(A.indices.tobytes()))
 
 
 def _preload_libamgx():
@@ -81,7 +121,9 @@ def amgx_solve(A, b, sym=False, tol=1e-10, maxiter=2000,
     per symmetry class, created once and reused for every solve. Multiple
     live Resources sets in one process (e.g. per-stepper caches) segfault
     inside AMGX. The caller-provided cache is therefore ignored for AMGX;
-    sparsity/value changes are handled by re-upload + re-setup per call."""
+    value changes are pushed via replace_coefficients when the sparsity is
+    unchanged (skips the AMG re-setup), else a full re-upload + re-setup."""
+    import time
     _ensure_init()
     import pyamgx
     A = A.tocsr()
@@ -100,17 +142,47 @@ def amgx_solve(A, b, sym=False, tol=1e-10, maxiter=2000,
                  "M": pyamgx.Matrix().create(rsc),
                  "X": pyamgx.Vector().create(rsc),
                  "B": pyamgx.Vector().create(rsc),
-                 "slv": pyamgx.Solver().create(rsc, cfg)}
+                 "slv": pyamgx.Solver().create(rsc, cfg),
+                 "fp": None}
         _ctx[key] = state
 
     M, X, B, slv = state["M"], state["X"], state["B"], state["slv"]
-    M.upload_CSR(A)
-    slv.setup(M)
+    # ---- SETUP-REUSE: fingerprint the sparsity; when unchanged, only push
+    # the new coefficient VALUES and reuse the built AMG hierarchy (skip the
+    # expensive setup). Otherwise re-upload the pattern and re-setup. ----
+    fp = _sparsity_fingerprint(A)
+    reuse = _SETUP_REUSE and state["fp"] is not None and state["fp"] == fp
+    t0 = time.perf_counter()
+    if reuse:
+        # Same pattern: only the values changed. AMGX expects the CSR VALUES
+        # array in the same (sorted) order that was uploaded originally.
+        M.replace_coefficients(np.ascontiguousarray(A.data, np.float64))
+        # No slv.setup(): the coarse hierarchy from the first setup is reused.
+    else:
+        M.upload_CSR(A)
+        slv.setup(M)
+        state["fp"] = fp
+    t_setup = time.perf_counter() - t0
     B.upload(np.ascontiguousarray(b, np.float64))
     x = np.zeros_like(b)
     X.upload(x)
+    t1 = time.perf_counter()
     slv.solve(B, X)
+    t_solve = time.perf_counter() - t1
     if slv.status not in ("success",):
         raise RuntimeError(f"AMGX solve status: {slv.status}")
     X.download(x)
+    # telemetry for the scaling harness (best-effort; ignore if unavailable)
+    try:
+        iters = int(slv.iterations_number)
+    except Exception:
+        iters = None
+    # get_residual() needs store_res_history in the config (off by default to
+    # avoid per-iteration overhead + console spam); skip it rather than trip
+    # AMGX's "Residual history was not recorded" exception every solve.
+    res = None
+    _last_stats[key] = {"iterations": iters, "residual": res,
+                        "setup_reused": bool(reuse), "t_setup_s": t_setup,
+                        "t_solve_s": t_solve, "nnz": int(A.nnz),
+                        "n": int(A.shape[0])}
     return x
