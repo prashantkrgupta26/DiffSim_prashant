@@ -1,0 +1,30 @@
+# 05 three dimensions (SBM sphere) — tolerance baseline.
+# Scientific invariants within DOCUMENTED tolerances, NOT bitwise GPU identity.
+# The 3-D verdict: the MONOLITHIC drag is the working, stable, physical path
+# (Cd = +0.381, reproducing the M1b lock). The confined unit-box domain inflates
+# Cd above the unconfined literature value; both engines see the same
+# confinement, so the bar is the monolithic's physical steady state.
+#
+# Ground truth (gpubox, CPU/splu, level 4, Re=100, alpha=10, dt=0.05):
+#   n_free = 4907   sphere surrogate faces = 64   D/h = 3.84   SBM dmax > 0
+#   MONOLITHIC steady Cd = +0.3812  (positive, physical)
+checks:
+  # the hero number: positive, physical, matches the M1b lock
+  # positive (physical, not the negative startup transient) and matches M1b
+  cd_mono:
+    reference: 0.381
+    atol: 0.05
+    min: 0.1
+  # the SBM shift is genuinely active in 3-D
+  dmax:
+    min: 0.001
+  # fixture sanity (level-4 de-risk resolution)
+  n_free:
+    reference: 4907
+    atol: 50
+  n_faces:
+    reference: 64
+    atol: 2
+  D_over_h:
+    reference: 3.84
+    rtol: 0.02
