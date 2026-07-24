@@ -103,8 +103,11 @@ def build_sbm_block(fx, alpha=ALPHA, beta_backflow=0.0):
     bf_c = np.asarray(T_vec.T @ bf)
 
     # SBM-governed free nodes: surrogate-face nodes (skip the box overwrite).
+    # Read the surrogate faces' element order from p_elem (p-generic: p=1 for
+    # uniform-P1, p=2 for the P2/P2-band fixtures) instead of hardcoding bin 1.
     mesh = dm.mesh
-    conn = mesh.conn_of[1][np.searchsorted(mesh.bins[1], sf.elem)]
+    pv_sf = int(np.unique(np.asarray(mesh.p_elem)[sf.elem])[0])
+    conn = mesh.conn_of[pv_sf][np.searchsorted(mesh.bins[pv_sf], sf.elem)]
     glob = np.unique(conn.ravel())
     free_idx = dm.constraints.free_nodes
     free_of = np.full(dm.n_nodes, -1, dtype=np.int64)

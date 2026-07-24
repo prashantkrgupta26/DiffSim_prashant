@@ -50,14 +50,29 @@ def _surrogate_face_node_ids(mesh, sf):
     obstacle boundary. Works for aligned (faces == true box faces) and offset
     (faces are the grid-aligned carved boundary) carves alike."""
     dim = mesh.dim
-    offs = _local_offsets(1, dim)              # [(p+1)^dim, dim] corner offsets
-    conn = mesh.conn                           # [Ne, 2^dim] p1 corner node ids
+    p_elem = np.asarray(mesh.p_elem)
+    # per-bin: global elem id -> (bin p, bin-local row) so this works for the
+    # UNIFORM path (mesh.conn) AND the mixed p1/p2 path (mesh.conn is None ->
+    # index conn_of[pv]). The "p1 corners of a face" are the order-p lattice
+    # nodes whose per-order offset equals the face `side` on axis `ax` AND whose
+    # tangential offsets are corners (0 or p) — the geometric box corners of the
+    # face, shared with the P1 corners under the joint dedup.
+    row_of = np.full(len(p_elem), -1, np.int64)
+    for pv, eids in mesh.bins.items():
+        row_of[eids] = np.arange(len(eids))
+    offs_by_p = {pv: _local_offsets(int(pv), dim) for pv in mesh.bins}
     ids = set()
     for e, f in zip(sf.elem, sf.face):
         ax, side = int(f) // 2, int(f) % 2
-        local = np.where(offs[:, ax] == side)[0]
-        for l in local:
-            ids.add(int(conn[e, l]))
+        pv = int(p_elem[e])
+        offs = offs_by_p[pv]
+        corner = (offs[:, ax] == (side * pv))            # side face on axis ax
+        for d in range(dim):
+            if d != ax:
+                corner &= np.isin(offs[:, d], (0, pv))   # tangential corners
+        conn = mesh.conn_of[pv][row_of[e]]
+        for l in np.where(corner)[0]:
+            ids.add(int(conn[l]))
     return np.array(sorted(ids), dtype=np.int64)
 
 
@@ -76,10 +91,54 @@ def obstacle_boundary_nodes(mesh, oracle):
 # --------------------------------------------------------------------------
 # shared mesh-build chain (mirrors build_sphere_3d)
 # --------------------------------------------------------------------------
-def _build_channel(level, Re, half, offset, device, dim, center):
+def _p2_band_array(ret, sf, band):
+    """Per-element order array (int8): P2 (order 2) for every retained element
+    within `band` cell-layers of a surrogate (obstacle) face, P1 (order 1)
+    elsewhere. `band=1` marks exactly the elements that own a surrogate face.
+
+    Grows the P2 set by BFS over face-neighbours `band` times (2:1-balanced
+    octree face adjacency via `face_neighbors`). Because the mesh is uniform-
+    level here, the one-knob rule (level XOR p across a face) is automatically
+    satisfied for ANY P1/P2 partition (level is constant, so only p changes)."""
+    from diffsim.octree.lookup import face_neighbors
+    ne = len(ret)
+    is_p2 = np.zeros(ne, dtype=bool)
+    is_p2[np.unique(np.asarray(sf.elem))] = True      # band=1 seed: face owners
+    # face_neighbors -> list of 2*dim arrays [ne]; entry k is the neighbour
+    # across face-direction k (-1 = domain boundary / carved-away).
+    nbrs = face_neighbors(ret)
+    for _ in range(int(band) - 1):
+        grow = is_p2.copy()
+        for j in nbrs:                                 # j: [ne] neighbour ids
+            ok = j >= 0
+            src = np.where(ok)[0]                       # elems with a neighbour
+            grow[src[is_p2[j[ok]]]] = True             # neighbour is P2 -> grow
+        is_p2 = grow
+    p_elem = np.where(is_p2, 2, 1).astype(np.int8)
+    return p_elem
+
+
+def _build_channel(level, Re, half, offset, device, dim, center, p=1,
+                   p2_band=0):
     """Carve a `Box` obstacle out of the unit-cube channel and build the mesh
     chain (mirrors tests/p2r0_task10_sphere_derisk.py::build_sphere_3d, with
-    Sphere -> Box and lam=0.0 for the exact body-fitted carve)."""
+    Sphere -> Box and lam=0.0 for the exact body-fitted carve).
+
+    `p` is the (equal-order) element order for BOTH velocity and pressure
+    (ndof = dim+1 collocated nodes). p=1 is the default (bit-for-bit unchanged);
+    p=2 builds the P2 mesh/basis/face tables for the FN3 basis-order stress test.
+    The whole chain (build_mesh/basis_tables/face_tables) is p-generic; the SBM
+    GeometryData.evaluate reads the p2 face tables so `dmax==0` still holds for
+    the aligned carve.
+
+    `p2_band > 0` overrides `p` with a VARIABLE-order mesh (FN3 axis 3): a band
+    of `p2_band` cell-layers of P2 elements around the obstacle, P1 in the far
+    field — EQUAL ORDER within every element (P2v+P2p in the band, P1v+P1p
+    outside), so PSPG stays on. Mixed-degree is first-class in build_mesh
+    (per-element `p_elem`, joint node dedup) + build_constraints (the P2 mid-edge
+    node on a P1/P2 interface is a p-hanging DOF with an interpolation row). The
+    DeviceMesh then carries a {1: P1-tables, 2: P2-tables} dict and the surrogate
+    faces are P2 (the band always contains the face owners)."""
     ndof = dim + 1
     D = 2 * half                               # obstacle side length
     nu = U_IN * D / Re
@@ -91,10 +150,19 @@ def _build_channel(level, Re, half, offset, device, dim, center):
     # lam=0.0 keeps only fully-interior cells => exact body-fitted carve.
     ret, _ = classify_lambda(tree, oracle, lam=0.0, domain="outside")
     sf = extract_surrogate(ret)
-    mesh = build_mesh(ret, p=1)
+    if p2_band and p2_band > 0:
+        p_elem = _p2_band_array(ret, sf, p2_band)
+        mesh = build_mesh(ret, p=p_elem)
+        tabs = {1: basis_tables(1, dim=dim), 2: basis_tables(2, dim=dim)}
+        # surrogate faces are P2 (band contains face owners) -> P2 face tables.
+        geo_ftab = face_tables(2, dim)
+    else:
+        mesh = build_mesh(ret, p=p)
+        tabs = basis_tables(p, dim=dim)
+        geo_ftab = face_tables(p, dim)
     cons = build_constraints(mesh)
-    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=dim), device)
-    geo = GeometryData.evaluate(oracle, ret, sf, face_tables(1, dim),
+    dm = DeviceMesh.from_mesh(mesh, cons, tabs, device)
+    geo = GeometryData.evaluate(oracle, ret, sf, geo_ftab,
                                 domain="outside")
     dmax = float(np.abs(geo.d).max())
 
