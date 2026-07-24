@@ -9,8 +9,15 @@ src/diffsim/physics/wodo_film.py (mapped gradients, frame advection,
 enrichment flux, evaporation dt-cap, Biot parameterization).  Dev
 ledger: docs/dev/2026-07-12-m5-s3-evaporation.md.  Tolerances
 measured-then-locked (>= 2x headroom; measured numbers in comments)."""
+import importlib.util
+
 import numpy as np
 import pytest
+
+_has_nvmath = importlib.util.find_spec("nvmath") is not None
+_skip_nvmath = pytest.mark.skipif(
+    not _has_nvmath, reason="nvmath (cuDSS) not available on this machine"
+)
 
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
@@ -598,6 +605,7 @@ def _s3b_grow_leg(dm, cons, t_implant=12.5, t_end=30.0,
     return st, phis_imp, a0
 
 
+@_skip_nvmath
 def test_s3b_mechanism_dissolve_vs_grow(device):
     """S3b gate (i) — THE EVAPORATION-QUENCH MECHANISM, deterministic
     (no noise): identical psi = 0.95 seeds (r0 = 0.2, the measured
@@ -647,6 +655,7 @@ def test_s3b_mechanism_dissolve_vs_grow(device):
     assert phis_dry < 0.5 * phis_wet, (phis_dry, phis_wet)
 
 
+@_skip_nvmath
 def test_s3b_coupling_contrast_and_variants(device):
     """S3b gates (ii)+(iii) — coupling contrast + variants:
     (ii) the crystallization-ON dried film differs measurably from

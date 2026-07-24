@@ -14,8 +14,15 @@ measured-then-locked (>= 2x headroom; measured numbers in comments).
 Assembly = HOST (D4 verdict: device atomics flake bit-class gates).
 Constructed-object asserts guard the missing-splat lesson (S3 Sec 2.4).
 """
+import importlib.util
+
 import numpy as np
 import pytest
+
+_has_nvmath = importlib.util.find_spec("nvmath") is not None
+_skip_nvmath = pytest.mark.skipif(
+    not _has_nvmath, reason="nvmath (cuDSS) not available on this machine"
+)
 
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
@@ -82,6 +89,7 @@ def _s4a_evap_stepper(dm, ke_vec, p=1):
     return st
 
 
+@_skip_nvmath
 def test_s4a_selective_evaporation_bookkeeping(device):
     """S4a gate (i): (a) BOOKKEEPING — the S3a telescoping identity
     holds at M=3: BOTH tracked nonvolatile species (SM idx0, polymer
@@ -132,6 +140,7 @@ def test_s4a_selective_evaporation_bookkeeping(device):
     assert mf_fast(st) < mf_slow(st), (mf_fast(st), mf_slow(st))
 
 
+@_skip_nvmath
 def test_s4a_selectivity_contrast(device):
     """S4a gate (ii): SELECTIVITY CONTRAST — flipping the k_e ratio
     (slow:fast instead of fast:slow) on the same species slots produces
@@ -398,6 +407,7 @@ def _s4b_Xi(st, i):
     return float((ph * ps).mean() / max(ph.mean(), 1e-12))
 
 
+@_skip_nvmath
 def test_s4b_three_species_crystallization(device):
     """S4b gates (i)+(ii)+(iii) on one K=3 annealing march (0 rejects):
 
@@ -491,6 +501,7 @@ def test_s4b_three_species_crystallization(device):
                                             X[2][-1])
 
 
+@_skip_nvmath
 def test_s4b_bdf2_deterministic(device):
     """CROSS-MATRIX cell: an S4b K=3 crystallization gate under BDF2
     (deterministic, the standing basis x tstep rule).  Short horizon

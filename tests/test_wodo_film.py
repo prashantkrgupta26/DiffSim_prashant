@@ -3,9 +3,16 @@ consistency. The load-bearing invariant is the sign pairing (advection
 +K theta/h, top flux +K phi_i): physical solute content h * Int(phi_i)
 is conserved EXACTLY per step (machine precision), while the film
 thins and the mapped fractions enrich."""
+import importlib.util
+
 import numpy as np
 import pytest
 import warp as wp
+
+_has_nvmath = importlib.util.find_spec("nvmath") is not None
+_skip_nvmath = pytest.mark.skipif(
+    not _has_nvmath, reason="nvmath (cuDSS) not available on this machine"
+)
 
 from diffsim.octree.build import build_uniform, Octree
 from diffsim.mesh.nodes import build_mesh
@@ -150,6 +157,7 @@ def _march_fixed_dt(st, nsteps, dt):
     return xs
 
 
+@_skip_nvmath
 def test_wodo_device_parity_spinodal(device):
     """GATE (i): ternary-spinodal trajectory parity < 1e-11 over 10
     march steps (tests/test_ternary_ch.py's config: chi=(6,.8,.8),
@@ -271,6 +279,7 @@ def test_wodo_bdf2_temporal_order(device):
     assert o2p > 1.7, (e2p, o2p)
 
 
+@_skip_nvmath
 def test_wodo_bdf2_adaptive_dt_and_rejects(device):
     """G2 gate (directive 2026-07-13): (a) ADAPTIVE-dt order study —
     prescribed alternating (dt0, dt0/2) sequence exercises r = 2 and
@@ -383,6 +392,7 @@ def test_wodo_face_mass_generic(device):
         assert dev < 1e-15, (p, dev)
 
 
+@_skip_nvmath
 def test_wodo_film_p2(device):
     """G1 capability gate: the film at p = 2 — (a) the conservation
     identity d/dt[h Int phi dtheta] = 0 holds at machine precision
@@ -864,6 +874,7 @@ def test_wodo_gp_residency_auto_cpu(device):
                         gp_residency="nonsense")
 
 
+@_skip_nvmath
 def test_wodo_device_parity_film(device):
     """Device-bound parity on the ACTUAL film physics (evaporation
     advection + top-face flux + var-mobility + b-regularizer — the

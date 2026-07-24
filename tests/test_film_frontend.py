@@ -31,10 +31,16 @@ docs/dev/2026-07-10-film-frontend-negi-validation.md):
       endpoint ratio > 1.3 asserted (adjacent 6000/3000 flatness 0.8%
       is within measurement noise -- strict monotonicity NOT asserted).
 """
+import importlib.util
 import os
 
 import numpy as np
 import pytest
+
+_has_yaml = importlib.util.find_spec("yaml") is not None
+_skip_yaml = pytest.mark.skipif(
+    not _has_yaml, reason="pyyaml not installed — YAML config files require it"
+)
 
 from diffsim.film import (FilmParams, FilmRun, run_preflight,
                           PreflightError, CONFIG_DIR)
@@ -54,6 +60,7 @@ def _cfg(name):
 # ---------------------------------------------------------------------
 # parameter/serialization gates (no GPU)
 # ---------------------------------------------------------------------
+@_skip_yaml
 def test_negi_config_parameters():
     """The four named configs carry EXACTLY the spec'd material system
     (guards the single-source-of-truth promise to the cluster kits)."""
@@ -73,6 +80,7 @@ def test_negi_config_parameters():
         assert p.noise > 0                              # CHC noise ON
 
 
+@_skip_yaml
 def test_params_roundtrip(tmp_path):
     p = _cfg("negi2018_6000rpm")
     path = tmp_path / "echo.yaml"
@@ -186,6 +194,7 @@ def test_preflight_underresolved_fails(tmp_path):
 # ---------------------------------------------------------------------
 # autopsy unit: force a dt-ladder collapse; the diagnosis must fire
 # ---------------------------------------------------------------------
+@_skip_yaml
 def test_autopsy_dt_collapse(tmp_path, device):
     # newton_max=1 cannot converge the first implicit solve; the single
     # reject drops dt below dt_min = dt0/2 -> dt_underflow -> autopsy
@@ -209,6 +218,7 @@ def test_autopsy_dt_collapse(tmp_path, device):
 # THE GATE: the four Negi 2-D cases end-to-end (module docstring for
 # the measured basis; full config resolution, ~70-105 s/case measured)
 # ---------------------------------------------------------------------
+@_skip_yaml
 def test_negi_2d_validation(tmp_path, device):
     summaries = {}
     finals = {}

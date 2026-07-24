@@ -75,8 +75,15 @@ Tolerances measured-then-locked (>= 2x headroom); noise-intensity-bound
 comparisons flagged where they matter (P1 Sec 8) — here their sigma_AC
 = 1 with the FDT normalization and dy = 1 nm depth are KNOWN, so onset
 comparisons are calibration-matched up to domain-size statistics."""
+import importlib.util
+
 import numpy as np
 import pytest
+
+_has_nvmath = importlib.util.find_spec("nvmath") is not None
+_skip_nvmath = pytest.mark.skipif(
+    not _has_nvmath, reason="nvmath (cuDSS) not available on this machine"
+)
 
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
@@ -495,6 +502,7 @@ def _binodal(breg):
     return gap(mu)[1:]
 
 
+@_skip_nvmath
 def test_s2b_phase_diagram_placement(device):
     """PLACEMENT (analytic, the 16390 chi set at the annealing T=403K):
     chi_aa = 1.2649 = 2.14 chi_c (chi_c = 0.5906 at N = (132.67, 1)) —
@@ -619,6 +627,7 @@ def _seed_discs(coords, n_seeds, r0, w, seed, min_sep=0.0):
     return psi, ctr
 
 
+@_skip_nvmath
 def test_s2d_grain_statistics(device):
     """Multi-grain bookkeeping on the Fig-6-class configuration (S2c
     case): O(15) PCE11 crystallite seeds (their 948-seed case scaled to
@@ -805,6 +814,7 @@ def _fig4_metrics(st, cons, mesh, i=0):
     return Xm, cri, cpo, ncr, int((dsz >= 8).sum())
 
 
+@_skip_nvmath
 def test_s2c_order_aaps_first(device):
     """WHICH PROCESS INITIATES FIRST (their pathway steps 1-3 +
     conclusion 2): at the Fig-4 deck parameters with FDT noise at
@@ -846,6 +856,7 @@ def test_s2c_order_aaps_first(device):
     assert r[:, 1].max() < 0.05 and int(r[:, 4].max()) == 0
 
 
+@_skip_nvmath
 def test_s2c_growth_mode_contrast(device):
     """GROWTH-DOMINATED vs DIFFUSION-LIMITED (their conclusions 3-4 +
     SI-7): deterministic seeded-growth contrast at the deck M_psi pair
@@ -946,6 +957,7 @@ def _mk_fig6_stepper(dm, mesh, cons, seeded, mpsi=2.5e-2, seed=11):
     return st
 
 
+@_skip_nvmath
 def test_s2c_crystallite_quench_and_dissolution(device):
     """THE FIG-6 MECHANISMS (their conclusions 1 + 3; ternary-trace
     M = 2, K = 2 at the Fig-6 deck, 15 seeds = their 948 at the same

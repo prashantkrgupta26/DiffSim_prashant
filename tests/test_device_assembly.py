@@ -1,9 +1,15 @@
 """M1d gates for DeviceNSAssembler (spec D2): consistency vs the host
 assembler at 1e-12 + speed measurement, both scatter variants."""
+import importlib.util
 import time
 
 import numpy as np
 import pytest
+
+_has_nvmath = importlib.util.find_spec("nvmath") is not None
+_skip_nvmath = pytest.mark.skipif(
+    not _has_nvmath, reason="nvmath (cuDSS) not available on this machine"
+)
 
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
@@ -100,6 +106,11 @@ def test_assemble_extra_matrix_rhs(device):
     nu, sigma = 0.05, 20.0
     asm = DeviceNSAssembler(dm)
     A0, b0 = asm.assemble(aq, dq, fq, nu, sigma)
+    # On CPU warp, vals_d.numpy() returns a memory view (not a copy), so
+    # A0.data shares the assembler's internal buffer — the second assemble()
+    # call zeros it.  Force an independent copy immediately.
+    A0 = A0.copy()
+    b0 = b0.copy()
     rng = np.random.default_rng(9)
     # extra entries on EXISTING pattern positions + rhs adds
     take = rng.choice(asm.nnz, 500, replace=False)
@@ -300,6 +311,7 @@ def test_stepper_device_resident_fused_parity(device):
         assert np.abs(a[:, 2] - b_[:, 2]).max() / scale < 1e-5
 
 
+@_skip_nvmath
 def test_assemble_device_resident(device):
     """D3 gate: device-resident CSR solves identically to the host path."""
     import torch

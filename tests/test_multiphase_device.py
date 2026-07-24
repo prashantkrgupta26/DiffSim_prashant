@@ -27,8 +27,15 @@ D2 gates:
   NEVER flaps across noise steps (the S2 plan-flapping regression),
   asserted via the plan counter after a noisy march.
 """
+import importlib.util
+
 import numpy as np
 import pytest
+
+_has_nvmath = importlib.util.find_spec("nvmath") is not None
+_skip_nvmath = pytest.mark.skipif(
+    not _has_nvmath, reason="nvmath (cuDSS) not available on this machine"
+)
 
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
@@ -268,6 +275,7 @@ def test_d1_one_step_parity(name, device):
         assert d2 < 1e-12, f"{name}: step-2 max|dx| = {d2:.3e}"
 
 
+@_skip_nvmath
 def test_d2_march_parity_and_plan_stability(device):
     """D2 gates: (a) march parity vs host on an S1-class seeded-growth
     config at OBSERVABLE level (psi area, phi mean/extremes — the
