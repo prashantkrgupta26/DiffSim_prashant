@@ -52,7 +52,7 @@ import time
 import numpy as np
 import warp as wp
 
-from diffsim import default_device
+from diffsim import default_device, default_linsolver
 from diffsim.octree.build import build_uniform, Octree
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
@@ -413,13 +413,16 @@ def main():
     ap.add_argument("--cases", type=str, default=",".join(ORDER))
     ap.add_argument("--level", type=int, default=7)
     ap.add_argument("--wall-cap", type=float, default=2400.0)
-    ap.add_argument("--linsolver", type=str, default="cudss")
+    ap.add_argument("--linsolver", type=str, default=None,
+                    help="linear-solve backend; default auto-resolves via "
+                         "default_linsolver() (splu on CPU, cudss on CUDA)")
     ap.add_argument("--noise", type=float, default=1e-3,
                     help="CHC conserved-flux noise amplitude (FDT shape)")
     args = ap.parse_args()
     logging.getLogger("nvmath").setLevel(logging.ERROR)
     wp.init()
     device = default_device()
+    args.linsolver = args.linsolver or default_linsolver(device=device)
     sc = 2 ** (args.level - 7)
     mesh, cons, hc = build_strip(args.level, 96 * sc, 48 * sc)
     print(f"strip: {len(mesh.tree)} elements "

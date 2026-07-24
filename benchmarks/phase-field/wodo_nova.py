@@ -50,7 +50,7 @@ import time
 import numpy as np
 import warp as wp
 
-from diffsim import default_device
+from diffsim import default_device, default_linsolver
 from diffsim.octree.build import build_uniform, Octree
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
@@ -171,7 +171,7 @@ def run_fig2d(fig, case, args, device):
     st = WodoFilmStepper(
         dm, chi=p["chi"], N=(p["Np"], p["Nf"], NS),
         M=(M11, 0.0, M22), kappa=(kap, kap), k_e=p["Bi"], dt=1e-4,
-        lat_scale=lat_scale, linsolver="cudss", noise=args.noise,
+        lat_scale=lat_scale, linsolver=args.linsolver, noise=args.noise,
         var_mob=True, b_reg=1e-3,
         noise_seed=abs(hash(tag + "q")) % 2 ** 31,
         use_device_assembly=args.device_bound)
@@ -271,7 +271,7 @@ def run_fig3d(case, args, device):
         st = WodoFilmStepper(
             dm, chi=p["chi"], N=(p["Np"], p["Nf"], NS),
             M=(M11, 0.0, M22), kappa=(kap, kap), k_e=p["Bi"], dt=1e-4,
-            lat_scale=p["lat"], linsolver="cudss", noise=args.noise,
+            lat_scale=p["lat"], linsolver=args.linsolver, noise=args.noise,
             var_mob=True, b_reg=1e-3, noise_seed=17,
             use_device_assembly=args.device_bound)
         rng = np.random.default_rng(17)
@@ -335,6 +335,9 @@ def main():
     ap.add_argument("--outdir", type=str, default=None,
                     help="snapshot/.npz output dir "
                          "(default benchmarks/data/wodo_nova)")
+    ap.add_argument("--linsolver", type=str, default=None,
+                    help="linear-solve backend; default auto-resolves via "
+                         "default_linsolver() (splu on CPU, cudss on CUDA)")
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
     if args.list:
@@ -348,6 +351,7 @@ def main():
     logging.getLogger("nvmath").setLevel(logging.ERROR)
     wp.init()
     device = default_device()
+    args.linsolver = args.linsolver or default_linsolver(device=device)
     cases = (cases_of(args.fig) if args.case == "all"
              else [c.strip() for c in args.case.split(",")])
     for case in cases:

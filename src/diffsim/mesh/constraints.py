@@ -4,7 +4,7 @@ import numpy as np
 import scipy.sparse as sp
 from ..octree import morton
 from ..octree.lookup import LeafLookup
-from .nodes import Mesh, _local_offsets
+from .nodes import Mesh, _local_offsets, _uniform_complete_level
 from .basis import lagrange_1d
 
 
@@ -30,6 +30,20 @@ def build_constraints(mesh: Mesh) -> Constraints:
     p-transition minimum rule; interpolation rows with transitive chain
     resolution."""
     tree, dim = mesh.tree, mesh.dim
+
+    # Fast path: a COMPLETE uniform grid has NO hanging nodes, so the constraint
+    # operator is the identity. Short-circuits the np.unique / np.isin walls
+    # (constraints.py hotspots) for the 100M PPE hero case. Bit-for-bit identical
+    # to the general path (which also yields identity T on such meshes).
+    L = _uniform_complete_level(tree)
+    if L is not None and mesh.p_elem is not None and \
+            len(np.unique(np.asarray(mesh.p_elem))) == 1:
+        Nn = len(mesh.node_coords)
+        T = sp.identity(Nn, format="csr", dtype=np.float64)
+        free_nodes = np.arange(Nn, dtype=np.int64)
+        hanging = np.zeros(Nn, bool)
+        return Constraints(T, free_nodes, hanging)
+
     lk = LeafLookup(tree)
     Nn = len(mesh.node_coords)
     lev = tree.levels.astype(np.int64)

@@ -53,3 +53,41 @@ def test_uniform_mesh_has_no_hanging():
     m = build_mesh(build_uniform(2), p=1)
     c = build_constraints(m)
     assert c.hanging.sum() == 0 and c.T.shape == (len(m.node_coords),) * 2
+
+
+@pytest.mark.parametrize("dim", [2, 3])
+@pytest.mark.parametrize("p", [1, 2])
+@pytest.mark.parametrize("periodic", [None, "all", "one"])
+@pytest.mark.parametrize("lvl", [2, 3])
+def test_uniform_fast_equals_general(dim, p, periodic, lvl):
+    """Closed-form uniform node/constraint build is bit-for-bit identical to the
+    general np.unique path (mesh) and the constraint reference (identity)."""
+    import diffsim.mesh.nodes as _N
+    from diffsim.mesh.constraints import (build_constraints,
+                                          _build_constraints_reference)
+    per = (None if periodic is None
+           else (True,) * dim if periodic == "all"
+           else (True,) + (False,) * (dim - 1))
+    tree = build_uniform(lvl, dim=dim, periodic=per)
+
+    saved = _N._uniform_complete_level
+    try:
+        _N._uniform_complete_level = lambda t: None
+        m_gen = _N.build_mesh(tree, p=p)          # general np.unique path
+    finally:
+        _N._uniform_complete_level = saved
+    m_fast = build_mesh(tree, p=p)                # closed-form fast path
+
+    assert np.array_equal(m_fast.node_icoords, m_gen.node_icoords)
+    assert np.allclose(m_fast.node_coords, m_gen.node_coords)
+    assert np.array_equal(m_fast.conn, m_gen.conn)
+    assert np.array_equal(m_fast.boundary_nodes, m_gen.boundary_nodes)
+    for pv in m_gen.conn_of:
+        assert np.array_equal(m_fast.conn_of[pv], m_gen.conn_of[pv])
+
+    c_fast = build_constraints(m_fast)
+    c_ref = _build_constraints_reference(m_fast)
+    assert np.array_equal(c_fast.free_nodes, c_ref.free_nodes)
+    assert np.array_equal(c_fast.hanging, c_ref.hanging)
+    d = c_fast.T - c_ref.T
+    assert d.nnz == 0 or abs(d).max() == 0.0
