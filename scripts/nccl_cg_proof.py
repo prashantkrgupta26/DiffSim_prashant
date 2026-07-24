@@ -489,9 +489,28 @@ def main():
     spmv = make_partitioned_spmv(A_local_csr, n_owned, n_ghost, comm, device)
 
     if args.precond == "amgx":
-        raise NotImplementedError("AMGX preconditioner is Task 3b (GPU only)")
+        # Block-Jacobi preconditioner: each rank preconditions with an AMGX
+        # solve on its OWNED diagonal block B = A_local[:, :n_owned] (drop the
+        # ghost columns → NO cross-rank coupling → block-Jacobi). B is a
+        # principal submatrix of the global SPD operator, hence SPD. Each rank
+        # holds exactly one block, so AMGX's process-global singleton (cached
+        # per (sym,tol,maxiter)) is reused across all CG iterations. We solve
+        # each block to a tight tolerance so M^{-1} ≈ B^{-1} is a FIXED linear
+        # operator (required for standard CG; a fixed-V-cycle apply is the
+        # cheaper follow-up). The per-apply host<->device copy of the owned
+        # vector is acceptable for this correctness proof.
+        import scipy.sparse
+        from diffsim.solvers.amgx import amgx_solve
+
+        B_owned = scipy.sparse.csr_matrix(A_local_csr[:, :n_owned])
+        B_owned.sort_indices()
+
+        def precond(r: torch.Tensor) -> torch.Tensor:
+            r_np = r.detach().cpu().numpy().astype(np.float64)
+            z_np = amgx_solve(B_owned, r_np, sym=True, tol=1e-10, maxiter=200)
+            return torch.tensor(z_np, dtype=torch.float64, device=device)
     else:
-        # Jacobi
+        # Jacobi (diagonal)
         def precond(r: torch.Tensor) -> torch.Tensor:
             return r / diag_local
 
