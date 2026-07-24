@@ -194,6 +194,114 @@ def sbm_wall_pressure_traction(dm, sf, geo, p_node, ndof):
     return brhs
 
 
+def sbm_consistent_flux(dm, sf, geo, x_all, nu, ndof, alpha=10.0,
+                        g_fn=None, symmetric_grad=False, include_penalty=False):
+    """CONSISTENT-FLUX boundary force on a weakly-imposed (Nitsche/SBM) wall,
+    per the group's NSHT_SBM reference.
+
+    NSHT_SBM's PRODUCTION Cd path is `include/BoundaryCalc_ExtraInter.h`
+    (`imgaTraversalOperation` -> `computeForce` -> `forceCalcIBM`). It computes
+    ONLY
+
+        Force_pressure(j) = p n_j  ,   Force_viscous(j) = -(grad(u).n)_j * nu
+
+    where p and grad(u) are LINEARLY EXTRAPOLATED from two interior points
+    (`fe`, `fe2`) out to the TRUE boundary GP (the SBM "consistent" shift), and
+    the surface measure is the TRUE-boundary area `TrueGPAreaGlobal`. The
+    Nitsche `Force_penalty` term IS DEFINED but is NEVER accumulated in the
+    active traversal (it is commented out in NSHTIBMPost.h / SumGPIBMPost.h and
+    absent from BoundaryCalc_ExtraInter.h) — so the production drag = pressure +
+    viscous of the field extrapolated to the true wall, NO penalty.
+
+    For a BODY-FITTED wall (d == 0, surrogate == true boundary, geo.corr == 1)
+    the extrapolation is the identity and this reduces EXACTLY to
+    `surrogate_traction`. The SBM shift enters ONLY as the field extrapolation
+    grad(u).d (Taylor) applied before taking the traction; it is 0 here.
+
+    This helper reproduces that: per direction j at each surrogate GP,
+
+        f_j = (p + grad(p).d?) n_j                         (pressure, shifted)
+              - nu (grad(u).n [+ grad(u)^T.n])_j            (viscous, shifted)
+              [+ (alpha nu / h)(u_j + (grad(u).d)_j - g_j)] (penalty, OPT-IN)
+
+    with the field values Taylor-shifted to the true boundary via grad(u).d
+    (pressure shift needs grad(p), omitted here — negligible for d small; exact
+    at d=0). `include_penalty=True` adds the full Nitsche penalty REACTION (the
+    `weakBCpenaltyParameter = Cb_f nu / h` term, Cb_f == alpha) — this is the
+    reaction functional's penalty flux, but note it is NOT part of the NSHT_SBM
+    production drag and on a leaky weak wall (u.n != 0) it is large and should
+    NOT be added for Cd. Default OFF to match the reference.
+
+    `symmetric_grad`: our own Nitsche assembly
+    (poisson.make_sbm_dirichlet_Ae, line 326 `-Na*gnb`) is the
+    component-diagonal LAPLACIAN form (one-sided grad(u).n), so
+    `symmetric_grad=False` (default) is consistent with OUR discretization AND
+    with the reference `calculateDiff` (which also uses the one-sided
+    grad(u).n). `symmetric_grad=True` uses the full stress grad(u)+grad(u)^T.
+
+    Orientation matches `surrogate_traction` (n = geo.n domain-outward; drag
+    downstream). For a STRONG node (u == g, d == 0) this reduces to the raw
+    traction. `g_fn(y) -> [Ngp, dim]` is the wall velocity data at the mapped
+    (true) points; None => no-slip g=0.
+
+    x_all: FULL node-major (u, p) vector. Host-side observable."""
+    dim = dm.dim
+    mesh = dm.mesh
+    p_face = np.unique(np.asarray(mesh.p_elem)[sf.elem])
+    if len(p_face) != 1:
+        from ..errors import ConfigError
+        raise ConfigError(
+            f"SBM face helper assumes uniform p on the face, got "
+            f"orders {p_face.tolist()}")
+    pv = int(p_face[0])
+    from ..mesh.faces import face_tables
+    ftab = face_tables(pv, dim)
+    nqf, nbf = ftab.nqf, ftab.nbf
+    conn = mesh.conn_of[pv][np.searchsorted(mesh.bins[pv], sf.elem)]
+    xv = x_all.reshape(dm.n_nodes, ndof)
+    h = mesh.tree.h()[sf.elem]
+    jacS = (h / 2.0) ** (dim - 1)
+    dscale = 2.0 / h
+    # wall velocity data at the mapped (true) surrogate points y = xq + d
+    gbar = (np.zeros((geo.n.shape[0], dim)) if g_fn is None
+            else np.ascontiguousarray(g_fn(geo.xq + geo.d), np.float64))
+    # SBM shift vector d at each face GP: [ne_f*nqf, dim]
+    dvec = geo.d.reshape(-1, dim) if geo.d.ndim == 2 else \
+        geo.d.reshape(len(sf.elem) * nqf, dim)
+    F = np.zeros(dim)
+    for fi in range(len(sf.elem)):
+        f = int(sf.face[fi])
+        un = xv[conn[fi], :dim]                          # [nbf, dim]
+        pn = xv[conn[fi], dim]                           # [nbf]
+        N = ftab.N[f]                                    # [nqf, nbf]
+        dN = ftab.dN[f] * dscale[fi]                     # [nqf, nbf, dim]
+        for q in range(nqf):
+            gp = fi * nqf + q
+            w = ftab.w[q] * jacS[fi] * geo.corr[gp]
+            n = geo.n[gp]
+            gradu = dN[q].T @ un                         # gradu[coord, comp]
+            pq = N[q] @ pn
+            uq = N[q] @ un                               # [dim] wall velocity
+            # SBM field extrapolation to the TRUE boundary (grad(u).d Taylor
+            # shift; d==0 for body-fitted => identity, matches reference).
+            # (grad(u).d)_comp = sum_coord d_coord * du_comp/d(coord)
+            shift = dvec[gp] @ gradu                     # [comp]
+            # viscous flux (per component): one-sided (grad(u).n)_comp =
+            # sum_coord n_coord du_comp/d(coord) = (gradu.T @ n)_comp.
+            # Matches surrogate_traction AND our Laplacian assembly / reference
+            # calculateDiff; symmetric_grad adds grad(u)^T.n = (gradu @ n).
+            visc = gradu.T @ n
+            if symmetric_grad:
+                visc = visc + gradu @ n
+            F += w * (pq * n - nu * visc)
+            if include_penalty:
+                # Nitsche penalty REACTION (alpha nu / h)(u + grad(u).d - g);
+                # NOT part of the NSHT_SBM production drag (see docstring).
+                pen_coef = alpha * nu * dscale[fi]       # alpha nu / h
+                F += w * pen_coef * (uq + shift - gbar[gp])
+    return F
+
+
 def surrogate_traction(dm, sf, geo, x_all, nu, ndof):
     """Force of the fluid ON the immersed obstacle: F = oint sigma . n_hat
     dS with n_hat the OBSTACLE-outward normal. ORIENTATION CONTRACT

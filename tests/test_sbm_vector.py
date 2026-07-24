@@ -121,3 +121,35 @@ def test_backflow_term_properties(device):
     # pure OUTFLOW (a = +n): the (a.n)_- clip kills it
     Aout, _ = sbm_vector_dirichlet(dm, sf, geo, g, 1.0, 3, a_face=geo.n)
     assert abs(Aout - A0).max() < 1e-15
+
+
+def test_consistent_flux_reduces_to_raw_traction(device):
+    """FN2: sbm_consistent_flux(include_penalty=False) is the NSHT_SBM
+    production drag (Force_pressure + Force_viscous, field extrapolated to the
+    true boundary). On a BODY-FITTED wall (d==0 => no extrapolation) it must
+    reduce BIT-EXACTLY to surrogate_traction, and the penalty variant must be
+    materially different (the penalty flux is load-bearing but NOT the drag)."""
+    from diffsim.sbm.vector import (surrogate_traction, sbm_consistent_flux)
+    from diffsim.geometry.csg import Box
+    dim, ndof, nu = 2, 3, 0.7
+    # aligned Box carve on a uniform tree => surrogate == true boundary, d==0.
+    oracle = Box((0.5, 0.5), (0.25, 0.25))
+    tree = build_uniform(4, dim=2)
+    ret, _ = classify_lambda(tree, oracle, 1.0, domain="outside")
+    sf = extract_surrogate(ret)
+    mesh = build_mesh(ret, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), device)
+    geo = GeometryData.evaluate(oracle, ret, sf, face_tables(1, 2),
+                                domain="outside")
+    assert np.abs(geo.d).max() < 1e-12, "aligned Box carve must give d==0"
+    # arbitrary (u, p) node field
+    rng = np.random.default_rng(7)
+    x_full = rng.standard_normal(dm.n_nodes * ndof)
+    raw = surrogate_traction(dm, sf, geo, x_full, nu, ndof)
+    cf = sbm_consistent_flux(dm, sf, geo, x_full, nu, ndof, alpha=10.0,
+                             include_penalty=False)
+    assert np.allclose(raw, cf, atol=1e-13), (raw, cf)      # bit-exact at d=0
+    cf_pen = sbm_consistent_flux(dm, sf, geo, x_full, nu, ndof, alpha=10.0,
+                                 include_penalty=True)
+    assert np.abs(cf_pen - cf).max() > 1e-3                 # penalty engaged

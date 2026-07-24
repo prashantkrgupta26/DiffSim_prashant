@@ -294,9 +294,20 @@ def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
                 break
         prev = u.copy()
     div = float(st.divergence_l2())
+    # FN2 diagnostic hook: expose the final FULL node-major (u,p) field so the
+    # drag helpers (surrogate_traction / sbm_consistent_flux) can be re-evaluated
+    # off the same steady state. Cheap (one reshape); does not affect the march.
+    x_full_final = None
+    if u is not None and not blew_up:
+        xfree = np.zeros(st.n_free * ndof)
+        xv = xfree.reshape(st.n_free, ndof)
+        xv[:, :dim] = u
+        xv[:, dim] = p
+        x_full_final = np.asarray(T_vec @ xfree)
     return dict(cd=cd, cl=cl, mean_u=mean_speed(u), div=div, steps=steps,
                 cd_hist=cd_hist, cl_hist=cl_hist, mu_hist=mu_hist,
-                pnorm=float(np.linalg.norm(st.p_star)), blew_up=blew_up)
+                pnorm=float(np.linalg.norm(st.p_star)), blew_up=blew_up,
+                x_full=x_full_final)
 
 
 # --------------------------------------------------------------------------
@@ -420,7 +431,8 @@ def march_monolithic(fx, dt=0.02, nsteps=400, rate_tol=2e-4, log_every=0,
         vol += w.sum()
     div = float(np.sqrt(tot / vol))
     return dict(cd=cd, cl=cl, mean_u=mean_speed(u_new), div=div, steps=steps,
-                cd_hist=cd_hist, cl_hist=cl_hist, mu_hist=mu_hist, p_pin=p_pin)
+                cd_hist=cd_hist, cl_hist=cl_hist, mu_hist=mu_hist, p_pin=p_pin,
+                x_full=np.asarray(T_vec @ x))
 
 
 # --------------------------------------------------------------------------
