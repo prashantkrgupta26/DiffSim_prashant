@@ -473,5 +473,108 @@ class TestPCGTorchAgnosticism:
         )
 
 
+class TestRandomRHS3DPoisson:
+    """N=1 (SerialComm) 3-D Poisson with random RHS exercises many CG iterations.
+
+    The manufactured-solution RHS is a single eigenmode of the 7-point Laplacian,
+    so MMS CG converges in ~1 iteration.  A fixed-seed random RHS populates the
+    Krylov space more broadly and forces the iterative distributed loop to run
+    many steps, which is the coverage gap closed by --rhs random.
+
+    Gate: iters > 5  AND  rel_err < 1e-8 (dist-CG vs scipy spsolve).
+    """
+
+    @pytest.fixture(autouse=True)
+    def skip_if_no_torch(self):
+        pytest.importorskip("torch", reason="torch not installed")
+
+    @pytest.fixture(autouse=True)
+    def skip_if_no_diffsim(self):
+        pytest.importorskip("diffsim", reason="diffsim not installed")
+
+    @pytest.fixture(params=[(8, 4, 4), (12, 6, 6)])
+    def dims(self, request):
+        return request.param
+
+    def test_random_rhs_multi_iter_and_accuracy(self, dims):
+        """random RHS: iters > 5 AND rel_err < 1e-8 vs scipy spsolve."""
+        import torch
+
+        # Import the driver helpers — they live in scripts/, not a package.
+        import importlib.util
+        import pathlib
+
+        driver_path = pathlib.Path(__file__).parent.parent / "scripts" / "nccl_cg_proof.py"
+        spec = importlib.util.spec_from_file_location("nccl_cg_proof", driver_path)
+        drv = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(drv)
+
+        from diffsim.mesh.partition import slab_partition
+        from diffsim.solvers.dist_cg import SerialComm, pcg
+        from diffsim.solvers.dist_cg_torch import TorchDistComm
+
+        device = torch.device("cpu")
+
+        # N=1 partition (world_size=1, rank=0) — uses the serial halo path
+        all_parts = slab_partition(dims, 1)
+        part = all_parts[0]
+        n_owned = len(part.owned)
+        n_ghost = len(part.ghost)
+
+        # Build local system with random RHS
+        A_local_csr, b_local, diag_local, _ = drv.assemble_local_poisson(
+            part, dims, device, rhs_mode="random"
+        )
+
+        # At N=1 we need a TorchDistComm or SerialComm-compatible object.
+        # TorchDistComm requires an active process group; use SerialComm-like
+        # wrapper that exercises exchange_halo (no-op) and allreduce (identity).
+        serial_comm = SerialComm()
+
+        # Wrap in a duck-typed adapter: pcg expects comm.allreduce_sum and
+        # comm.exchange_halo; SerialComm provides both on numpy/torch tensors.
+        padded = torch.zeros(n_owned + n_ghost, dtype=torch.float64, device=device)
+
+        def spmv(p_owned):
+            padded[:n_owned].copy_(p_owned)
+            serial_comm.exchange_halo(padded)   # no-op at N=1
+            p_np = padded.cpu().numpy()
+            Ap_np = np.asarray(A_local_csr @ p_np, dtype=np.float64)
+            return torch.tensor(Ap_np, dtype=torch.float64, device=device)
+
+        def precond(r):
+            return r / diag_local
+
+        x_local, info = pcg(spmv, precond, b_local, serial_comm, rtol=1e-10)
+
+        assert info["converged"], (
+            f"random-RHS PCG did not converge (dims={dims}): "
+            f"iters={info['iters']}, last_resid={info['resid_history'][-1]:.2e}"
+        )
+        assert info["iters"] > 5, (
+            f"Expected iters > 5 for random RHS (dims={dims}), got {info['iters']}. "
+            "If iters==1 the random RHS is still a near-eigenmode — check _random_rhs_full."
+        )
+
+        # Reference solve: same random RHS via assemble_global_poisson
+        A_ref, b_ref, _ = drv.assemble_global_poisson(dims, rhs_mode="random")
+        x_ref = scipy.sparse.linalg.spsolve(A_ref, b_ref)
+
+        # Gather local solution (N=1 → owned is all nodes, already in gid order)
+        x_dist = x_local.cpu().numpy()
+
+        # Re-order: x_dist[loc_row] is for global gid = part.owned[loc_row]
+        x_global = np.zeros(int(np.prod(dims)), dtype=np.float64)
+        x_global[part.owned] = x_dist
+
+        err = np.abs(x_global - x_ref)
+        rel_err = float(np.max(err) / (np.max(np.abs(x_ref)) + 1e-300))
+
+        assert rel_err < 1e-8, (
+            f"random-RHS accuracy too low (dims={dims}): rel_err={rel_err:.3e}. "
+            "Likely the distributed b and serial b disagree — check rhs_full indexing."
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

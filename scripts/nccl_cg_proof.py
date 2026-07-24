@@ -22,13 +22,27 @@ Arguments
 --precond   Preconditioner: "jacobi" (always-on) or "amgx" (Task 3b, GPU).
 --dims      NX,NY,NZ grid node counts (e.g. 8,4,4).
 --rtol      Solver relative tolerance (default 1e-10).
+--rhs       RHS mode: "mms" (manufactured solution, default) or "random".
 
-Manufactured solution
----------------------
+Manufactured solution (--rhs mms)
+----------------------------------
     u(x,y,z)  = sin(pi*x) * sin(pi*y) * sin(pi*z)     (on [0,1]^3)
     f(x,y,z)  = 3 * pi^2 * u(x,y,z)                   (-Delta u = f)
 
 Dirichlet BCs: u = 0 on all faces (the manufactured solution vanishes there).
+
+Random RHS (--rhs random)
+--------------------------
+Interior node RHS values are drawn from a fixed-seed standard normal:
+    rhs_full = np.random.default_rng(0).standard_normal(nx*ny*nz)
+    b[gid]   = rhs_full[gid]   for each interior node gid
+
+All ranks generate the SAME rhs_full (same seed, same indexing) so that the
+distributed build and the serial reference build produce the IDENTICAL global b.
+Boundary nodes keep Dirichlet b=0 (identity rows).  This mode exercises many
+CG iterations (the full β-recurrence / p-update distributed loop), whereas the
+MMS mode converges in ~1 iteration because the single-eigenmode RHS collapses
+the Krylov space.
 
 Grid: uniform (NX x NY x NZ) nodes at
     x_i = i/(NX-1),  y_j = j/(NY-1),  z_k = k/(NZ-1)
@@ -43,7 +57,8 @@ Rank 0 assembles the full (serial) system, solves with scipy.sparse.linalg.spsol
 then gathers the distributed solution and compares:
     rel_err = ||x_dist - x_ref||_inf / ||x_ref||_inf
 
-Must be < 1e-8 for the test to pass.
+Must be < 1e-8 for the test to pass.  For --rhs mms the exact manufactured
+solution is also compared; for --rhs random only the scipy reference is used.
 """
 from __future__ import annotations
 
@@ -97,14 +112,38 @@ def _is_boundary(i0: int, i1: int, i2: int, dims: tuple[int, int, int]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Random RHS helper
+# ---------------------------------------------------------------------------
+
+def _random_rhs_full(dims: tuple[int, int, int]) -> np.ndarray:
+    """Return a deterministic random RHS vector for all nx*ny*nz nodes.
+
+    Uses a fixed seed (0) so ALL ranks and the serial reference produce the
+    identical array.  Interior nodes are indexed by global node id gid;
+    boundary nodes use index value that will be overridden by the Dirichlet
+    identity row (b[boundary] = u_exact for mms, 0 for random).
+    """
+    nx, ny, nz = dims
+    return np.random.default_rng(0).standard_normal(nx * ny * nz)
+
+
+# ---------------------------------------------------------------------------
 # Full (serial) global system assembly
 # ---------------------------------------------------------------------------
 
-def assemble_global_poisson(dims: tuple[int, int, int]):
+def assemble_global_poisson(dims: tuple[int, int, int], rhs_mode: str = "mms"):
     """Assemble the full (nx*ny*nz) x (nx*ny*nz) 7-point Poisson matrix.
 
     Returns (A_csr, b, x_exact) in fp64.  Dirichlet BCs are enforced by
     setting boundary rows to identity (A[k,k]=1, b[k]=u(boundary point)).
+
+    Parameters
+    ----------
+    dims : (nx, ny, nz)
+    rhs_mode : "mms" (default) or "random"
+        "mms"    — interior b[k] = 3*pi^2 * sin(pi*x)*sin(pi*y)*sin(pi*z)
+        "random" — interior b[k] = rhs_full[k], where rhs_full is generated
+                   with a fixed seed (same as assemble_local_poisson).
     """
     nx, ny, nz = dims
     n = nx * ny * nz
@@ -119,7 +158,12 @@ def assemble_global_poisson(dims: tuple[int, int, int]):
 
     X, Y, Z = _grid_coords(dims)
     x_exact = _u_exact(X, Y, Z)
-    f = _f_rhs(X, Y, Z)
+
+    if rhs_mode == "mms":
+        f = _f_rhs(X, Y, Z)
+    else:
+        # random: one deterministic call; interior nodes index by gid
+        f = _random_rhs_full(dims)
 
     rows, cols, vals = [], [], []
     b = np.zeros(n, dtype=np.float64)
@@ -132,7 +176,10 @@ def assemble_global_poisson(dims: tuple[int, int, int]):
                 if _is_boundary(i0, i1, i2, dims):
                     # Dirichlet: identity row
                     rows.append(k); cols.append(k); vals.append(1.0)
-                    b[k] = x_exact[k]
+                    if rhs_mode == "mms":
+                        b[k] = x_exact[k]
+                    else:
+                        b[k] = 0.0   # homogeneous Dirichlet for random RHS
                     continue
 
                 # Interior stencil
@@ -165,6 +212,7 @@ def assemble_local_poisson(
     part,
     dims: tuple[int, int, int],
     device: torch.device,
+    rhs_mode: str = "mms",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build the local partitioned Poisson system for this rank.
 
@@ -176,6 +224,10 @@ def assemble_local_poisson(
         Global grid dimensions.
     device : torch.device
         Target device.
+    rhs_mode : "mms" or "random"
+        "mms"    — interior RHS from manufactured solution (default).
+        "random" — interior RHS from a fixed-seed random vector indexed by
+                   global node id; boundary nodes keep Dirichlet b=0.
 
     Returns
     -------
@@ -206,9 +258,15 @@ def assemble_local_poisson(
 
     X, Y, Z = _grid_coords(dims)
     x_exact_all = _u_exact(X, Y, Z)
-    f_all = _f_rhs(X, Y, Z)
 
-    # b vector (owned rows): interior nodes get f, boundary get u_exact
+    if rhs_mode == "mms":
+        f_all = _f_rhs(X, Y, Z)
+    else:
+        # Deterministic random: same seed on every rank, indexed by global gid
+        f_all = _random_rhs_full(dims)
+
+    # b vector (owned rows): interior nodes get f, boundary get u_exact (mms)
+    # or 0 (random, homogeneous Dirichlet)
     b_np = np.zeros(n_owned, dtype=np.float64)
     diag_np = np.zeros(n_owned, dtype=np.float64)
 
@@ -227,7 +285,10 @@ def assemble_local_poisson(
             cols_local.append(loc_row)     # local col = local row (owned)
             vals_local.append(1.0)
             diag_np[loc_row] = 1.0
-            b_np[loc_row] = x_exact_all[gid]
+            if rhs_mode == "mms":
+                b_np[loc_row] = x_exact_all[gid]
+            else:
+                b_np[loc_row] = 0.0   # homogeneous Dirichlet
             continue
 
         # Interior: stencil diagonal
@@ -305,9 +366,18 @@ def make_partitioned_spmv(A_local_csr, n_owned: int, n_ghost: int, comm, device:
 # Reference solve (serial, rank 0 only)
 # ---------------------------------------------------------------------------
 
-def serial_reference_solve(dims: tuple[int, int, int]) -> np.ndarray:
-    """Solve the full Poisson system serially with scipy.spsolve."""
-    A, b, _ = assemble_global_poisson(dims)
+def serial_reference_solve(dims: tuple[int, int, int], rhs_mode: str = "mms") -> np.ndarray:
+    """Solve the full Poisson system serially with scipy.spsolve.
+
+    Parameters
+    ----------
+    dims : (nx, ny, nz)
+    rhs_mode : "mms" or "random"
+        Passed through to assemble_global_poisson; must match the mode used
+        in assemble_local_poisson so that dist-CG and serial reference use
+        identical RHS vectors.
+    """
+    A, b, _ = assemble_global_poisson(dims, rhs_mode=rhs_mode)
     x_ref = scipy.sparse.linalg.spsolve(A, b)
     return x_ref.astype(np.float64)
 
@@ -328,6 +398,10 @@ def parse_args():
                    help="Grid dimensions NX,NY,NZ (e.g. 8,4,4)")
     p.add_argument("--rtol", type=float, default=1e-10,
                    help="Solver relative tolerance")
+    p.add_argument("--rhs", default="mms", choices=["mms", "random"],
+                   help=("RHS mode: 'mms' (manufactured solution, default) or "
+                         "'random' (fixed-seed standard normal, exercises many "
+                         "CG iterations via the full distributed loop)"))
     return p.parse_args()
 
 
@@ -394,9 +468,10 @@ def main():
     # ----------------------------------------------------------------
     # Assemble local system
     # ----------------------------------------------------------------
+    rhs_mode = args.rhs
     t0 = time.perf_counter()
     A_local_csr, b_local, diag_local, x_exact_local = assemble_local_poisson(
-        part, dims, device
+        part, dims, device, rhs_mode=rhs_mode
     )
     t_assemble = time.perf_counter() - t0
 
@@ -461,7 +536,7 @@ def main():
         print(f"\n{'='*60}")
         print(f"Reference solve (scipy.spsolve)...")
         t0 = time.perf_counter()
-        x_ref = serial_reference_solve(dims)
+        x_ref = serial_reference_solve(dims, rhs_mode=rhs_mode)
         t_ref = time.perf_counter() - t0
         print(f"Reference solve: {t_ref:.3f}s")
 
@@ -472,6 +547,7 @@ def main():
         print(f"\n--- VALIDATION RESULTS ---")
         print(f"world_size : {world_size}")
         print(f"dims       : {dims}  (n_total={nx*ny*nz})")
+        print(f"rhs_mode   : {rhs_mode}")
         print(f"iters      : {info['iters']}")
         print(f"rel_err    : {rel_err:.3e}  (||x_dist - x_ref||_inf / ||x_ref||_inf)")
         print(f"converged  : {info['converged']}")
