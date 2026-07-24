@@ -99,10 +99,10 @@ def main(level=8):
     print(f"\nper-iteration: host {1e3 * t_host / info_h['iters']:.3f} ms   "
           f"fused {1e3 * t_fused / info_f['iters']:.3f} ms")
     # --- viz (additive; no-ops on base venv) ---
-    _viz.history(
+    _viz.bar_chart(
         __file__,
         ["splu", "host CG", "fused CG"],
-        {"time (s)": [t_direct, t_host, t_fused]},
+        [t_direct, t_host, t_fused],
         "solver_times",
         xlabel="solver", ylabel="wall time (s)",
     )

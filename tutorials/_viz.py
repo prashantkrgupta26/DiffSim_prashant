@@ -21,6 +21,11 @@ Emitters (all return None on failure):
   history(tutorial_file, t, series, stem, *, xlabel="t", ylabel="value")
       Time-history plot (Cd/Cl/energy/…) via plots.history.
 
+  bar_chart(tutorial_file, labels, values, stem, *, xlabel="", ylabel="value",
+            title=None)
+      Categorical bar chart (per-solver time, method comparison) — matplotlib
+      direct, for categorical x-axes where history/convergence do not apply.
+
   surface_profile(tutorial_file, x, series, stem, *, reference=None,
                   xlabel="arc-length", ylabel="Cp")
       Surface profile (centerline u, Cp, …) via plots.surface_profile.
@@ -157,6 +162,44 @@ def history(
         return out
     except Exception as exc:
         print(f"[viz] history failed: {exc}")
+        return None
+
+
+def bar_chart(
+    tutorial_file: str | pathlib.Path,
+    labels,
+    values,
+    stem: str,
+    *,
+    xlabel: str = "",
+    ylabel: str = "value",
+    title: str | None = None,
+) -> pathlib.Path | None:
+    """Categorical bar chart (e.g. per-solver wall time).
+
+    Uses matplotlib directly — diffsim.viz has no bar helper, and HAS_VIZ
+    implies matplotlib is importable.  For categorical x-axes (solver names,
+    method labels) where the time-history/convergence plots do not apply.
+    """
+    if not HAS_VIZ:
+        _hint()
+        return None
+    try:
+        import matplotlib.pyplot as plt
+
+        out = figures_dir(tutorial_file) / f"{stem}.png"
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.bar([str(x) for x in labels], list(values))
+        if xlabel:
+            ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        if title:
+            ax.set_title(title)
+        _save_fig(ax, out)
+        print(f"[viz] wrote {out}")
+        return out
+    except Exception as exc:
+        print(f"[viz] bar_chart failed: {exc}")
         return None
 
 
