@@ -98,3 +98,48 @@ def test_renders_importable_without_gl():
     assert callable(lic) and callable(mesh_slice) and callable(contour)
     # offscreen_gl_ok never raises, returns a bool
     assert isinstance(offscreen_gl_ok(), bool)
+
+
+# ---------------------------------------------------------------------------
+# Task 4 — matplotlib quantitative plots (no GL dependency)
+# ---------------------------------------------------------------------------
+
+def test_convergence_plot(tmp_path):
+    from diffsim.viz.plots import convergence
+    import matplotlib.pyplot as plt
+    levels = [2, 3, 4, 5]
+    values = [0.4, 0.1, 0.025, 0.006]
+    ax = convergence(levels, values, reference=None, slope=2.0)
+    fig = ax.get_figure()
+    fig.savefig(str(tmp_path / "conv.png"))
+    assert (tmp_path / "conv.png").stat().st_size > 0
+    # has at least 1 line (the main series) + 1 slope reference
+    assert len(ax.get_lines()) >= 2
+    plt.close("all")
+
+
+def test_surface_profile_with_inset(tmp_path):
+    from diffsim.viz.plots import surface_profile
+    import matplotlib.pyplot as plt
+    x = np.linspace(0, 2 * np.pi, 50)
+    ax = surface_profile(
+        x, {"DiffSim": np.cos(x)},
+        reference={"Lit": (x[::5], np.cos(x[::5]))},
+        inset={"xlim": (1.0, 2.0), "ylim": (-1.0, 0.0)},
+    )
+    fig = ax.get_figure()
+    fig.savefig(str(tmp_path / "prof.png"))
+    assert (tmp_path / "prof.png").stat().st_size > 0
+    plt.close("all")
+
+
+def test_history_plot(tmp_path):
+    from diffsim.viz.plots import history
+    import matplotlib.pyplot as plt
+    t = np.linspace(0, 10, 200)
+    ax = history(t, {"Cd": 1.4 + 0.05 * np.sin(2 * t)})
+    fig = ax.get_figure()
+    fig.savefig(str(tmp_path / "hist.png"))
+    assert (tmp_path / "hist.png").stat().st_size > 0
+    assert len(ax.get_lines()) == 1
+    plt.close("all")
