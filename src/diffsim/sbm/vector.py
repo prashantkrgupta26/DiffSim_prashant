@@ -82,6 +82,33 @@ def sbm_vector_dirichlet(dm, sf, geo, g_fn, nu, ndof, alpha=10.0,
     return A, brhs
 
 
+def sbm_vector_dirichlet_twosided(dm, sf_plus, geo_plus, sf_minus, geo_minus,
+                                  g_fn, nu, ndof, alpha=10.0,
+                                  a_face_plus=None, a_face_minus=None,
+                                  beta_backflow=1.0):
+    """Two-sided co-dim-1 shell Nitsche assembly (ThinShell §2.1 convention:
+    <a,b>_Gamma~ := <a,b>_Gamma~+ + <a,b>_Gamma~-). The zero-thickness rigid
+    shell carries a weak Dirichlet (no-slip, g_fn) on BOTH sides of Gamma; the
+    two-sided surrogate has DISTINCT outward normals on Gamma~+ and Gamma~-, so
+    the Nitsche blocks are the SUM of the single-sided blocks over each side,
+    each assembled with its OWN (sf, geo) — reusing the verified single-sided
+    kernel ``sbm_vector_dirichlet`` verbatim. Summing the two opposing-normal
+    sides is exactly what makes the shell BLOCK the flow (the opposing normal
+    contributions add rather than cancel) and admits a two-sided pressure jump.
+
+    Returns (A_face, b_face) over the FULL node-major vector DOFs, the sum of
+    the two sides. Either side may be empty (handled by the single-sided
+    assembler returning zero blocks). ``a_face_plus`` / ``a_face_minus`` are
+    the optional per-side advecting fields for backflow stabilization."""
+    Ap, bp = sbm_vector_dirichlet(dm, sf_plus, geo_plus, g_fn, nu, ndof,
+                                  alpha=alpha, a_face=a_face_plus,
+                                  beta_backflow=beta_backflow)
+    Am, bm = sbm_vector_dirichlet(dm, sf_minus, geo_minus, g_fn, nu, ndof,
+                                  alpha=alpha, a_face=a_face_minus,
+                                  beta_backflow=beta_backflow)
+    return (Ap + Am).tocsr(), bp + bm
+
+
 def sbm_vector_penalty(dm, sf, geo, g_fn, nu, ndof, alpha=10.0):
     """(A_face, b_face) of the PENALTY-ONLY viscous Nitsche block over FULL
     node-major vector DOFs (unconstrained): the third Dirichlet term alone,
