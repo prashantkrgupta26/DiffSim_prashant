@@ -219,6 +219,37 @@ def build_square_channel_2d(level, Re, half, offset, device, y_offset=0.0):
                           center=(0.5, 0.5), y_offset=y_offset)
 
 
+def build_channel_long(level, Re, half, offset, device, cx=None, cy=0.5,
+                       y_offset=0.0):
+    """2-D ELONGATED-domain square-in-channel fixture for vortex shedding.
+
+    The octree is intrinsically the unit box [0,1]^2 (Morton coords), so the
+    physical domain is the unit box. Rather than stretch coordinates, this
+    fixture achieves a LONG streamwise wake by (a) shrinking the obstacle side
+    `D = 2*half` and (b) placing the obstacle NEAR THE INLET (`cx` a few D from
+    x=0), so there are ~(1 - cx)/D obstacle-diameters of clear wake before the
+    outflow at x=1. The prior shedding study proved the unit-box mesh does NOT
+    shed because the outflow sat only ~4*D downstream (von Karman needs
+    ~10-20*D); here a small D with an inlet-side obstacle puts the outflow
+    ~14-20*D downstream at low blockage (D/Ly = D since Ly=1).
+
+    Requirements for the exact body-fitted carve (dmax==0, standard Nitsche):
+    `half = k / 2^level` (cell-aligned) and `cx`, `cy` cell-aligned too. The
+    lateral walls at y=0 and y=1 remain TRUE OUTER-BOUNDARY faces (strong
+    Dirichlet via coordinate masks in `_build_channel`), NOT surrogate faces,
+    so only the immersed square carries weak Nitsche no-slip. `y_offset` seeds
+    the symmetry break exactly as in `build_square_channel_2d`.
+
+    Example (level=8, half=8/256=0.03125): D=0.0625, blockage 6.25%, obstacle
+    center cx=32/256=0.125 => (1-0.125)/0.0625 = 14 D of downstream wake.
+    """
+    if cx is None:
+        # default: place the obstacle center a few D from the inlet
+        cx = max(4.0 * half, 0.1)
+    return _build_channel(level, Re, half, offset, device, dim=2,
+                          center=(cx, cy), y_offset=y_offset)
+
+
 def build_cube_channel_3d(level, Re, half, offset, device):
     """3-D cube-in-channel fixture (rungs A'/C') — the 2-D analogue with
     `dim=3`, `Box((cx,cy,cz),(half,half,half))`, lateral walls on y and z."""

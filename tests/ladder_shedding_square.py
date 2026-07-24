@@ -54,11 +54,19 @@ from ladder_rungB_square_nitsche import (build_box_strong_bc, build_sbm_block,
 # --------------------------------------------------------------------------
 # transient transverse inflow tilt (the symmetry-breaking trigger)
 # --------------------------------------------------------------------------
-def make_trigger_gfn(fx, g_strong, dt, trigger_steps, eps):
+def make_trigger_gfn(fx, g_strong, dt, trigger_steps, eps, ramp_steps=0):
     """Build a time-dependent `g_fn(coords_at_dir, t)` that adds a small
     transverse `v = eps*U_IN` to the INFLOW strong nodes for t < trigger_steps*dt,
     then reverts to the baseline (`g_strong`). The inflow rows are identified by
     matching coords to `fx['inflow_mask']` in the strong-node ordering.
+
+    `ramp_steps > 0` (2026-07-23) SMOOTHLY ramps the AXIAL inflow from 0 to U_IN
+    over the first `ramp_steps` steps (a raised-cosine start-up), instead of the
+    impulsive `U_IN` at t=0. The impulsive start on the elongated mesh drove a
+    violent Cd swing (+10 -> -6 -> +6 in three steps); the ramp removes that
+    startup shock (a pure boundary perturbation — stepper numerics untouched).
+    The transverse trigger is also ramped in over the SAME window and out again
+    at `trigger_steps` (a smooth raised-cosine pulse), a gentler seed.
 
     Returns (g_fn, trigger_t_end). The trigger is a pure boundary perturbation:
     it enters ONLY through the existing `u_new[dir_nodes]=gvals` overwrite."""
@@ -67,11 +75,21 @@ def make_trigger_gfn(fx, g_strong, dt, trigger_steps, eps):
     # which of the strong_nodes are inflow nodes (in strong-node ordering):
     is_inflow_strong = inflow_mask_free[strong_nodes]
     t_end = trigger_steps * dt
+    t_ramp = ramp_steps * dt
 
     def g_fn(coords_at_dir, t):
         g = g_strong.copy()
+        # smooth raised-cosine axial ramp 0 -> U_IN over [0, t_ramp]
+        if t_ramp > 0 and t < t_ramp - 1e-12:
+            s = 0.5 * (1.0 - np.cos(np.pi * t / t_ramp))    # 0 -> 1
+            g[is_inflow_strong, 0] *= s
         if t < t_end - 1e-12:
-            g[is_inflow_strong, 1] = eps * U_IN       # transverse tilt on inflow
+            # transverse tilt: raised-cosine pulse over [0, t_end] (peak mid-way)
+            if t_end > 0:
+                w = np.sin(np.pi * t / t_end) ** 2          # 0 at ends, 1 mid
+            else:
+                w = 1.0
+            g[is_inflow_strong, 1] = eps * U_IN * w
         return g
 
     return g_fn, t_end
@@ -82,7 +100,8 @@ def make_trigger_gfn(fx, g_strong, dt, trigger_steps, eps):
 # --------------------------------------------------------------------------
 def shed_projection(fx, dt, nsteps, trigger_steps=200, eps=0.05,
                     alpha=ALPHA, solver="splu", beta_backflow=0.5,
-                    graddiv_gamma=FN1_GRADDIV_GAMMA, log_every=200):
+                    graddiv_gamma=FN1_GRADDIV_GAMMA, log_every=200,
+                    ramp_steps=0):
     """Consistent-projection + weak-Nitsche long march with the transient
     inflow-tilt trigger. Mirrors `ladder_rungB_square_nitsche.march_projection`
     exactly (rot_pin_wall=True, correction re-pin on) except `g_fn` is the
@@ -95,7 +114,8 @@ def shed_projection(fx, dt, nsteps, trigger_steps=200, eps=0.05,
                                                    beta_backflow=0.0)
     bf_pv, bf_ftab, bf_conn = _bf_conn(fx)
     correction_penalty = build_correction_penalty(fx, alpha=alpha)
-    g_fn, t_end = make_trigger_gfn(fx, g_strong, dt, trigger_steps, eps)
+    g_fn, t_end = make_trigger_gfn(fx, g_strong, dt, trigger_steps, eps,
+                                   ramp_steps=ramp_steps)
 
     st = LerayProjectionStepper(
         dm, nu, dt, f_fn=lambda x, t: np.zeros((len(x), dim)), g_fn=g_fn,
@@ -160,7 +180,8 @@ def shed_projection(fx, dt, nsteps, trigger_steps=200, eps=0.05,
 # --------------------------------------------------------------------------
 def shed_monolithic(fx, dt, nsteps, trigger_steps=200, eps=0.05,
                     alpha=ALPHA, graddiv_gamma=FN1_GRADDIV_GAMMA,
-                    backflow_beta=0.5, boundary_vorticity=True, log_every=200):
+                    backflow_beta=0.5, boundary_vorticity=True, log_every=200,
+                    ramp_steps=0):
     """Same-mesh saddle NS with the SBM Nitsche block and the SAME transient
     inflow tilt on the strong rows. The unsteady-wake oracle."""
     dim = fx["dim"]
@@ -171,6 +192,7 @@ def shed_monolithic(fx, dt, nsteps, trigger_steps=200, eps=0.05,
     strong_nodes, g_strong = build_box_strong_bc(fx)
     is_inflow_strong = fx["inflow_mask"][strong_nodes]
     t_end = trigger_steps * dt
+    t_ramp = ramp_steps * dt
 
     T = cons.T.tocsr()
     T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
@@ -226,8 +248,12 @@ def shed_monolithic(fx, dt, nsteps, trigger_steps=200, eps=0.05,
             A = A + assemble_bvs_block(dm, u_node, nu, dt, ndof, faces=bf_faces)
         A = A.tolil()
         g_now = g_strong.copy()
+        if t_ramp > 0 and t_new < t_ramp - 1e-12:
+            s = 0.5 * (1.0 - np.cos(np.pi * t_new / t_ramp))
+            g_now[is_inflow_strong, 0] *= s
         if t_new < t_end - 1e-12:
-            g_now[is_inflow_strong, 1] = eps * U_IN
+            w = np.sin(np.pi * t_new / t_end) ** 2 if t_end > 0 else 1.0
+            g_now[is_inflow_strong, 1] = eps * U_IN * w
         for k, i in enumerate(strong_nodes):
             for c in range(dim):
                 r = i * ndof + c
