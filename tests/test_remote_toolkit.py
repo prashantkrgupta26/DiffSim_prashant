@@ -34,11 +34,14 @@ def test_lib_log_path_and_tmux_name():
     assert out[0] == "/logs/solve-20260717-1.log"
     assert out[1] == "diffsim-20260717-1"   # '/' sanitized to '-'
 
-def test_nova_stubs_are_guarded():
+def test_nova_scripts_require_args():
+    # The Nova scripts are now WIRED (git-bundle ship + sbatch + <=4-GPU cap /
+    # squeue/sacct poll). Run with no args they must still be guarded: print a
+    # usage line and exit 64 (EX_USAGE) rather than doing anything unguarded.
     for s in ("nova-sync-submit.sh", "nova-poll.sh"):
         r = _sh(s)
         assert r.returncode == 64, f"{s} rc={r.returncode}"
-        assert "not yet wired" in r.stderr
+        assert "usage:" in r.stderr.lower()
 
 # NOTE: _sh() is defined once at the top — do not redefine in later task additions.
 def _gpubox_up():
