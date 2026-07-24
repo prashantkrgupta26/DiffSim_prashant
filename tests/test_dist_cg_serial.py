@@ -366,5 +366,112 @@ class TestPCGEdgeCases:
         )
 
 
+class TestPCGTorchAgnosticism:
+    """Prove pcg() works with torch CPU tensors (no GPU needed).
+
+    Task 3a requirement: pcg() must accept torch tensors in addition to numpy
+    arrays so that TorchDistComm (Task 3b, GPU) can drop in without touching
+    the CG core.  We verify:
+      - SerialComm + small SPD matmul spmv + Jacobi precond converges.
+      - The torch-tensor result matches the numpy result (same relative accuracy).
+    """
+
+    @pytest.fixture(autouse=True)
+    def skip_if_no_torch(self):
+        """Skip the whole class if torch is not installed."""
+        pytest.importorskip("torch", reason="torch not installed")
+
+    def _make_torch_system(self, m: int):
+        """Return (A_torch, diag_inv_torch, b_torch, x_true_torch) on CPU."""
+        import torch
+
+        A_sp = laplacian_2d(m)
+        rng = np.random.default_rng(1234)
+        x_true_np = rng.standard_normal(m * m)
+        b_np = np.asarray(A_sp @ x_true_np, dtype=np.float64)
+
+        # Dense torch version (small test matrix)
+        A_dense = torch.tensor(A_sp.toarray(), dtype=torch.float64)
+        b_torch = torch.tensor(b_np, dtype=torch.float64)
+        x_true_torch = torch.tensor(x_true_np, dtype=torch.float64)
+        diag_inv = torch.tensor(1.0 / A_sp.diagonal(), dtype=torch.float64)
+
+        return A_dense, diag_inv, b_torch, x_true_torch
+
+    def test_torch_cpu_tensors_converge(self):
+        """pcg() with torch CPU tensors + SerialComm converges to rel_err < 1e-8."""
+        import torch
+
+        m = 8
+        A_dense, diag_inv, b_torch, x_true_torch = self._make_torch_system(m)
+
+        comm = SerialComm()
+
+        def spmv_torch(p):
+            comm.exchange_halo(p)          # no-op for SerialComm
+            return A_dense @ p             # torch matmul, stays fp64
+
+        def jacobi_torch(r):
+            return diag_inv * r
+
+        x_torch, info = pcg(spmv_torch, jacobi_torch, b_torch, comm, rtol=1e-10)
+
+        assert info["converged"], (
+            f"torch-tensor PCG did not converge: iters={info['iters']}, "
+            f"last_resid={info['resid_history'][-1]:.2e}"
+        )
+        assert isinstance(x_torch, torch.Tensor), "x_local should be a torch.Tensor"
+
+        rel_err = float(
+            torch.linalg.norm(x_torch - x_true_torch)
+            / torch.linalg.norm(x_true_torch)
+        )
+        assert rel_err < 1e-8, (
+            f"torch-tensor PCG solution accuracy too low: rel_err={rel_err:.2e}"
+        )
+
+    def test_torch_matches_numpy_result(self):
+        """pcg() with torch tensors gives the same solution as with numpy arrays."""
+        import torch
+
+        m = 8
+        A_sp = laplacian_2d(m)
+        A_dense, diag_inv_torch, b_torch, _ = self._make_torch_system(m)
+
+        b_np = b_torch.numpy()
+        diag_inv_np = diag_inv_torch.numpy()
+
+        comm = SerialComm()
+
+        # numpy run
+        def spmv_np(p):
+            comm.exchange_halo(p)
+            return np.asarray(A_sp @ p, dtype=np.float64)
+
+        def jacobi_np(r):
+            return diag_inv_np * r
+
+        x_np, info_np = pcg(spmv_np, jacobi_np, b_np, comm, rtol=1e-10)
+
+        # torch run
+        def spmv_torch(p):
+            comm.exchange_halo(p)
+            return A_dense @ p
+
+        def jacobi_torch(r):
+            return diag_inv_torch * r
+
+        x_torch, info_torch = pcg(spmv_torch, jacobi_torch, b_torch, comm, rtol=1e-10)
+
+        assert info_np["converged"] and info_torch["converged"]
+
+        # Solutions should agree to near-machine-epsilon
+        x_torch_np = x_torch.numpy()
+        np.testing.assert_allclose(
+            x_torch_np, x_np, rtol=1e-10, atol=1e-12,
+            err_msg="torch and numpy PCG solutions diverge"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

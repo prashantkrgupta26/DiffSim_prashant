@@ -1,13 +1,15 @@
 """Distributed Preconditioned Conjugate Gradient (PCG) solver.
 
-Pure numpy fp64 implementation with injection-based comm, spmv, and
+Array-agnostic fp64 implementation with injection-based comm, spmv, and
 preconditioner protocols.  CPU-runnable with SerialComm (N=1); drop-in
 replaceable with NCCL-backed variants in Task 3 without touching pcg().
 
 Design principles
 -----------------
-- No torch / warp imports — stays CPU-runnable.
-- fp64 throughout (explicit dtype=np.float64).
+- Array-agnostic: works with numpy arrays AND torch tensors (CPU or GPU).
+  Uses ``_as_f64`` for type-preserving fp64 coercion and ``_zeros_like``
+  for allocation that matches the input's array type and device.
+- fp64 throughout.
 - Injection: comm, spmv, precond are passed in; pcg() has no opinions about
   the physical mesh, matrix format, or MPI/NCCL library.
 - N=1 degenerate path via SerialComm equals a serial CG solve exactly.
@@ -35,6 +37,48 @@ import math
 from typing import Protocol, runtime_checkable
 
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Array-agnostic helpers
+# ---------------------------------------------------------------------------
+
+def _as_f64(x):
+    """Coerce *x* to fp64, preserving array type (numpy or torch).
+
+    - numpy array  → ``x.astype(np.float64, copy=False)``
+    - torch tensor → ``x.double()``
+    - other        → ``np.asarray(x, dtype=np.float64)``
+    """
+    try:
+        import torch as _torch
+        if isinstance(x, _torch.Tensor):
+            return x.double()
+    except ImportError:
+        pass
+    if isinstance(x, np.ndarray):
+        return x.astype(np.float64, copy=False)
+    return np.asarray(x, dtype=np.float64)
+
+
+def _zeros_like_f64(x):
+    """Return a zero array/tensor with the same type, device and shape as *x*, fp64.
+
+    - numpy array  → ``np.zeros(x.shape, dtype=np.float64)``
+    - torch tensor → ``torch.zeros_like(x, dtype=torch.float64)``
+    """
+    try:
+        import torch as _torch
+        if isinstance(x, _torch.Tensor):
+            return _torch.zeros_like(x, dtype=_torch.float64)
+    except ImportError:
+        pass
+    return np.zeros(x.shape, dtype=np.float64)
+
+
+def _dot(a, b) -> float:
+    """Element-wise dot product → Python float.  Works for numpy and torch."""
+    return float((a * b).sum())
 
 
 # ---------------------------------------------------------------------------
@@ -95,13 +139,13 @@ class SerialComm:
 def pcg(
     spmv,
     precond,
-    b_local: np.ndarray,
+    b_local,
     comm: Comm,
     *,
     rtol: float = 1e-10,
     maxit: int | None = None,
-    x0: np.ndarray | None = None,
-) -> tuple[np.ndarray, dict]:
+    x0=None,
+):
     """Distributed Preconditioned Conjugate Gradient solver (fp64).
 
     Solves A x = b where A is a distributed SPD matrix.  All vectors are
@@ -182,19 +226,19 @@ def pcg(
     owned-length vectors and operates on them with numpy dot products followed
     by allreduce_sum.
     """
-    b_local = np.asarray(b_local, dtype=np.float64)
+    b_local = _as_f64(b_local)
     n_owned = b_local.shape[0]
 
     if maxit is None:
         maxit = max(200, 2 * n_owned)
 
     # ---- global ||b|| (needed for relative convergence criterion) ----------
-    bb_local = float(np.dot(b_local, b_local))
+    bb_local = _dot(b_local, b_local)
     bb_global = comm.allreduce_sum(bb_local)
     bnorm_global = math.sqrt(max(bb_global, 0.0))
     # Guard: if b==0 the solution is 0 and we are already converged.
     if bnorm_global == 0.0:
-        x_local = np.zeros(n_owned, dtype=np.float64)
+        x_local = _zeros_like_f64(b_local)
         return x_local, {
             "iters": 0,
             "resid_history": [0.0],
@@ -203,26 +247,26 @@ def pcg(
 
     # ---- initialise --------------------------------------------------------
     if x0 is not None:
-        x_local = np.array(x0, dtype=np.float64, copy=True)
+        x_local = _as_f64(x0)
     else:
-        x_local = np.zeros(n_owned, dtype=np.float64)
+        x_local = _zeros_like_f64(b_local)
 
     # r = b - A x_0.  For x_0 = 0 this is just b.
     if x0 is not None:
-        Ax0 = spmv(x_local.copy())          # spmv may need the ghost buffer
+        Ax0 = spmv(x_local.clone() if hasattr(x_local, 'clone') else x_local.copy())
         r_owned = b_local - Ax0
     else:
-        r_owned = b_local.copy()
+        r_owned = b_local.clone() if hasattr(b_local, 'clone') else b_local.copy()
 
     z_owned = precond(r_owned)              # z = M^{-1} r
-    p_owned = z_owned.copy()               # p = z
+    p_owned = z_owned.clone() if hasattr(z_owned, 'clone') else z_owned.copy()
 
     # rz = <r, z>_global
-    rz_local = float(np.dot(r_owned, z_owned))
+    rz_local = _dot(r_owned, z_owned)
     rz = comm.allreduce_sum(rz_local)
 
     # initial ||r||_global for resid_history
-    rr_local = float(np.dot(r_owned, r_owned))
+    rr_local = _dot(r_owned, r_owned)
     rr_global = comm.allreduce_sum(rr_local)
     rnorm = math.sqrt(max(rr_global, 0.0))
     rel_resid = rnorm / bnorm_global
@@ -237,7 +281,7 @@ def pcg(
         # pcg passes p_owned (length n_owned) to spmv.  The spmv wrapper (Task 3)
         # owns the ghost-padded buffer and calls comm.exchange_halo internally.
         Ap_owned = spmv(p_owned)            # spmv handles halo exchange internally
-        pAp_local = float(np.dot(p_owned, Ap_owned))
+        pAp_local = _dot(p_owned, Ap_owned)
         pAp = comm.allreduce_sum(pAp_local)
 
         if pAp <= 0.0:
@@ -247,20 +291,20 @@ def pcg(
         alpha = rz / pAp
 
         # x = x + alpha p
-        x_local += alpha * p_owned
+        x_local = x_local + alpha * p_owned
 
         # r = r - alpha Ap
-        r_owned -= alpha * Ap_owned
+        r_owned = r_owned - alpha * Ap_owned
 
         # z = M^{-1} r
         z_owned = precond(r_owned)
 
         # Allreduce 1: rz_new = <r_new, z_new>_global
-        rz_new_local = float(np.dot(r_owned, z_owned))
+        rz_new_local = _dot(r_owned, z_owned)
         rz_new = comm.allreduce_sum(rz_new_local)
 
         # Allreduce 3: rr = <r_new, r_new>_global (convergence check)
-        rr_local = float(np.dot(r_owned, r_owned))
+        rr_local = _dot(r_owned, r_owned)
         rr_global = comm.allreduce_sum(rr_local)
 
         rnorm = math.sqrt(max(rr_global, 0.0))
