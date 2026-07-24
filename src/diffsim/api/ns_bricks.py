@@ -62,6 +62,282 @@ from ..assembly.operators import _kernel_cache
 from ..physics.vms import tau_m_metric, tau_c_metric
 
 
+# --------------------------------------------------------------------------
+# Outflow backflow stabilization (change #6 of the consistent-projection fix)
+# --------------------------------------------------------------------------
+def outflow_faces(mesh, axis=0, side=1, coord=1.0, tol=1e-9):
+    r"""Enumerate the OUTER-BOUNDARY faces on the outflow plane ``x_axis=coord``.
+
+    Returns ``(elem, face, ntilde)``: ``elem`` [Nf] element ids (into the tree),
+    ``face`` [Nf] local face ids ``2*axis+side``, and ``ntilde`` [dim] the constant
+    domain-outward unit normal on that plane (e.g. ``(+1,0)`` for the x=1 face).
+
+    A face qualifies when it is a mesh boundary face (no neighbour across it) of
+    the requested orientation AND its face centre lies on the plane. For the unit
+    cube channel the default (``axis=0, side=1, coord=1.0``) is the free x=1
+    outflow. Host-side; the outflow-face count is O(mesh side), so a small loop is
+    fine (mirrors the SBM surrogate-face path)."""
+    from ..octree.lookup import face_neighbors, face_offsets
+    from ..octree import morton
+    dim = mesh.dim
+    tree = mesh.tree
+    f = 2 * axis + side
+    nbr = face_neighbors(tree)[f]                       # -1 == boundary face
+    scale = 2.0 ** -morton.lmax(dim)
+    lo = tree.anchors() * scale
+    h = tree.h()
+    face_coord = lo[:, axis] + (h if side == 1 else 0.0)
+    keep = np.where((nbr < 0) & (np.abs(face_coord - coord) < tol))[0]
+    ntilde = face_offsets(dim).astype(np.float64)[f]    # unit outward normal
+    return keep.astype(np.int64), np.full(len(keep), f, np.int8), ntilde
+
+
+def assemble_backflow_block(dm, u_free, beta, ndof, faces=None,
+                            axis=0, side=1, coord=1.0, rho=1.0):
+    r"""Velocity-based backflow stabilization on the outflow face (Bazilevs et al.
+    CMAME 2009; Esmaily-Moghadam et al. Comput. Mech. 2011; directional-do-nothing,
+    Braack-Mucha). Adds the weak-form term
+
+        - beta * rho * \int_{Gamma_out} (u . n)_-  (u . v) dGamma ,
+          (u . n)_- = min(u . n, 0)
+
+    to the momentum block, ACTIVE ONLY where there is reverse flow (u.n < 0). The
+    open "do-nothing" outflow leaves the convective energy flux unbounded when the
+    wake pushes fluid back in through the outlet; this term restores a dissipative
+    (negative-definite) contribution exactly there, and is ~0 (benign) with no
+    backflow. Picard-linearized: (u.n)_- is frozen at the supplied advecting field
+    ``u_free`` and the trial/test pair is the remaining (u . v).
+
+    ``u_free`` [n_free, dim] is the advecting velocity in CONSTRAINED free-node
+    space (the current Picard iterate for the predictor, the current Newton state
+    for the monolithic). ``beta`` = 0 returns a zero matrix (bit-for-bit OFF).
+    Returns a CSR of shape (n_free*ndof, n_free*ndof), constrained & node-major —
+    add it to the assembled momentum block BEFORE the strong-row overwrite."""
+    dim = dm.dim
+    mesh = dm.mesh
+    if beta == 0.0:
+        Nn = dm.n_nodes * ndof
+        Z = sp.csr_matrix((Nn, Nn))
+        T = dm.constraints.T.tocsr()
+        T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
+        return (T_vec.T @ Z @ T_vec).tocsr()
+    if faces is None:
+        elem, face, ntilde = outflow_faces(mesh, axis=axis, side=side,
+                                            coord=coord)
+    else:
+        elem, face, ntilde = faces
+    # uniform p on the outflow face (channel is p1; matches surrogate_traction).
+    from ..mesh.faces import face_tables
+    p_face = np.unique(np.asarray(mesh.p_elem)[elem]) if len(elem) else \
+        np.array([1])
+    if len(p_face) != 1:
+        from ..errors import ConfigError
+        raise ConfigError(
+            f"outflow backflow assumes uniform p on the face, got "
+            f"orders {p_face.tolist()}")
+    pv = int(p_face[0])
+    ftab = face_tables(pv, dim)
+    nqf, nbf = ftab.nqf, ftab.nbf
+    conn = mesh.conn_of[pv][np.searchsorted(mesh.bins[pv], elem)]  # [Nf, nbf]
+    u_full = np.asarray(dm.constraints.T @ u_free)                # node-major
+    h = mesh.tree.h()[elem]
+    jacS = (h / 2.0) ** (dim - 1)
+    Nn = dm.n_nodes * ndof
+    rows, cols, vals = [], [], []
+    for fi in range(len(elem)):
+        f = int(face[fi])
+        N = ftab.N[f]                                             # [nqf, nbf]
+        un = u_full[conn[fi], :dim]                               # [nbf, dim]
+        # face-GP advecting velocity and its outward-normal component
+        uq = N @ un                                               # [nqf, dim]
+        un_dot_n = uq @ ntilde                                    # [nqf]
+        un_neg = np.minimum(un_dot_n, 0.0)                        # (u.n)_-
+        # Ab[a,b] = -beta*rho * int (u.n)_- N_a N_b dGamma  (per component)
+        Ab = -beta * rho * np.einsum(
+            "qa,qb,q,q->ab", N, N, un_neg, ftab.w) * jacS[fi]
+        gnodes = conn[fi]
+        for c in range(dim):
+            gdof = gnodes * ndof + c
+            rows.append(np.repeat(gdof, nbf))
+            cols.append(np.tile(gdof, nbf))
+            vals.append(Ab.ravel())
+    if rows:
+        A = sp.coo_matrix((np.concatenate(vals),
+                           (np.concatenate(rows), np.concatenate(cols))),
+                          shape=(Nn, Nn)).tocsr()
+    else:
+        A = sp.csr_matrix((Nn, Nn))
+    T = dm.constraints.T.tocsr()
+    T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
+    return (T_vec.T @ A @ T_vec).tocsr()
+
+
+# --------------------------------------------------------------------------
+# P1 boundary-vorticity stabilization (change #5 of the consistent-projection
+# fix; Pacheco, Schussnig, Steinbach, Fries, IJNME 2021, nme.6615;
+# arXiv:2411.02100).
+# --------------------------------------------------------------------------
+def _bvs_face_setup(dm, faces, axis, side, coord):
+    """Shared outflow-face gather for the boundary-vorticity terms. Returns
+    ``(pv, ftab, elem, face, ntilde, conn, h)`` where ``conn`` [Nf, nbf] is the
+    element node connectivity on the requested pressure bin and ``h`` [Nf] the
+    element sizes. Mirrors ``assemble_backflow_block``'s uniform-order face
+    gather (channel is p1)."""
+    from ..mesh.faces import face_tables
+    mesh = dm.mesh
+    if faces is None:
+        elem, face, ntilde = outflow_faces(mesh, axis=axis, side=side,
+                                            coord=coord)
+    else:
+        elem, face, ntilde = faces
+    p_face = np.unique(np.asarray(mesh.p_elem)[elem]) if len(elem) else \
+        np.array([1])
+    if len(p_face) != 1:
+        from ..errors import ConfigError
+        raise ConfigError(
+            f"boundary-vorticity term assumes uniform p on the outflow face, "
+            f"got orders {p_face.tolist()}")
+    pv = int(p_face[0])
+    ftab = face_tables(pv, dim=mesh.dim)
+    conn = mesh.conn_of[pv][np.searchsorted(mesh.bins[pv], elem)]
+    h = mesh.tree.h()[elem]
+    return pv, ftab, elem, face, ntilde, conn, h
+
+
+def _bvs_delta(u_face_q, h_e, nu, dt, dim):
+    r"""The stabilization coefficient ``delta`` = the PSPG parameter ``tau_m``
+    (Pacheco et al.: the boundary-vorticity term shares the PSPG parameter),
+    evaluated at the outflow face element. Metric form on axis-aligned cubes,
+    matching ``physics.vms.tau_m_metric`` term-for-term (same CI_F, GG, uGu,
+    transient (2/dt)^2 with b0=1) so the monolithic C-block and the projection
+    PPE use an IDENTICAL delta. ``u_face_q`` [nqf, dim] is the face-GP velocity;
+    the scalar magnitude used is the max over the face GPs (element-constant
+    tau_m, as in the volume kernel which freezes tau_m per element)."""
+    from ..physics.vms import CI_F
+    umag = float(np.sqrt((u_face_q ** 2).sum(1)).max()) if len(u_face_q) else 0.0
+    sig2 = (2.0 / dt) ** 2 if dt is not None else 0.0
+    uGu = 4.0 * umag ** 2 / h_e ** 2
+    GG = dim * (2.0 / h_e) ** 4
+    return 1.0 / np.sqrt(sig2 + uGu + CI_F * nu ** 2 * GG)
+
+
+def _cross_grad_n_2d(dNq, ntilde):
+    r"""2-D scalar ``(grad q x n)_z = dq/dx * n_y - dq/dy * n_x`` for each
+    basis function. ``dNq`` [nbf, 2] physical grad of the test/basis functions,
+    ``ntilde`` [2] outward normal. Returns [nbf]."""
+    return dNq[:, 0] * ntilde[1] - dNq[:, 1] * ntilde[0]
+
+
+def bvs_ppe_source(dm, u_free, nu, dt, faces=None,
+                   axis=0, side=1, coord=1.0):
+    r"""P1 boundary-vorticity PPE source (change #5), for the PROJECTION PPE.
+
+    The pressure equation carries the boundary integral (Pacheco et al. Eq. 9)
+
+        delta * (grad q x n, nu curl u)_Gamma
+
+    which standard PSPG DROPS for P1 (the elementwise viscous residual nu*lap u
+    vanishes), fabricating a spurious ``dp/dn ~ 0`` at the open outflow and
+    letting the divergence slowly accumulate. Retaining it induces the correct
+    normal pseudo-traction. Here ``u = u_hat`` is KNOWN, so the term is a pure
+    RHS source. The PPE assembles ``(...PSPG..., q) = 0``; moving this boundary
+    term to the RHS gives the contribution
+
+        rhs_a += - delta * nu * int_Gamma (grad N_a x n) * curl(u_hat) dGamma .
+
+    2-D only (rung A): curl u_hat is the scalar vorticity
+    ``omega = du_y/dx - du_x/dy`` and ``(grad N_a x n)`` the scalar above.
+
+    Returns a FULL node-major (``dm.n_nodes``) scalar array to add to the PPE
+    RHS BEFORE the constraint reduction. ``u_free`` [n_free, dim] is the
+    predicted velocity in constrained free-node space."""
+    dim = dm.dim
+    if dim != 2:
+        from ..errors import ConfigError
+        raise ConfigError("boundary-vorticity PPE source is implemented for "
+                          "2-D (curl u scalar); got dim=%d" % dim)
+    pv, ftab, elem, face, ntilde, conn, h = _bvs_face_setup(
+        dm, faces, axis, side, coord)
+    u_full = np.asarray(dm.constraints.T @ u_free)                # node-major
+    jacS = (h / 2.0) ** (dim - 1)
+    rhs = np.zeros(dm.n_nodes)
+    for fi in range(len(elem)):
+        f = int(face[fi])
+        dN = ftab.dN[f] * (2.0 / h[fi])          # [nqf, nbf, dim] physical
+        un = u_full[conn[fi], :dim]              # [nbf, dim]
+        uq = ftab.N[f] @ un                      # [nqf, dim] face-GP velocity
+        delta = _bvs_delta(uq, h[fi], nu, dt, dim)
+        # scalar vorticity omega = du_y/dx - du_x/dy at each face GP
+        omega = (np.einsum("qb,b->q", dN[:, :, 0], un[:, 1])
+                 - np.einsum("qb,b->q", dN[:, :, 1], un[:, 0]))
+        # (grad N_a x n)_z per node at each GP: dN_a/dx*n_y - dN_a/dy*n_x
+        cross = dN[:, :, 0] * ntilde[1] - dN[:, :, 1] * ntilde[0]   # [nqf, nbf]
+        # be_a = -delta*nu * int (grad N_a x n) * omega dGamma
+        be = -delta * nu * np.einsum(
+            "qa,q,q->a", cross, omega, ftab.w) * jacS[fi]
+        np.add.at(rhs, conn[fi], be)
+    return rhs
+
+
+def assemble_bvs_block(dm, u_free, nu, dt, ndof, faces=None,
+                       axis=0, side=1, coord=1.0):
+    r"""P1 boundary-vorticity C-block (change #5), for the MONOLITHIC PSPG
+    continuity row. Same term ``delta*(grad q x n, nu curl u)_Gamma`` as
+    ``bvs_ppe_source``, but with ``u`` UNKNOWN, so it is a matrix coupling the
+    pressure (continuity) test row of node ``a`` to the velocity DOFs of node
+    ``b`` on the outflow face:
+
+        A[a*ndof+dim, b*ndof + 1] += delta*nu * (grad N_a x n) *  dN_b/dx  dG
+        A[a*ndof+dim, b*ndof + 0] += delta*nu * (grad N_a x n) * (-dN_b/dy) dG
+
+    (from omega = sum_b dN_b/dx u_y,b - dN_b/dy u_x,b). This is the same-mesh
+    consistency partner of ``bvs_ppe_source`` — the monolithic and the split
+    carry the IDENTICAL outflow term so the same-mesh oracle stays exact.
+    ``u_free`` sets ``delta`` (tau_m, velocity-dependent); the coupling is
+    linear in u. Returns a CONSTRAINED node-major CSR to ADD to the assembled
+    momentum block before the strong-row overwrite. 2-D only (rung A)."""
+    dim = dm.dim
+    if dim != 2:
+        from ..errors import ConfigError
+        raise ConfigError("boundary-vorticity C-block is implemented for 2-D "
+                          "(curl u scalar); got dim=%d" % dim)
+    pv, ftab, elem, face, ntilde, conn, h = _bvs_face_setup(
+        dm, faces, axis, side, coord)
+    u_full = np.asarray(dm.constraints.T @ u_free)
+    jacS = (h / 2.0) ** (dim - 1)
+    Nn = dm.n_nodes * ndof
+    rows, cols, vals = [], [], []
+    for fi in range(len(elem)):
+        f = int(face[fi])
+        dN = ftab.dN[f] * (2.0 / h[fi])          # [nqf, nbf, dim] physical
+        un = u_full[conn[fi], :dim]
+        uq = ftab.N[f] @ un
+        delta = _bvs_delta(uq, h[fi], nu, dt, dim)
+        cross = dN[:, :, 0] * ntilde[1] - dN[:, :, 1] * ntilde[0]   # [nqf, nbf]
+        gnodes = conn[fi]
+        qrow = gnodes * ndof + dim               # continuity (pressure) rows
+        # coupling to u_y (component 1): + delta*nu * cross_a * dN_b/dx
+        Cy = delta * nu * np.einsum(
+            "qa,qb,q->ab", cross, dN[:, :, 0], ftab.w) * jacS[fi]
+        # coupling to u_x (component 0): - delta*nu * cross_a * dN_b/dy
+        Cx = -delta * nu * np.einsum(
+            "qa,qb,q->ab", cross, dN[:, :, 1], ftab.w) * jacS[fi]
+        nbf = conn.shape[1]
+        rows.append(np.repeat(qrow, nbf)); cols.append(
+            np.tile(gnodes * ndof + 1, nbf)); vals.append(Cy.ravel())
+        rows.append(np.repeat(qrow, nbf)); cols.append(
+            np.tile(gnodes * ndof + 0, nbf)); vals.append(Cx.ravel())
+    if rows:
+        A = sp.coo_matrix((np.concatenate(vals),
+                           (np.concatenate(rows), np.concatenate(cols))),
+                          shape=(Nn, Nn)).tocsr()
+    else:
+        A = sp.csr_matrix((Nn, Nn))
+    T = dm.constraints.T.tocsr()
+    T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
+    return (T_vec.T @ A @ T_vec).tocsr()
+
+
 def make_linear_ns_Ae(nbf: int, nqp: int, dim: int):
     """Element-matrix kernel: inputs aq [ne*nqp, dim] advecting field at GPs,
     div_aq [ne*nqp], scalars nu, sigma, sig2tau; writes Ae node-major."""
