@@ -9,6 +9,7 @@ guarded inside the function body that needs it.
 from .export import export_vtu, export_vtu_sbm, export_body_vtp
 from .renders import Style, lic, mesh_slice, contour
 from .plots import convergence, surface_profile, history
+from .share import paraview_state
 
 __all__ = [
     "export_vtu",
@@ -21,4 +22,5 @@ __all__ = [
     "convergence",
     "surface_profile",
     "history",
+    "paraview_state",
 ]
