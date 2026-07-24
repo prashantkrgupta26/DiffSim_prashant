@@ -39,6 +39,15 @@ RSYNC_EXCLUDES=(
   --exclude '*.pt'
 )
 
-# --- nova (scripts stubbed for now) ---
+# --- nova (Iowa State SLURM) ---
+# Nova has NO GitHub auth: ship code via `git bundle` over the Duo ssh channel,
+# then fetch+checkout into /work (2PB scratch). HOME is over-quota — NEVER run
+# jobs from HOME; everything lives under NOVA_REPO_ABS on /work.
 export NOVA_HOST="${NOVA_HOST:-nova}"
-export NOVA_REPO_ABS="${NOVA_REPO_ABS:-}"   # set when Nova scripts are wired
+export NOVA_REPO_ABS="${NOVA_REPO_ABS:-/work/mech-ai/baskarg/DiffSim}"
+export NOVA_ACCOUNT="${NOVA_ACCOUNT:-mech-ai}"
+export NOVA_QOS="${NOVA_QOS:-normal}"
+export NOVA_CPUS_PER_TASK="${NOVA_CPUS_PER_TASK:-6}"   # Nova caps <=6 cpu/GPU
+# HARD CAP: <=4 concurrent Nova GPU jobs (account gres/gpu quota is 19, pooled).
+export NOVA_MAX_GPU_JOBS="${NOVA_MAX_GPU_JOBS:-4}"
+export NOVA_BUNDLE_DIR="${NOVA_BUNDLE_DIR:-/work/mech-ai/baskarg/bundles}"
