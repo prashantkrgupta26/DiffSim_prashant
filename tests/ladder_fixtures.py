@@ -119,7 +119,7 @@ def _p2_band_array(ret, sf, band):
 
 
 def _build_channel(level, Re, half, offset, device, dim, center, p=1,
-                   p2_band=0):
+                   p2_band=0, y_offset=0.0):
     """Carve a `Box` obstacle out of the unit-cube channel and build the mesh
     chain (mirrors tests/p2r0_task10_sphere_derisk.py::build_sphere_3d, with
     Sphere -> Box and lam=0.0 for the exact body-fitted carve).
@@ -144,6 +144,12 @@ def _build_channel(level, Re, half, offset, device, dim, center, p=1,
     nu = U_IN * D / Re
     center = np.asarray(center, dtype=float).copy()
     center[0] += offset                        # sub-cell shift breaks alignment
+    # y_offset: a PERMANENT transverse shift of the obstacle center. A sub-cell
+    # y_offset breaks the mesh's y-symmetry (dmax>0, a genuine SBM shift on the
+    # rung-C code path) and seeds vortex shedding that the symmetry-preserving
+    # scheme cannot erase. y_offset=0 (default) is bit-for-bit unchanged.
+    if dim >= 2:
+        center[1] += y_offset
     oracle = Box(tuple(center), tuple([half] * dim))
     tree = build_uniform(level, dim=dim)
     n_full = len(tree)
@@ -198,7 +204,7 @@ def _build_channel(level, Re, half, offset, device, dim, center, p=1,
         n_fluid_cells=len(ret), n_full_cells=n_full)
 
 
-def build_square_channel_2d(level, Re, half, offset, device):
+def build_square_channel_2d(level, Re, half, offset, device, y_offset=0.0):
     """2-D square-in-channel fixture (rungs A/B/C).
 
     Returns a dict with (device mesh `dm`, constraints `cons`, `oracle`,
@@ -206,9 +212,11 @@ def build_square_channel_2d(level, Re, half, offset, device):
     the mesh objects and BC data the drivers need. `half = k/2^level` +
     `offset=0` => exact body-fitted (`dmax==0`, `geo.corr==1`); a sub-cell
     `offset` => genuine SBM shift (`0 < dmax < h`). `Re` via `nu = U_IN*D/Re`,
-    `D = 2*half`."""
+    `D = 2*half`. `y_offset` (default 0) shifts the obstacle transversely to
+    seed shedding (a permanent asymmetry the symmetry-preserving scheme cannot
+    restore); a sub-cell `y_offset` yields `dmax>0` (SBM shift path)."""
     return _build_channel(level, Re, half, offset, device, dim=2,
-                          center=(0.5, 0.5))
+                          center=(0.5, 0.5), y_offset=y_offset)
 
 
 def build_cube_channel_3d(level, Re, half, offset, device):
