@@ -1,0 +1,32 @@
+# 04 shifted boundary (SBM) — tolerance baseline (genuine shift d != 0).
+# Scientific invariants within DOCUMENTED tolerances, NOT bitwise GPU identity.
+# The bar is faithfulness to the same-mesh-WITH-SHIFT monolithic oracle.
+#
+# Ground truth (gpubox, CPU/splu, level 4, Re=40, offset=0.05, dt=0.02):
+#   dmax = 0.0500  (0 < dmax < h=0.0625; dmax/h = 0.80 -> a real sub-cell shift)
+#   area-corrected GPs = 4
+#   projection Cd = +1.5407   monolithic (true shift) Cd = +1.5457  (rel 0.32%)
+#   projection mean|u| = 0.9090   monolithic 0.8527   (rel 6.60%)
+checks:
+  # the shift is genuinely active (sub-cell)
+  dmax:
+    min: 0.001
+    max: 0.0625
+  dmax_over_h:
+    reference: 0.80
+    atol: 0.05
+  # verified projection drag with the shift active
+  cd_proj:
+    reference: 1.5407
+    atol: 0.05
+  cd_mono:
+    reference: 1.5457
+    atol: 0.05
+  # faithfulness: projection + SBM shift matches the same-mesh-with-shift mono
+  cd_rel:
+    max: 0.15
+  mu_rel:
+    max: 0.20
+  # the shift must NOT be zeroed in the default (reference) run
+  zero_shift:
+    equals: false

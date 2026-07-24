@@ -1,0 +1,28 @@
+# 03 weak Dirichlet / Nitsche — tolerance baseline (flow past a square, d=0).
+# Scientific invariants within DOCUMENTED tolerances, NOT bitwise GPU identity.
+# The bar is faithfulness to the SAME-MESH monolithic (not the literature square
+# Cd, which needs a far larger domain to remove confinement/blockage).
+#
+# Ground truth (gpubox, CPU/splu, level 4, Re=40, dt=0.02, weak Nitsche):
+#   projection Cd = +1.3529   monolithic Cd = +1.3941   (rel 2.96%)
+#   projection mean|u| = 0.9057   monolithic 0.8550     (rel 5.93%)
+#   dmax = 0.0 (cell-aligned => standard Nitsche); did NOT blow up.
+checks:
+  # the run must be stable (the weak consistent-projection path is validated)
+  blew_up:
+    equals: false
+  # cell-aligned carve => the SBM shift is inert (standard Nitsche)
+  dmax:
+    max: 0.0
+  # verified projection drag
+  cd_proj:
+    reference: 1.3529
+    atol: 0.05
+  cd_mono:
+    reference: 1.3941
+    atol: 0.05
+  # faithfulness: the weak-Nitsche projection matches the same-mesh mono
+  cd_rel:
+    max: 0.15
+  mu_rel:
+    max: 0.20

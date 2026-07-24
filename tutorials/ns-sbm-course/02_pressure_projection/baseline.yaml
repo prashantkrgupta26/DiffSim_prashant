@@ -1,0 +1,32 @@
+# 01 monolithic VMS — tolerance baseline (lid-driven cavity vs Ghia).
+# Scientific invariants within DOCUMENTED tolerances, NOT bitwise GPU identity.
+# The decisive checks are (a) the monolithic tracks Ghia within the coarse-mesh
+# band and (b) the projection tracks the SAME-MESH monolithic (faithfulness).
+#
+# Ground truth (gpubox, CPU/splu, level 4 = 16x16, Re=100, dt=0.05, 200 steps):
+#   max|proj-mono|=0.0486  max|proj-Ghia|=0.0164  max|mono-Ghia|=0.0620
+#   lid station y=0.9766: proj +0.8376  mono +0.8529  Ghia +0.84123
+#   ||div u||: monolithic 0.194  projection 2.035 (finite/bounded, NOT zero)
+checks:
+  # (a) the oracle tracks the Ghia 129^2 table within coarse-mesh tolerance
+  d_mono_ghia:
+    max: 0.09
+  # (b) the projection tracks the same-mesh monolithic — faithfulness
+  d_proj_mono:
+    max: 0.08
+  d_proj_ghia:
+    max: 0.05
+  # lid-adjacent station spot-check (index 1, y=0.9766)
+  u_mono_lid:
+    reference: 0.8529
+    atol: 0.03
+  u_proj_lid:
+    reference: 0.8376
+    atol: 0.03
+  # weak-divergence VMS: finite and bounded, NOT driven to zero
+  div_mono:
+    min: 0.0
+    max: 2.0
+  div_proj:
+    min: 0.0
+    max: 5.0

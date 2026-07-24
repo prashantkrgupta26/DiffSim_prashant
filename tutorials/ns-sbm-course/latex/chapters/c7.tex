@@ -1,0 +1,45 @@
+\chapter{Multi-GPU (planned)}
+\label{ch:c7}
+
+\begin{keybox}\textbf{PLANNED --- not yet written.} This chapter and its
+module (\file{07\_multi\_gpu/}) are a placeholder. The outline below is what
+a future session will build from; see \file{HANDOFF.md} for the full
+instructions.\end{keybox}
+
+\emph{Module: \file{07\_multi\_gpu/} (stub). Beyond a single GPU: the
+distributed solve for problems whose DOF count exceeds one card's memory ---
+the multi-node deployment tier.}
+
+\section*{What this chapter will teach}
+\begin{itemize}
+\item \textbf{When one GPU is not enough.} Chapter~\ref{ch:c6} reaches
+  ${\sim}$100M DOF on a single big node (GH200/NVL4). The next tier ---
+  the film hero and finer meshes --- needs a \emph{distributed} solve. This
+  chapter is the roadmap (Track S / the P2 milestone).
+\item \textbf{Device-FGMRES + distributed AMG.} The mandated iterative path
+  (cuDSS cannot factorize the hero) makes a device-resident FGMRES with a
+  distributed AMG/AMGX preconditioner the load-bearing kernel. The
+  multi-GPU comms pattern (halo exchange for the SpMV, the coarse-grid
+  gather) is the design surface.
+\item \textbf{The partitioning + comms budget.} The 100M-DOF budget line
+  (bytes/dof, nnz/dof, index width per the mixed-width rule, comms volume)
+  extended to $N$ GPUs; the deployment-tier declaration (Horizon
+  gb-large / AWS on-demand clusters).
+\end{itemize}
+
+\section*{Source material (for the author of this chapter)}
+\begin{itemize}
+\item The roadmap reconciliation (Track P / Track S) and the P2
+  NSHT-SBM-Shell hero spec (the multi-node hero this chapter serves).
+\item The device-FGMRES design note (mandatory for the film hero per the
+  scaling conclusion).
+\item Chapter~\ref{ch:c6}'s single-GPU AMGX study as the baseline the
+  multi-GPU path must weak-scale from.
+\item The remote-deploy toolkit (\file{scripts/remote/}) for the
+  gpubox/Nova multi-GPU wiring.
+\end{itemize}
+
+\section*{Status}
+Future. This is a roadmap chapter: the single-GPU AMGX result
+(Ch.~\ref{ch:c6}) must land first --- it defines the per-GPU baseline the
+distributed solve weak-scales from.

@@ -1,0 +1,59 @@
+\chapter{Toward 100M DOF (planned)}
+\label{ch:c6}
+
+\begin{keybox}\textbf{PLANNED --- not yet written.} This chapter and its
+module (\file{06\_toward\_100M\_dof/}) are a placeholder. The outline below
+and the source pointers are what a future session will build from; see
+\file{HANDOFF.md} at the course root for the full, actionable
+instructions.\end{keybox}
+
+\emph{Module: \file{06\_toward\_100M\_dof/} (stub). The pressure-projection
+engine's reason to exist: its SPD pressure-Poisson admits algebraic
+multigrid, so it --- unlike the indefinite saddle --- reaches
+hundred-million-DOF meshes.}
+
+\section*{What this chapter will teach}
+\begin{itemize}
+\item \textbf{The scaling verdict.} The cuDSS direct solver \emph{cannot}
+  factorize the film hero (15.15M DOF, 1.6B nnz) on a GH200 --- an
+  HBM-saturation capacity wall, identical in fp64 and fp32. So the
+  100M-DOF pathway is \textbf{iterative, not direct}, which is exactly why
+  the projection engine (SPD-PPE $\to$ AMG/AMGX) is the load-bearing choice.
+\item \textbf{The AMGX PPE study (task W1).} The Leray stepper's SPD PPE
+  driven through AMGX (PCG $+$ classical-AMG V-cycle) on 3-D uniform meshes:
+  per-solve time, AMG iteration count, residual, memory, and the
+  single-GPU DOF ceiling. Textbook AMG scaling; 100M fits in roughly
+  33\,GB/GPU. Parity check vs \code{splu} at small levels.
+\item \textbf{Device $K_p$ assembly (the mesh-build wall).} The A100/GH200
+  forensics found a ${\sim}61$\,s/step host-side floor (assembly / scatter /
+  GP fields) common to all three GPU generations --- a silent Amdahl
+  ceiling. The chapter measures it, then shows the device-assembled $K_p$
+  path that removes it, and the \emph{one-time} mesh-build cost that
+  remains.
+\item \textbf{The L8$\to$GH200 path.} The PPE scalar DOF map for a 3-D
+  uniform octree at level $L$ is $n=(2^L+1)^3$: L7 ${\sim}$2.1M,
+  L8 ${\sim}$16.6M, L9 ${\sim}$133M. 100M sits between L8 and L9. The
+  study reveals where the single-GPU ceiling actually bites (the Warp
+  $2^{31}$ array-shape limit vs host COO$\to$CSR assembly) and the
+  deployment tier (single big node: GH200/NVL4) it targets.
+\end{itemize}
+
+\section*{Source material (for the author of this chapter)}
+\begin{itemize}
+\item \file{tests/ppe\_amgx\_scaling.py} --- the W1 weak/strong-scaling
+  harness (the real brick this module drives; run on the box in a proj
+  lane with \code{LD\_LIBRARY\_PATH} set for AMGX).
+\item The scaling-pathway program rule and the ``iterative-not-direct''
+  conclusion: \file{docs/dev/production-code-conventions.md}
+  (scaling-pathway section) and the SP-1/P2 milestone notes.
+\item \file{docs/dev/2026-07-23-projection-ladder-FINAL-synthesis.md} ---
+  the projection engine's validation state.
+\item The stage-residency + 100M-DOF-budget table format (bytes/dof,
+  nnz/dof, index width, multi-GPU comms) every scaling chapter must carry.
+\end{itemize}
+
+\section*{Target numbers (to be measured and locked)}
+Per-level PPE solve time and AMG iteration count at L5--L8; the
+\code{amgx}-vs-\code{splu} parity residual at L4--L5; the measured
+bytes/dof and the projected 100M-DOF single-GPU memory (${\sim}$33\,GB
+target).

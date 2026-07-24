@@ -1,0 +1,23 @@
+# Chapter 05 — 3-D immersed sphere (SBM-NS). MONOLITHIC drag path (the hero
+# number, Cd = +0.381). Reference mode marches to steady; --pipeline adds the
+# projection composition invariants. Level 4 is the de-risk resolution (host
+# splu ~seconds/step); level 5 wants cuDSS/AMGX.
+level: 4
+Re: 100
+alpha: 10.0
+dt: 0.05
+max_steps: 60
+rate_tol: 5.0e-3
+pipeline: false
+device: cpu
+precision: fp64
+modes:
+  quick:
+    level: 3
+    max_steps: 20
+  reference:
+    level: 4
+    max_steps: 60
+  research:
+    level: 5
+    max_steps: 80

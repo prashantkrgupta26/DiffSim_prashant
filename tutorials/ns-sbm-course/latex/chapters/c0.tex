@@ -1,0 +1,107 @@
+\chapter{Governing equations and the two engines}
+\label{ch:c0}
+
+\emph{Module: \file{00\_setup\_and\_smoke\_test/}. Read this before
+running anything --- it sets the notation and the two engines the whole
+course compares.}
+
+\section{Strong form}
+
+On a domain $\Omega$ with density $1$ and kinematic viscosity $\nu$, the
+incompressible Navier--Stokes equations for velocity $u$ and pressure $p$
+are (\file{ns\_bricks.py:11--14}):
+\begin{align}
+\partial_t u + (u\cdot\grad)u &= -\grad p + \nu\,\grad\!\cdot(\grad u) + f
+  &&\text{(momentum),}\\
+\grad\cdot u &= 0 &&\text{(incompressibility).}
+\end{align}
+
+\subsection{Boundary conditions}
+\begin{itemize}
+\item \textbf{Dirichlet} (inflow, walls, moving lid, no-slip body): $u=g$
+  on $\Gamma_D$. Imposed \emph{strongly} (row replacement) or \emph{weakly}
+  (Nitsche, Ch.~\ref{ch:c3}; SBM, Ch.~\ref{ch:c4}).
+\item \textbf{Outflow / ``do-nothing''}: the natural boundary condition of
+  the weak form. Integrating the viscous and pressure terms by parts drops
+  their surface terms at the outflow, leaving $\nu\,\partial_n u - p\,n=0$
+  (a traction-free condition) (\file{ns\_bricks.py:16--17}).
+\end{itemize}
+
+\subsection{Nondimensionalization}
+The examples fix a reference speed $U$ and a body length scale $D$ and set
+the viscosity from the Reynolds number,
+\begin{equation}
+\nu = \frac{U\,D}{\Rey}.
+\end{equation}
+In the channel fixtures $U=U_{\text{in}}=1$ and $D=2\times\text{half}$ (the
+obstacle side length); the cavity uses $D=L=1$. Drag is reported as
+$\Cd = F_x/q_{\text{ref}}$ with $q_{\text{ref}}=\tfrac12 U^2 D$ in 2-D and
+$\tfrac12 U^2\pi R^2$ for the sphere.
+
+\section{Equal-order $P_1/P_1$ and why we stabilize}
+
+DiffSim uses \textbf{equal-order} ($P_1/P_1$, and $P_2/P_2$) collocated
+velocity--pressure elements: \code{ndof = dim + 1} per node, node-major
+$(u_1,\dots,u_{\dim},p)$. Equal-order pairs violate the inf--sup (LBB)
+condition, so the pure Galerkin saddle system is singular / oscillatory in
+pressure. \textbf{Both} engines therefore add residual-based
+VMS/SUPG--PSPG stabilization on the momentum strong residual
+(\file{ns\_bricks.py:23--27}). The PSPG term is the one that makes
+equal-order work; without it the pressure--pressure block is empty and the
+saddle is singular. The full derivation is Chapter~\ref{ch:c1}.
+
+\begin{keybox}\textbf{Key idea.} Equal-order collocated elements are cheap
+and simple but LBB-unstable. Residual-based VMS is not optional polish ---
+it is what makes the pressure well-posed at all. The same $\tau_M,\tau_C$
+appear in \emph{both} engines.\end{keybox}
+
+\section{The two engines}
+\label{sec:c0-two-engines}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & \textbf{Monolithic} (oracle) & \textbf{Projection} (scalable)\\
+\midrule
+Class & \code{LinearizedMonolithicStepper} &
+  \code{LerayProjectionStepper}\\
+Solve & one coupled $(u,p)$ saddle & predictor $\to$ SPD PPE $\to$ correct\\
+Operator & indefinite $\saddle$ & one nonsym.\ + two SPD sub-solves\\
+Scales via & direct / block-precond.\ FGMRES & \textbf{SPD PPE $\to$ AMG/CG}\\
+Source & \file{steppers/linearized.py} & \file{steppers/leray.py}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The \textbf{monolithic} solver is the \emph{correctness oracle}: robust,
+and its steady state is the bar every projection run is measured against.
+The \textbf{projection} solver is the \emph{scalability lever}: its
+pressure step is a symmetric positive-definite (SPD) Poisson problem that
+algebraic multigrid handles at scales where the indefinite saddle
+factorization runs out of memory. For 3-D drag on today's feasible meshes
+the monolithic path is the working one (Ch.~\ref{ch:c5}); the projection
+engine is the path to the 100M-DOF hero (Ch.~\ref{ch:c6}).
+
+\begin{runbox}\textbf{Run it.} In \file{00\_setup\_and\_smoke\_test/}, run
+\code{python doctor.py} (environment gate) then \code{python run.py}
+(a tiny lid-driven cavity through \emph{both} engines). The smoke passes
+when both engines march to a finite, bounded state and the projection
+tracks the monolithic; compare with \file{EXPECTED.md}.\end{runbox}
+
+\section{The Shifted Boundary Method in brief}
+The SBM lets an immersed body sit \emph{off} the mesh grid. Instead of
+body-fitting, we keep a grid-aligned octree and pick a \textbf{surrogate
+boundary} $\Gambar$ (whole element faces that hug the true boundary
+$\Gamma$). A \textbf{Taylor shift} transfers the boundary condition from
+$\Gambar$ to $\Gamma$ using a distance vector $d$ (surrogate Gauss point
+$\to$ closest point on $\Gamma$). When the body \emph{is} grid-aligned,
+$d=0$ and SBM degenerates to ordinary Nitsche --- which is why the modules
+build up from $d=0$ (Ch.~\ref{ch:c3}) to $d\neq0$ (Ch.~\ref{ch:c4},
+Ch.~\ref{ch:c5}).
+
+\question What does $q_{\text{ref}}$ become for a 3-D sphere of radius $R$,
+and why is it $\pi R^2$ rather than $\pi R^2/2$?
+
+\question On an equal-order pair, is the pressure defined uniquely for a
+closed cavity? What does the code pin, and where (see
+Ch.~\ref{ch:c2})?

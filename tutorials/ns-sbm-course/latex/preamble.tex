@@ -1,0 +1,61 @@
+% NS-SBM course - shared preamble
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[numbers,sort&compress]{natbib}   % course bibliography (refs.bib)
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=teal,urlcolor=purple]{hyperref}
+\usepackage{mdframed}
+\usepackage{enumitem}
+
+% let TeX stretch spacing on occasional hard-to-break prose lines
+% rather than overflow the margin (no visible effect on normal lines)
+\emergencystretch=1.5em
+
+\definecolor{codebg}{RGB}{245,247,250}
+\definecolor{codekw}{RGB}{0,90,160}
+\definecolor{codecom}{RGB}{110,120,130}
+\definecolor{codestr}{RGB}{160,60,40}
+
+\lstdefinestyle{py}{
+  language=Python, backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small, keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecom}\itshape, stringstyle=\color{codestr},
+  showstringspaces=false, breaklines=true, frame=single,
+  framerule=0pt, rulecolor=\color{codebg}, numbers=none, xleftmargin=6pt}
+\lstset{style=py}
+
+% concept boxes ----------------------------------------------------------
+\newmdenv[linecolor=teal!60,linewidth=1pt,backgroundcolor=teal!4,
+  skipabove=8pt,skipbelow=8pt,innertopmargin=6pt,innerbottommargin=6pt]{keybox}
+\newmdenv[linecolor=purple!55,linewidth=1pt,backgroundcolor=purple!4,
+  skipabove=8pt,skipbelow=8pt,innertopmargin=6pt,innerbottommargin=6pt]{runbox}
+
+% "explore on your own" questions
+\newcounter{qcounter}[section]
+\newcommand{\question}[1]{\refstepcounter{qcounter}%
+  \par\smallskip\noindent\textbf{\textcolor{purple!70!black}{Q\thesection.\theqcounter}}\; #1\par}
+
+% shorthand
+\newcommand{\grad}{\nabla}
+\newcommand{\dd}[2]{\frac{\partial #1}{\partial #2}}
+\newcommand{\pd}[2]{\frac{\partial #1}{\partial #2}}
+\newcommand{\dV}{\,dV}\newcommand{\dS}{\,dS}\newcommand{\dA}{\,dA}
+\newcommand{\intv}{\int_\Omega}
+\newcommand{\code}[1]{\lstinline[basicstyle=\ttfamily\small]|#1|}
+% NS-SBM shorthand
+\newcommand{\Rey}{\mathrm{Re}}
+\newcommand{\Cd}{C_d}
+\newcommand{\uh}{u_h}\newcommand{\ph}{p_h}
+\newcommand{\tauM}{\tau_M}\newcommand{\tauC}{\tau_C}
+\newcommand{\Gambar}{\tilde\Gamma}\newcommand{\nbar}{\bar n}
+\newcommand{\inner}[2]{\left(#1,\,#2\right)}
+\newcommand{\bnd}[3]{\left\langle #1,\,#2\right\rangle_{#3}}
+% saddle-point block matrix
+\newcommand{\saddle}{\begin{bmatrix}F&G\\D&C\end{bmatrix}}
+% \file: typewriter paths that break at / and . so long paths never
+% overflow the margin (\nolinkurl from hyperref, tt style).
+\urlstyle{tt}
+\newcommand{\file}[1]{{\small\nolinkurl{#1}}}

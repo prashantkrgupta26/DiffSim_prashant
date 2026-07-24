@@ -1,0 +1,108 @@
+\chapter{The pressure-projection engine}
+\label{ch:c2}
+
+\emph{Module: \file{02\_pressure\_projection/}. The scalable engine.
+Predictor $\to$ SPD pressure-Poisson $\to$ velocity correction; the same
+lid-driven cavity, the same answer; and why this is the 100M-DOF path.}
+
+\section{The Helmholtz--Leray split}
+The projection engine implements Algorithm~1 of the Helmholtz--Leray VMS
+draft (\file{leray.py:1--23}). Per step, with $p^{*}$ the extrapolated
+pressure (order~1: $p^{*}=\hat p^n$):
+\begin{enumerate}
+\item \textbf{Momentum predictor} (nonlinear, Picard): solve the monolithic
+  block with the pressure DOFs pinned to $p^{*}$'s nodal values, so the
+  momentum rows see $\grad p^{*}$ through the coupling
+  (\file{leray.py:6--13}, \file{719--830}).
+\item \textbf{PPE} --- the SPD pressure-Poisson for the increment
+  $\phi=\hat p - p^{*}$:
+  \[
+  \inner{\grad\phi}{\grad q} = \sigma\,\inner{\hat u - \tauM r_m(\hat u,p^{*})}{\grad q}
+  \]
+  with the h-based $\tauM$ (\file{leray.py:14--19}, \file{948--1106}).
+\item \textbf{Velocity correction} (fine scale retained):
+  $u^{n+1}=\hat u - \tfrac1\sigma(\grad\hat p - \grad p^{*})$.
+\item $p^{*}\leftarrow\hat p$ (first-order incremental).
+\end{enumerate}
+
+\begin{keybox}\textbf{Key idea --- why projection scales.} The pressure
+step is a \textbf{symmetric positive-definite} Poisson problem. Unlike the
+indefinite saddle, it is the natural target for algebraic multigrid $+$ CG
+--- the mandated path to the 100M-DOF hero (\file{leray\_sbm.py:19--23}).
+This is the whole reason projection exists alongside the monolithic
+oracle.\end{keybox}
+
+\section{The VMS-consistent PPE (\texttt{consistent\_projection})}
+Na\"ively splitting the projection \emph{breaks faithfulness}: the split's
+steady state is generally \emph{not} the monolithic steady state. The
+\code{consistent_projection} mode (the 2026-07-23 fix,
+\file{leray.py:48--72}) is the single switch that turns on the coherent
+VMS-stabilized Helmholtz--Leray set so the monolithic steady state becomes
+a \textbf{fixed point} of the split. It bundles six items:
+\begin{description}
+\item[\#1 PSPG-consistent PPE operator] the coarse divergence is kept
+  \emph{collocated} with the test $q$ (NOT integrated by parts), so the
+  split's discrete incompressibility matches the monolithic PSPG continuity
+  row term-for-term (\file{leray.py:1007--1034}). The full-flux by-parts
+  path fabricates a spurious boundary term $\sigma(\uh\cdot n,q)_\Gamma$ at
+  an open outflow.
+\item[\#2 fine scale $u'=-\tauM r_m$ in BOTH the PPE source AND the L2
+  correction] with the consistent mass $D=G^\top$ (\file{leray.py:53--61}).
+\item[\#3 disjoint outflow BCs (Baskar's rule)] velocity is left free at the
+  outflow (natural do-nothing $\partial_n u=0$), while the pressure
+  \emph{correction} $p'=0$ is imposed as a Dirichlet condition on the
+  outflow nodes. Authoritative: $\grad u\cdot n=0$ in the predictor
+  \emph{only}, $p'=0$ in the PPE \emph{only} (\file{leray.py:62--69}).
+\item[\#4 rotational-incremental pressure update (Timmermans 1996)]
+  $p=p^{*}+\phi-\nu\,\grad\!\cdot\hat u$, valid for constant $\nu$
+  (\file{leray.py:1114--1168}).
+\item[\#5/\#6] a $P_1$ boundary-vorticity outflow term and backflow
+  (directional do-nothing) stabilization, both on the outflow.
+\end{description}
+Two secular-drift cures ride with the mode: the rotational correction $q$
+is pinned to zero on the outflow rows and, for immersed walls, on the
+SBM/wall nodes --- the latter is \textbf{the drag fix} for weak-Nitsche
+bodies (Ch.~\ref{ch:c3}).
+
+\section{Fine scale threaded through all three sub-solves}
+The fine-scale velocity $-\tauM r_m$ is computed once in the PPE pass and
+\emph{stashed} (\code{fs_vel}, \file{leray.py:973}) so the same $u'$ enters
+the PPE source \emph{and} the velocity correction --- the consistency that
+makes the correction a true discrete projection.
+
+\section{The composed SBM engine}
+\code{LeraySBMStepper} (\file{leray\_sbm.py:81--160}) \emph{composes} the
+base projection stepper with an immersed-geometry oracle (it does not fork
+it). It runs the surrogate pipeline once, builds the shifted-Nitsche face
+block once (\code{sbm_vector_dirichlet}), and injects it into the predictor
+via the \code{extra_block}/\code{sbm_nodes} hook. The box inflow/walls are
+strong; the immersed body is weak (SBM). This is the engine of
+Ch.~\ref{ch:c4}--\ref{ch:c5}.
+
+\section{Verification: the same cavity, the same answer}
+The module re-runs the Chapter~\ref{ch:c1} lid-driven cavity through the
+projection engine on the same level-4 mesh. The projection tracks the
+monolithic to within the coarse-mesh band:
+\[
+\max|\text{proj}-\text{mono}| = \LdcProjMono,\qquad
+\max|\text{proj}-\text{Ghia}| = \LdcProjGhia.
+\]
+The pointwise projection $\|\grad\!\cdot u\| = \LdcDivProj$ is finite and
+bounded (not zero) --- the same weak-divergence story as
+Ch.~\ref{ch:c1}. The right divergence gate is the \textbf{PPE-space
+solenoidality identity} $\|\sigma B^\top\hat u - K_p\phi\|\approx0$, which
+is machine-zero at the fixed point.
+
+\begin{runbox}\textbf{Run it.} \code{python run.py} in
+\file{02\_pressure\_projection/} reproduces the cavity through the
+projection engine and checks it against the monolithic. Try
+\code{--no-consistent} to drop \code{consistent_projection} and watch
+faithfulness degrade.\end{runbox}
+
+\question Enclosed flow pins one pressure DOF (free-node 0); external flow
+imposes $p'=0$ on the outflow. Why can't external flow use the node-0 pin,
+and why can't enclosed flow use an outflow Dirichlet?
+
+\question The base ``strong'' split on an \emph{open} outflow (without the
+consistent machinery) is pressure-unstable and can blow up. Which of the
+six \code{consistent_projection} items most directly cures that, and why?
