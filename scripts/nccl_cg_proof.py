@@ -424,6 +424,10 @@ def main():
     # Device selection
     if args.backend == "nccl":
         device = torch.device(f"cuda:{local_rank}")
+        # NCCL binds its internal buffers to the CURRENT cuda device, not the
+        # per-tensor device — every rank MUST pin its device before any NCCL op
+        # or all ranks collide on cuda:0 (CUDA error 999 in batch_isend_irecv).
+        torch.cuda.set_device(local_rank)
     else:
         device = torch.device("cpu")
 
@@ -512,21 +516,33 @@ def main():
     # ----------------------------------------------------------------
     # Gather distributed solution on rank 0 for comparison
     # ----------------------------------------------------------------
-    # Collect n_owned sizes across ranks
-    n_owned_tensor = torch.tensor([n_owned], dtype=torch.int64)
-    all_n_owned = [torch.zeros(1, dtype=torch.int64) for _ in range(world_size)]
+    # Collect n_owned sizes across ranks. Collective tensors must live on the
+    # backend's device: CUDA for NCCL (CPU tensors raise "No backend type
+    # associated with device type cpu"), CPU for gloo. `device` is already the
+    # right one for this backend.
+    n_owned_tensor = torch.tensor([n_owned], dtype=torch.int64, device=device)
+    all_n_owned = [torch.zeros(1, dtype=torch.int64, device=device)
+                   for _ in range(world_size)]
     dist.all_gather(all_n_owned, n_owned_tensor)
     all_n_owned_list = [int(t.item()) for t in all_n_owned]
+    max_n = max(all_n_owned_list)
 
-    # x_local is a torch tensor; gather to rank 0
-    x_local_cpu = x_local.cpu() if isinstance(x_local, torch.Tensor) else torch.tensor(x_local, dtype=torch.float64)
-
+    # Gather the solution with a PADDED all_gather (NCCL has no robust gather/
+    # scatter and requires equal-sized tensors; slabs differ by the remainder).
+    # Each rank pads its owned solution to max_n, all_gather, then rank 0 trims
+    # per-rank and concatenates in rank order (== global node order for slabs).
+    x_dev = (x_local.to(device=device, dtype=torch.float64)
+             if isinstance(x_local, torch.Tensor)
+             else torch.tensor(x_local, dtype=torch.float64, device=device))
+    x_pad = torch.zeros(max_n, dtype=torch.float64, device=device)
+    x_pad[:n_owned] = x_dev
+    gathered = [torch.zeros(max_n, dtype=torch.float64, device=device)
+                for _ in range(world_size)]
+    dist.all_gather(gathered, x_pad)
     if rank == 0:
-        gathered = [torch.zeros(n, dtype=torch.float64) for n in all_n_owned_list]
-        dist.gather(x_local_cpu, gathered, dst=0)
-        x_dist = torch.cat(gathered).numpy()
+        parts = [gathered[r][:all_n_owned_list[r]] for r in range(world_size)]
+        x_dist = torch.cat(parts).cpu().numpy()
     else:
-        dist.gather(x_local_cpu, dst=0)
         x_dist = None
 
     # ----------------------------------------------------------------
