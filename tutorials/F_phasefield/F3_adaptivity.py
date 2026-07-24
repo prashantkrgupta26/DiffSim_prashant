@@ -87,6 +87,9 @@ import warp as wp
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..",
                                 "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import _viz as _viz  # guarded viz helper (no-ops when [viz] not installed)
+
 from diffsim.octree.build import build_uniform, refine_elements
 from diffsim.octree.balance import balance2to1
 from diffsim.mesh.nodes import build_mesh
@@ -156,19 +159,22 @@ def epoch(tree, mesh, cons, st, c, mu, thresh=0.5):
     return tree2, mesh2, cons2, dm2, st2, c2, mu2, int(mark.sum()), cost
 
 
-def main(n_epochs=2, steps_before=8, steps_per_epoch=5):
+def main(n_epochs=2, steps_before=8, steps_per_epoch=5, level=5):
     print("=" * 70)
     print("Adaptive spinodal CH: 2 re-mesh epochs, conservation watched")
     print("=" * 70)
-    tree = build_uniform(5, dim=2)
+    tree = build_uniform(level, dim=2)
     mesh, cons, dm = make_problem(tree)
     st = CahnHilliardStepper(dm, M, KAPPA, DT, order=1)
     rng = np.random.default_rng(3)
     st.set_initial(lambda x: 0.05 * rng.standard_normal(len(x)))
-    print(f"  uniform level 5: {len(tree)} elems; developing the "
+    print(f"  uniform level {level}: {len(tree)} elems; developing the "
           f"pattern for {steps_before} steps...")
+    t_log, E_log = [], []
     for _ in range(steps_before):
         c, mu = st.step()
+        t_log.append(st.t)
+        E_log.append(diagnostics(st, dm, mesh, c)[1])
     m, E = diagnostics(st, dm, mesh, c)
     print(f"  pre-adapt:  elems {len(tree):6d}  mass {m:+.12e}  "
           f"E {E:.6f}")
@@ -182,12 +188,17 @@ def main(n_epochs=2, steps_before=8, steps_per_epoch=5):
               f"drift {m2 - m:+.3e}  |dE| {abs(E2 - E):.1e}")
         for _ in range(steps_per_epoch):
             c, mu = st.step()
+            t_log.append(st.t)
+            E_log.append(diagnostics(st, dm, mesh, c)[1])
         m, E = diagnostics(st, dm, mesh, c)
         print(f"    after {steps_per_epoch} steps: mass {m:+.12e}  "
               f"E {E:.6f}  c in [{c.min():+.2f},{c.max():+.2f}]")
     print("  Drift EXACTLY zero at each epoch: nested refinement means")
     print("  P re-expresses the same function — conservation by")
     print("  NESTEDNESS, not by luck. (Coarsening would break this.)")
+    # --- viz (additive; no-ops on base venv) ---
+    _viz.history(__file__, t_log, {"F[c]": E_log}, "adaptive_energy_history",
+                 xlabel="t", ylabel="Free energy F[c]")
 
 
 if __name__ == "__main__":

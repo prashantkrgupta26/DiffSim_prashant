@@ -116,6 +116,9 @@ import warp as wp
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..",
                                 "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import _viz as _viz  # guarded viz helper (no-ops when [viz] not installed)
+
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
@@ -181,6 +184,7 @@ def demo_1_spinodal(level=5, nsteps=20):
     rng = np.random.default_rng(3)
     c = st.set_initial(lambda x: 0.05 * rng.standard_normal(len(x)))
     m0, E, L = diagnostics(st, dm, mesh, c, kappa)
+    t_log, E_log, L_log = [0.0], [E], [L]
     print(f"  {'step':>4} {'mass drift':>11} {'energy':>10} "
           f"{'L(t)':>7}  c-range")
     print(f"  {0:4d} {0.0:11.1e} {E:10.4f} {L:7.3f}  "
@@ -189,6 +193,9 @@ def demo_1_spinodal(level=5, nsteps=20):
     for n in range(nsteps):
         c, mu = st.step()
         m, E, L = diagnostics(st, dm, mesh, c, kappa)
+        t_log.append(st.t)
+        E_log.append(E)
+        L_log.append(L)
         note = ""
         if n == 0:
             note = "  <-- step-0 mu-init transient (see docstring!)"
@@ -202,11 +209,21 @@ def demo_1_spinodal(level=5, nsteps=20):
           f"(v = 1 test function).")
     print(f"  energy monotone from step 1 ({viol} violations); "
           f"L(t) grew: coarsening.")
+    # --- viz (additive; no-ops on base venv) ---
+    _viz.history(__file__, t_log,
+                 {"F[c]": E_log, "L(t)": L_log},
+                 "spinodal_energy_coarsening",
+                 xlabel="t", ylabel="F[c] / L(t)")
     return c
 
 
+def main(level=5, nsteps=20):
+    """Run the CH spinodal demo (default full-size; pass small values for tests)."""
+    return demo_1_spinodal(level=level, nsteps=nsteps)
+
+
 if __name__ == "__main__":
-    demo_1_spinodal()
+    main()
     print("""
 EXPLORE
  1. Convex splitting. Our Newton solves the fully implicit potential;

@@ -25,10 +25,15 @@ Numbers move with hardware; the RANKING and the sync counts must not.
 
 Run:  python tutorials/P_performance/P2_solver_showdown.py
 """
+import os
+import sys
 import time
 
 import numpy as np
 from scipy.sparse.linalg import splu
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import _viz as _viz  # guarded viz helper (no-ops when [viz] not installed)
 
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
@@ -54,8 +59,8 @@ def build(level):
     return A
 
 
-if __name__ == "__main__":
-    level = 8
+def main(level=8):
+    """Run the solver showdown and emit a timing comparison figure."""
     A = build(level)
     n = A.shape[0]
     rng = np.random.default_rng(1)
@@ -93,6 +98,19 @@ if __name__ == "__main__":
           f"{sc.count:>7} {np.linalg.norm(x_f - x_d) / ref:>13.2e}")
     print(f"\nper-iteration: host {1e3 * t_host / info_h['iters']:.3f} ms   "
           f"fused {1e3 * t_fused / info_f['iters']:.3f} ms")
+    # --- viz (additive; no-ops on base venv) ---
+    _viz.history(
+        __file__,
+        ["splu", "host CG", "fused CG"],
+        {"time (s)": [t_direct, t_host, t_fused]},
+        "solver_times",
+        xlabel="solver", ylabel="wall time (s)",
+    )
+    return t_direct, t_host, t_fused
+
+
+if __name__ == "__main__":
+    main()
     print("""
 EXPLORE
   (a) The break-even question that decides track-D's architecture: splu

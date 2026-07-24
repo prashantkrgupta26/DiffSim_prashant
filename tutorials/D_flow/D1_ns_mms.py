@@ -26,8 +26,14 @@ EXPECTED RESULTS (nu = 0.1):
 
 Run:  python tutorials/D_flow/D1_ns_mms.py
 """
+import os
+import sys
+
 import numpy as np
 from scipy.sparse.linalg import splu
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import _viz as _viz  # guarded viz helper (no-ops when [viz] not installed)
 
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
@@ -99,20 +105,33 @@ def solve(level, nu):
     return eu, ep
 
 
-if __name__ == "__main__":
-    nu = 0.1
-    res = [solve(lv, nu) for lv in (3, 4, 5)]
+def main(levels=(3, 4, 5), nu=0.1):
+    """Run the NS-MMS convergence study and emit convergence figures."""
+    res = [solve(lv, nu) for lv in levels]
     eu = [r[0] for r in res]
     ep = [r[1] for r in res]
     print("velocity: errors " + "  ".join(f"{e:.3e}" for e in eu)
           + "   orders "
-          + "  ".join(f"{np.log2(eu[i] / eu[i + 1]):.2f}" for i in range(2)))
+          + "  ".join(f"{np.log2(eu[i] / eu[i + 1]):.2f}" for i in range(len(eu) - 1)))
     print("pressure: errors " + "  ".join(f"{e:.3e}" for e in ep)
           + "   orders "
-          + "  ".join(f"{np.log2(ep[i] / ep[i + 1]):.2f}" for i in range(2)))
-    eu_lo, _ = solve(4, 1e-3)
-    print(f"advection-dominated nu=1e-3, level 4: velocity err {eu_lo:.3e} "
-          "(finite and small => SUPG is doing its job)")
+          + "  ".join(f"{np.log2(ep[i] / ep[i + 1]):.2f}" for i in range(len(ep) - 1)))
+    if len(levels) == 3:
+        eu_lo, _ = solve(4, 1e-3)
+        print(f"advection-dominated nu=1e-3, level 4: velocity err {eu_lo:.3e} "
+              "(finite and small => SUPG is doing its job)")
+    # --- viz (additive; no-ops on base venv) ---
+    _viz.convergence(__file__, list(levels), eu, "convergence_velocity",
+                     slope=2, xlabel="refinement level", ylabel="L2 velocity error",
+                     label="velocity")
+    _viz.convergence(__file__, list(levels), ep, "convergence_pressure",
+                     slope=1, xlabel="refinement level", ylabel="L2 pressure error",
+                     label="pressure")
+    return eu, ep
+
+
+if __name__ == "__main__":
+    main()
     print("""
 EXPLORE
   (a) Remove the pressure pin. What does splu report, and why? (A2's

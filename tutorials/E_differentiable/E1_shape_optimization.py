@@ -32,9 +32,15 @@ mesh topology, only on the smooth geometric quantities.
 
 Run:  python tutorials/E_differentiable/E1_shape_optimization.py     (~2 min)
 """
+import os
+import sys
+
 import numpy as np
 import torch
 from scipy.sparse.linalg import splu
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import _viz as _viz  # guarded viz helper (no-ops when [viz] not installed)
 
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
@@ -78,10 +84,10 @@ def forward(theta):
     return oracle, prob, dm, A, meta, u_all
 
 
-if __name__ == "__main__":
-    truth = np.array([0.52, 0.47, 0.31])
-    # synthesize the "sensor data" from the secret geometry
+def main(n_iters=100):
+    """Run the shape-optimization loop and emit an objective-history figure."""
     from diffsim.mesh.pointeval import point_eval_weights
+    truth = np.array([0.52, 0.47, 0.31])
     _, _, dm_t, _, _, u_all_t = forward(truth)
     targets = np.asarray(point_eval_weights(dm_t.mesh, PROBES) @ u_all_t)
 
@@ -89,13 +95,15 @@ if __name__ == "__main__":
                          requires_grad=True)
     opt = torch.optim.Adam([theta], lr=2e-2)
     print(f"{'iter':>4} {'J':>12} {'cx':>8} {'cy':>8} {'r':>8}")
-    for it in range(100):
+    J_log = []
+    for it in range(n_iters):
         if it == 60:
             for g in opt.param_groups:
                 g["lr"] = 4e-3                    # settle Adam's oscillation
         oracle, prob, dm, A, meta, u_all = forward(theta.detach().numpy())
         evalJ, dJdu_fn = probe_qoi(dm, PROBES, targets)
         J = evalJ(u_all)
+        J_log.append(float(J))
         if it % 10 == 0:
             t = theta.detach().numpy()
             print(f"{it:>4} {J:>12.3e} {t[0]:>8.4f} {t[1]:>8.4f} {t[2]:>8.4f}")
@@ -115,6 +123,15 @@ if __name__ == "__main__":
     print(f"\nrecovered theta = {found.round(5)}")
     print(f"true      theta = {truth}")
     print(f"|error|         = {np.abs(found - truth).round(6)}")
+    # --- viz (additive; no-ops on base venv) ---
+    _viz.history(__file__, list(range(len(J_log))), {"J": J_log},
+                 "objective_history",
+                 xlabel="iteration", ylabel="objective J")
+    return found
+
+
+if __name__ == "__main__":
+    main()
     print("""
 EXPLORE
   (a) Delete probes until recovery fails. How few readings determine three

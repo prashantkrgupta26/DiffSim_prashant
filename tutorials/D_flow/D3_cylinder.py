@@ -21,9 +21,15 @@ EXPECTED RESULTS (level 5, ~50 pseudo-steps, ~15 s):
 
 Run:  python tutorials/D_flow/D3_cylinder.py
 """
+import os
+import sys
+
 import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.linalg import splu
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import _viz as _viz  # guarded viz helper (no-ops when [viz] not installed)
 
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
@@ -43,8 +49,9 @@ R, CTR, U_IN = 0.07, (0.3, 0.5), 1.0
 NU = 2 * U_IN * R / 20.0                        # Re_D = 20
 
 
-if __name__ == "__main__":
-    level, ndof, dim, dt = 5, 3, 2, 0.05
+def main(level=5, dt=0.05, max_steps=160):
+    """Run the cylinder flow and emit a drag-history figure + VTU."""
+    ndof, dim = 3, 2
     # ---- carve the exterior domain and prepare the SBM data (A6 + A3) ----
     oracle = Sphere(CTR, R)
     tree = build_uniform(level, dim=2)
@@ -81,7 +88,8 @@ if __name__ == "__main__":
     x = np.zeros(nfree * ndof)
     sigma = 1.0 / dt
     qref = 0.5 * U_IN ** 2 * 2 * R
-    for step in range(1, 161):
+    Cd_history, Cl_history, step_history = [], [], []
+    for step in range(1, max_steps + 1):
         u_node = x.reshape(nfree, ndof)[:, :dim]
         aq, dq = gp_field(u_node)
         fq = {pv: aq[pv] / dt for pv in xq}      # BDF1 history term
@@ -103,11 +111,25 @@ if __name__ == "__main__":
         x_new = splu(A.tocsr().tocsc()).solve(b)
         rate = np.abs(x_new - x).max() / dt
         x = x_new
+        F_step = surrogate_traction(dm, sf, geo, np.asarray(T_vec @ x), NU, ndof)
+        Cd_history.append(F_step[0] / qref)
+        Cl_history.append(F_step[1] / qref)
+        step_history.append(step * dt)
         if step > 10 and rate < 5e-3:
             break
     F = surrogate_traction(dm, sf, geo, np.asarray(T_vec @ x), NU, ndof)
     print(f"steady after {step} steps:  Cd = {F[0] / qref:.3f}   "
           f"Cl = {F[1] / qref:+.5f}")
+    # --- viz (additive; no-ops on base venv) ---
+    _viz.history(__file__, step_history,
+                 {"Cd": Cd_history, "Cl": Cl_history},
+                 "drag_lift_history",
+                 xlabel="pseudo-time", ylabel="Force coefficient")
+    return F[0] / qref, F[1] / qref
+
+
+if __name__ == "__main__":
+    main()
     print("""
 EXPLORE
   (a) Break the symmetry: move the cylinder to (0.3, 0.45). How large is

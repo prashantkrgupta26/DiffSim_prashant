@@ -98,6 +98,9 @@ import warp as wp
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..",
                                 "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import _viz as _viz  # guarded viz helper (no-ops when [viz] not installed)
+
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
@@ -156,6 +159,7 @@ def demo_1_coarsening(level=5, nsteps=150, print_every=15):
     c = st.set_initial(lambda x: 0.2 * rng.standard_normal(len(x)))
     E = free_energy(st, dm, mesh, c, kappa)
     viol = 0
+    t_log, E_log = [0.0], [E]
     print(f"  {'step':>4} {'t':>5} {'energy':>10}  c-range        "
           f"|c|>0.9")
     print(f"  {0:4d} {0.0:5.2f} {E:10.6f}  "
@@ -166,6 +170,8 @@ def demo_1_coarsening(level=5, nsteps=150, print_every=15):
         if E_new > E + 1e-10:
             viol += 1
         E = E_new
+        t_log.append(st.t)
+        E_log.append(E)
         if (n + 1) % print_every == 0:
             sat = float(np.mean(np.abs(c) > 0.9))
             print(f"  {n+1:4d} {st.t:5.2f} {E:10.6f}  "
@@ -176,6 +182,9 @@ def demo_1_coarsening(level=5, nsteps=150, print_every=15):
     print("  (gradient term smooths the noise), then grows to +-1 as")
     print("  the wells win. Energy decays through both — Eq. dF/dt <= 0")
     print("  does not care which term is doing the work.")
+    # --- viz (additive; no-ops on base venv) ---
+    _viz.history(__file__, t_log, {"F[c]": E_log}, "demo1_energy_history",
+                 xlabel="t", ylabel="Free energy F[c]")
 
 
 # ----------------------------------------------------------------------
@@ -217,12 +226,16 @@ def demo_2_shrinking_circle(level=6, nsteps=25):
         iz = np.where(np.sign(cz[:-1]) != np.sign(cz[1:]))[0]
         return float(r_node[order][iz[0]])
 
+    t_log, Rm_log, Rth_log = [], [], []
     print(f"  {'t':>6} {'R measured':>11} {'R theory':>9} {'rel err':>8}")
     for n in range(nsteps):
         c = st.step()
         if (n + 1) % 5 == 0 or n == nsteps - 1:
             Rm = measured_radius(c)
             Rth = np.sqrt(R0 ** 2 - 2 * M * kappa * st.t)
+            t_log.append(st.t)
+            Rm_log.append(Rm)
+            Rth_log.append(Rth)
             print(f"  {st.t:6.2f} {Rm:11.4f} {Rth:9.4f} "
                   f"{abs(Rm-Rth)/Rth:8.1%}")
     Rm = measured_radius(c)
@@ -232,6 +245,11 @@ def demo_2_shrinking_circle(level=6, nsteps=25):
     print("  A nonlinear PDE, a curvature flow, and a one-line exact")
     print("  answer. When a benchmark like this exists, USE it before")
     print("  trusting any prettier problem.")
+    # --- viz (additive; no-ops on base venv) ---
+    _viz.history(__file__, t_log,
+                 {"R measured": Rm_log, "R theory": Rth_log},
+                 "demo2_shrinking_circle",
+                 xlabel="t", ylabel="radius R")
 
 
 if __name__ == "__main__":

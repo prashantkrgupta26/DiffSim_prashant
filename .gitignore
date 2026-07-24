@@ -28,6 +28,10 @@ docs/dev/nova-mirrors/**/*.npz
 # --- generated docs site content (from tutorials/build_site.py) ---
 docs/site_src/
 
+# --- tutorial viz output (tutorials/_viz.py writes here; never commit PNGs/VTUs) ---
+tutorials/*/figures/
+tutorials/*/*/figures/
+
 # --- paper drafts (local only; NEVER push) ---
 papers/
 paper-outlines-*.tar.gz

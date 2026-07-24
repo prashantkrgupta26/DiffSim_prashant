@@ -24,7 +24,13 @@ WHAT IS RUNNING UNDERNEATH.
 
 Run:  python tutorials/D_flow/D2_lid_driven_cavity.py     (~30 s)
 """
+import os
+import sys
+
 import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import _viz as _viz  # guarded viz helper (no-ops when [viz] not installed)
 
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
@@ -52,8 +58,8 @@ def lid(x, t):
     return g
 
 
-if __name__ == "__main__":
-    level, Re, dt = 5, 100.0, 0.05
+def main(level=5, Re=100.0, dt=0.05, max_steps=400):
+    """Run the lid-driven cavity and emit a centerline profile figure."""
     tree = build_uniform(level, dim=2)
     mesh = build_mesh(tree, p=1)
     cons = build_constraints(mesh)
@@ -64,7 +70,7 @@ if __name__ == "__main__":
     stepper.set_initial(lambda x: np.zeros((len(x), 2)))
 
     prev = None
-    for step in range(1, 401):
+    for step in range(1, max_steps + 1):
         x = stepper.step()
         u = x[:, :2]
         if prev is not None and np.abs(u - prev).max() / dt < 2e-4:
@@ -81,6 +87,19 @@ if __name__ == "__main__":
         print(f"{y:>8.4f} {uo:>10.4f} {ug:>10.4f} {uo - ug:>9.4f}")
     print(f"\nmax |diff| = {np.abs(u_c - GHIA_U).max():.4f}   "
           f"(a 33x33 grid vs Ghia's 129x129 — tolerance 0.06)")
+    # --- viz (additive; no-ops on base venv) ---
+    _viz.surface_profile(
+        __file__, GHIA_Y,
+        {"DiffSim": u_c},
+        "centerline_u",
+        reference={"Ghia (1982)": (GHIA_Y, GHIA_U)},
+        xlabel="y", ylabel="u (x=0.5)",
+    )
+    return u_c
+
+
+if __name__ == "__main__":
+    main()
     print("""
 EXPLORE
   (a) Refine to level 6 and watch the profile tighten (runtime ~4x).

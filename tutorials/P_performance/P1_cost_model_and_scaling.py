@@ -42,10 +42,15 @@ EXPECTED RESULTS (measured, levels 5-8) — a story in two acts:
 
 Run:  python tutorials/P_performance/P1_cost_model_and_scaling.py
 """
+import os
+import sys
 import time
 
 import numpy as np
 from scipy.sparse.linalg import splu
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import _viz as _viz  # guarded viz helper (no-ops when [viz] not installed)
 
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
@@ -82,9 +87,9 @@ def stages(level):
     return n, t, A.nnz
 
 
-if __name__ == "__main__":
-    stages(4)                                    # WARM the JIT cache first!
-    levels = (5, 6, 7, 8)
+def main(levels=(5, 6, 7, 8), warm_level=4):
+    """Run the per-stage scaling study and emit a scaling figure."""
+    stages(warm_level)                           # WARM the JIT cache first!
     rows = [stages(lv) for lv in levels]
     keys = ["mesh", "constraints", "assemble", "factorize", "backsolve"]
     print(f"{'level':>6} {'n':>8} {'nnz':>9} "
@@ -100,16 +105,27 @@ if __name__ == "__main__":
             n1, t1, _ = rows[i + 1]
             exps.append(np.log(t1[k] / t0[k]) / np.log(n1 / n0))
         print(f"  {k:>12}: " + "  ".join(f"{e:5.2f}" for e in exps))
-    # the memory-cliff estimate, GPU edition
-    import shutil
-    n8 = rows[-1][0]
+    n_last = rows[-1][0]
     print(f"""
-memory model at level 8 (n = {n8}):
+memory model at level {levels[-1]} (n = {n_last}):
   sparse CSR:  ~{rows[-1][2] * 16 / 1e6:.0f} MB   (16 B/nnz)
-  DENSE would be 8 n^2 = {8 * n8 ** 2 / 1e9:.1f} GB  <- the cliff the 1-D
+  DENSE would be 8 n^2 = {8 * n_last ** 2 / 1e9:.1f} GB  <- the cliff the 1-D
   document computes; here it arrives at level ~8 already. Sparse formats
   are not an optimization, they are admission to the building.
 """)
+    # --- viz (additive; no-ops on base venv) ---
+    ns = [r[0] for r in rows]
+    for k in keys:
+        ts = [r[1][k] for r in rows]
+        _viz.convergence(__file__, [np.log2(n) for n in ns], ts,
+                         f"scaling_{k}",
+                         xlabel="log2(n)", ylabel="time (s)",
+                         label=k)
+    return rows
+
+
+if __name__ == "__main__":
+    main()
     print("""
 EXPLORE
   (a) Add p=2 columns to the table. Which stages' constants grow by the

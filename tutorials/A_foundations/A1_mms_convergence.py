@@ -20,8 +20,14 @@ Your exact numbers may differ in the third digit; the ORDERS must not.
 
 Run:  python tutorials/A_foundations/A1_mms_convergence.py
 """
+import os
+import sys
+
 import numpy as np
 from scipy.sparse.linalg import splu
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import _viz as _viz  # guarded viz helper (no-ops when [viz] not installed)
 
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
@@ -72,12 +78,31 @@ def solve(level: int, p: int) -> float:
     return l2_error_masked(dm, u_all, u_star, lambda x: np.ones(len(x), bool))
 
 
-if __name__ == "__main__":
-    for p, levels in ((1, (4, 5, 6)), (2, (3, 4, 5))):
+def main(levels_p1=(4, 5, 6), levels_p2=(3, 4, 5)):
+    """Run the MMS convergence study and emit a convergence figure."""
+    results = {}
+    for p, levels in ((1, levels_p1), (2, levels_p2)):
         errs = [solve(lv, p) for lv in levels]
         orders = [np.log2(errs[i] / errs[i + 1]) for i in range(len(errs) - 1)]
         print(f"p={p}: errors " + "  ".join(f"{e:.3e}" for e in errs)
               + "   orders " + "  ".join(f"{o:.2f}" for o in orders))
+        results[p] = (levels, errs)
+    # --- viz (additive; no-ops on base venv) ---
+    # p=1 convergence plot
+    lv1, e1 = results[1]
+    _viz.convergence(__file__, lv1, e1, "convergence_p1",
+                     slope=2, xlabel="refinement level", ylabel="L2 error",
+                     label="p=1")
+    # p=2 convergence plot
+    lv2, e2 = results[2]
+    _viz.convergence(__file__, lv2, e2, "convergence_p2",
+                     slope=3, xlabel="refinement level", ylabel="L2 error",
+                     label="p=2")
+    return results
+
+
+if __name__ == "__main__":
+    main()
     print("""
 EXPLORE
   (a) Use u* = x^2 + y^2 (f = -4). At p=2 the error should be MACHINE ZERO
