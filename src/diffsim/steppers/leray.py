@@ -43,7 +43,8 @@ class LerayProjectionStepper:
                  inner_relax=1.0, inner_accel="none", inner_anderson_m=3,
                  consistent_ppe=False, consistent_projection=False,
                  backflow_beta=None, graddiv_gamma=None,
-                 rotational_pin_outflow=None):
+                 rotational_pin_outflow=None, graddiv_dynamic=False,
+                 rotational_pin_wall=False):
         # ---- CONSISTENT-PROJECTION MODE (the 2026-07-23 fix, changes #1-#4) ----
         # ONE mode that turns on the coherent VMS-stabilized Helmholtz-Leray set
         # (ns_projection_vms_paper Eq 44a-c / Algorithm 1, exact discrete forms):
@@ -142,6 +143,11 @@ class LerayProjectionStepper:
             self.rotational_pin_outflow = bool(consistent_projection)
         else:
             self.rotational_pin_outflow = bool(rotational_pin_outflow)
+        # FN4 (2026-07-23): pin the rotational -nu*q correction to 0 on the
+        # IMMERSED-WALL (sbm_nodes) rows — the wall analog of the F3b outflow
+        # pin; THE rung-B drag fix (see the pressure-update note). Default
+        # False => bit-for-bit.
+        self.rotational_pin_wall = bool(rotational_pin_wall)
         self.graddiv_gamma = (0.0 if graddiv_gamma is None
                               else float(graddiv_gamma))
         self._graddiv_gamma_block = None   # lazily built (needs dm; below)
@@ -311,8 +317,19 @@ class LerayProjectionStepper:
         # the predictor momentum system. Zero unless graddiv_scale > 0 and the
         # variant is selected; assembled once (tau_C frozen at the steady,
         # velocity-independent value, |u|-part dropped for a cached operator).
+        # ---- FN4 graddiv_dynamic (2026-07-23): the CACHED block drops the
+        # |u|-part of tau_M, so its tau_C ~ nu*sqrt(CI_F) is DIFFUSIVE-limit
+        # only — it SHRINKS with Re (nu = U D/Re), the opposite of what
+        # Re-robustness needs (FN3: constant gamma=20 fails at Re=100 while 50
+        # holds; the advective tau_C ~ |u| h grows with the local speed). With
+        # graddiv_dynamic=True the "graddiv" variant instead REASSEMBLES the
+        # block each predictor iteration at the CURRENT advecting field with
+        # the FULL metric tau_C (advective + diffusive tau_M), the true
+        # VMS-continuity grad-div. Default False => cached block, bit-for-bit.
+        self.graddiv_dynamic = bool(graddiv_dynamic)
         self._graddiv_block = None
-        if self.velocity_update == "graddiv" and self.graddiv_scale != 0.0:
+        if (self.velocity_update == "graddiv" and self.graddiv_scale != 0.0
+                and not self.graddiv_dynamic):
             self._graddiv_block = self._graddiv_matrix()
         # F3b constant-coefficient grad-div block: gamma * (div w, div u) added
         # to the predictor (a robust, mechanism-independent divergence cure).
@@ -378,6 +395,61 @@ class LerayProjectionStepper:
             # per-element grad-div: Ge[e, a, i, b, j]
             #   = coef[e] * (dN_a/dx_i)(dN_b/dx_j) * w * jac
             # dN scaled to physical by dsc; note (dsc*dsc) folded into GdG.
+            GdG = np.einsum("qad,qbc,q->abdc", tb.dN, tb.dN, tb.w)  # ref
+            conn = dm.mesh.conn_of[pv].astype(np.int64)
+            nbf = conn.shape[1]
+            scale_e = coef * (dsc ** 2) * jac             # [ne]
+            for a in range(nbf):
+                for bcol in range(nbf):
+                    for i in range(dim):
+                        for j in range(dim):
+                            r = conn[:, a] * ndof + i
+                            c = conn[:, bcol] * ndof + j
+                            v = GdG[a, bcol, i, j] * scale_e
+                            rows.append(r)
+                            cols.append(c)
+                            vals.append(v)
+        Nn = dm.n_nodes * ndof
+        G = sp.coo_matrix((np.concatenate(vals),
+                           (np.concatenate(rows), np.concatenate(cols))),
+                          shape=(Nn, Nn)).tocsr()
+        T = dm.constraints.T.tocsr()
+        T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
+        return (T_vec.T @ G @ T_vec).tocsr()
+
+    def _graddiv_tauc_block(self, aq):
+        """FN4 Re-robust tau_C grad-div (2026-07-23): the VMS-continuity
+        grad-div block assembled at the CURRENT velocity, metric form on
+        axis-aligned cubes:
+
+            tau_M = 1/sqrt(4|u|^2/h^2 + CI_F nu^2 G:G),  tau_C = 1/(tau_M g.g)
+
+        (the steady tau_M WITH the advective |u|-part — tau_C ~ |u| h/(2 dim)
+        in the advective limit, so the grad-div weight GROWS with the local
+        speed/Re; the cached _graddiv_matrix drops the |u|-part and its
+        diffusive tau_C ~ nu SHRINKS with Re — FN3 showed that a Re-fixed
+        weight is not robust). |u| per element = mean GP speed. Same element
+        structure as _graddiv_matrix; scaled by graddiv_scale. ``aq`` are the
+        per-bin GP velocities of the current predictor iterate."""
+        dm = self.dm
+        dim = dm.dim
+        ndof = self.ndof
+        from ..physics.vms import CI_F
+        rows, cols, vals = [], [], []
+        for pv, b in dm.bins.items():
+            tb = dm.tables_by_p[pv]
+            h = dm.mesh.tree.h()[dm.mesh.bins[pv]]
+            jac = (h / 2.0) ** dim
+            dsc = (2.0 / h)
+            ne = len(h)
+            nqp = tb.nqp
+            umag_e = np.sqrt((aq[pv] ** 2).sum(1)).reshape(ne, nqp).mean(1)
+            GG = dim * (2.0 / h) ** 4
+            gg = dim * (2.0 / h) ** 2
+            tauM = 1.0 / np.sqrt(4.0 * umag_e ** 2 / h ** 2
+                                 + CI_F * self.nu ** 2 * GG)
+            tauC = 1.0 / (tauM * gg)                      # [ne]
+            coef = self.graddiv_scale * tauC              # [ne]
             GdG = np.einsum("qad,qbc,q->abdc", tb.dN, tb.dN, tb.w)  # ref
             conn = dm.mesh.conn_of[pv].astype(np.int64)
             nbf = conn.shape[1]
@@ -705,7 +777,13 @@ class LerayProjectionStepper:
             # P2-R0 "graddiv" variant: add the cached extra grad-div (LSIC)
             # penalty to the momentum system (RHS unchanged — homogeneous
             # penalty). No-op for the other variants (block is None).
-            if self._graddiv_block is not None:
+            # FN4 graddiv_dynamic: reassemble at the CURRENT advecting field
+            # with the FULL (advective+diffusive) tau_C — the Re-robust
+            # VMS-continuity grad-div.
+            if (self.velocity_update == "graddiv" and self.graddiv_dynamic
+                    and self.graddiv_scale != 0.0):
+                A = (A + self._graddiv_tauc_block(aq))
+            elif self._graddiv_block is not None:
                 A = (A + self._graddiv_block)
             # F3b constant-gamma grad-div penalty (robust divergence cure).
             # RHS unchanged (homogeneous). No-op when block is None (default).
@@ -746,8 +824,22 @@ class LerayProjectionStepper:
 
     # ---------------- the step ----------------
     def step(self, extra_block=None, sbm_nodes=None, ppe_surrogate_flux=None,
-             correction_penalty=None, wall_traction_rhs=None):
+             correction_penalty=None, wall_traction_rhs=None,
+             wall_pressure_neumann=None):
         """One projection step.
+
+        ``wall_pressure_neumann`` is the FN4 DIAGNOSTIC wall-pressure PPE
+        boundary-source hook (2026-07-23). When callable,
+        ``wall_pressure_neumann(uhat)`` returns a FULL node-major
+        (``dm.n_nodes``) scalar added to the PPE RHS before the constraint
+        reduction. Default ``None`` => homogeneous-Neumann wall (bit-for-bit).
+        NOTE: the FN4 investigation REJECTED KIO-style Neumann sources through
+        this hook as the rung-B drag fix — the wall-pressure defect is the
+        ROTATIONAL update's -nu*q term at the weak wall, cured by
+        ``rotational_pin_wall`` (see the pressure-update note and
+        sbm_wall_pressure_neumann's verdict); the homogeneous-Neumann wall
+        (Suresh Remark 3.9) is correct as-is. The hook remains for the
+        documented diagnostics (ladder_rungB drivers).
 
         ``correction_penalty`` is the FN1 weak-Nitsche RE-PIN hook (2026-07-23).
         The Nitsche no-slip on the immersed body is imposed on the PREDICTOR
@@ -825,7 +917,8 @@ class LerayProjectionStepper:
             self.inner_res_hist = []
             uhat, phi, p_hat, uq, fs_vel, sigma = self._projection_pass(
                 t_new, extra_block, sbm_nodes, ppe_surrogate_flux,
-                wall_traction_rhs=wall_traction_rhs)
+                wall_traction_rhs=wall_traction_rhs,
+                wall_pressure_neumann=wall_pressure_neumann)
         else:
             uhat, phi, p_hat, uq, fs_vel, sigma = self._inner_solve(
                 t_new, extra_block, sbm_nodes, ppe_surrogate_flux)
@@ -835,7 +928,8 @@ class LerayProjectionStepper:
             correction_penalty=correction_penalty)
 
     def _projection_pass(self, t_new, extra_block, sbm_nodes,
-                         ppe_surrogate_flux, wall_traction_rhs=None):
+                         ppe_surrogate_flux, wall_traction_rhs=None,
+                         wall_pressure_neumann=None):
         """One predictor -> PPE -> pressure-update PASS against the CURRENT
         ``self.p_star``. Returns ``(uhat, phi, p_hat, uq, fs_vel, sigma)``: the
         predicted velocity, the pressure increment ``phi``, the updated
@@ -949,6 +1043,14 @@ class LerayProjectionStepper:
         # choice, used only as a planted-break to prove the BC is load-bearing.
         if ppe_surrogate_flux is not None:
             rhs = rhs + np.asarray(ppe_surrogate_flux(uhat))
+        # FN4 CONSISTENT (KIO) Neumann wall-pressure PPE source (the drag fix):
+        # a boundary source imposing dphi/dn = dp_consistent/dn - dp*/dn at the
+        # immersed no-slip wall, so phi develops the correct stagnation-high /
+        # suction-back wall pressure the homogeneous-Neumann default omits.
+        # ``wall_pressure_neumann(uhat)`` -> FULL node-major scalar. None =>
+        # homogeneous-Neumann wall (bit-for-bit unchanged).
+        if wall_pressure_neumann is not None:
+            rhs = rhs + np.asarray(wall_pressure_neumann(uhat))
         # P1 boundary-vorticity source (#5): the outflow term
         # delta*(grad q x n, nu curl u_hat)_Gamma standard PSPG drops for P1.
         # Pure RHS source (u_hat known); default OFF (bit-for-bit) — only on
@@ -1013,6 +1115,23 @@ class LerayProjectionStepper:
             if self.rotational_pin_outflow:
                 for r in self._pin_rows():
                     q[int(r)] = 0.0
+            # FN4 cure (2026-07-23, THE rung-B drag fix): pin the rotational
+            # correction q to 0 on the IMMERSED-WALL (SBM) nodes, the exact
+            # wall analog of the F3b outflow pin above. At a WEAK-Nitsche wall
+            # the predictor carries O(1) divergence (penetration) in the wall
+            # cells, so the Timmermans -nu*q term writes an O(0.5),
+            # refinement-GROWING pressure error straight onto the wall nodes
+            # every step (measured: seeded-monolithic Cd +1.39 -> +0.60 at L4
+            # and +2.02 -> +1.03 at L5 from this term ALONE; the predictor and
+            # PPE are exact/near-exact at the seed). That bias feeds back
+            # through the predictor and settles the split at the drag-wrong
+            # equilibrium (Cd -1.07). Timmermans' correction is a smooth-field
+            # consistency term for the pressure BC; at a wall whose div is
+            # dominated by the weak-BC penetration it is INCONSISTENT with the
+            # same-mesh monolithic saddle (which carries no such term).
+            # Default OFF (bit-for-bit); the rung-B driver turns it on.
+            if self.rotational_pin_wall and sbm_nodes is not None:
+                q[np.asarray(sbm_nodes, dtype=np.int64)] = 0.0
             p_hat = self.p_star + phi - self.nu * q
         else:                                    # "standard" (default)
             p_hat = self.p_star + phi

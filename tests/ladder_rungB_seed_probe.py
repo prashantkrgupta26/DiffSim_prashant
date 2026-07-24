@@ -19,7 +19,9 @@ from scipy.sparse.linalg import splu
 
 from diffsim.steppers.leray import LerayProjectionStepper
 from diffsim.sbm.vector import (sbm_vector_dirichlet, sbm_vector_penalty,
-                                sbm_wall_pressure_traction, surrogate_traction)
+                                sbm_wall_pressure_traction,
+                                sbm_wall_pressure_neumann,
+                                sbm_wall_pressure_kio_vms, surrogate_traction)
 from diffsim.physics.poisson import gauss_points
 from diffsim.api.ns_bricks import assemble_linear_ns
 
@@ -133,7 +135,8 @@ def make_nopen_flux(fx, sigma):
 
 def seed_probe(fx, x_mono, dt, alpha=ALPHA, correction_repin=True,
                wall_traction=False, wtrac_sign=1.0, nopen=False,
-               graddiv_gamma=50.0, nsteps=5):
+               graddiv_gamma=50.0, nsteps=5, wall_pneumann=False,
+               tauc_graddiv=False, graddiv_scale=1.0, rot_pin_wall=False):
     """Seed (u_mono, p_mono) into the projection split and take ``nsteps`` steps.
     Returns dict with per-step du_from_seed (max|u - u_seed|), ‖phi‖ (increment),
     mean|u|, Cd, blew_up."""
@@ -160,7 +163,10 @@ def seed_probe(fx, x_mono, dt, alpha=ALPHA, correction_repin=True,
         dm, nu, dt, f_fn=f_fn, g_fn=g_fn, order=1, picard_iters=1,
         solver="splu", pressure_outflow_nodes=fx["outflow_nodes"],
         consistent_projection=True,
-        graddiv_gamma=(graddiv_gamma if graddiv_gamma else None))
+        velocity_update=("graddiv" if tauc_graddiv else "consistent"),
+        graddiv_scale=graddiv_scale, graddiv_dynamic=tauc_graddiv,
+        graddiv_gamma=(graddiv_gamma if graddiv_gamma else None),
+        rotational_pin_wall=rot_pin_wall)
     st.dir_nodes = strong_nodes
     # SEED: history <- u_mono, p* <- p_mono.
     st.hist.rotate(u_seed.ravel())
@@ -175,13 +181,39 @@ def seed_probe(fx, x_mono, dt, alpha=ALPHA, correction_repin=True,
         b = sbm_wall_pressure_traction(dm, sf, geo, st.p_star, ndof)
         return wtrac_sign * np.asarray(T_vec.T @ b)
 
+    # FN4 consistent (KIO) wall-pressure PPE source (see the rung-B driver):
+    # True/"vms" -> the fine-scale-weighted mesh-independent form; dict ->
+    # sbm_wall_pressure_neumann kwargs (raw oint g q, diagnostics only).
+    def wall_pn_vms(uhat):
+        from diffsim.solvers.timestepping import bdf_coeffs, bdf_order_now
+        o = bdf_order_now(st.t + st.dt, st.dt, st.order,
+                          have_history=st.hist.have(2))
+        bdf = bdf_coeffs(o, st.dt)
+        u1 = st._uvec(st.hist.pre1)
+        u2 = st._uvec(st.hist.pre2) if st.hist.have(2) else None
+        return sbm_wall_pressure_kio_vms(dm, sf, geo, uhat, u1, u2, bdf,
+                                         st.dt, nu, ndof,
+                                         timestab=st.timestab)
+
+    kio_kw = wall_pneumann if isinstance(wall_pneumann, dict) else {}
+
+    def wall_pn_raw(uhat):
+        return sbm_wall_pressure_neumann(dm, sf, geo, uhat, st.p_star, nu,
+                                         ndof, **kio_kw)
+
+    wall_pn_hook = None
+    if wall_pneumann:
+        wall_pn_hook = wall_pn_raw if isinstance(wall_pneumann, dict) \
+            else wall_pn_vms
+
     q = qref(fx)
     out = dict(du=[], phinorm=[], mean_u=[], cd=[], blew_up=False)
     for step in range(nsteps):
         u, p = st.step(extra_block=(Af_c, bf_c), sbm_nodes=sbm_nodes,
                        ppe_surrogate_flux=nopen_flux,
                        correction_penalty=correction_penalty,
-                       wall_traction_rhs=wall_rhs())
+                       wall_traction_rhs=wall_rhs(),
+                       wall_pressure_neumann=wall_pn_hook)
         if not np.isfinite(u).all() or np.abs(u).max() > 1e4:
             out["blew_up"] = True
             break
@@ -207,14 +239,20 @@ def run(level=5, half=0.125, Re=40, dt=0.02, nsteps_mono=600):
     # (repin, graddiv, tag) — the FN1 decisive gate: graddiv_gamma stabilizes
     # the growing interior-divergence mode; the correction re-pin holds the weak
     # wall trace. Without graddiv the split diverges (|p*| past 1e6); with it the
-    # seeded monolithic is a BOUNDED fixed point.
-    combos = [(False, 0.0, "base (no fix, FAIL)"),
-              (True, 0.0, "repin only, no graddiv"),
-              (False, 50.0, "graddiv only (gamma=50)"),
-              (True, 50.0, "repin + graddiv (THE FIX)")]
-    for repin, gg, tag in combos:
+    # seeded monolithic is a BOUNDED fixed point. FN4 (2026-07-23): the seeded
+    # WALL PRESSURE is preserved only with the rotational wall pin — without it
+    # the -nu*q update walks Cd off the seed (+2.02 -> -2.93 at L5) even though
+    # the velocity stays bounded; the KIO wall-p Neumann combo documents the
+    # REJECTED boundary-source path (drives Cd to ~+14).
+    # (repin, graddiv_gamma, wall_pneumann, rot_pin_wall, tag)
+    combos = [(False, 0.0, False, False, "base (no fix, FAIL)"),
+              (True, 50.0, False, False, "repin + graddiv-g50 (FN1, drag-wrong)"),
+              (True, 50.0, True, False, "FN1 + KIO wall-p Neumann (REJECTED)"),
+              (True, 50.0, False, True, "FN1 + rotational WALL PIN (FN4 FIX)")]
+    for repin, gg, wpn, pin, tag in combos:
         r = seed_probe(fx, x_mono, dt, correction_repin=repin,
-                       graddiv_gamma=gg, nsteps=100)
+                       graddiv_gamma=gg, nsteps=100, wall_pneumann=wpn,
+                       rot_pin_wall=pin)
         if r["blew_up"]:
             print(f"[seed] {tag:28s}: BLEW UP after {len(r['du'])} steps",
                   flush=True)

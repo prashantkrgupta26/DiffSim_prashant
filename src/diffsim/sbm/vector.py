@@ -194,6 +194,255 @@ def sbm_wall_pressure_traction(dm, sf, geo, p_node, ndof):
     return brhs
 
 
+def sbm_wall_pressure_neumann(dm, sf, geo, u_node, pstar_node, nu, ndof,
+                              f_node=None, include_conv=False,
+                              include_visc=True, include_poff=True,
+                              scale=1.0, return_parts=False):
+    r"""DIAGNOSTIC (KIO-style) Neumann wall-pressure PPE source on the
+    surrogate faces — the FN4 investigation record (2026-07-23). NOT the
+    rung-B drag fix: that is the stepper's ``rotational_pin_wall`` (leray.py).
+    Kept, default OFF everywhere, because its term-level switches DOCUMENT
+    the measured defect structure.
+
+    Karniadakis-Israeli-Orszag (JCP 1991) consistent pressure Neumann BC from
+    the normal momentum balance at the immersed no-slip wall, rotational
+    (curl-curl) viscous form:
+
+        dp/dn = n . [ -du/dt - (a.grad)u - nu grad x (grad x u) + f ]   (KIO)
+
+    with n = geo.n the DOMAIN-outward surrogate normal (== the true wall
+    normal at d=0), applied to the INCREMENT phi = p_hat - p* (main.pdf p')
+    as  dphi/dn = dp_consistent/dn - dp*/dn : the boundary source
+
+        rhs[a] += scale * oint_{Gamma~} ( g_KIO - grad(p*).n ) N_a dGamma~
+
+    added to the weak PPE RHS. Returns a FULL node-major (dm.n_nodes) scalar
+    (added BEFORE the constraint reduction; mirrors bvs_ppe_source). 2-D only
+    (curl u scalar).
+
+    MEASURED FN4 VERDICT (why this is diagnostic-only): the face assembly
+    (w * (h/2)^{dim-1} * geo.corr — identical to sbm_wall_pressure_traction /
+    bvs_ppe_source) carries NO h-power bug, and the datum is dimensionally a
+    correct dp/dn — yet EVERY variant of this raw ``oint g q`` source is a
+    mesh-DEPENDENT overcorrector on rung B (Re=40, from rest, scale=1.0):
+
+        poff only:               Cd +2.01 (L4) / +8.92 (L5)
+        poff+visc (KIO no-slip): Cd +2.08 (L4) / +9.08 (L5)
+        poff+visc+conv:          Cd +2.20 (L4) / +9.18 (L5)
+        same-mesh mono target:      +1.39 (L4) / +2.02 (L5)
+
+    because the projection's wall-pressure defect is NOT a missing Neumann
+    datum: the seeded-monolithic step-1 decomposition shows the predictor is
+    an EXACT fixed point and the PPE reproduces the monolithic Cd to 0.1%
+    under the homogeneous-Neumann wall — the error is written by the
+    ROTATIONAL update's -nu*q term at the weak wall (O(0.4-0.5) on the wall
+    nodes, GROWING under refinement). A boundary source can only counter-
+    fight that bias, which is why the Opus sweep needed the mesh-dependent
+    damping (~0.07 at L5). With ``rotational_pin_wall`` the homogeneous-
+    Neumann wall (Suresh Remark 3.9) is CORRECT as-is and needs no source.
+
+    Term evaluation at each surrogate GP (P1: grad u elementwise-constant):
+      * viscous rotational (include_visc, the KIO no-slip datum): in 2-D
+        curl u = omega (scalar); n.(grad x omega) = -d(omega)/d(tau) is a
+        TANGENTIAL derivative along the wall, so it integrates by parts along
+        the CLOSED surrogate loop to the P1-exact weak form
+            rhs_a += -nu int_Gamma (grad N_a x n) . omega dGamma
+        (needs only FIRST derivatives; same rotational form as the outflow
+        bvs_ppe_source, but weighted by the physical nu — it is a BC, not a
+        tau_m-weighted stabilization).
+      * increment offset -grad(p*).n (include_poff): collocated from the
+        lagged pressure.
+      * convective -(u_h.grad)u_h.n (include_conv, DIAGNOSTIC ONLY): the
+        discrete-trace term discussed above; + f at the GP when f_node given.
+
+    u_node / pstar_node: CONSTRAINED free-node fields (n_free[,dim]) OR full
+    node-major (auto-detected by length). f_node optional full/free body force
+    at GPs (None => 0). ``return_parts=True`` returns the dict
+    {"conv": ..., "visc": ..., "poff": ...} of UNSCALED per-term node-major
+    vectors instead of the combined source (diagnostics)."""
+    dim = dm.dim
+    if dim != 2:
+        from ..errors import ConfigError
+        raise ConfigError("consistent wall-pressure Neumann is implemented "
+                          "for 2-D (curl u scalar); got dim=%d" % dim)
+    mesh = dm.mesh
+    p_face = np.unique(np.asarray(mesh.p_elem)[sf.elem])
+    if len(p_face) != 1:
+        from ..errors import ConfigError
+        raise ConfigError(
+            f"SBM face helper assumes uniform p on the face, got "
+            f"orders {p_face.tolist()}")
+    pv = int(p_face[0])
+    from ..mesh.faces import face_tables
+    ftab = face_tables(pv, dim)
+    nqf, nbf = ftab.nqf, ftab.nbf
+    conn = mesh.conn_of[pv][np.searchsorted(mesh.bins[pv], sf.elem)]
+    Tc = dm.constraints.T
+
+    def _to_full(field, k):
+        arr = np.asarray(field)
+        if arr.shape[0] == Tc.shape[1]:                # constrained free-node
+            return np.asarray(Tc @ arr)
+        return arr                                     # already full node-major
+
+    u_full = _to_full(u_node, dim)                     # [n_nodes, dim]
+    p_full = _to_full(pstar_node, 1)                   # [n_nodes]
+    h = mesh.tree.h()[sf.elem]
+    jacS = (h / 2.0) ** (dim - 1)
+    dscale = 2.0 / h
+    parts = {"conv": np.zeros(dm.n_nodes),
+             "visc": np.zeros(dm.n_nodes),
+             "poff": np.zeros(dm.n_nodes)}
+    for fi in range(len(sf.elem)):
+        f = int(sf.face[fi])
+        un = u_full[conn[fi], :dim]                    # [nbf, dim]
+        pn = p_full[conn[fi]]                          # [nbf]
+        N = ftab.N[f]                                  # [nqf, nbf]
+        dN = ftab.dN[f] * dscale[fi]                   # [nqf, nbf, dim] physical
+        for q in range(nqf):
+            gp = fi * nqf + q
+            w = ftab.w[q] * jacS[fi] * geo.corr[gp]
+            n = geo.n[gp]                              # domain-outward normal
+            gradu = dN[q].T @ un                       # gradu[coord, comp]
+            uq = N[q] @ un                             # [dim] discrete trace
+            gradp = dN[q].T @ pn                       # [dim] grad p*
+            # DIAGNOSTIC convective part: -(u_h.grad)u_h.n at the discrete
+            # trace (+ f). Mesh-divergent (see docstring); off by default.
+            conv = -(uq @ gradu)                       # [dim]
+            if f_node is not None:
+                conv = conv + np.asarray(f_node)[gp]
+            np.add.at(parts["conv"], conn[fi], w * (n @ conv) * N[q])
+            # increment offset: -grad(p*).n, collocated.
+            np.add.at(parts["poff"], conn[fi], -w * (gradp @ n) * N[q])
+            # viscous rotational (weak, P1-exact, the KIO no-slip datum):
+            #   -nu (grad N_a x n) . curl u
+            omega = (dN[q][:, 0] @ un[:, 1]            # du_y/dx
+                     - dN[q][:, 1] @ un[:, 0])         # - du_x/dy  (scalar)
+            cross = dN[q][:, 0] * n[1] - dN[q][:, 1] * n[0]   # [nbf]
+            np.add.at(parts["visc"], conn[fi], -nu * w * cross * omega)
+    if return_parts:
+        return parts
+    rhs = np.zeros(dm.n_nodes)
+    if include_conv:
+        rhs += parts["conv"]
+    if include_visc:
+        rhs += parts["visc"]
+    if include_poff:
+        rhs += parts["poff"]
+    return scale * rhs
+
+
+def sbm_wall_pressure_kio_vms(dm, sf, geo, uhat, u1, u2, bdf, dt, nu, ndof,
+                              timestab=True, scale=1.0):
+    r"""REJECTED FN4 experiment (2026-07-23, kept as the investigation
+    record; default OFF everywhere): the KIO wall-pressure source weighted by
+    the PPE's OWN fine-scale channel. NOT the rung-B drag fix — that is the
+    stepper's ``rotational_pin_wall`` (leray.py).
+
+    THE IDEA: the consistent-projection PPE assembles
+
+        (grad phi, grad q) = -sigma (div u_hat, q) - sigma (tau_m r_m, grad q)
+
+    whose fine-scale term carries the natural wall flux
+    dphi/dn = -sigma tau_m r_m . n  (r_m the strong momentum residual), so a
+    raw ``oint g q`` Neumann source adds data at WEIGHT 1 against a channel
+    of weight sigma*tau_m (h-dependent). Imposing the KIO balance THROUGH the
+    same weight,  s = sigma tau_m [ r_m.n + g_KIO - grad(p*).n ],  makes the
+    convective and grad(p*) parts cancel ALGEBRAICALLY (same discrete
+    evaluations), leaving
+
+        s = sigma tau_m [ (du/dt|_BDF).n  -  nu (curl curl u).n ]
+
+    — the BDF trace acceleration (collocated) + the rotational viscous term
+    (weak, P1-exact: -sigma tau_m nu (grad N_a x n).omega).
+
+    MEASURED VERDICT — REJECTED: the sigma^2 tau_m (u_hat - u_hist).n
+    acceleration term is a DERIVATIVE feedback on the wall trace that
+    amplifies per-step predictor drift (sigma^2 tau_m ~ 20), and the split
+    lands far from the monolithic: from rest Cd = +10.9 (L4) / +11.7 (L5),
+    seeded-monolithic driven to +15/+11, with or without the rotational wall
+    pin (target +1.39/+2.02). The premise was also wrong: the wall-pressure
+    defect is the rotational -nu*q update at the weak wall (see
+    sbm_wall_pressure_neumann's verdict note), not a missing PPE wall datum —
+    with ``rotational_pin_wall`` the homogeneous-Neumann wall needs no
+    source.
+
+    Args: ``uhat`` the predicted velocity (free-node [n_free,dim] or full
+    node-major), ``u1``/``u2`` the BDF history velocities (same layout; u2
+    may be None), ``bdf=(b0,b1,b2)`` the CURRENT BDF coefficients (b2=0 on
+    startup), ``dt`` the step, ``timestab`` matches the stepper's tau_m
+    transient term (tau uses dt when True — mirrors the PPE's taum_fs).
+    Returns a FULL node-major (dm.n_nodes) scalar to ADD to the PPE RHS
+    before the constraint reduction. 2-D only (curl u scalar)."""
+    dim = dm.dim
+    if dim != 2:
+        from ..errors import ConfigError
+        raise ConfigError("KIO VMS wall-pressure source is implemented for "
+                          "2-D (curl u scalar); got dim=%d" % dim)
+    from ..physics.vms import tau_hbased_host
+    mesh = dm.mesh
+    p_face = np.unique(np.asarray(mesh.p_elem)[sf.elem])
+    if len(p_face) != 1:
+        from ..errors import ConfigError
+        raise ConfigError(
+            f"SBM face helper assumes uniform p on the face, got "
+            f"orders {p_face.tolist()}")
+    pv = int(p_face[0])
+    from ..mesh.faces import face_tables
+    ftab = face_tables(pv, dim)
+    nqf = ftab.nqf
+    conn = mesh.conn_of[pv][np.searchsorted(mesh.bins[pv], sf.elem)]
+    Tc = dm.constraints.T
+
+    def _to_full(field):
+        if field is None:
+            return None
+        arr = np.asarray(field)
+        if arr.shape[0] == Tc.shape[1]:                # constrained free-node
+            return np.asarray(Tc @ arr)
+        return arr                                     # already full node-major
+
+    b0, b1, b2 = bdf
+    sigma = b0 / dt
+    u_full = _to_full(uhat)                            # [n_nodes, dim]
+    u1_full = _to_full(u1)
+    u2_full = _to_full(u2)
+    h = mesh.tree.h()[sf.elem]
+    jacS = (h / 2.0) ** (dim - 1)
+    dscale = 2.0 / h
+    rhs = np.zeros(dm.n_nodes)
+    for fi in range(len(sf.elem)):
+        f = int(sf.face[fi])
+        un = u_full[conn[fi], :dim]                    # [nbf, dim]
+        u1n = u1_full[conn[fi], :dim]
+        u2n = (u2_full[conn[fi], :dim] if u2_full is not None else None)
+        N = ftab.N[f]                                  # [nqf, nbf]
+        dN = ftab.dN[f] * dscale[fi]                   # [nqf, nbf, dim] physical
+        for q in range(nqf):
+            gp = fi * nqf + q
+            w = ftab.w[q] * jacS[fi] * geo.corr[gp]
+            n = geo.n[gp]                              # domain-outward normal
+            uq = N[q] @ un                             # [dim] trace of u_hat
+            # tau_m at the face GP — mirrors the PPE's taum_fs (h-based tau at
+            # the fluid element's h, transient term at dt when timestab).
+            taum = float(tau_hbased_host(
+                np.array([np.linalg.norm(uq)]), np.array([h[fi]]), nu,
+                dt=(dt if timestab else None), dim=dim)[0])
+            st_w = sigma * taum
+            # BDF trace acceleration (du/dt|_BDF).n, collocated: the exact
+            # time content of r_m at the face GP (sigma u_hat - history).
+            dudt = (b0 * uq - b1 * (N[q] @ u1n)
+                    - (b2 * (N[q] @ u2n) if u2n is not None else 0.0)) / dt
+            np.add.at(rhs, conn[fi], st_w * w * (n @ dudt) * N[q])
+            # rotational viscous KIO term, weak (P1-exact):
+            #   -sigma tau_m nu (grad N_a x n) . omega
+            omega = (dN[q][:, 0] @ un[:, 1]            # du_y/dx
+                     - dN[q][:, 1] @ un[:, 0])         # - du_x/dy  (scalar)
+            cross = dN[q][:, 0] * n[1] - dN[q][:, 1] * n[0]
+            np.add.at(rhs, conn[fi], -st_w * nu * w * cross * omega)
+    return scale * rhs
+
+
 def sbm_consistent_flux(dm, sf, geo, x_all, nu, ndof, alpha=10.0,
                         g_fn=None, symmetric_grad=False, include_penalty=False):
     """CONSISTENT-FLUX boundary force on a weakly-imposed (Nitsche/SBM) wall,

@@ -53,7 +53,8 @@ from scipy.sparse.linalg import splu
 
 from diffsim.steppers.leray import LerayProjectionStepper
 from diffsim.sbm.vector import (sbm_vector_dirichlet, sbm_vector_penalty,
-                                surrogate_traction)
+                                sbm_wall_pressure_neumann,
+                                sbm_wall_pressure_kio_vms, surrogate_traction)
 from diffsim.mesh.faces import face_tables
 from diffsim.api.ns_bricks import (assemble_linear_ns, assemble_backflow_block,
                                    assemble_bvs_block, outflow_faces)
@@ -195,13 +196,17 @@ def _a_face(fx, u_free, ftab, conn):
 # when SEEDED but destabilizes from rest; the PPE no-penetration coupling
 # (fix ii) was not the stabilizer. The constant gamma is Re/mesh-dependent (a
 # tau_C-scaled grad-div would be more robust). See task-FN1-report.md.
+# FN4 (2026-07-23): the drag residual is FIXED by rot_pin_wall (the rotational
+# -nu*q wall pin) — see march_projection's docstring and task-FN4-report.md.
 FN1_GRADDIV_GAMMA = 50.0
 
 
 def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
                      log_every=0, consistent_projection=True, solver="splu",
                      alpha=ALPHA, beta_backflow=0.5, correction_repin=True,
-                     graddiv_gamma=FN1_GRADDIV_GAMMA):
+                     graddiv_gamma=FN1_GRADDIV_GAMMA, wall_pneumann=False,
+                     tauc_graddiv=False, graddiv_scale=1.0,
+                     rot_pin_wall=False):
     """March the base projection stepper (consistent mode) with WEAK Nitsche
     no-slip on the obstacle, injected via the extra_block/sbm_nodes hook.
     Returns dict(cd, cl, mean_u, div, steps, cd_hist, cl_hist, ...).
@@ -209,7 +214,22 @@ def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
     `alpha` is the Nitsche penalty scale (anti-vacuity knob — 0 removes the
     penalty). `beta_backflow` stabilizes inflow through the immersed body
     during the transient (mirrors LeraySBMStepper); it defaults to 0.5 under
-    the consistent scheme (benign at steady state)."""
+    the consistent scheme (benign at steady state).
+
+    FN4 (2026-07-23): `rot_pin_wall` is THE drag fix — pin the rotational
+    -nu*q pressure correction to 0 on the immersed-wall (SBM) nodes (the wall
+    analog of the F3b outflow pin). At a weak-Nitsche wall the predictor's
+    div(u_hat) is O(1) penetration garbage, and -nu*q writes a refinement-
+    growing O(0.5) wall-pressure bias every step (measured by the seeded-
+    monolithic step-1 decomposition — predictor and PPE are exact at the
+    seed). With the pin: Cd matches the same-mesh mono at L4 (3.0%) AND L5
+    (8.7%), same settings, no tuning. `wall_pneumann` keeps the REJECTED
+    KIO-style PPE wall sources for diagnostics (dict of
+    sbm_wall_pressure_neumann kwargs, or "vms" for the fine-scale-weighted
+    form — both mesh-dependent/destabilizing; see their docstrings).
+    `tauc_graddiv` swaps the fixed-gamma grad-div for the tau_C (VMS) dynamic
+    grad-div (`velocity_update="graddiv"` + `graddiv_dynamic`, scaled by
+    `graddiv_scale`)."""
     dim = fx["dim"]
     dm = fx["dm"]
     sf, geo = fx["sf"], fx["geo"]
@@ -234,9 +254,42 @@ def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
         dm, nu, dt, f_fn=f_fn, g_fn=g_fn, order=order, picard_iters=1,
         solver=solver, pressure_outflow_nodes=fx["outflow_nodes"],
         consistent_projection=consistent_projection,
-        graddiv_gamma=(graddiv_gamma if graddiv_gamma else None))
+        velocity_update=("graddiv" if tauc_graddiv else "consistent"),
+        graddiv_scale=graddiv_scale, graddiv_dynamic=tauc_graddiv,
+        graddiv_gamma=(graddiv_gamma if graddiv_gamma else None),
+        rotational_pin_wall=rot_pin_wall)
     st.dir_nodes = strong_nodes                    # box strong; obstacle weak
     st.set_initial(lambda c: np.zeros((len(c), dim)))
+
+    # FN4 consistent (KIO) wall-pressure PPE hook (the drag fix). None =>
+    # homogeneous-Neumann wall (the FN1 drag-losing default).
+    #   True / "vms" -> sbm_wall_pressure_kio_vms, the MESH-INDEPENDENT
+    #     fine-scale-weighted form: total wall flux dphi/dn =
+    #     sigma tau_m (dp_KIO/dn - dp*/dn), scale=1.0 at every level.
+    #   dict -> sbm_wall_pressure_neumann kwargs (the raw oint g q source;
+    #     term-level DIAGNOSTIC variants — mesh-dependent, kept to document
+    #     the FN4 scaling bug).
+    def wall_pn_vms(uhat):
+        from diffsim.solvers.timestepping import bdf_coeffs, bdf_order_now
+        o = bdf_order_now(st.t + st.dt, st.dt, st.order,
+                          have_history=st.hist.have(2))
+        bdf = bdf_coeffs(o, st.dt)
+        u1 = st._uvec(st.hist.pre1)
+        u2 = st._uvec(st.hist.pre2) if st.hist.have(2) else None
+        return sbm_wall_pressure_kio_vms(dm, sf, geo, uhat, u1, u2, bdf,
+                                         st.dt, nu, ndof,
+                                         timestab=st.timestab)
+
+    kio_kw = wall_pneumann if isinstance(wall_pneumann, dict) else {}
+
+    def wall_pn_raw(uhat):
+        return sbm_wall_pressure_neumann(dm, sf, geo, uhat, st.p_star, nu,
+                                         ndof, **kio_kw)
+
+    wall_pn_hook = None
+    if wall_pneumann:
+        wall_pn_hook = wall_pn_raw if isinstance(wall_pneumann, dict) \
+            else wall_pn_vms
 
     def extra_block(u_free):
         """Cached geometry SBM block + per-step backflow increment on the
@@ -270,7 +323,8 @@ def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
         # wall so no through-flux is imposed on the pressure correction.
         u, p = st.step(extra_block=extra_block(cur_u_free()),
                        sbm_nodes=sbm_nodes, ppe_surrogate_flux=None,
-                       correction_penalty=correction_penalty)
+                       correction_penalty=correction_penalty,
+                       wall_pressure_neumann=wall_pn_hook)
         if not np.isfinite(u).all() or not np.isfinite(p).all() \
                 or np.abs(u).max() > 1e4:
             blew_up = True
@@ -485,8 +539,11 @@ def run_rungB(level=5, half=0.125, res=(40, 100), device="cpu",
 
         mono_beta = 0.5
         mono_bvs = True
+        # FN4: the verdict projection carries the rotational WALL PIN (the
+        # drag fix). rot_pin_wall=False reproduces the FN1-era drag defect.
         pr = march_projection(fx, dt=dt, nsteps=nsteps, rate_tol=rate_tol_p,
-                              log_every=log_every, alpha=alpha, solver=solver)
+                              log_every=log_every, alpha=alpha, solver=solver,
+                              rot_pin_wall=True)
         mo = march_monolithic(fx, dt=dt, nsteps=nsteps, rate_tol=rate_tol_m,
                               log_every=log_every, backflow_beta=mono_beta,
                               boundary_vorticity=mono_bvs, alpha=alpha)

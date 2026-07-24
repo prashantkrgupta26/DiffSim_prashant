@@ -22,19 +22,23 @@ MEASURED RUNG-B VERDICT (post-FN1 fix, this test locks it in as a regression):
     arrests the growing interior-divergence mode: NO blow-up, ‖div‖ bounded to the
     monolithic's level, mean|u| tracks the monolithic to ~5%, |p*| bounded, and the
     SEEDED monolithic is a BOUNDED fixed point (ladder_rungB_seed_probe.py).
-  * RESIDUAL (honest, NOT yet fixed): the drag Cd (dominated by the WALL PRESSURE-
-    TRACTION) is NOT recovered — proj Cd ~ +0.36 vs mono ~+1.40 at level 4. The
-    split's steady wall pressure differs from the monolithic saddle; the lagged
-    wall pressure-traction term helps Cd when SEEDED but destabilizes from rest,
-    and more grad-div drives Cd more negative. So weak-Nitsche projection is
-    velocity-faithful but drag-unfaithful.
+  * DRAG — FIXED by FN4 (2026-07-23): the FN1-era residual (proj Cd ~ +0.06 vs
+    mono ~+1.39 at level 4) was DIAGNOSED by the seeded-monolithic step-1
+    decomposition: predictor EXACT at the seed, PPE (homogeneous-Neumann wall)
+    exact to 0.1% — the wall pressure was being rewritten by the ROTATIONAL
+    update's -nu*q term, whose input div(u_hat) at a weak-Nitsche wall is O(1)
+    penetration garbage (bias O(0.4-0.5), GROWING under refinement). The fix is
+    ``rotational_pin_wall``: pin q=0 on the SBM wall nodes (the wall analog of
+    the F3b outflow pin). Cd then matches the same-mesh monolithic at BOTH
+    L4 (3.0%) and L5 (8.7%) with the SAME settings — mesh-independent, no
+    tuning. KIO-style PPE wall Neumann sources were tried and REJECTED
+    (mesh-dependent overcorrectors; see sbm_wall_pressure_neumann).
 
 DECISIVE READ: strong Dirichlet on this mesh (rung A) is a stable fixed point of
 the consistent projection; swapping strong -> WEAK NITSCHE BROKE it (divergence).
-The FN1 grad-div + re-pin fix RESTORES stability and velocity-faithfulness (the
-seeded monolithic is now a bounded fixed point), leaving the wall pressure-traction
-(drag) as the open residual. The defect isolated to the Nitsche coupling (base
-projection cleared by rung A; shift absent, dmax==0).
+The FN1 grad-div + re-pin fix RESTORES stability and velocity-faithfulness; the
+FN4 rotational wall pin RESTORES the drag. The defect isolated to the Nitsche
+coupling (base projection cleared by rung A; shift absent, dmax==0).
 
 Kept CHEAP (level 4, short march). Full Re-40/100 numbers live in the driver
 (tests/ladder_rungB_square_nitsche.py); the seed fixed-point gate lives in
@@ -145,16 +149,79 @@ def test_projection_weak_nitsche_stable_and_velocity_faithful(rungB_results):
         f"{mo['mean_u']:.4f} (frac {mu_frac:.3f}) — velocity not faithful")
 
 
-def test_projection_weak_nitsche_drag_residual(rungB_results):
-    """HONEST RESIDUAL (locked): the FN1 fix restores stability + velocity
-    faithfulness but does NOT recover the drag Cd (wall pressure-traction). The
-    projection's steady wall pressure differs from the monolithic saddle, so
-    Cd is decisively off (well outside the R0 15% oracle tol). If this ever
-    starts matching, the wall pressure-traction has been fixed and the rung-B
-    residual must be revisited."""
+def test_projection_weak_nitsche_drag_defect_without_wall_pin(rungB_results):
+    """BASELINE (rotational wall pin OFF, the FN1 default): the FN1 grad-div +
+    re-pin fix restores stability + velocity faithfulness but does NOT recover
+    the drag Cd (~+0.06 vs mono ~+1.39 at L4). FN4 DIAGNOSIS (2026-07-23,
+    seeded-monolithic step-1 decomposition): the predictor is an EXACT fixed
+    point of the seed and the PPE (homogeneous-Neumann wall) reproduces the
+    monolithic Cd to 0.1% — the wall-pressure error is written by the
+    ROTATIONAL update's -nu*q term (q = M^-1 B^T u_hat): at the WEAK-Nitsche
+    wall the predictor's divergence is O(1) penetration garbage concentrated
+    in the wall cells, and -nu*q dumps an O(0.4-0.5), refinement-GROWING
+    pressure bias straight onto the wall nodes every step. Kept as the
+    load-bearing baseline: the drag defect is REAL and localized to the
+    rotational update at the wall (NOT the PPE wall BC — KIO-style Neumann
+    sources were tried and REJECTED as mesh-dependent overcorrectors; see
+    sbm_wall_pressure_neumann's verdict note)."""
     pr, mo = rungB_results["pr"], rungB_results["mo"]
     cd_rel = abs(pr["cd"] - mo["cd"]) / abs(mo["cd"])
     assert cd_rel > TOL_CD_REL, (
-        f"consistent-projection weak-Nitsche Cd={pr['cd']:+.4f} unexpectedly "
-        f"matches monolithic Cd={mo['cd']:+.4f} (rel {cd_rel:.3%}) — the wall "
-        f"pressure-traction may have been fixed; revisit the rung-B residual.")
+        f"consistent-projection weak-Nitsche Cd={pr['cd']:+.4f} (wall pin OFF) "
+        f"unexpectedly matches monolithic Cd={mo['cd']:+.4f} (rel {cd_rel:.3%}) "
+        f"— the rotational -nu*q wall defect should keep Cd off.")
+
+
+def test_projection_wall_pin_recovers_drag(rungB_results):
+    """FN4 THE DRAG FIX (2026-07-23, locked): pinning the ROTATIONAL pressure
+    correction q to 0 on the immersed-wall (SBM) nodes — the exact wall analog
+    of the F3b outflow pin — recovers the rung-B drag. Timmermans' -nu*q is a
+    smooth-field consistency correction; at a weak-Nitsche wall its input
+    div(u_hat) is dominated by the weak-BC penetration and the term writes an
+    O(0.5) wall-pressure bias that settles the split at the drag-wrong
+    equilibrium. With ``rotational_pin_wall=True`` (NO tuning knob, NO PPE
+    wall source — the homogeneous-Neumann wall of Suresh Remark 3.9 stays):
+
+        L4: Cd +1.3529 vs mono +1.3941 (3.0%)   <- asserted here
+        L5: Cd +2.1909 vs mono +2.0151 (8.7%)   <- mesh-independence test
+
+    and the seeded monolithic now PRESERVES the wall pressure (step-1 Cd
+    +1.404 / +2.028 vs the un-pinned drop to +0.60 / +1.03).
+
+    ANTI-VACUITY: the pin is load-bearing — WITHOUT it Cd ~ +0.06 (the
+    baseline test above)."""
+    fx, mo = rungB_results["fx"], rungB_results["mo"]
+    pr_pin = march_projection(fx, dt=DT, nsteps=NSTEPS, rate_tol=5e-4,
+                              alpha=ALPHA, rot_pin_wall=True)
+    assert not pr_pin.get("blew_up", False), "wall-pin projection blew up"
+    cd_rel = abs(pr_pin["cd"] - mo["cd"]) / abs(mo["cd"])
+    assert cd_rel < TOL_CD_REL, (
+        f"rotational-wall-pin Cd={pr_pin['cd']:+.4f} does NOT recover "
+        f"monolithic Cd={mo['cd']:+.4f} (rel {cd_rel:.3%}, tol "
+        f"{TOL_CD_REL:.0%}) — the FN4 drag fix regressed.")
+    # and it stays velocity-faithful (mean|u| tracks, div bounded).
+    mu_frac = pr_pin["mean_u"] / mo["mean_u"]
+    assert 0.7 < mu_frac < 1.3, (
+        f"wall-pin projection mean|u|={pr_pin['mean_u']:.4f} does not track "
+        f"monolithic {mo['mean_u']:.4f} (frac {mu_frac:.3f}).")
+
+
+def test_projection_wall_pin_mesh_independent():
+    """FN4 MESH-INDEPENDENCE GATE (the decisive one): the SAME fix — same
+    settings, NO per-level scale/tuning — recovers the same-mesh monolithic
+    Cd at LEVEL 5 as well (the level where every KIO-style boundary source
+    needed a ~0.07 mesh-dependent damping). This is what proves the FN4
+    diagnosis: the defect was a refinement-growing -nu*q wall bias, and
+    removing it (not counter-scaling a boundary source) is mesh-independent."""
+    fx5 = build_square_channel_2d(5, RE, half=HALF, offset=0, device="cpu")
+    mo5 = march_monolithic(fx5, dt=DT, nsteps=600, rate_tol=2e-4,
+                           backflow_beta=0.5, boundary_vorticity=True,
+                           alpha=ALPHA)
+    pr5 = march_projection(fx5, dt=DT, nsteps=600, rate_tol=5e-4,
+                           alpha=ALPHA, rot_pin_wall=True)
+    assert not pr5.get("blew_up", False), "L5 wall-pin projection blew up"
+    cd_rel = abs(pr5["cd"] - mo5["cd"]) / abs(mo5["cd"])
+    assert cd_rel < TOL_CD_REL, (
+        f"L5 rotational-wall-pin Cd={pr5['cd']:+.4f} vs mono "
+        f"{mo5['cd']:+.4f} (rel {cd_rel:.3%}, tol {TOL_CD_REL:.0%}) — the "
+        f"FN4 fix is NOT mesh-independent.")
