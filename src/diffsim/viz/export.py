@@ -268,21 +268,43 @@ def export_body_vtp(
     triangles: np.ndarray,
     path: Union[str, os.PathLike],
 ) -> pathlib.Path:
-    """Write the embedded-body surface as a VTK PolyData (.vtp) file."""
-    try:
-        import meshio
-    except ImportError as e:
-        raise ImportError(
-            "export_body_vtp requires 'meshio'. Install with: pip install diffsim[viz]"
-        ) from e
+    """Write the embedded-body surface as a VTK PolyData (.vtp) file.
 
+    `.vtp` (VTK PolyData) is written via PyVista/VTK — meshio does not support
+    the PolyData writer.  Falls back to a meshio triangle `.vtu` only if the
+    caller passes a non-`.vtp` extension.
+    """
     path = pathlib.Path(path)
     verts = np.asarray(vertices, dtype=np.float64)
     if verts.shape[1] == 2:
         verts = np.column_stack([verts, np.zeros(len(verts))])
-    tris = np.asarray(triangles, dtype=np.int32)
-    m = meshio.Mesh(points=verts, cells=[("triangle", tris)])
+    tris = np.asarray(triangles, dtype=np.int64)
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    if path.suffix.lower() == ".vtp":
+        try:
+            import pyvista as pv
+        except ImportError as e:
+            raise ImportError(
+                "export_body_vtp writes .vtp via 'pyvista'. Install with: "
+                "pip install diffsim[viz]"
+            ) from e
+        # PyVista faces array: [n0, i0, i1, i2, n1, ...] with n=3 per triangle.
+        faces = np.column_stack(
+            [np.full(len(tris), 3, np.int64), tris]).ravel()
+        surf = pv.PolyData(verts, faces)
+        surf.save(str(path))
+        return path
+
+    # non-.vtp extension: use meshio triangle mesh
+    try:
+        import meshio
+    except ImportError as e:
+        raise ImportError(
+            "export_body_vtp requires 'meshio' (non-.vtp) or 'pyvista' (.vtp). "
+            "Install with: pip install diffsim[viz]"
+        ) from e
+    m = meshio.Mesh(points=verts, cells=[("triangle", tris.astype(np.int32))])
     meshio.write(str(path), m)
     return path
 

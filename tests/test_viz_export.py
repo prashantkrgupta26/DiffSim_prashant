@@ -83,3 +83,111 @@ def test_export_npz_roundtrip(tmp_path):
     out = export_vtu(npz_path, tmp_path / "snap.vtu")
     m = meshio.read(str(out))
     np.testing.assert_allclose(m.point_data["phi_p"], phi_p, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Task 2 — SBM cell data + embedded-body .vtp
+# ---------------------------------------------------------------------------
+
+def _sbm_fixture(level=3, lam=1.0):
+    """Build a tiny 3-D SBM setup around a sphere and return the pieces the
+    exporter needs: (mesh, retained_tree, frac, sf, geom).
+
+    level=3 (136 retained elements) is the smallest resolution that yields
+    BOTH fully-interior elements (frac==1) and surrogate-face elements around
+    a radius-0.3 sphere, which the element_type tests need."""
+    from diffsim.geometry.csg import Sphere
+    from diffsim.sbm.surrogate import (
+        classify_lambda, extract_surrogate, GeometryData)
+    from diffsim.mesh.faces import face_tables
+
+    oracle = Sphere((0.5, 0.5, 0.5), 0.3)
+    tree = build_uniform(level, dim=3)
+    ret, frac = classify_lambda(tree, oracle, lam, domain="inside")
+    sf = extract_surrogate(ret)
+    mesh = build_mesh(ret, p=1)
+    geo = GeometryData.evaluate(oracle, ret, sf, face_tables(1, 3),
+                                domain="inside")
+    return mesh, ret, frac, sf, geo
+
+
+def test_export_vtu_sbm_cell_arrays(tmp_path):
+    import meshio
+    from diffsim.viz import export_vtu_sbm
+
+    mesh, ret, frac, sf, geo = _sbm_fixture()
+    Nn = len(mesh.node_coords)
+    out = export_vtu_sbm(
+        mesh, tmp_path / "sbm.vtu",
+        fields={"phi_p": np.zeros(Nn), "phi_f": np.zeros(Nn)},
+        retained_tree=ret, frac=frac, geom=geo, sf=sf)
+    assert out.exists()
+
+    m = meshio.read(str(out))
+    # all three SBM cell arrays present
+    assert "element_type" in m.cell_data
+    assert "frac_in" in m.cell_data
+    assert "d_mean" in m.cell_data
+    ne = len(ret)
+    # concatenated over cell blocks, they cover every element exactly once
+    et = np.concatenate(m.cell_data["element_type"])
+    fr = np.concatenate(m.cell_data["frac_in"])
+    dm = np.concatenate(m.cell_data["d_mean"])
+    assert et.shape == (ne,)
+    assert fr.shape == (ne,)
+    assert dm.shape == (ne,)
+    # independent reference: elements with frac==1 that are NOT surrogate have
+    # element_type 0
+    surrogate = np.zeros(ne, bool)
+    surrogate[np.unique(sf.elem)] = True
+    interior = (frac == 1.0) & ~surrogate
+    # order in the concatenated arrays follows mesh.bins ordering — for a
+    # uniform p1 mesh that is the natural element order, so compare directly
+    assert (et[interior] == 0).all()
+    assert (et[surrogate] == 2).all()
+
+
+def test_export_body_vtp_roundtrip(tmp_path):
+    import pyvista as pv
+    from diffsim.viz import export_body_vtp
+
+    verts = np.array([[0.0, 0.0, 0.0],
+                      [1.0, 0.0, 0.0],
+                      [1.0, 1.0, 0.0],
+                      [0.0, 1.0, 0.0]], dtype=np.float64)
+    tris = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    out = export_body_vtp(verts, tris, tmp_path / "body.vtp")
+    assert out.exists()
+
+    surf = pv.read(str(out))
+    np.testing.assert_allclose(np.asarray(surf.points), verts, atol=1e-12)
+    # PyVista faces: flat [3, i0, i1, i2, 3, ...]; reshape to (Nt, 4), drop count
+    faces = surf.faces.reshape(-1, 4)[:, 1:]
+    np.testing.assert_array_equal(np.sort(faces, axis=0),
+                                  np.sort(tris, axis=0))
+
+
+def test_element_type_values(tmp_path):
+    """A surrogate-face element has element_type==2; a fully-interior element
+    has element_type==0."""
+    from diffsim.viz import export_vtu_sbm
+    import meshio
+
+    mesh, ret, frac, sf, geo = _sbm_fixture()
+    Nn = len(mesh.node_coords)
+    out = export_vtu_sbm(
+        mesh, tmp_path / "vals.vtu",
+        fields={"phi_p": np.zeros(Nn), "phi_f": np.zeros(Nn)},
+        retained_tree=ret, frac=frac, geom=geo, sf=sf)
+    m = meshio.read(str(out))
+    et = np.concatenate(m.cell_data["element_type"])
+
+    # there IS at least one surrogate element and at least one interior element
+    assert len(sf.elem) > 0
+    known_surrogate = int(np.unique(sf.elem)[0])
+    assert et[known_surrogate] == 2
+    interior_ids = np.where((frac == 1.0))[0]
+    interior_ids = [i for i in interior_ids
+                    if i not in set(np.unique(sf.elem).tolist())]
+    assert len(interior_ids) > 0
+    assert et[interior_ids[0]] == 0
