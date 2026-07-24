@@ -38,6 +38,9 @@ Issues = "https://github.com/BaskarGS/diffsim/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-xdist>=3.5", "ruff>=0.6"]
+# Phase-1 visualization: VTU/PVD export + PyVista off-screen renders.
+# Optional — `import diffsim` never imports pyvista/meshio at module level.
+viz = ["pyvista>=0.44", "meshio>=5.3"]
 # cuDSS GPU direct solver (measured stepping default at 200k+ dofs)
 cudss = ["nvmath-python[cu12]>=0.2"]
 # AMGX has no PyPI package: build github.com/NVIDIA/AMGX, then
