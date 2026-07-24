@@ -38,8 +38,8 @@ class SlabPart:
     rank: int
     owned: np.ndarray
     ghost: np.ndarray
-    send: dict
-    recv: dict
+    send: dict[int, np.ndarray]
+    recv: dict[int, np.ndarray]
 
     def local_index(self, global_ids: np.ndarray) -> np.ndarray:
         """Map global node ids to local indices within (owned + ghost).
@@ -65,10 +65,6 @@ class SlabPart:
         n_owned = len(self.owned)
         n_ghost = len(self.ghost)
         local = np.empty(len(global_ids), dtype=np.int64)
-
-        # Build lookup tables
-        owned_set = set(self.owned)
-        ghost_set = set(self.ghost)
 
         # Create inverse maps: global_id -> local index
         owned_map = {gid: i for i, gid in enumerate(self.owned)}

@@ -77,47 +77,38 @@ def test_completeness_and_disjointness(partition_fixture):
 
 
 def test_ghost_correctness(partition_fixture):
-    """Ghost nodes are exactly the adjacent axis-0 planes of neighbors."""
+    """Ghost nodes are exactly the adjacent axis-0 planes of neighbors.
+
+    Expected ghost is derived directly from the slab numbering rule:
+      rows_per_rank = nx // n_ranks
+      rank r owns i0 in [r*rows_per_rank, (r+1)*rows_per_rank)  (last rank: up to nx)
+      lower ghost plane (r > 0):         i0 = r*rows_per_rank - 1
+      upper ghost plane (r < n_ranks-1): i0 = (r+1)*rows_per_rank
+    Global id = i0*ny*nz + i1*nz + i2.
+    """
     dims, n_ranks, parts = partition_fixture
     nx, ny, nz = dims
 
-    def to_global_id(i0: int, i1: int, i2: int) -> int:
-        """Compute global node id (axis 0 slowest)."""
-        return i0 * ny * nz + i1 * nz + i2
-
-    def plane_ids(i0: int) -> set:
-        """Get all global ids for a plane at axis-0 index i0."""
-        ids = set()
-        for i1 in range(ny):
-            for i2 in range(nz):
-                ids.add(to_global_id(i0, i1, i2))
-        return ids
-
-    # Compute axis-0 ranges for each rank (same logic as slab_partition)
     rows_per_rank = nx // n_ranks
-    i0_ranges = []
-    for r in range(n_ranks):
-        i0_start = r * rows_per_rank
-        if r == n_ranks - 1:
-            i0_stop = nx
-        else:
-            i0_stop = (r + 1) * rows_per_rank
-        i0_ranges.append((i0_start, i0_stop))
 
-    # For each rank, verify ghost correctness
+    def plane_ids_set(i0: int) -> set:
+        """All global ids for the plane at axis-0 index i0."""
+        return {i0 * ny * nz + i1 * nz + i2
+                for i1 in range(ny)
+                for i2 in range(nz)}
+
     for r, part in enumerate(parts):
-        i0_start, i0_stop = i0_ranges[r]
-        expected_ghost = set()
+        expected_ghost: set[int] = set()
 
-        # Lower neighbor's last plane
+        # Lower ghost: single plane just below rank r's owned range
         if r > 0:
-            prev_i0_start, prev_i0_stop = i0_ranges[r - 1]
-            expected_ghost.update(plane_ids(prev_i0_stop - 1))
+            lower_ghost_i0 = r * rows_per_rank - 1
+            expected_ghost.update(plane_ids_set(lower_ghost_i0))
 
-        # Upper neighbor's first plane
+        # Upper ghost: first plane of rank r+1 (= one past rank r's owned range)
         if r < n_ranks - 1:
-            next_i0_start, next_i0_stop = i0_ranges[r + 1]
-            expected_ghost.update(plane_ids(next_i0_start))
+            upper_ghost_i0 = (r + 1) * rows_per_rank
+            expected_ghost.update(plane_ids_set(upper_ghost_i0))
 
         actual_ghost = set(part.ghost)
         assert actual_ghost == expected_ghost, \
@@ -214,21 +205,21 @@ def test_local_index_round_trip(partition_fixture):
 
 
 def test_local_index_out_of_range(partition_fixture):
-    """local_index raises ValueError for ids outside owned ∪ ghost."""
+    """local_index raises ValueError for ids outside owned ∪ ghost.
+
+    Uses total_nodes (== nx*ny*nz) as the out-of-range id: it is always
+    strictly above every valid global id in [0, total_nodes), so it is
+    guaranteed to be absent from owned ∪ ghost for every parametrization,
+    including n_ranks=1 where the entire node space is owned.
+    """
     dims, n_ranks, parts = partition_fixture
     nx, ny, nz = dims
     total_nodes = nx * ny * nz
 
     for part in parts:
-        # Find a node not in owned ∪ ghost
-        owned_set = set(part.owned)
-        ghost_set = set(part.ghost)
-        for candidate in range(total_nodes):
-            if candidate not in owned_set and candidate not in ghost_set:
-                # Found an out-of-range id
-                with pytest.raises(ValueError):
-                    part.local_index(np.array([candidate], dtype=np.int64))
-                break
+        out_of_range = np.array([total_nodes], dtype=np.int64)
+        with pytest.raises(ValueError):
+            part.local_index(out_of_range)
 
 
 def test_n_ranks_1_degenerate(dims_fixture):
