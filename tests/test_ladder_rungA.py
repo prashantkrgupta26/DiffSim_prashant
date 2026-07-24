@@ -45,9 +45,23 @@ MEASURED (level 5, Re=40, this test):
     taking one consistent-projection step PRESERVES it (Cd +4.18 -> +4.12,
     ‖div‖ 1.22 -> 1.29, du_from_seed 6e-2) — vs the base split's Cd -> -55,
     ‖div‖ 1.22 -> 6.0. (Probe: tests/rungA_outflow_diag.py.)
-  * FROM REST, Re=40 steady: projection Cd -> +3.73 (monolithic +4.18, ~11%),
+  * FROM REST, Re=40 steady: projection Cd -> +3.84 (monolithic +4.18, ~8%),
     mean|u| -> 1.044 (monolithic 1.038, <1%) — matches the same-mesh oracle;
     no weak plateau, no blow-up.
+
+P2HARDEN (2026-07-23) — STRONG-WALL rotational pin. The FN4 wall-pressure pin
+(rotational_pin_wall) is EXTENDED to the STRONG-Dirichlet obstacle: q=0 is pinned
+on the obstacle nodes (passed to step() as wall_pin_nodes — the obstacle SUBSET of
+dir_nodes, NOT inflow/outflow), so the rotational update p = p* + phi - nu*q does
+not stamp a spurious wall pressure the drag traction integral reads. It is now ON
+by default under consistent_projection. MEASURED (this test, L5, Re=40):
+  * 2-D: gap 10.94% (pin OFF) -> 8.09% (pin ON) — Cd +3.719 -> +3.838 vs mono
+    +4.175. The pin is LOAD-BEARING and tightens the strong-wall gap.
+  * 3-D rung A' (L4, cuDSS): gap 18.01% (OFF) -> 17.37% (ON) — Cd +2.602 ->
+    +2.622 vs mono +3.173. The pin helps only marginally in 3-D: the 3-D
+    strong-wall gap is DOMINATED by a different cause (pressure-extrapolation /
+    traction on the strong wall + L4 confinement), NOT the rotational -nu*q bias.
+The pin never hurts and is default-OFF for the base split (bit-for-bit).
 
 The BASE single-pass split (consistent_projection=False) is UNCHANGED and still
 fails (kept as the anti-vacuity contrast). The fix ships default-OFF, bit-for-bit
@@ -150,9 +164,11 @@ def test_consistent_projection_matches_monolithic(rungA_results):
     assert prc["div"] < 5.0 * mo["div"], (
         f"consistent-projection ‖div‖={prc['div']:.3f} not controlled to the "
         f"monolithic level ‖div‖={mo['div']:.3f}")
-    # Cd matches the same-mesh oracle (R0 tol 15%).
+    # Cd matches the same-mesh oracle. With the P2harden strong-wall pin ON
+    # (default under consistent_projection) the 2-D gap tightened 10.9% -> 8.1%,
+    # so tighten the asserted tol to 10% (was 15%) to lock the improvement in.
     cd_rel = abs(prc["cd"] - mo["cd"]) / abs(mo["cd"])
-    assert cd_rel < 0.15, (
+    assert cd_rel < 0.10, (
         f"consistent-projection Cd={prc['cd']:+.4f} does not match monolithic "
         f"Cd={mo['cd']:+.4f} (rel {cd_rel:.3%})")
     # mean|u| develops to the monolithic magnitude — NO weak plateau.
@@ -161,6 +177,31 @@ def test_consistent_projection_matches_monolithic(rungA_results):
         f"consistent-projection mean|u|={prc['mean_u']:.4f} pins weak vs "
         f"monolithic {mo['mean_u']:.4f} (frac {mu_frac:.3f})")
     assert abs(prc["mean_u"] - mo["mean_u"]) / mo["mean_u"] < 0.20
+
+
+def test_strong_wall_pin_is_load_bearing(rungA_results):
+    """P2harden anti-vacuity: the STRONG-Dirichlet rotational wall-pin
+    (rotational_pin_wall, extended to wall_pin_nodes) is LOAD-BEARING — turning
+    it OFF widens the strong-wall drag gap and ON tightens it toward the same-
+    mesh monolithic. Measured (L5, Re=40): gap 10.94% (OFF) -> 8.09% (ON),
+    Cd +3.719 -> +3.838 vs mono +4.175. This proves the wall-pressure -nu*q bias
+    is a real (partial) cause of the strong-wall gap, and that the default-ON pin
+    under consistent_projection is doing the work (not a no-op)."""
+    fx, mo = rungA_results["fx"], rungA_results["mo"]
+    pin_off = march_projection(fx, dt=DT, nsteps=NSTEPS_FIX, rate_tol=5e-4,
+                               consistent_projection=True,
+                               rotational_pin_wall=False)
+    pin_on = rungA_results["prc"]        # default-ON under consistent_projection
+    gap_off = abs(pin_off["cd"] - mo["cd"]) / abs(mo["cd"])
+    gap_on = abs(pin_on["cd"] - mo["cd"]) / abs(mo["cd"])
+    # the pin MOVES the answer (not a no-op) ...
+    assert abs(pin_on["cd"] - pin_off["cd"]) > 1e-3, (
+        f"strong-wall pin changed Cd by only {abs(pin_on['cd']-pin_off['cd']):.2e}"
+        f" — the pin is a no-op, the extension did not engage the obstacle nodes.")
+    # ... and it moves it TOWARD the monolithic (tighter gap).
+    assert gap_on < gap_off, (
+        f"strong-wall pin did NOT tighten the gap: OFF={gap_off:.3%} -> "
+        f"ON={gap_on:.3%}. The wall-pin extension regressed.")
 
 
 @pytest.fixture(scope="module")

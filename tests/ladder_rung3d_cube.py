@@ -100,7 +100,8 @@ def zero_shift(fx):
 # --------------------------------------------------------------------------
 def march_projection_strong_3d(fx, dt, nsteps, rate_tol, log_every, solver,
                                device, alpha=ALPHA,
-                               graddiv_gamma=FN1_GRADDIV_GAMMA):
+                               graddiv_gamma=FN1_GRADDIV_GAMMA,
+                               rotational_pin_wall=False):
     """Rung A' projection: the base LerayProjectionStepper in consistent mode
     with the cube nodes in the STRONG Dirichlet set (strong no-slip, dmax==0 —
     the SBM block is inert).  Same consistent-projection config as the 2-D
@@ -131,9 +132,12 @@ def march_projection_strong_3d(fx, dt, nsteps, rate_tol, log_every, solver,
         solver=solver, pressure_outflow_nodes=fx["outflow_nodes"],
         consistent_projection=True, velocity_update="consistent",
         graddiv_gamma=(graddiv_gamma if graddiv_gamma else None),
-        rotational_pin_wall=False)          # strong wall: no weak-wall pin
+        rotational_pin_wall=rotational_pin_wall)   # P2harden: strong-wall pin
     st.dir_nodes = strong_nodes
     st.set_initial(lambda c: np.zeros((len(c), dim)))
+    # STRONG-WALL rotational pin (P2harden): pin q=0 on the obstacle SUBSET only
+    # (NOT box inflow/walls). None when off => step() bit-for-bit.
+    wall_pin_nodes = obst if rotational_pin_wall else None
 
     T = dm.constraints.T.tocsr()
     T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
@@ -146,7 +150,7 @@ def march_projection_strong_3d(fx, dt, nsteps, rate_tol, log_every, solver,
     blew_up = False
     steps = 0
     for steps in range(1, nsteps + 1):
-        u, p = st.step()
+        u, p = st.step(wall_pin_nodes=wall_pin_nodes)
         if not np.isfinite(u).all() or not np.isfinite(p).all() \
                 or np.abs(u).max() > 1e4:
             blew_up = True

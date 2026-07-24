@@ -832,8 +832,17 @@ class LerayProjectionStepper:
     # ---------------- the step ----------------
     def step(self, extra_block=None, sbm_nodes=None, ppe_surrogate_flux=None,
              correction_penalty=None, wall_traction_rhs=None,
-             wall_pressure_neumann=None):
+             wall_pressure_neumann=None, wall_pin_nodes=None):
         """One projection step.
+
+        ``wall_pin_nodes`` (2026-07-23, P2harden) is the STRONG-Dirichlet wall
+        analog of ``sbm_nodes`` for the rotational wall-pressure pin: the
+        free-node indices of the OBSTACLE wall (the strong ``dir_nodes`` SUBSET
+        that carries the immersed body, NOT inflow/outflow). When
+        ``rotational_pin_wall`` is on, q=0 is pinned on these rows too, so the
+        rotational update p = p* + phi - nu*q does not write a spurious wall
+        pressure the drag integral would read. Default ``None`` => bit-for-bit
+        (the strong-wall pin is off unless the rung-A driver supplies the set).
 
         ``wall_pressure_neumann`` is the FN4 DIAGNOSTIC wall-pressure PPE
         boundary-source hook (2026-07-23). When callable,
@@ -925,10 +934,12 @@ class LerayProjectionStepper:
             uhat, phi, p_hat, uq, fs_vel, sigma = self._projection_pass(
                 t_new, extra_block, sbm_nodes, ppe_surrogate_flux,
                 wall_traction_rhs=wall_traction_rhs,
-                wall_pressure_neumann=wall_pressure_neumann)
+                wall_pressure_neumann=wall_pressure_neumann,
+                wall_pin_nodes=wall_pin_nodes)
         else:
             uhat, phi, p_hat, uq, fs_vel, sigma = self._inner_solve(
-                t_new, extra_block, sbm_nodes, ppe_surrogate_flux)
+                t_new, extra_block, sbm_nodes, ppe_surrogate_flux,
+                wall_pin_nodes=wall_pin_nodes)
         # ---- Step 3: velocity correction (uses the final pass) ----
         return self._correct_and_finish(
             uhat, phi, p_hat, uq, fs_vel, sigma, dim, gvals, sbm_nodes, t_new,
@@ -936,7 +947,7 @@ class LerayProjectionStepper:
 
     def _projection_pass(self, t_new, extra_block, sbm_nodes,
                          ppe_surrogate_flux, wall_traction_rhs=None,
-                         wall_pressure_neumann=None):
+                         wall_pressure_neumann=None, wall_pin_nodes=None):
         """One predictor -> PPE -> pressure-update PASS against the CURRENT
         ``self.p_star``. Returns ``(uhat, phi, p_hat, uq, fs_vel, sigma)``: the
         predicted velocity, the pressure increment ``phi``, the updated
@@ -1137,14 +1148,30 @@ class LerayProjectionStepper:
             # dominated by the weak-BC penetration it is INCONSISTENT with the
             # same-mesh monolithic saddle (which carries no such term).
             # Default OFF (bit-for-bit); the rung-B driver turns it on.
-            if self.rotational_pin_wall and sbm_nodes is not None:
-                q[np.asarray(sbm_nodes, dtype=np.int64)] = 0.0
+            #
+            # STRONG-WALL EXTENSION (2026-07-23, P2harden): the SAME wall-pressure
+            # bias exists at a STRONG-Dirichlet body-fitted wall (rung A/A′). The
+            # strong overwrite u_new[dir_nodes]=g fixes the VELOCITY after the
+            # correction, but p_hat = p* + phi - nu*q still carries the -nu*q bias
+            # ON THE WALL NODES, and the drag traction integral reads that biased
+            # wall pressure. At a strong wall the obstacle nodes live in
+            # dir_nodes, NOT sbm_nodes, so the caller signals them separately via
+            # ``wall_pin_nodes`` (the obstacle SUBSET of dir_nodes — NOT inflow/
+            # outflow, whose q must stay free). Pin q=0 on whichever node set
+            # carries the wall: sbm_nodes for the weak wall, wall_pin_nodes for
+            # the strong wall. Both gated on rotational_pin_wall (default OFF).
+            if self.rotational_pin_wall:
+                if sbm_nodes is not None:
+                    q[np.asarray(sbm_nodes, dtype=np.int64)] = 0.0
+                if wall_pin_nodes is not None:
+                    q[np.asarray(wall_pin_nodes, dtype=np.int64)] = 0.0
             p_hat = self.p_star + phi - self.nu * q
         else:                                    # "standard" (default)
             p_hat = self.p_star + phi
         return uhat, phi, p_hat, uq, fs_vel, sigma
 
-    def _inner_solve(self, t_new, extra_block, sbm_nodes, ppe_surrogate_flux):
+    def _inner_solve(self, t_new, extra_block, sbm_nodes, ppe_surrogate_flux,
+                     wall_pin_nodes=None):
         """STABILIZED inner predictor<->PPE iteration (Task 4).
 
         Drives ``self.p_star`` to the within-step fixed point of the map
@@ -1171,7 +1198,8 @@ class LerayProjectionStepper:
         m = max(1, self.inner_anderson_m)
         for it in range(self.inner_max):
             bundle = self._projection_pass(
-                t_new, extra_block, sbm_nodes, ppe_surrogate_flux)
+                t_new, extra_block, sbm_nodes, ppe_surrogate_flux,
+                wall_pin_nodes=wall_pin_nodes)
             p_hat = bundle[2]
             r = p_hat - self.p_star                       # fixed-point residual
             res = float(np.linalg.norm(r))

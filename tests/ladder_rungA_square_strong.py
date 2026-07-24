@@ -83,7 +83,8 @@ def mean_speed(u_node):
 # PROJECTION march (base LerayProjectionStepper, strong obstacle)
 # --------------------------------------------------------------------------
 def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
-                     log_every=0, consistent_projection=False, solver="splu"):
+                     log_every=0, consistent_projection=False, solver="splu",
+                     rotational_pin_wall=None):
     """March the base projection stepper (single-pass) with STRONG no-slip on
     the obstacle. Returns dict(cd, cl, mean_u, div, steps, cd_hist, cl_hist).
 
@@ -95,7 +96,18 @@ def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
     ``consistent_projection=True`` engages the 2026-07-23 consistent-projection
     fix (PSPG-consistent PPE with a COLLOCATED coarse divergence, fine-scale in
     both PPE + correction, disjoint outflow BCs via `pressure_outflow_nodes`,
-    rotational pressure update). Default False = the base single-pass split."""
+    rotational pressure update). Default False = the base single-pass split.
+
+    ``rotational_pin_wall`` (2026-07-23, P2harden) extends the FN4 wall-pressure
+    pin to the STRONG-Dirichlet obstacle: q=0 is pinned on the obstacle nodes so
+    the rotational update p = p* + phi - nu*q does not write a spurious wall
+    pressure that the drag traction integral reads. The obstacle free-node
+    subset (NOT inflow/outflow) is passed to `st.step(wall_pin_nodes=...)`.
+    Default None => ON when consistent_projection (the rotational update is
+    live), OFF otherwise (base split has no -nu*q term, so the pin is a no-op
+    but kept off for bit-for-bit clarity)."""
+    if rotational_pin_wall is None:
+        rotational_pin_wall = bool(consistent_projection)
     dim = fx["dim"]
     dm, mesh = fx["dm"], fx["mesh"]
     sf, geo = fx["sf"], fx["geo"]
@@ -113,9 +125,16 @@ def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
     st = LerayProjectionStepper(
         dm, nu, dt, f_fn=f_fn, g_fn=g_fn, order=order, picard_iters=1,
         solver=solver, pressure_outflow_nodes=fx["outflow_nodes"],
-        consistent_projection=consistent_projection)
+        consistent_projection=consistent_projection,
+        rotational_pin_wall=rotational_pin_wall)
     st.dir_nodes = strong_nodes                    # override: box + obstacle strong
     st.set_initial(lambda c: np.zeros((len(c), dim)))
+    # STRONG-WALL rotational pin (P2harden): the obstacle free-node SUBSET only
+    # (NOT inflow/walls — pinning q on the channel inflow would be wrong). q=0 is
+    # pinned here so the -nu*q wall-pressure bias the drag integral reads is
+    # removed. None when the pin is off (base split) so step() stays bit-for-bit.
+    wall_pin_nodes = (np.where(fx["obstacle_node_mask"])[0]
+                      if rotational_pin_wall else None)
 
     T = dm.constraints.T.tocsr()
     T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
@@ -127,7 +146,7 @@ def march_projection(fx, dt=0.02, nsteps=400, rate_tol=None, order=2,
     u = None
     blew_up = False
     for steps in range(1, nsteps + 1):
-        u, p = st.step()
+        u, p = st.step(wall_pin_nodes=wall_pin_nodes)
         # blow-up guard: the base single-pass projection on an OPEN outflow is
         # pressure-unstable (‖p‖/div grow unbounded — the weak-fixed-point
         # verdict's experiment-4 mechanism); bail once it diverges so the driver
