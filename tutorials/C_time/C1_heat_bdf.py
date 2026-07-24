@@ -34,8 +34,9 @@ from diffsim.mesh.basis import basis_tables
 from diffsim.assembly.operators import DeviceMesh, assemble_csr
 from diffsim.physics.poisson import gauss_points, make_load_kernel
 from diffsim.solvers.timestepping import bdf_coeffs, bdf_order_now, History
+from diffsim import default_device
 
-DEVICE = "cuda:0"
+DEVICE = default_device()
 OM = 2 * np.pi
 u_ex = lambda x, t: np.cos(OM * t) * np.sin(np.pi * x[:, 0]) \
     * np.sin(np.pi * x[:, 1])

@@ -26,6 +26,7 @@ from hero_h1_sphere_steady import K, U_IN, NU, ALPHA_F
 from hero_h3_bunny_steady import make_bunny_oracle as make_oracle
 from hero_h3_bunny_steady import BUNNY_JSON
 from diffsim.geometry.provided_inr import ProvidedINROracle, extract_modes
+from diffsim import default_device
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
@@ -54,7 +55,7 @@ def build_epoch(V):
     sf = extract_surrogate(ret)
     mesh = build_mesh(ret, p=1)
     cons = build_constraints(mesh)
-    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3), "cuda:0")
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3), default_device())
     coords = mesh.node_coords[cons.free_nodes]
     on = lambda v, c: np.abs(coords[:, c] - v) < 1e-12
     strong = np.where(on(0.0, 0) | on(0.0, 1) | on(1.0, 1)

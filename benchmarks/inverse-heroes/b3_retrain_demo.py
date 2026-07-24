@@ -31,6 +31,7 @@ with contextlib.redirect_stdout(buf):
     pass
 
 # rebuild directly (compact re-implementation of the dvd loop, Ra=1e4)
+from diffsim import default_device
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
@@ -45,7 +46,7 @@ ndof, dim = 3, 2
 tree = build_uniform(level, dim=2)
 mesh = build_mesh(tree, p=1)
 cons = build_constraints(mesh)
-dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), "cuda:0")
+dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), default_device())
 Tc = cons.T.tocsr()
 nfree = Tc.shape[1]
 coords = mesh.node_coords[cons.free_nodes]

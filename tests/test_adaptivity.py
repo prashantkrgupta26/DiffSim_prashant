@@ -15,11 +15,13 @@ from diffsim.sbm.surrogate import classify_lambda
 from diffsim.adaptivity.transfer import transfer_operator
 from diffsim.physics.scalar_transport import assemble_scalar_ad
 from diffsim.physics.poisson import gauss_points
+from diffsim import default_device
 
 pytestmark = pytest.mark.tier2
 
 
-def _carve(r, level=5, device="cuda:0"):
+def _carve(r, level=5, device=None):
+    device = default_device() if device is None else device
     tree = build_uniform(level, dim=2)
     ret, _ = classify_lambda(tree, Sphere((0.5, 0.5), r), 1.0,
                              domain="outside")

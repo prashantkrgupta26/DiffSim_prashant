@@ -42,8 +42,9 @@ from diffsim.geometry.trimesh import icosphere
 from diffsim.sbm.surrogate import classify_lambda, extract_surrogate, GeometryData
 from diffsim.sbm.poisson import SBMPoisson
 from diffsim.physics.poisson import l2_error_masked
+from diffsim import default_device
 
-DEVICE = "cuda:0"
+DEVICE = default_device()
 u_star = lambda x: np.sin(np.pi * x[:, 0]) * np.cos(np.pi * x[:, 1])
 f_star = lambda x: 2 * np.pi ** 2 * u_star(x)
 u3 = lambda x: (np.sin(np.pi * x[:, 0]) * np.cos(np.pi * x[:, 1])

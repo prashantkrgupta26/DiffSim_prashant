@@ -107,7 +107,8 @@ def test_m1a_baselines_locked(device):
 
 
 if __name__ == "__main__":
-    vals = compute_baselines("cuda:0")
+    from diffsim import default_device
+    vals = compute_baselines(default_device())
     os.makedirs(os.path.dirname(BASELINE_PATH), exist_ok=True)
     with open(BASELINE_PATH, "w") as fh:
         json.dump(vals, fh, indent=2, sort_keys=True)

@@ -5,6 +5,7 @@ import os as _bos, sys as _bsys  # noqa: E402  (benchmark import bootstrap)
 _bsys.path.insert(0, _bos.path.dirname(_bos.path.dirname(_bos.path.abspath(__file__))))
 import _bench_bootstrap  # noqa: E402,F401
 import numpy as np, time
+from diffsim import default_device
 from diffsim.octree.build import build_uniform, refine_elements
 from diffsim.octree.balance import balance2to1
 from diffsim.mesh.nodes import build_mesh
@@ -14,7 +15,8 @@ from diffsim.assembly.operators import DeviceMesh
 from diffsim.physics.cahn_hilliard import CahnHilliardStepper
 from diffsim.adaptivity.transfer import transfer_operator
 
-def make(tree, device="cuda:0"):
+def make(tree, device=None):
+    device = default_device() if device is None else device
     mesh = build_mesh(tree, p=1)
     cons = build_constraints(mesh)
     dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), device)

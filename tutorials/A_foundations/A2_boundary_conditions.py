@@ -42,8 +42,9 @@ from diffsim.mesh.basis import basis_tables
 from diffsim.assembly.operators import DeviceMesh, assemble_csr
 from diffsim.physics.poisson import (gauss_points, make_load_kernel,
                                      l2_error_masked)
+from diffsim import default_device
 
-DEVICE = "cuda:0"
+DEVICE = default_device()
 u_star = lambda x: np.cos(np.pi * x[:, 0]) * np.cos(np.pi * x[:, 1])
 f_star = lambda x: 2 * np.pi ** 2 * u_star(x)
 

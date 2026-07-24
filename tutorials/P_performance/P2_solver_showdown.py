@@ -37,8 +37,9 @@ from diffsim.mesh.basis import basis_tables
 from diffsim.assembly.operators import DeviceMesh, assemble_csr, CSROperator
 from diffsim.solvers.krylov import cg as cg_host
 from diffsim.solvers.krylov_dev import cg_dev, SyncCounter
+from diffsim import default_device
 
-DEVICE = "cuda:0"
+DEVICE = default_device()
 
 
 def build(level):

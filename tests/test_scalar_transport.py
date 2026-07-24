@@ -11,12 +11,14 @@ from diffsim.mesh.basis import basis_tables
 from diffsim.assembly.operators import DeviceMesh
 from diffsim.physics.scalar_transport import assemble_scalar_ad
 from diffsim.physics.poisson import gauss_points, l2_error
+from diffsim import default_device
 
 pytestmark = pytest.mark.tier2
 
 
 def _solve(dim, level, p, a_fn, kappa, u_star, f_fn, sigma=0.0,
-           device="cuda:0"):
+           device=None):
+    device = default_device() if device is None else device
     tree = build_uniform(level, dim=dim)
     mesh = build_mesh(tree, p=p)
     cons = build_constraints(mesh)

@@ -29,8 +29,9 @@ from diffsim.mesh.constraints import build_constraints
 from diffsim.mesh.basis import basis_tables
 from diffsim.assembly.operators import DeviceMesh, assemble_csr
 from diffsim.physics.poisson import gauss_points, l2_error_masked
+from diffsim import default_device
 
-DEVICE = "cuda:0"
+DEVICE = default_device()
 
 
 class Bratu3D:

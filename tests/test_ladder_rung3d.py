@@ -51,6 +51,7 @@ except Exception:
 pytestmark = pytest.mark.skipif(
     not _HAS_CUDA, reason="Task-7 3-D rung needs cuDSS on a CUDA device")
 
+from diffsim import default_device
 from ladder_fixtures import build_cube_channel_3d
 from ladder_rungB_square_nitsche import march_projection, TOL_CD_REL, ALPHA
 from ladder_rung3d_cube import (march_monolithic_3d, zero_shift, _recd,
@@ -62,7 +63,7 @@ OFFSET = 0.05         # dmax = 0.05, dmax/h = 0.80 (genuine sub-cell shift)
 RE = 40               # steady, below shedding onset
 DT = 0.02
 NSTEPS = 300          # both marches converge (rate_tol) well inside this
-DEVICE = "cuda:0"
+DEVICE = default_device()
 SOLVER = "cudss"
 
 

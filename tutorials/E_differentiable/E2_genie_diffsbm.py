@@ -72,6 +72,7 @@ from diffsim.sbm.surrogate import (classify_lambda, extract_surrogate,
                                    GeometryData)
 from diffsim.sbm.poisson import SBMPoisson
 from diffsim.sbm.adjoint import solve_adjoint, shape_gradient, probe_qoi
+from diffsim import default_device
 
 SPHERE_PT = os.path.join(os.path.dirname(__file__), "..", "..",
                          "assets", "sdf", "model_single_head0.pt")
@@ -140,7 +141,7 @@ def build_epoch(V, alpha):
     mesh = build_mesh(ret, p=1)
     cons = build_constraints(mesh)
     dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3),
-                              "cuda:0")
+                              default_device())
     _EPOCH.clear()
     _EPOCH.update(ret=ret, sf=sf, mesh=mesh, cons=cons, dm=dm)
 

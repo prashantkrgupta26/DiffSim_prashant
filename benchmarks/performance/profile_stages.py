@@ -23,9 +23,10 @@ def t(label, fn, store, *a, **k):
     return out
 
 
-def profile_case(dim, level, device="cuda:0"):
+def profile_case(dim, level, device=None):
     import scipy.sparse as sp
     from scipy.sparse.linalg import splu
+    from diffsim import default_device
     from diffsim.octree.build import build_uniform
     from diffsim.mesh.nodes import build_mesh
     from diffsim.mesh.constraints import build_constraints
@@ -36,6 +37,7 @@ def profile_case(dim, level, device="cuda:0"):
     from diffsim.sbm.ns_adjoint import (ns_volume_cotangents,
                                         ns_load_cotangents)
 
+    device = default_device() if device is None else device
     S = {}
     tree = t("mesh:build_uniform", build_uniform, S, level, dim=dim)
     mesh = t("mesh:build_mesh", build_mesh, S, tree, p=1)

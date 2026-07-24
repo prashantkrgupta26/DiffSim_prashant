@@ -59,6 +59,7 @@ import _bench_bootstrap  # noqa
 
 import numpy as np
 
+from diffsim import default_device
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
@@ -342,7 +343,7 @@ def gate_arithmetic(res: dict, baseline_hours_lo=10.0, baseline_hours_hi=30.0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--device", default=default_device())
     ap.add_argument("--level", type=int, default=8)   # 257×257 = 66,049 nodes
     ap.add_argument("--n-steps", type=int, default=40)
     ap.add_argument("--dt-ps", type=float, default=5.0,

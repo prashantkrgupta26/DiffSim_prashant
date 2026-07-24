@@ -32,6 +32,7 @@ def main(level=6, steps=150):
     from diffsim.mesh.constraints import build_constraints
     from diffsim.mesh.basis import basis_tables
     from diffsim.assembly.operators import DeviceMesh
+    from diffsim import default_device
     from diffsim.geometry.csg import Sphere
     from diffsim.sbm.surrogate import (classify_lambda, extract_surrogate,
                                        GeometryData)
@@ -45,7 +46,7 @@ def main(level=6, steps=150):
     mesh = build_mesh(ret, p=1)
     cons = build_constraints(mesh)
     dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2),
-                              "cuda:0")
+                              default_device())
     geo = GeometryData.evaluate(oracle, ret, sf, face_tables(1, 2),
                                 domain="outside")
     Tc = cons.T.tocsr()

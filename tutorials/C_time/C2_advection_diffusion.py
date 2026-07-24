@@ -44,8 +44,9 @@ from diffsim.assembly.operators import DeviceMesh, assemble_csr
 from diffsim.physics.poisson import gauss_points, l2_error_masked
 from diffsim.physics.vms import tau_metric_host
 from diffsim.solvers.timestepping import bdf_coeffs, bdf_order_now, History
+from diffsim import default_device
 
-DEVICE = "cuda:0"
+DEVICE = default_device()
 KAPPA = 1e-3
 AVEC = np.array([1.0, 0.5]) / np.sqrt(1.25)      # unit advection direction
 

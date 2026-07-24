@@ -36,8 +36,9 @@ from diffsim.sbm.surrogate import classify_lambda, extract_surrogate, GeometryDa
 from diffsim.sbm.vector import sbm_vector_dirichlet, surrogate_traction
 from diffsim.api.ns_bricks import assemble_linear_ns
 from diffsim.physics.poisson import gauss_points
+from diffsim import default_device
 
-DEVICE = "cuda:0"
+DEVICE = default_device()
 R, CTR, U_IN = 0.07, (0.3, 0.5), 1.0
 NU = 2 * U_IN * R / 20.0                        # Re_D = 20
 

@@ -25,6 +25,7 @@ import time
 
 import numpy as np
 
+from diffsim import default_device
 from diffsim.octree.build import build_uniform
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
@@ -38,7 +39,7 @@ from diffsim.sbm.poisson import SBMPoisson
 from diffsim.physics.poisson import l2_error_masked
 
 OUT = "band_study_results.txt"      # appended in the cwd
-DEV = "cuda:0"
+DEV = default_device()
 R = 0.19   # canonical (findings 4b(j) Nova verdict): small AND far from dyadics at every level; 0.25 catastrophically dyadic, 0.27 sits in the L7 halo
 
 

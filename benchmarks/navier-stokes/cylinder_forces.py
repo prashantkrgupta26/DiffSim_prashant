@@ -43,6 +43,7 @@ def main():
     import types
     import scipy.sparse as sp
     from scipy.sparse.linalg import splu
+    from diffsim import default_device
     from diffsim.octree.build import build_uniform
     from diffsim.mesh.nodes import build_mesh
     from diffsim.mesh.constraints import build_constraints
@@ -63,7 +64,7 @@ def main():
     sf = extract_surrogate(ret)
     mesh = build_mesh(ret, p=1)
     cons = build_constraints(mesh)
-    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), "cuda:0")
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), default_device())
     geo = GeometryData.evaluate(oracle, ret, sf, face_tables(1, 2),
                                 domain="outside")
     T = dm.constraints.T.tocsr()
