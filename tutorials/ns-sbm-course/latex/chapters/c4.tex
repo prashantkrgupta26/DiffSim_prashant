@@ -64,8 +64,8 @@ F = \oint_{\Gambar}\big(p\,n - \nu\,(\grad u)^\top n\big)\,\text{corr}\,\mathrm{
 \end{equation}
 with the crucial \textbf{orientation contract}: \code{geo.n} is
 domain-outward (= \emph{into} the obstacle for exterior flow), so the
-obstacle-outward normal is $\hat n=-\code{geo.n}$ and the integrand is
-$+p\,\code{geo.n}-\nu(\grad u)^\top\code{geo.n}$. At $d=0$ this reduces to
+obstacle-outward normal is $\hat n=-\texttt{geo.n}$ and the integrand is
+$+p\,\texttt{geo.n}-\nu(\grad u)^\top\texttt{geo.n}$. At $d=0$ this reduces to
 the raw body-fitted traction.
 
 \section{Verification: a genuine sub-cell shift}
@@ -95,7 +95,7 @@ matches the same-mesh-with-shift monolithic to \ShCdRel{} in drag ---
 \textbf{projection $+$ SBM works end-to-end in 2-D}.
 
 \begin{keybox}\textbf{Anti-vacuity (the shift is load-bearing).} Run with
-\code{--zero-shift} to set $\code{geo.d}=0$, $\code{geo.corr}=1$ while
+\code{--zero-shift} to set $\texttt{geo.d}=0$, $\texttt{geo.corr}=1$ while
 keeping everything else fixed; the match against the TRUE shifted oracle
 breaks --- proof the Taylor term and area correction are doing real
 work.\end{keybox}

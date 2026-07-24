@@ -1,0 +1,32 @@
+# 00 smoke test — tolerance baseline. Scientific-invariant checks, NOT bitwise
+# GPU identity. A correct smoke marches BOTH NS engines on a tiny 8x8 cavity to
+# a finite, bounded velocity field. It is a PLUMBING smoke (20 steps, coarse
+# mesh) — the engine-agreement is loose here on purpose; the real faithfulness
+# comparison is Chapters 01-02. What must hold:
+#   * both engines produce a finite field (no NaN/Inf leaked),
+#   * the lid trace is respected: |u|max ~ 1 (the lid speed),
+#   * the pointwise ||div u|| is finite and bounded (weak-divergence VMS
+#     scheme; NOT driven to zero), not a blow-up.
+#
+# Ground truth (gpubox, CPU/splu, level 3, Re=100, dt=0.05, 20 steps):
+#   monolithic |u|max=1.000 ||div||=0.117 ; projection |u|max=1.000 ||div||=1.33
+#   max|proj-mono|=0.870 (transient at 20 steps — loose, see Ch.01-02)
+checks:
+  all_finite:
+    equals: true
+  n_steps:
+    min: 1
+  # the lid drives the top wall at U=1; |u|max must reach ~1 and not blow up
+  umax_mono:
+    min: 0.5
+    max: 2.0
+  umax_proj:
+    min: 0.5
+    max: 2.0
+  # finite/bounded weak divergence (a diverging solve blows up to O(1e3+))
+  div_mono:
+    min: 0.0
+    max: 10.0
+  div_proj:
+    min: 0.0
+    max: 10.0

@@ -1,0 +1,9 @@
+# Chapter 00 smoke — a tiny 8x8 lid-driven cavity through BOTH NS engines.
+# The mesh is deliberately coarse: this proves the toolchain + the harness
+# plumbing, not the physics. Runs on the host (splu) in seconds.
+level: 3        # 8x8 cells
+Re: 100
+dt: 0.05
+nsteps: 20
+device: cpu
+precision: fp64

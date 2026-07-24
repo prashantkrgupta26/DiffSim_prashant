@@ -7,22 +7,22 @@ lid-driven cavity, the same answer; and why this is the 100M-DOF path.}
 
 \section{The Helmholtz--Leray split}
 The projection engine implements Algorithm~1 of the Helmholtz--Leray VMS
-draft (\file{leray.py:1--23}). Per step, with $p^\*$ the extrapolated
-pressure (order~1: $p^\*=\hat p^n$):
+draft (\file{leray.py:1--23}). Per step, with $p^{*}$ the extrapolated
+pressure (order~1: $p^{*}=\hat p^n$):
 \begin{enumerate}
 \item \textbf{Momentum predictor} (nonlinear, Picard): solve the monolithic
-  block with the pressure DOFs pinned to $p^\*$'s nodal values, so the
-  momentum rows see $\grad p^\*$ through the coupling
+  block with the pressure DOFs pinned to $p^{*}$'s nodal values, so the
+  momentum rows see $\grad p^{*}$ through the coupling
   (\file{leray.py:6--13}, \file{719--830}).
 \item \textbf{PPE} --- the SPD pressure-Poisson for the increment
-  $\phi=\hat p - p^\*$:
+  $\phi=\hat p - p^{*}$:
   \[
-  \inner{\grad\phi}{\grad q} = \sigma\,\inner{\hat u - \tauM r_m(\hat u,p^\*)}{\grad q}
+  \inner{\grad\phi}{\grad q} = \sigma\,\inner{\hat u - \tauM r_m(\hat u,p^{*})}{\grad q}
   \]
   with the h-based $\tauM$ (\file{leray.py:14--19}, \file{948--1106}).
 \item \textbf{Velocity correction} (fine scale retained):
-  $u^{n+1}=\hat u - \tfrac1\sigma(\grad\hat p - \grad p^\*)$.
-\item $p^\*\leftarrow\hat p$ (first-order incremental).
+  $u^{n+1}=\hat u - \tfrac1\sigma(\grad\hat p - \grad p^{*})$.
+\item $p^{*}\leftarrow\hat p$ (first-order incremental).
 \end{enumerate}
 
 \begin{keybox}\textbf{Key idea --- why projection scales.} The pressure
@@ -54,7 +54,7 @@ a \textbf{fixed point} of the split. It bundles six items:
   outflow nodes. Authoritative: $\grad u\cdot n=0$ in the predictor
   \emph{only}, $p'=0$ in the PPE \emph{only} (\file{leray.py:62--69}).
 \item[\#4 rotational-incremental pressure update (Timmermans 1996)]
-  $p=p^\*+\phi-\nu\,\grad\!\cdot\hat u$, valid for constant $\nu$
+  $p=p^{*}+\phi-\nu\,\grad\!\cdot\hat u$, valid for constant $\nu$
   (\file{leray.py:1114--1168}).
 \item[\#5/\#6] a $P_1$ boundary-vorticity outflow term and backflow
   (directional do-nothing) stabilization, both on the outflow.

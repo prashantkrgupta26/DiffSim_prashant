@@ -1,0 +1,17 @@
+# Chapter 01 — lid-driven cavity, monolithic VMS (+ projection for faithfulness).
+# Reference mode (level 4, Re=100, 200 steps) reproduces the Ghia comparison in
+# EXPECTED.md. quick trims steps; research refines the mesh.
+level: 4
+Re: 100
+dt: 0.05
+nsteps: 200
+device: cpu
+precision: fp64
+modes:
+  quick:
+    nsteps: 100
+  reference:
+    nsteps: 200
+  research:
+    level: 5
+    nsteps: 400
