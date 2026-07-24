@@ -98,6 +98,69 @@ class Box(SDFOracle):
         return outside + inside
 
 
+class Plane(SDFOracle):
+    """Signed distance to an (unbounded) hyperplane: psi = n_hat . (x - p0),
+    with n_hat a unit normal and p0 a point on the plane. Its zero-set is a
+    co-dim-1 surface — the THIN-SHELL primitive (ThinShell paper §2.4): a
+    zero-thickness rigid surface Gamma with fluid on BOTH sides. Exact SDF
+    (|grad psi| = 1) => near_eikonal. For a shell that spans the full extent
+    of the computational box (e.g. the blocked-channel plate spanning the whole
+    channel height, ThinShell Fig 5) the plane IS the plate exactly.
+
+    Unlike Sphere/Box, NEITHER side of psi = 0 is an obstacle interior: both
+    {psi<0} and {psi>0} are fluid. The shell surrogate excludes the band of
+    elements the zero-set cuts (classify_shell_intercepted); the two-sided
+    extractor then splits the exposed faces into Gamma~+ / Gamma~- by the sign
+    of n . n_tilde (extract_two_sided_surrogate)."""
+
+    near_eikonal = True
+
+    def __init__(self, point, normal):
+        n = _t(normal)
+        self.point = _t(point)
+        self.normal = n / torch.linalg.norm(n)
+        self.dim = len(self.point)
+
+    @property
+    def params(self):
+        return [self.point, self.normal]
+
+    def psi(self, x):
+        return (x - self.point) @ self.normal
+
+
+class Segment(SDFOracle):
+    """Unsigned distance to a line segment [a, b] in 2-D: psi = |x - proj|,
+    the co-dim-1 thin-plate primitive for a FINITE plate (ThinShell §2.4.1,
+    Fig 8: flow past a thin plate centered in the channel). psi >= 0 with the
+    zero-set exactly the segment; grad psi flips across the plate (two-sided
+    normals), so this is a genuine open-surface representation, not a carved
+    body. NOT eikonal at the endpoints/segment (the distance-to-a-1-D-set has
+    a ridge) => Newton projection.
+
+    The two-sided surrogate never queries points ON the segment (surrogate GPs
+    sit O(h) off it in the excluded band), so the endpoint/on-segment gradient
+    degeneracy is not exercised by the shell pipeline."""
+
+    near_eikonal = False
+
+    def __init__(self, a, b):
+        self.a = _t(a)
+        self.b = _t(b)
+        self.dim = len(self.a)
+
+    @property
+    def params(self):
+        return [self.a, self.b]
+
+    def psi(self, x):
+        ab = self.b - self.a
+        t = ((x - self.a) @ ab) / (ab @ ab)
+        t = torch.clamp(t, 0.0, 1.0)
+        proj = self.a + t.unsqueeze(1) * ab
+        return torch.linalg.norm(x - proj, dim=1)
+
+
 class Complement(SDFOracle):
     """psi -> -psi: a set operation for composing shapes (e.g. a plate with a
     hole). NOT the mechanism for exterior domains — that is the `domain` flag."""

@@ -100,6 +100,78 @@ def classify_lambda(tree: Octree, oracle, lam: float, domain: str = "inside",
     return ret, frac[keep]
 
 
+def classify_shell_intercepted(tree: Octree, shell_oracle,
+                               n1: int = 5, lipschitz_bound: float = 2.0):
+    """Element classification for a co-dim-1 THIN SHELL (ThinShell Alg 3):
+    the shell Gamma is the zero level set of ``shell_oracle`` (a Plane or a
+    Segment — a zero-thickness surface with fluid on BOTH sides, NOT a
+    volumetric body). We EXCLUDE the band of elements the shell CUTS
+    (ShellIntercepted) and RETAIN everything else, yielding the two-sided
+    surrogate domain Omega~ = Omega \\ (shell band). This is the structural
+    mirror of ``classify_lambda`` but with the exclusion criterion 'element
+    intersects Gamma => drop' instead of the volume-fraction retention rule.
+
+    Interception test: an element is cut iff shell_psi CHANGES SIGN across it
+    (min < 0 < max over the cell), i.e. the zero-set passes through. Estimated
+    on the same n1^dim tensor Gauss-Legendre lattice ``classify_lambda`` uses.
+    An UNSIGNED shell (Segment: psi >= 0 with the zero-set the plate) is cut
+    iff min psi drops below the cell's own half-diagonal reach.
+
+    Two-pass narrowband (identical Lipschitz argument to ``classify_lambda``):
+    an element whose center value satisfies |psi(c)| > lipschitz_bound *
+    (sqrt(dim)/2) * h cannot be cut by the zero set (valid for |grad psi| <=
+    lipschitz_bound) and is decided NOT-cut by the center sign alone; only the
+    remaining band pays the dense rule. lipschitz_bound=np.inf forces dense
+    sampling everywhere (the exactness hook).
+
+    Returns (retained Octree, intercepted[N] bool over the INPUT tree ordering,
+    so callers can inspect the excluded band; the returned Octree contains only
+    the retained (~intercepted) leaves)."""
+    if n1 < 2:
+        raise ValueError(f"n1 must be >= 2, got {n1}")
+    dim = tree.dim
+    h = tree.h()
+
+    # Pass 1: elements far from Gamma (by the Lipschitz bound) cannot be cut.
+    psi_c = shell_oracle.classify(tree.centers())
+    radius = lipschitz_bound * (np.sqrt(dim) / 2.0) * h
+    decided = np.abs(psi_c) > radius            # clearly not cut
+    intercepted = np.zeros(len(tree), bool)     # decided-far => not cut
+
+    # Pass 2: dense sampling on the near band; cut iff psi spans zero.
+    # The lattice spans the CLOSED cell [0, 1]^dim (corners included) so that
+    # a shell exactly on a cell face is bracketed consistently — interior-only
+    # Gauss points miss face-aligned zero sets. A shell flush on a cell face
+    # is then detected on BOTH adjacent cells (its zero-set touches each), so
+    # both neighbours are excluded and the plate sits centered in the excluded
+    # band; a shell strictly inside one cell excludes only that cell.
+    band = np.where(~decided)[0]
+    if len(band):
+        node = np.linspace(0.0, 1.0, n1)                   # [0, 1] incl. corners
+        grids = np.meshgrid(*([node] * dim), indexing="ij")
+        offs = np.stack([g.ravel() for g in grids], axis=1)   # [n1^dim, dim]
+        scale = 2.0 ** -morton.lmax(dim)
+        lo = tree.anchors()[band] * scale
+        hb = h[band]
+        xq = (lo[:, None, :] + offs[None, :, :] * hb[:, None, None]).reshape(-1, dim)
+        psi = shell_oracle.classify(xq).reshape(len(band), len(offs))
+        pmin, pmax = psi.min(axis=1), psi.max(axis=1)
+        # signed shell (Plane): the zero-set touches the closed cell iff psi
+        # spans zero (min <= 0 <= max, with a nonzero span to exclude the
+        # measure-zero grazing of a single corner).
+        signed_cut = (pmin <= 0.0) & (pmax >= 0.0) & (pmax > pmin)
+        # unsigned (>=0) shell (Segment): cut iff the closest zero-set point is
+        # inside the cell, i.e. min distance < the cell half-diagonal reach.
+        reach = (np.sqrt(dim) / 2.0) * hb
+        unsigned_cut = (pmin >= 0.0) & (pmin < reach)
+        intercepted[band] = signed_cut | unsigned_cut
+
+    keep = ~intercepted
+    ret = Octree(tree.keys[keep], tree.levels[keep], dim=dim,
+                 periodic=tree.periodic)
+    return ret, intercepted
+
+
 @dataclass(frozen=True)
 class SurrogateFaces:
     """Surrogate-face list, sorted by (elem, face) for determinism."""
@@ -223,7 +295,24 @@ class GeometryData:
     def evaluate(cls, oracle, tree: Octree, sf: SurrogateFaces, ftab,
                  domain: str = "inside",
                  warm_feet: np.ndarray = None,
-                 max_fail_frac: float = 0.0) -> "GeometryData":
+                 max_fail_frac: float = 0.0,
+                 mode: str = "volumetric") -> "GeometryData":
+        """``mode`` (default "volumetric"): the ONE-SIDED volumetric SBM path —
+        n is oriented out of the computational domain via the ``domain`` flag,
+        and corr = n_tilde . n is asserted > 0 (a well-oriented one-sided
+        surrogate). BIT-FOR-BIT unchanged from the original.
+
+        ``mode="shell"``: the co-dim-1 TWO-SIDED shell path (ThinShell §2.1).
+        There is no single domain side — each surrogate face carries fluid on
+        its OWN side of Gamma. n is oriented per-face to align with that face's
+        outward surrogate normal n_tilde (so corr = |n_tilde . n| > 0 on BOTH
+        Gamma~+ and Gamma~-), which is exactly the condition that prevents
+        cancellation of opposing normal contributions in the two-sided Nitsche
+        sum. The ``domain`` flag is ignored (both sides are fluid); the
+        corr>0 assertion is RELAXED to |corr|>0 (the shell band triggers
+        corr<0 on one side under the fixed ``domain`` sign)."""
+        if mode not in ("volumetric", "shell"):
+            raise ValueError(f"mode must be 'volumetric' or 'shell', got {mode!r}")
         sgn = -_domain_sign(domain)      # out-of-domain: +grad for "inside"
         xq = face_gauss_points(tree, sf, ftab)
         d, n_grad, ok = oracle.distance_vector(
@@ -245,9 +334,67 @@ class GeometryData:
                 f"closest-point projection failed at {int((~ok).sum())} of "
                 f"{len(ok)} surrogate Gauss points; admissibility report: "
                 f"{admissibility(oracle, xq)}")
-        n = sgn * n_grad
-        ntilde = face_offsets(tree.dim).astype(np.float64)[sf.face]
-        corr = np.einsum("id,id->i", np.repeat(ntilde, ftab.nqf, axis=0), n)
+        ntilde = np.repeat(
+            face_offsets(tree.dim).astype(np.float64)[sf.face], ftab.nqf, axis=0)
+        if mode == "shell":
+            # per-GP: orient n to align with this face's outward surrogate
+            # normal n_tilde (out of the retained fluid on THIS side of Gamma),
+            # so corr = |n_tilde . n| > 0 on both Gamma~+ and Gamma~-.
+            raw = np.einsum("id,id->i", ntilde, n_grad)
+            n = np.sign(raw)[:, None] * n_grad
+            corr = np.abs(raw)
+        else:
+            n = sgn * n_grad
+            corr = np.einsum("id,id->i", ntilde, n)
         return cls(np.ascontiguousarray(xq), np.ascontiguousarray(d),
                    np.ascontiguousarray(n), np.ascontiguousarray(corr),
                    ok, domain)
+
+
+def extract_two_sided_surrogate(tree: Octree, oracle, ftab,
+                                warm_feet: np.ndarray = None,
+                                max_fail_frac: float = 0.0):
+    """Two-sided co-dim-1 shell surrogate extractor (ThinShell §2.1, Alg 5 +
+    the two-sided decomposition). Given the shell-EXCLUDED retained tree
+    (from ``classify_shell_intercepted``) and the shell ``oracle``, extract the
+    exposed surrogate faces of the excluded band and split them into
+
+        Gamma~+  (I_s = int_face n . n_tilde  >= 0)
+        Gamma~-  (I_s < 0)
+
+    by the sign of the per-face integral of n . n_tilde (n the TRUE interface
+    normal at the projected point, n_tilde the outward surrogate normal). This
+    is the geometric ingredient that yields distinct outward normals and
+    two-sided traces/jumps across Gamma without cancellation.
+
+    Returns ``(geo_plus, geo_minus)`` where each is a
+    ``(SurrogateFaces, GeometryData)`` pair carrying the faces and the frozen
+    shell-mode geometry cache for that side. Either side may be empty (a
+    one-sided boundary — e.g. a plate flush against an outer wall); callers
+    that require both sides to be load-bearing should assert non-empty.
+
+    Unlike the volumetric extractor, corr<0 is EXPECTED (it is the -side) and
+    is NOT raised on: the geometry is evaluated in ``mode="shell"`` where n is
+    oriented per-face so corr>0 on each side, and the +/- split is recorded
+    separately via the face-integral sign."""
+    sf = extract_surrogate(tree)
+    # true interface normal from grad psi at the projected foot (unoriented).
+    xq = face_gauss_points(tree, sf, ftab)
+    _d, n_grad, ok = oracle.distance_vector(
+        xq, y0=(xq + warm_feet) if warm_feet is not None else None)
+    ntilde = np.repeat(
+        face_offsets(tree.dim).astype(np.float64)[sf.face], ftab.nqf, axis=0)
+    dot = np.einsum("id,id->i", ntilde, n_grad).reshape(len(sf.elem), ftab.nqf)
+    # I_s = average of n . n_tilde over each face (sign classifies the side).
+    Is = (dot * ftab.w[None, :]).sum(axis=1)
+    plus = Is >= 0.0
+    minus = ~plus
+
+    def _side(mask):
+        sub = SurrogateFaces(sf.elem[mask], sf.face[mask])
+        geo = GeometryData.evaluate(oracle, tree, sub, ftab, mode="shell",
+                                    warm_feet=warm_feet,
+                                    max_fail_frac=max_fail_frac)
+        return sub, geo
+
+    return _side(plus), _side(minus)
