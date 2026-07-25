@@ -549,6 +549,11 @@ def parse_args():
                    help=("RHS mode for --stage synthetic: 'mms' (manufactured solution, "
                          "default) or 'random' (fixed-seed standard normal). "
                          "--stage real always uses fixed-seed random RHS."))
+    p.add_argument("--no-verify", action="store_true",
+                   help=("Skip the serial scipy.spsolve reference + correctness "
+                         "comparison (which does not scale past ~L5). Reports "
+                         "iters + solve_time only — for large-N scaling/timing "
+                         "runs where correctness is already established."))
     return p.parse_args()
 
 
@@ -762,7 +767,25 @@ def main():
     # ----------------------------------------------------------------
     # Correctness check on rank 0
     # ----------------------------------------------------------------
-    if rank == 0:
+    if rank == 0 and args.no_verify:
+        # Scaling/timing mode: correctness already established at L4/L5; the
+        # serial scipy reference does not scale, so report iters + solve_time.
+        n_total = nx * ny * nz
+        stage_desc = (f"real (level={level})" if args.stage == "real"
+                      else "synthetic")
+        print(f"\n--- SCALING RESULT (no-verify) ---")
+        print(f"stage      : {stage_desc}")
+        print(f"world_size : {world_size}")
+        print(f"n_total    : {n_total}")
+        print(f"precond    : {args.precond}")
+        print(f"iters      : {info['iters']}")
+        print(f"solve_time : {t_solve:.4f}s")
+        print(f"converged  : {info['converged']}")
+        print(f"SCALE  world_size={world_size} n_total={n_total} "
+              f"precond={args.precond} iters={info['iters']} "
+              f"solve_s={t_solve:.4f}")
+
+    if rank == 0 and not args.no_verify:
         print(f"\n{'='*60}")
         print(f"Reference solve (scipy.spsolve)...")
         t0 = time.perf_counter()
