@@ -114,3 +114,33 @@ def test_mono3d_solver_routing_parity():
     res_legacy = run_flow_past_3d(**kw)
     res_routed = run_flow_past_3d(mono_solver="splu", device="cpu", **kw)
     assert np.allclose(res_legacy["cd"], res_routed["cd"], rtol=0, atol=1e-12)
+
+
+def test_device_assembly_parity_cpu_3d(device):
+    """assembly="device" matches assembly="host" on the 3-D monolithic march.
+
+    DeviceNSAssembler volume fill + two-sided SBM face system (Af_c) via
+    extra_matrix/extra_rhs device slots + strong rows on device must produce
+    bit-for-bit identical Cd to the host LIL-surgery path.
+    """
+    from p2r1c_thin_plate_flow_3d import run_flow_past_3d
+    kw = dict(level=3, nsteps=2, dt=0.01, nu=0.1, verbose=False)
+    res_h = run_flow_past_3d(assembly="host", **kw)
+    res_d = run_flow_past_3d(assembly="device", **kw)
+    assert np.allclose(res_h["cd"], res_d["cd"], rtol=1e-9, atol=1e-11), (
+        f"device-assembly 3-D Cd diverged: {res_h['cd']} vs {res_d['cd']}")
+
+
+def test_device_assembly_parity_cpu_3d_adaptive(device):
+    """assembly="device" works on the adaptive 3-D mesh and matches assembly="host".
+
+    Mirrors test_device_assembly_parity_cpu_adaptive (2-D): confirms the
+    constraint-aware device pattern covers all Af_c entries on a hanging-node
+    mesh.  Uses level=3, refine_to=4, nsteps=2 — runs in ~2s on Mac CPU.
+    """
+    from p2r1c_thin_plate_flow_3d import run_flow_past_3d
+    kw = dict(level=3, refine_to=4, nsteps=2, dt=0.01, nu=0.1, verbose=False)
+    res_h = run_flow_past_3d(assembly="host", **kw)
+    res_d = run_flow_past_3d(assembly="device", **kw)
+    assert np.allclose(res_h["cd"], res_d["cd"], rtol=1e-9, atol=1e-11), (
+        f"device-assembly 3-D adaptive Cd diverged: {res_h['cd']} vs {res_d['cd']}")
