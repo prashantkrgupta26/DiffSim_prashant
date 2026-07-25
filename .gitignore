@@ -1,3 +1,6 @@
+# --- git worktrees (local isolation, never track) ---
+.worktrees/
+
 # --- Python / env ---
 .venv/
 __pycache__/
