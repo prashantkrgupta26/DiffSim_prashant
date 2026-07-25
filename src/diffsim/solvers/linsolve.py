@@ -1,12 +1,19 @@
 """Unified linear-solve dispatch for the steppers (M1b GPU-residency work).
 
 Backends:
-  "splu"  — scipy SuperLU on the host (prototype default; unbeatable small,
-            pays factorization on EVERY new matrix).
-  "fused" — the single-sync device Krylov (solvers/krylov_dev): BiCGStab for
-            nonsymmetric systems, CG for SPD; Jacobi preconditioned; the
-            iterations live on the GPU, one scalar readback per
-            check_every iterations (m1a finding 3 / P2 measurements).
+  "splu"   — scipy SuperLU on the host (prototype default; unbeatable small,
+             pays factorization on EVERY new matrix).
+  "fused"  — the single-sync device Krylov (solvers/krylov_dev): BiCGStab for
+             nonsymmetric systems, CG for SPD; Jacobi preconditioned; the
+             iterations live on the GPU, one scalar readback per
+             check_every iterations (m1a finding 3 / P2 measurements).
+  "gpu_cg" — single-GPU resident PCG via dist_cg.pcg + SerialComm.  SPD
+             systems only (sym=True required; raises ValueError otherwise).
+             Builds a torch.sparse_csr_tensor on `device`, runs Jacobi-
+             preconditioned CG, returns a host numpy array.  First step
+             toward the 100M PPE path on GPU (the direct-solver cuDSS wall
+             blocks the 100M scale; iterative CG on the SPD Laplacian is
+             the escape route).  No factorization; no matrix caching.
   "amgx"  — NVIDIA AMGX (algebraic multigrid) through pyamgx, when built:
             AMG-preconditioned Krylov — flattens the O(h^-1) Jacobi
             iteration growth (P2 Explore (b)). Falls back with a clear
@@ -1107,6 +1114,62 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         if not info.get("converged"):
             raise ConvergenceError(f"fused solve failed: {info}")
         return x
+
+    if solver == "gpu_cg":
+        # Single-GPU resident PCG via dist_cg.pcg + SerialComm.
+        # Only valid for SPD systems (sym=True); the PPE Laplacian is the
+        # canonical caller.  Uses torch.sparse_csr_tensor for the on-device
+        # SpMV (same pattern as make_partitioned_spmv in nccl_cg_proof.py)
+        # and a Jacobi (diagonal) preconditioner.  Returns a host numpy
+        # array to match the existing solver contract.
+        if not sym:
+            raise ValueError(
+                "gpu_cg requires sym=True (SPD systems only); "
+                "use 'fused' for non-symmetric systems")
+        import torch
+        from .dist_cg import pcg, SerialComm
+        torch_device = torch.device(str(device))
+        # Build torch.sparse_csr_tensor from the scipy CSR matrix (A is
+        # already .tocsr() from the top of solve_linear).
+        crow = torch.tensor(A.indptr.astype(np.int64),
+                            dtype=torch.int64, device=torch_device)
+        col = torch.tensor(A.indices.astype(np.int64),
+                           dtype=torch.int64, device=torch_device)
+        val = torch.tensor(np.ascontiguousarray(A.data, dtype=np.float64),
+                           dtype=torch.float64, device=torch_device)
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            A_t = torch.sparse_csr_tensor(crow, col, val,
+                                          size=tuple(A.shape),
+                                          dtype=torch.float64,
+                                          device=torch_device)
+        # On-device SpMV: no halo (SerialComm) so p is owned-only.
+        def spmv(p):
+            return torch.mv(A_t, p)
+        # Jacobi preconditioner: extract diagonal once, guard zeros.
+        diag_np = np.asarray(A.diagonal(), dtype=np.float64).copy()
+        diag_np[diag_np == 0.0] = 1.0
+        diag_t = torch.tensor(diag_np, dtype=torch.float64,
+                              device=torch_device)
+        def precond(r):
+            return r / diag_t
+        # Convert b to a device tensor.
+        b_dev = torch.tensor(np.ascontiguousarray(b, dtype=np.float64),
+                             dtype=torch.float64, device=torch_device)
+        comm = SerialComm()
+        rtol_cg = tol if tol > 0.0 else 1e-8
+        maxit_cg = maxiter if maxiter > 0 else 5000
+        x_dev, info = pcg(spmv, precond, b_dev, comm,
+                          rtol=rtol_cg, maxit=maxit_cg)
+        if not info.get("converged"):
+            raise ConvergenceError(
+                f"gpu_cg solve failed: iters={info.get('iters')}, "
+                f"final_resid={info.get('resid_history', [None])[-1]}")
+        # Return host numpy array (same contract as splu / cudss).
+        if isinstance(x_dev, torch.Tensor):
+            return x_dev.cpu().numpy()
+        return np.asarray(x_dev)
 
     if solver == "amgx":
         from .amgx import amgx_solve
