@@ -140,3 +140,81 @@ remove the pressure null-space.
 |-------------|-------------------------------------------|
 | CI (Mac)    | Pipeline runs end-to-end; Cd_mean finite and O(1)-plausible; perturbation breaks symmetry (ON/OFF Cl_std ratio > 10) |
 | gpubox full | Cd_mean ∈ [3.29, 3.45], St ∈ [0.12, 0.18] (ThinShell.pdf Table 1 band); no outlet-reflection peak at f~0.032 in Cl spectrum |
+
+---
+
+## BOTH-SOLVER vs LITERATURE (2026-07-25): monolithic + projection
+
+The R1a gate is not "which solver matches the other" but **which solver matches
+the LITERATURE** (Cd 3.29–3.45, St ~0.15; Najjar & Balachandar 3.36/0.14).
+Per `ns_projection_vms_paper §4.3 + Fig.10` the monolithic VMS **OVERpredicts**
+Cd (~25%, the pressure-fine-scale/grad-div term); the projection is the more
+literature-faithful one — so monolithic is NOT ground truth.
+
+The driver now has a projection path (`run_flow_past_projection`, marched via
+`LeraySBMShellStepper` with the merged outflow-BC p'-scheme levers:
+`consistent_projection=True, inner_iterate=True, inner_max=8, inner_relax=0.5,
+rotational_pin_wall=True`, whole-outflow-line p'=0 Dirichlet) and a both-solver
+comparison entry point (`compare_solvers`, or `SOLVER=both`/`COMPARE=1` in
+`__main__`).  The PPE solver is `PPE_SOLVER` (splu on CPU, **gpu_cg on GPU**).
+
+### Small-case verification (Mac CPU, done):
+
+- L3, 6 steps, Re=10: projection Cd 123.0 → **+42.8** (positive, decaying);
+  monolithic Cd 129.6 → +70.1.  Projection ~40% below monolithic — the SAME
+  documented sign/shape-correct, magnitude-low behavior as the 3-D projection.
+- Two-sided load-bearing confirmed (one-sided force differs by >700x).
+- PPE ran (solve_linear `sym=True` once per step).
+
+### Resolved Re=250 — MONOLITHIC (unchanged; splu saddle → gpubox):
+
+```bash
+ssh gpubox "cd ~/DiffSim && \
+    LEVEL=7 NSTEPS=1000000 DT=5e-5 NU=0.004 U_INF=1.0 \
+    PLATE_XC=0.1389 PLATE_YC=0.5 PLATE_L=0.0625 \
+    PERT_EPS=0.03 PERT_T_END=1.0 \
+    .venv/bin/python tests/p2r1a_thin_plate_flow.py 2>&1 | tee logs/p2r1a_re250_mono_$(date +%Y%m%d_%H%M%S).log"
+```
+
+### Resolved Re=250 — BOTH SOLVERS in one run (projection PPE on gpu_cg):
+
+```bash
+ssh gpubox "cd ~/DiffSim && \
+    NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1 NCCL_CUMEM_ENABLE=0 \
+    SOLVER=both PPE_SOLVER=gpu_cg \
+    LEVEL=7 NSTEPS=1000000 DT=5e-5 NU=0.004 U_INF=1.0 \
+    PLATE_XC=0.1389 PLATE_YC=0.5 PLATE_L=0.0625 \
+    PERT_EPS=0.03 PERT_T_END=1.0 T_START=20.0 \
+    .venv/bin/python tests/p2r1a_thin_plate_flow.py 2>&1 | tee logs/p2r1a_re250_both_$(date +%Y%m%d_%H%M%S).log"
+```
+
+This prints the Cd/St-vs-literature table for BOTH solvers (Cd time-averaged
+from `T_START=20.0`, St from the FFT of Cl over the plate physical length
+L=1.0).  `PPE_SOLVER=gpu_cg` routes the SPD pressure-Poisson through the
+scalable Jacobi-CG device path; the Oseen predictor stays on splu (not SPD) at
+L7 — for near-L9 the predictor is the bottleneck (FGMRES/AMGX follow-on).  The
+NCCL env vars are the gpubox WSL2 workaround (harmless single-GPU; required if
+gpu_cg touches multi-GPU).
+
+### Expected mesh / wall:
+
+- Mesh: base L7 (128² octree ≈ 16k cells uniform), wake refined L9, plate cells
+  L9–11 via adaptive refinement (`--adaptive`, not yet wired into the driver;
+  uniform L7 is the current path).
+- Wall: ~2–4 h single-A100/GH200 for 1M steps at uniform L7 (monolithic splu);
+  the projection leg's gpu_cg PPE is comparable-or-faster per step at L7 and is
+  the ONLY path that scales to L9-near-plate (~186k nodes) where host-splu walls.
+- Averaging window: `T_START=20.0`, march to t≈50 (≥ 20 shedding periods at
+  St≈0.15, f_shed≈0.15).
+
+### Expected literature outcome (the deliverable):
+
+- **Monolithic** Cd expected ~25% HIGH of the 3.36 ref (VMS overprediction,
+  paper Fig.10) → Cd ~4.0–4.2, likely ABOVE the 3.29–3.45 band.
+- **Projection** Cd expected to land IN or NEAR the 3.29–3.45 band (the more
+  literature-faithful solver).  If instead the projection converges ~40% LOW of
+  monolithic (i.e. Cd ~2.5–3.0, BELOW the band) that is the immersed-shell
+  deficiency (deeper p2-r2a-monolithic-pivot defect), NOT a feature — that is
+  exactly the question this run settles.
+- St ≈ 0.15 expected for both (shedding frequency is a wake property, less
+  solver-sensitive than Cd magnitude).

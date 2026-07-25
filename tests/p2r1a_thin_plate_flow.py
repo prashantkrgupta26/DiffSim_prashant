@@ -105,6 +105,7 @@ from diffsim.sbm.vector import (
 from diffsim.api.ns_bricks import assemble_linear_ns
 from diffsim.physics.poisson import gauss_points
 from diffsim.solvers.timestepping import bdf_coeffs
+from diffsim.steppers.leray_sbm import LeraySBMShellStepper
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +457,350 @@ def run_flow_past_one_sided(**kwargs):
 
 
 # ---------------------------------------------------------------------------
+# PROJECTION path (LeraySBMShellStepper) — 2-D mirror of the merged 3-D
+# projection driver (tests/p2r1c_thin_plate_flow_3d_projection.py).
+# ---------------------------------------------------------------------------
+#
+# WHY A SECOND SOLVER: the both-solver harness runs the SAME 2-D thin-plate
+# case through (a) the monolithic VMS-saddle (run_flow_past above) and (b) this
+# projection/PPE split, then compares BOTH Cd/St against the LITERATURE band
+# (Najjar & Balachandar 1995: Cd 3.36, St 0.14; Table-1 band Cd 3.29-3.45,
+# St ~0.15).  Per ns_projection_vms_paper §4.3+Fig.10 the monolithic VMS
+# OVERpredicts Cd (~25%, the pressure-fine-scale/grad-div term) and the
+# projection is the more literature-faithful one — so monolithic is NOT ground
+# truth; the LITERATURE is.  This driver is the projection leg of that test.
+#
+# The wiring copies the merged 3-D projection driver EXACTLY where it is
+# dim-generic: the (strong_mask, u_inf, outflow_nodes) BC convention, the
+# lever defaults (consistent_projection=True, inner_iterate=True, inner_max=8,
+# inner_relax=0.5, rotational_pin_wall=True), and the whole-outflow-face p'=0
+# Dirichlet.  The ONLY 2-D specialization is the outlet node set: in 3-D the
+# outlet is a 2-D FACE (a sheet of nodes) at x=x_max; in 2-D it is a 1-D LINE
+# of nodes at x=x_max.  Both are just "the free nodes with x≈x_max", so the
+# same np.abs(coords[:,0]-x_max)<tol mask works verbatim.
+#
+# Geometry/force use the SAME two-oracle signed-psi workaround as the
+# monolithic path (Segment classify + Plane extract; _build_shell), the same
+# finite Segment plate, two-sided shell, and perturbation kick.
+
+
+def _outer_bc_masks_2d(mesh, cons, U_inf):
+    """Strong outer BCs for 2-D flow past a plate, in the free-node-major
+    (strong_mask, u_inf) convention LeraySBMShellStepper expects.
+
+    Mirrors _outer_bc_masks_3d from the merged 3-D projection driver:
+      - inflow (x=x_min) + top/bottom walls (y=y_min|y_max): u=(U_inf, 0)
+        [freestream velocity-Dirichlet -> natural grad(phi).n=0 PPE BC]
+      - outflow (x=x_max): do-nothing (velocity FREE); the WHOLE outflow LINE
+        (a 1-D set of nodes in 2-D, the analogue of the 3-D outlet face) carries
+        the PPE p'=0 Dirichlet (incremental van-Kan p'-scheme, Eq. 68d) via
+        ``pressure_outflow_nodes`` — NOT the single enclosed-flow corner pin the
+        monolithic saddle uses.  Pinning the whole outlet imposes the physical
+        outlet pressure so the incremental p* does not drift (the 2026-07-25
+        outflow-BC fix, dim-generic).  The plate/shell gets NO pressure
+        Dirichlet (phi natural-Neumann there).
+
+    Returns (strong_mask [n_free] bool, u_inf [n_free, 2] float,
+             outflow_nodes [k] int, inflow_vy_rows [m] int):
+      - strong_mask/u_inf : the strong velocity-Dirichlet set for the box.
+      - outflow_nodes     : FREE-node indices on the outlet line x=x_max.
+      - inflow_vy_rows    : FREE-node indices of the INFLOW nodes (used by the
+        march to inject the symmetry-breaking transverse kick — the stepper
+        overrides u_inf[inflow, 1] for early time, mirroring the monolithic path).
+    """
+    dim = 2
+    coords = mesh.node_coords[cons.free_nodes]
+    tol = 1e-10
+    x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
+    y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
+    inflow = np.abs(coords[:, 0] - x_min) < tol
+    walls = (np.abs(coords[:, 1] - y_min) < tol) | \
+            (np.abs(coords[:, 1] - y_max) < tol)
+    strong_mask = inflow | walls
+    u_inf = np.zeros((len(coords), dim))
+    u_inf[strong_mask, 0] = U_inf                      # freestream u_x = U_inf
+    # outflow LINE x=x_max: 1-D node set (2-D analogue of the 3-D outlet face)
+    outflow_line = np.abs(coords[:, 0] - x_max) < tol
+    outflow_nodes = np.where(outflow_line)[0].astype(np.int64)
+    inflow_nodes = np.where(inflow)[0].astype(np.int64)
+    return strong_mask, u_inf, outflow_nodes, inflow_nodes
+
+
+def run_flow_past_projection(
+    level=5,
+    nsteps=10,
+    dt=0.01,
+    U_inf=1.0,
+    nu=0.1,
+    alpha=50.0,
+    plate_xc=0.375,
+    plate_yc=0.5,
+    plate_L=0.25,
+    dim=2,
+    verbose=False,
+    ppe_solver="splu",       # splu on CPU (Mac); gpu_cg on GPU (gpubox/GH200)
+    predictor_solver="splu",
+    picard_iters=2,
+    order=2,
+    consistent_projection=True,
+    inner_iterate=True,
+    inner_max=8,
+    inner_relax=0.5,
+    rotational_pin_wall=True,
+    _two_sided=True,
+    _return_fields=False,
+    _return_stepper=False,
+    pert_eps=None,           # symmetry-breaking kick: fraction of U_inf (None/0 = off)
+    pert_t_end=1.0,          # physical time at which the kick is switched off
+):
+    """Run 2-D flow past a finite thin plate via the PROJECTION stepper.
+
+    2-D mirror of tests/p2r1c_thin_plate_flow_3d_projection.run_flow_past_3d_projection,
+    marched with LeraySBMShellStepper (two-sided shell SBM + Helmholtz-Leray
+    projection split).  Same finite Segment plate + two-sided shell + two-oracle
+    signed-psi workaround (Segment classify / Plane extract) + perturbation kick
+    + Cd/Cl history as the monolithic run_flow_past.
+
+    Parameters mirror run_flow_past plus the projection levers:
+      ppe_solver : "splu" on CPU (Mac) / "gpu_cg" on GPU (gpubox/GH200).  The
+        PPE Laplacian is SPD so gpu_cg is valid there; the Oseen predictor is
+        NOT SPD so predictor_solver stays "splu" (or FGMRES/AMGX on device).
+      consistent_projection / inner_iterate / inner_max / inner_relax /
+      rotational_pin_wall : the merged 3-D projection driver's lever defaults —
+        the outflow-BC p'-scheme set that makes the immersed-shell Cd
+        POSITIVE + NON-DIVERGING (correct sign/shape).
+
+    Returns a dict with:
+      'cd'         : np.ndarray [nsteps] — drag coefficient (streamwise x)
+      'cl'         : np.ndarray [nsteps] — lift coefficient (transverse y)
+      'n_excluded' : int — excluded cells (non-zero confirms plate active)
+      'nsteps'     : int — steps taken
+      'ppe_solver' : str — the PPE solver actually requested (confirms path)
+      + 'mesh'/'node_fields' when _return_fields, 'stepper' when _return_stepper.
+    """
+    ndof = dim + 1
+    t0 = time.time()
+
+    # ---- geometry + two-sided surrogate (SAME two-oracle workaround) --------
+    fx = _build_shell(level, plate_xc, plate_yc, plate_L, dim=dim)
+    dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
+
+    if verbose:
+        print(f"[p2r1a-proj] level={level}  n_excluded={fx['n_excluded']}  "
+              f"sfp={fx['sfp'].elem.size}  sfm={fx['sfm'].elem.size}  "
+              f"nsteps={nsteps}  dt={dt}  nu={nu}  "
+              f"ppe_solver={ppe_solver}", flush=True)
+
+    # ---- BCs in the (strong_mask, u_inf, outflow_nodes) free-node convention
+    strong_mask, u_inf_arr, outflow_nodes, inflow_nodes = _outer_bc_masks_2d(
+        mesh, cons, U_inf)
+
+    def f_fn(x, t):
+        return np.zeros((len(x), dim))
+
+    # ---- one-sided anti-vacuity lever: drop Gamma~+ (fold onto minus side) --
+    if _two_sided:
+        sfp, gp = fx["sfp"], fx["gp"]
+    else:
+        # Empty Gamma~+ is illegal (one-face-order invariant); reuse sfm/gm as
+        # the plus side too — the one-sided anti-vacuity assembly.
+        sfp, gp = fx["sfm"], fx["gm"]
+
+    # ---- projection stepper: two-sided shell + PPE -------------------------
+    st = LeraySBMShellStepper(
+        sfp, gp, fx["sfm"], fx["gm"],
+        dm, nu, dt, f_fn,
+        u_inf=u_inf_arr, strong_mask=strong_mask,
+        order=order, picard_iters=picard_iters,
+        solver=predictor_solver, ppe_solver=ppe_solver,
+        alpha=alpha, beta_backflow=1.0,
+        pressure_outflow_nodes=outflow_nodes,
+        consistent_projection=consistent_projection,
+        inner_iterate=inner_iterate, inner_max=inner_max,
+        inner_relax=inner_relax,
+        rotational_pin_wall=rotational_pin_wall,
+        verbose=verbose,
+    )
+    st.set_initial(lambda coords: np.zeros((len(coords), dim)))
+
+    # Symmetry-breaking perturbation setup (mirrors the monolithic path): a
+    # small transverse kick at the INFLOW nodes for t < pert_t_end.  In the
+    # projection path the box velocity is imposed strongly through st.u_inf, so
+    # the kick is applied by mutating st.u_inf[inflow, 1] on/off per step.
+    _pert_active = (pert_eps is not None) and (float(pert_eps) != 0.0)
+    _pert_vkick = float(pert_eps) * U_inf if _pert_active else 0.0
+    if _pert_active and verbose:
+        print(f"[p2r1a-proj] perturbation ON: eps={pert_eps}, "
+              f"v_kick={_pert_vkick:.4f}, t_end={pert_t_end}, "
+              f"n_inflow_nodes={len(inflow_nodes)}", flush=True)
+
+    ref_force = 0.5 * U_inf ** 2 * plate_L    # nondim denominator (matches mono)
+
+    cd_hist = np.zeros(nsteps)
+    cl_hist = np.zeros(nsteps)
+
+    for step in range(nsteps):
+        t_new = (step + 1) * dt
+        # Apply/clear the transverse kick on the inflow u_y BEFORE the step.
+        if _pert_active:
+            st.u_inf[inflow_nodes, 1] = (_pert_vkick if t_new < pert_t_end
+                                         else 0.0)
+        st.step()
+        F = st.surrogate_traction()
+        cd_hist[step] = F[0] / ref_force   # drag (streamwise = x)
+        cl_hist[step] = F[1] / ref_force   # lift (transverse = y)
+        if verbose:
+            print(f"[p2r1a-proj] step {step:3d}  Cd={cd_hist[step]:+.4f}  "
+                  f"Cl={cl_hist[step]:+.4f}", flush=True)
+
+    elapsed = time.time() - t0
+    if verbose:
+        print(f"[p2r1a-proj] done in {elapsed:.1f}s  "
+              f"Cd[-1]={cd_hist[-1]:+.4f}  Cl[-1]={cl_hist[-1]:+.4f}", flush=True)
+
+    result = dict(
+        cd=cd_hist,
+        cl=cl_hist,
+        n_excluded=fx["n_excluded"],
+        nsteps=nsteps,
+        ppe_solver=ppe_solver,
+    )
+
+    if _return_fields:
+        u = st.base._uvec(st.base.hist.pre1)
+        xfree = np.zeros(st.n_free * ndof)
+        xv = xfree.reshape(st.n_free, ndof)
+        xv[:, :dim] = u
+        xv[:, dim] = st.base.p_star
+        x_all = np.asarray(st._T_vec @ xfree).reshape(-1, ndof)
+        result["mesh"] = mesh
+        result["node_fields"] = {
+            "velocity_magnitude": np.linalg.norm(x_all[:, :dim], axis=1),
+            "pressure": x_all[:, dim],
+        }
+    if _return_stepper:
+        result["stepper"] = st
+
+    return result
+
+
+def run_flow_past_projection_one_sided(**kwargs):
+    """Anti-vacuity run for the projection path: only Gamma~- assembled (drop
+    Gamma~+).  Used by the smoke gate to verify the two-sided coupling is
+    load-bearing (mirrors the monolithic run_flow_past_one_sided)."""
+    kwargs["_two_sided"] = False
+    return run_flow_past_projection(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Both-solver comparison vs the LITERATURE
+# ---------------------------------------------------------------------------
+# Literature band (ThinShell.pdf §4.3 Table 1 + Najjar & Balachandar 1995):
+LIT_CD_LOW, LIT_CD_HIGH = 3.29, 3.45     # Cd band
+LIT_CD_REF = 3.36                        # Najjar & Balachandar center
+LIT_ST_REF = 0.15                        # Strouhal (Najjar 0.14; band ~0.15)
+
+
+def compare_solvers(t_start=None, plate_L_physical=None, **cfg):
+    """Run the SAME 2-D thin-plate case through BOTH solvers (monolithic and
+    projection) and report each solver's Cd (time-average) + St (FFT of Cl)
+    against the LITERATURE band (Cd 3.29-3.45, St ~0.15; Najjar 3.36/0.14).
+
+    The deliverable is WHICH SOLVER matches the literature — NOT which matches
+    the other.  Per ns_projection_vms_paper §4.3 the monolithic VMS
+    OVERpredicts Cd (~25%) and the projection is the more literature-faithful
+    one, so this comparison settles whether the projection's lower Cd is a
+    FEATURE (paper-consistent) or an immersed-shell deficiency.
+
+    Parameters
+    ----------
+    t_start : float or None
+        Post-transient time at which Cd time-averaging begins (defaults to
+        halfway through the march).
+    plate_L_physical : float or None
+        PHYSICAL plate length used for St = f*L/U (defaults to cfg['plate_L'],
+        i.e. the octree-normalized length; for the RE250 config denormalize by
+        the domain height, see __main__).
+    **cfg : forwarded to BOTH run_flow_past and run_flow_past_projection
+        (level, nsteps, dt, U_inf, nu, alpha, plate_xc, plate_yc, plate_L,
+        pert_eps, pert_t_end, ...).
+
+    Returns a dict:
+      {'mono': {'cd_mean','St','freq','cd','cl'},
+       'proj': {'cd_mean','St','freq','cd','cl','ppe_solver'},
+       'literature': {'cd_low','cd_high','cd_ref','st_ref'}}
+    and prints the comparison table.
+    """
+    from diffsim.postproc.shedding import time_avg_cd, strouhal
+
+    U_inf = cfg.get("U_inf", 1.0)
+    dt = cfg.get("dt", 0.01)
+    nsteps = cfg.get("nsteps", 10)
+    plate_L = cfg.get("plate_L", 0.25)
+    L_phys = plate_L if plate_L_physical is None else plate_L_physical
+
+    # Which projection knobs to pull out of cfg (leave the rest for both).
+    proj_only = {}
+    for k in ("ppe_solver", "predictor_solver", "picard_iters", "order",
+              "consistent_projection", "inner_iterate", "inner_max",
+              "inner_relax", "rotational_pin_wall"):
+        if k in cfg:
+            proj_only[k] = cfg.pop(k)
+
+    t_arr = np.arange(1, nsteps + 1) * dt
+    ts = t_arr[len(t_arr) // 2] if t_start is None else t_start
+
+    def _reduce(res):
+        cd_mean = time_avg_cd(t_arr, res["cd"], t_start=ts)
+        try:
+            St, freq = strouhal(t_arr, res["cl"], U_inf, L_phys)
+        except ValueError:
+            St, freq = float("nan"), float("nan")
+        return cd_mean, St, freq
+
+    res_m = run_flow_past(**cfg)
+    cd_m, st_m, f_m = _reduce(res_m)
+
+    res_p = run_flow_past_projection(**cfg, **proj_only)
+    cd_p, st_p, f_p = _reduce(res_p)
+
+    def _cd_dist(cd):
+        # signed absolute distance to the nearest band edge (0 if inside band)
+        if cd < LIT_CD_LOW:
+            return cd - LIT_CD_LOW
+        if cd > LIT_CD_HIGH:
+            return cd - LIT_CD_HIGH
+        return 0.0
+
+    print("\n" + "=" * 72)
+    print("BOTH-SOLVER vs LITERATURE — 2-D thin plate")
+    print(f"  Literature: Cd {LIT_CD_LOW}-{LIT_CD_HIGH} (ref {LIT_CD_REF}), "
+          f"St ~{LIT_ST_REF} (Najjar & Balachandar 3.36/0.14)")
+    print("-" * 72)
+    hdr = f"{'solver':<12}{'Cd_mean':>10}{'|dCd_ref|':>11}{'relCd_ref':>11}" \
+          f"{'St':>8}{'|dSt|':>8}"
+    print(hdr)
+    for name, cd, st in (("monolithic", cd_m, st_m), ("projection", cd_p, st_p)):
+        dcd = abs(cd - LIT_CD_REF)
+        rel = dcd / LIT_CD_REF
+        dst = abs(st - LIT_ST_REF)
+        band = "" if _cd_dist(cd) == 0.0 else "  (out-of-band)"
+        print(f"{name:<12}{cd:>10.4f}{dcd:>11.4f}{rel:>10.1%}"
+              f"{st:>8.4f}{dst:>8.4f}{band}")
+    print("=" * 72 + "\n")
+
+    return dict(
+        mono=dict(cd_mean=cd_m, St=st_m, freq=f_m,
+                  cd=res_m["cd"], cl=res_m["cl"]),
+        proj=dict(cd_mean=cd_p, St=st_p, freq=f_p,
+                  cd=res_p["cd"], cl=res_p["cl"],
+                  ppe_solver=res_p.get("ppe_solver")),
+        literature=dict(cd_low=LIT_CD_LOW, cd_high=LIT_CD_HIGH,
+                        cd_ref=LIT_CD_REF, st_ref=LIT_ST_REF),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Re=250 full-resolution configuration (ThinShell.pdf §4.3)
 # Run on gpubox ONLY — see docs/dev/p2r1a-thin-plate-runbook.md
 # ---------------------------------------------------------------------------
@@ -523,6 +868,29 @@ if __name__ == "__main__":
     # Re number for the case name (dimensionless: Re = U_inf / nu for L=1)
     re_approx = int(round(U_inf / nu)) if nu > 0 else 0
     case_name = f"p2r1a_re{re_approx}_L{level}"
+
+    # ---- BOTH-SOLVER comparison mode (SOLVER=both or COMPARE=1) ------------
+    # Runs monolithic AND projection on the SAME config and prints the
+    # Cd/St-vs-literature table.  The projection PPE solver is PPE_SOLVER
+    # (default splu on CPU; set gpu_cg on gpubox/GH200).
+    _compare = (os.environ.get("SOLVER", "").lower() == "both"
+                or os.environ.get("COMPARE", "") == "1")
+    if _compare:
+        ppe_solver = os.environ.get("PPE_SOLVER", "splu")
+        _t_start_env = os.environ.get("T_START", "")
+        t_start = float(_t_start_env) if _t_start_env else None
+        out = compare_solvers(
+            t_start=t_start, plate_L_physical=plate_L_physical,
+            level=level, nsteps=nsteps, dt=dt, nu=nu, U_inf=U_inf,
+            plate_xc=plate_xc, plate_yc=plate_yc, plate_L=plate_L,
+            pert_eps=pert_eps, pert_t_end=pert_t_end,
+            ppe_solver=ppe_solver,
+        )
+        print(f"[p2r1a] monolithic: Cd_mean={out['mono']['cd_mean']:.4f}  "
+              f"St={out['mono']['St']:.4f}")
+        print(f"[p2r1a] projection: Cd_mean={out['proj']['cd_mean']:.4f}  "
+              f"St={out['proj']['St']:.4f}  (ppe={out['proj']['ppe_solver']})")
+        sys.exit(0)
 
     # Run with _return_fields=True so we get mesh + node fields for VTU export.
     # The CI smoke test calls run_flow_past() directly without _return_fields,
