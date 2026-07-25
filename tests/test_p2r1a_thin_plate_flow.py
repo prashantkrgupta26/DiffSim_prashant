@@ -184,11 +184,12 @@ def test_mono_solver_routing_parity():
 
 
 def test_compare_solvers_accepts_mono_knobs():
-    """compare_solvers must route mono_solver/device to the monolithic leg
-    ONLY — the projection leg does not accept them (reviewer-found TypeError)."""
+    """compare_solvers must route mono_solver/device/assembly to the monolithic
+    leg ONLY — the projection leg does not accept them (reviewer-found TypeError).
+    Passes assembly="device" so the mono_only routing of assembly is exercised."""
     from p2r1a_thin_plate_flow import compare_solvers
     out = compare_solvers(level=4, nsteps=3, dt=0.01, nu=0.1, U_inf=1.0,
-                          mono_solver="splu", device="cpu")
+                          mono_solver="splu", device="cpu", assembly="device")
     assert np.all(np.isfinite(out["mono"]["cd_mean"]))
     assert np.all(np.isfinite(out["proj"]["cd_mean"]))
 
@@ -203,3 +204,23 @@ def test_device_assembly_parity_cpu(device):
     res_d = run_flow_past(assembly="device", **kw)
     assert np.allclose(res_h["cd"], res_d["cd"], rtol=1e-9, atol=1e-11), (
         f"device-assembly Cd diverged: {res_h['cd']} vs {res_d['cd']}")
+
+
+def test_device_assembly_parity_cpu_adaptive(device):
+    """assembly="device" works on the adaptive (hanging-node) mesh and matches
+    assembly="host" to distribution tolerance.
+
+    Evidence-based gate (C1 review finding): the csr_slots coverage experiment
+    on level=4, refine_to=6 (56 hanging nodes, 956 Af_c nnz) returned SUCCESS —
+    all Af_c entries are present in the constraint-aware device pattern.  The
+    preemptive ValueError was removed; this test documents the verified outcome.
+
+    Uses level=4, refine_to=6, nsteps=3 (fast; ~seconds on Mac CPU).
+    """
+    from p2r1a_thin_plate_flow import run_flow_past
+    kw = dict(level=4, refine_to=6, nsteps=3, dt=0.01, nu=0.1, U_inf=1.0,
+              verbose=False)
+    res_h = run_flow_past(assembly="host", **kw)
+    res_d = run_flow_past(assembly="device", **kw)
+    assert np.allclose(res_h["cd"], res_d["cd"], rtol=1e-9, atol=1e-11), (
+        f"device-assembly adaptive Cd diverged: {res_h['cd']} vs {res_d['cd']}")

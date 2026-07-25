@@ -489,12 +489,15 @@ def run_flow_past(
         from diffsim.errors import BackendError
         import warp as wp
 
-        if refine_to is not None:
-            raise ValueError(
-                "assembly='device' is not supported for adaptive (hanging-node) "
-                "meshes: the SBM face system (Af_c) may contain entries absent "
-                "from the device assembler's element-pair pattern. "
-                "Use assembly='host' for adaptive meshes.")
+        # No pre-emptive gate for adaptive (hanging-node) meshes: the
+        # DeviceNSAssembler's constraint-aware weighted scatter expands
+        # element entries THROUGH the constraint weights (D1 item 3),
+        # producing the same free-dof pattern as T^T K T.  An experiment
+        # on level=4, refine_to=6 (56 hanging nodes, 956 Af_c nnz) confirmed
+        # that ALL Af_c entries are covered by the device pattern (csr_slots
+        # SUCCESS — no BackendError).  The try/except below is the honesty
+        # net: if a future mesh or Af_c variant genuinely exceeds the pattern,
+        # it is reported clearly rather than silently skipped.
 
         _dev_asm = DeviceNSAssembler(dm)    # symbolic pattern once per epoch
 
@@ -520,7 +523,10 @@ def run_flow_past(
             np.ascontiguousarray(_Af_csr.data, np.float64),
             dtype=wp.float64, device=dm.device)
 
-        # bf_c sparse: only nonzero dofs uploaded
+        # bf_c sparse: only nonzero dofs uploaded.
+        # int32 dof indices: _scatter_vec_kernel requires gdof: wp.array(dtype=wp.int32)
+        # (API contract in device_assembly.py).  On meshes where Nfull >= 2^31
+        # the assembler itself refuses at construction, so int32 is always safe here.
         _bf_nz = np.nonzero(bf_c)[0]
         _bf_dofs_d = wp.array(_bf_nz.astype(np.int32), dtype=wp.int32,
                               device=dm.device)
