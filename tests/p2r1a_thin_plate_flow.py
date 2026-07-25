@@ -374,6 +374,7 @@ def run_flow_past(
     pert_t_end=1.0,    # time (physical) at which the kick is switched off
     mono_solver="splu",  # monolithic solver backend (splu | cudss | fused)
     device="cpu",      # device for non-splu backends (cpu | cuda | hip)
+    assembly="host",   # assembly backend: "host" (default, bit-for-bit) | "device"
 ):
     """Run flow past a finite thin plate with transient BDF2 march.
 
@@ -401,6 +402,11 @@ def run_flow_past(
     device : str
         Device for non-splu backends: "cpu" or "cuda"/"hip" for GPU.
         Default "cpu".
+    assembly : str
+        Assembly backend: "host" (default, bit-for-bit host path) or
+        "device" (DeviceNSAssembler; symbolic pattern once per mesh epoch,
+        numeric fill on device per step, SBM face system via cached slots).
+        "host" default keeps all existing tests bit-for-bit unchanged.
 
     Returns a dict with:
       'cd'       : np.ndarray [nsteps] — drag coefficient history
@@ -462,6 +468,76 @@ def run_flow_past(
 
     xq = gauss_points(mesh, dm.tables_by_p)
 
+    # ---- Device assembler setup (once per mesh epoch) -----------------------
+    # Builds symbolic pattern + slot maps; caches SBM face system slots so only
+    # VALUE arrays need refreshing per step (pattern fixed; geometry is static).
+    # Gated to uniform meshes: on adaptive (hanging-node) meshes the Af_c
+    # entries may not exist in the device pattern (constraint-aware T^T K T
+    # creates off-diagonal entries not in the element-pair graph) — detected
+    # via csr_slots and reported clearly rather than silently skipped.
+    _dev_asm = None           # DeviceNSAssembler (None => host path)
+    _af_slots_d = None        # device CSR slots for Af_c
+    _af_vals_d = None         # device values array for Af_c (refreshed per step)
+    _bf_dofs_d = None         # device dof indices for bf_c nonzeros
+    _bf_vals_d = None         # device values array for bf_c nonzeros
+    _strong_rows = None       # sorted unique strong rows (set once per epoch)
+    _Af_csr = None            # CSR form of Af_c (cached for value refresh)
+    _Af_csr_nnz = None        # nnz of Af_csr (to assert pattern unchanged)
+
+    if assembly == "device":
+        from diffsim.assembly.device_assembly import DeviceNSAssembler
+        from diffsim.errors import BackendError
+        import warp as wp
+
+        if refine_to is not None:
+            raise ValueError(
+                "assembly='device' is not supported for adaptive (hanging-node) "
+                "meshes: the SBM face system (Af_c) may contain entries absent "
+                "from the device assembler's element-pair pattern. "
+                "Use assembly='host' for adaptive meshes.")
+
+        _dev_asm = DeviceNSAssembler(dm)    # symbolic pattern once per epoch
+
+        # --- SBM face system -> fixed-pattern device slots (cached) ----------
+        _Af_csr = Af_c.tocsr()
+        _Af_csr_nnz = _Af_csr.nnz
+        _af_rows, _af_cols = _Af_csr.nonzero()
+        try:
+            _af_slots = _dev_asm.csr_slots(_af_rows, _af_cols)
+        except BackendError as _e:
+            raise ValueError(
+                f"assembly='device': SBM face system (Af_c) contains entries "
+                f"absent from the device assembler's CSR pattern. This is a "
+                f"REAL finding: the constraint-aware face-system entries on this "
+                f"mesh exceed the element-pair graph. Use assembly='host'. "
+                f"Original error: {_e}") from _e
+
+        # Cast slots to the assembler's index dtype (int32 for small meshes)
+        _af_slots_np = _af_slots.astype(_dev_asm._idx_np)
+        _af_slots_d = wp.array(_af_slots_np, dtype=_dev_asm._idx_dtype,
+                               device=dm.device)
+        _af_vals_d = wp.array(
+            np.ascontiguousarray(_Af_csr.data, np.float64),
+            dtype=wp.float64, device=dm.device)
+
+        # bf_c sparse: only nonzero dofs uploaded
+        _bf_nz = np.nonzero(bf_c)[0]
+        _bf_dofs_d = wp.array(_bf_nz.astype(np.int32), dtype=wp.int32,
+                              device=dm.device)
+        _bf_vals_d = wp.array(
+            np.ascontiguousarray(bf_c[_bf_nz], np.float64),
+            dtype=wp.float64, device=dm.device)
+
+        # --- strong rows: BCs + inflow-kick rows + pressure pin (one plan) ---
+        # np.unique sorts the rows, giving a canonical order we'll use for
+        # strong_b_vals per step.  set_strong_rows preserves input order, so
+        # the sorted unique array is consistent with the per-step value lookup.
+        _strong_rows = np.unique(
+            np.concatenate([np.asarray(bc_rows, np.int64),
+                            np.asarray(inflow_vy_rows, np.int64),
+                            np.array([int(p_pin)], np.int64)]))
+        _dev_asm.set_strong_rows(_strong_rows)
+
     # ---- BDF2 march ---------------------------------------------------------
     # Initialize: u=0 everywhere
     x_cur = np.zeros(nfree * ndof)
@@ -495,41 +571,87 @@ def run_flow_past(
         else:
             fq_raw = _gp_history_fq(dm, mesh, T, u_pre1, u_pre2, b1, b2, dt, dim)
 
-        # Assemble monolithic NS
-        A, b = assemble_linear_ns(dm, aq, dq, fq_raw, nu, sigma=sigma)
-        A = (A + Af_c).tolil()
-        b = b + bf_c
+        if assembly == "device":
+            # ---- Device assembly path ---------------------------------------
+            # Strong values in _strong_rows ORDER (np.unique-sorted order).
+            # Build a dict from all strong-row values, then index by _strong_rows.
+            _val_of = {}
+            for _r, _v in zip(bc_rows, bc_vals):
+                _val_of[int(_r)] = float(_v)
+            # Inflow-kick rows: value depends on time
+            if _pert_active and t_new < pert_t_end:
+                _vkick = _pert_vkick
+            else:
+                _vkick = 0.0
+            for _r in inflow_vy_rows:
+                _val_of[int(_r)] = _vkick
+            # Pressure pin
+            _val_of[int(p_pin)] = 0.0
+            # Build strong_b_vals in sorted unique row order (_strong_rows)
+            _sb = np.array([_val_of.get(int(_r), 0.0) for _r in _strong_rows])
 
-        # Apply strong Dirichlet BCs
-        for r, v in zip(bc_rows, bc_vals):
-            A.rows[r] = [int(r)]; A.data[r] = [1.0]; b[r] = v
+            # Af_c is geometry-cached (assembled once before the loop); its
+            # value array is constant each step.  Use the pre-uploaded
+            # _af_vals_d directly — no per-step reallocation needed.
+            # (The pattern-unchanged assert is a safety guard for future
+            # callers that might pass a per-step Af_c.)
+            assert _Af_csr.nnz == _Af_csr_nnz, (
+                f"Af_c sparsity changed mid-march: {_Af_csr.nnz} vs "
+                f"{_Af_csr_nnz}. Cannot refresh device values safely.")
 
-        # Symmetry-breaking perturbation: override inflow u_y for t < pert_t_end.
-        # This mirrors test_cylinder_strouhal.py's kick:
-        #   ``vkick = 0.05 * U_IN if t_new < 0.5 else 0.0``
-        # The kick imposes a small constant transverse velocity at the inflow
-        # for early time, breaking the perfect up-down symmetry so the wake
-        # destabilises to the von Karman / bluff-body shedding branch.
-        # After t >= pert_t_end the inflow reverts to pure streamwise (u_y = 0),
-        # already set by the base bc_rows loop above (no additional action).
-        if _pert_active and t_new < pert_t_end:
-            vkick = _pert_vkick
-            for r in inflow_vy_rows:
-                ri = int(r)
-                A.rows[ri] = [ri]; A.data[ri] = [1.0]; b[ri] = vkick
+            # assemble: volume fill + extra_matrix(Af) + extra_rhs(bf)
+            # + strong rows — order mirrors host: A_vol + Af_c, b + bf_c,
+            # then LIL surgery.  Oracle: aq/dq/fq as flat pv-keyed dicts.
+            Acsr, b = _dev_asm.assemble(
+                aq, dq, fq_raw, nu, sigma,
+                strong_b_vals=_sb,
+                extra_matrix=(_af_slots_d, _af_vals_d),
+                extra_rhs=(_bf_dofs_d, _bf_vals_d))
 
-        # Pressure pin
-        A.rows[p_pin] = [p_pin]; A.data[p_pin] = [1.0]; b[p_pin] = 0.0
+            # Solve (same routing as host path)
+            if mono_solver == "splu":
+                x_cur = splu(Acsr.tocsc()).solve(b)
+            else:
+                x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
+                                     device=device)
 
-        # Solve — routed through solve_linear so MONO_SOLVER/DEVICE select
-        # the backend (splu host | cudss GPU-direct | fused GPU-BiCGStab).
-        # Matrix changes every step (Picard convection + kick rows): no cache_key.
-        Acsr = A.tocsr()
-        if mono_solver == "splu":
-            x_cur = splu(Acsr.tocsc()).solve(b)      # legacy path, bit-for-bit
         else:
-            x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
-                                 device=device)
+            # ---- Host assembly path (default; bit-for-bit unchanged) --------
+            # Assemble monolithic NS
+            A, b = assemble_linear_ns(dm, aq, dq, fq_raw, nu, sigma=sigma)
+            A = (A + Af_c).tolil()
+            b = b + bf_c
+
+            # Apply strong Dirichlet BCs
+            for r, v in zip(bc_rows, bc_vals):
+                A.rows[r] = [int(r)]; A.data[r] = [1.0]; b[r] = v
+
+            # Symmetry-breaking perturbation: override inflow u_y for t < pert_t_end.
+            # This mirrors test_cylinder_strouhal.py's kick:
+            #   ``vkick = 0.05 * U_IN if t_new < 0.5 else 0.0``
+            # The kick imposes a small constant transverse velocity at the inflow
+            # for early time, breaking the perfect up-down symmetry so the wake
+            # destabilises to the von Karman / bluff-body shedding branch.
+            # After t >= pert_t_end the inflow reverts to pure streamwise (u_y = 0),
+            # already set by the base bc_rows loop above (no additional action).
+            if _pert_active and t_new < pert_t_end:
+                vkick = _pert_vkick
+                for r in inflow_vy_rows:
+                    ri = int(r)
+                    A.rows[ri] = [ri]; A.data[ri] = [1.0]; b[ri] = vkick
+
+            # Pressure pin
+            A.rows[p_pin] = [p_pin]; A.data[p_pin] = [1.0]; b[p_pin] = 0.0
+
+            # Solve — routed through solve_linear so MONO_SOLVER/DEVICE select
+            # the backend (splu host | cudss GPU-direct | fused GPU-BiCGStab).
+            # Matrix changes every step (Picard convection + kick rows): no cache_key.
+            Acsr = A.tocsr()
+            if mono_solver == "splu":
+                x_cur = splu(Acsr.tocsc()).solve(b)      # legacy path, bit-for-bit
+            else:
+                x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
+                                     device=device)
 
         # Extract velocity for next step
         u_new = x_cur.reshape(nfree, ndof)[:, :dim]
@@ -897,8 +1019,9 @@ def compare_solvers(t_start=None, plate_L_physical=None, **cfg):
     # Which monolithic knobs to pull out of cfg (leave the rest for both).
     # NOTE: "device" stays in cfg so BOTH legs see it (projection also accepts
     # device= since Task 3 threads it to its DeviceMesh build).
+    # "assembly" is mono-only: the projection path does not accept it.
     mono_only = {}
-    for k in ("mono_solver",):
+    for k in ("mono_solver", "assembly"):
         if k in cfg:
             mono_only[k] = cfg.pop(k)
 
@@ -1074,6 +1197,7 @@ if __name__ == "__main__":
     pert_t_end = float(os.environ.get("PERT_T_END", "1.0"))
     mono_solver = os.environ.get("MONO_SOLVER", "splu")
     device      = os.environ.get("DEVICE", "cpu")
+    assembly    = os.environ.get("ASSEMBLY", "host")
     # Physical plate length: plate_L is the octree-normalized length (divided by
     # domain height H=16).  St = f*L/U uses the PHYSICAL plate length, so we
     # multiply back by 16 to denormalize.  For the default smoke run (plate_L=0.25,
@@ -1105,7 +1229,7 @@ if __name__ == "__main__":
             plate_xc=plate_xc, plate_yc=plate_yc, plate_L=plate_L,
             refine_to=refine_to, wake_refine=wake_refine, band_cells=band_cells,
             pert_eps=pert_eps, pert_t_end=pert_t_end,
-            mono_solver=mono_solver, device=device,
+            mono_solver=mono_solver, device=device, assembly=assembly,
             ppe_solver=ppe_solver,
         )
         print(f"[p2r1a] monolithic: Cd_mean={out['mono']['cd_mean']:.4f}  "
@@ -1127,6 +1251,7 @@ if __name__ == "__main__":
         pert_t_end=pert_t_end,
         mono_solver=mono_solver,
         device=device,
+        assembly=assembly,
     )
     print(f"Cd={res['cd']}")
     print(f"Cl={res['cl']}")

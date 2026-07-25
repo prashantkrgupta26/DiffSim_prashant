@@ -191,3 +191,15 @@ def test_compare_solvers_accepts_mono_knobs():
                           mono_solver="splu", device="cpu")
     assert np.all(np.isfinite(out["mono"]["cd_mean"]))
     assert np.all(np.isfinite(out["proj"]["cd_mean"]))
+
+
+def test_device_assembly_parity_cpu(device):
+    """assembly="device" on the CPU Warp device must match assembly="host"
+    to distribution tolerance (host-device assembly parity; on cpu the
+    scatter is deterministic so the tolerance is tight)."""
+    from p2r1a_thin_plate_flow import run_flow_past
+    kw = dict(level=4, nsteps=3, dt=0.01, nu=0.1, U_inf=1.0, verbose=False)
+    res_h = run_flow_past(assembly="host", **kw)
+    res_d = run_flow_past(assembly="device", **kw)
+    assert np.allclose(res_h["cd"], res_d["cd"], rtol=1e-9, atol=1e-11), (
+        f"device-assembly Cd diverged: {res_h['cd']} vs {res_d['cd']}")
