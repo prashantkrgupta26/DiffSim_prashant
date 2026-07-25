@@ -821,6 +821,7 @@ def run_flow_past_projection(
     pert_eps=None,           # symmetry-breaking kick: fraction of U_inf (None/0 = off)
     pert_t_end=1.0,          # physical time at which the kick is switched off
     device="cpu",            # device for the DeviceMesh build (cpu | cuda:0)
+    device_assembly=False,   # route K_p (PPE Laplacian) through DeviceScalarPoissonAssembler
 ):
     """Run 2-D flow past a finite thin plate via the PROJECTION stepper.
 
@@ -894,6 +895,7 @@ def run_flow_past_projection(
         inner_iterate=inner_iterate, inner_max=inner_max,
         inner_relax=inner_relax,
         rotational_pin_wall=rotational_pin_wall,
+        device_assembly=device_assembly,
         verbose=verbose,
     )
     st.set_initial(lambda coords: np.zeros((len(coords), dim)))
@@ -1015,10 +1017,12 @@ def compare_solvers(t_start=None, plate_L_physical=None, **cfg):
     L_phys = plate_L if plate_L_physical is None else plate_L_physical
 
     # Which projection knobs to pull out of cfg (leave the rest for both).
+    # device_assembly: routes K_p (PPE Laplacian) through DeviceScalarPoissonAssembler;
+    # projection-only (the monolithic path uses assembly= for its NS system).
     proj_only = {}
     for k in ("ppe_solver", "predictor_solver", "picard_iters", "order",
               "consistent_projection", "inner_iterate", "inner_max",
-              "inner_relax", "rotational_pin_wall"):
+              "inner_relax", "rotational_pin_wall", "device_assembly"):
         if k in cfg:
             proj_only[k] = cfg.pop(k)
 
@@ -1204,6 +1208,10 @@ if __name__ == "__main__":
     mono_solver = os.environ.get("MONO_SOLVER", "splu")
     device      = os.environ.get("DEVICE", "cpu")
     assembly    = os.environ.get("ASSEMBLY", "host")
+    # ASSEMBLY=device -> device_assembly=True for the PROJECTION leg (K_p via
+    # DeviceScalarPoissonAssembler; predictor + SBM extra_block remain host).
+    # CASE (c) confirmed: device_assembly only affects K_p, not extra_block.
+    device_assembly = (assembly == "device")
     # Physical plate length: plate_L is the octree-normalized length (divided by
     # domain height H=16).  St = f*L/U uses the PHYSICAL plate length, so we
     # multiply back by 16 to denormalize.  For the default smoke run (plate_L=0.25,
@@ -1236,7 +1244,7 @@ if __name__ == "__main__":
             refine_to=refine_to, wake_refine=wake_refine, band_cells=band_cells,
             pert_eps=pert_eps, pert_t_end=pert_t_end,
             mono_solver=mono_solver, device=device, assembly=assembly,
-            ppe_solver=ppe_solver,
+            ppe_solver=ppe_solver, device_assembly=device_assembly,
         )
         print(f"[p2r1a] monolithic: Cd_mean={out['mono']['cd_mean']:.4f}  "
               f"St={out['mono']['St']:.4f}")

@@ -223,3 +223,22 @@ def test_two_sided_coupling_load_bearing():
         f"two-sided coupling not load-bearing: two-sided={cd_two:.4f}, "
         f"one-sided={cd_one:.4f}, rel_diff={rel_diff:.3f} (< 5%) — the "
         "Gamma~+ side is inert")
+
+
+def test_projection_device_assembly_parity(device="cpu"):
+    """Projection with device_assembly=True must match the host-assembly
+    projection march (CPU Warp device: deterministic, tight tolerance).
+
+    CASE (c): device_assembly routes K_p (scalar PPE Laplacian) through
+    DeviceScalarPoissonAssembler; the predictor (assemble_linear_ns) and the
+    extra_block (SBM Nitsche system) are BOTH host-side and unchanged.  The
+    device K_p equals assemble_csr(dm) to FP tolerance (leray.py:299-309),
+    so Cd must match to 1e-9 relative / 1e-11 absolute.
+    """
+    from p2r1a_thin_plate_flow import run_flow_past_projection
+    kw = dict(level=4, nsteps=3, dt=0.01, nu=0.1, ppe_solver="splu",
+              verbose=False)
+    res_h = run_flow_past_projection(**kw)
+    res_d = run_flow_past_projection(device_assembly=True, **kw)
+    assert np.allclose(res_h["cd"], res_d["cd"], rtol=1e-9, atol=1e-11), (
+        f"projection device-assembly diverged: {res_h['cd']} vs {res_d['cd']}")
