@@ -107,3 +107,10 @@ def test_3d_thin_plate_two_sided_loadbearing():
         f"|Cd_twosided|={abs(cd_2s):.4f}  |Cd_onesided|={abs(cd_1s):.4f}"
     )
     print(f"\n[3d-loadbearing] Cd_2s={cd_2s:+.4f}  Cd_1s={cd_1s:+.4f}")
+
+
+def test_mono3d_solver_routing_parity():
+    kw = dict(level=3, nsteps=2, dt=0.01, nu=0.1, U_inf=1.0, verbose=False)
+    res_legacy = run_flow_past_3d(**kw)
+    res_routed = run_flow_past_3d(mono_solver="splu", device="cpu", **kw)
+    assert np.allclose(res_legacy["cd"], res_routed["cd"], rtol=0, atol=1e-12)

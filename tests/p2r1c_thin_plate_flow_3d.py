@@ -60,6 +60,7 @@ from diffsim.sbm.vector import (
 from diffsim.api.ns_bricks import assemble_linear_ns
 from diffsim.physics.poisson import gauss_points
 from diffsim.solvers.timestepping import bdf_coeffs
+from diffsim.solvers.linsolve import solve_linear
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +84,7 @@ def _make_sheet(x_c, y_c, z_c, half_y, half_z):
 
 
 def _build_shell_3d(level, x_c, y_c, z_c, half_y, half_z,
-                    refine_to=None, band_cells=2):
+                    refine_to=None, band_cells=2, device="cpu"):
     """Build dim=3 octree (uniform or adaptive) + two-sided shell surrogate.
 
     refine_to=None  -> uniform octree at ``level`` (current behavior, unchanged).
@@ -110,7 +111,7 @@ def _build_shell_3d(level, x_c, y_c, z_c, half_y, half_z,
         n_excluded = amr["n_excluded"]
         extra = dict(n_nodes=amr["n_nodes"], n_hanging=amr["n_hanging"],
                      build_time=amr["build_time"])
-    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3), "cpu")
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3), device)
     ftab = face_tables(1, 3)
     (sfp, gp), (sfm, gm) = extract_two_sided_surrogate(ret, sheet, ftab)
     return dict(dm=dm, mesh=mesh, cons=cons, sfp=sfp, gp=gp, sfm=sfm, gm=gm,
@@ -305,6 +306,8 @@ def run_flow_past_3d(
     band_cells=2,
     _two_sided=True,
     _return_fields=False,
+    mono_solver="splu",
+    device="cpu",
 ):
     """Run 3-D flow past a finite thin plate with transient BDF2 march.
 
@@ -332,6 +335,12 @@ def run_flow_past_3d(
         Internal flag — False => one-sided (anti-vacuity test).
     _return_fields : bool
         Internal flag — True => also return mesh + node fields dict.
+    mono_solver : str
+        Monolithic solve backend: "splu" (host LU), "cudss" (GPU direct),
+        or "fused" (GPU BiCGStab). Default "splu" preserves legacy behavior.
+    device : str
+        Device for non-splu backends: "cpu" or "cuda"/"hip" for GPU.
+        Default "cpu".
 
     Returns a dict with:
       'cd'         : np.ndarray [nsteps] — drag coefficient (x-direction)
@@ -350,7 +359,7 @@ def run_flow_past_3d(
     # ---- geometry + mesh ----------------------------------------------------
     fx = _build_shell_3d(level, plate_xc, plate_yc, plate_zc,
                          plate_half_y, plate_half_z,
-                         refine_to=refine_to, band_cells=band_cells)
+                         refine_to=refine_to, band_cells=band_cells, device=device)
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
 
     if verbose:
@@ -426,8 +435,15 @@ def run_flow_past_3d(
         # Pressure pin
         A.rows[p_pin] = [p_pin]; A.data[p_pin] = [1.0]; b[p_pin] = 0.0
 
-        # Solve
-        x_cur = splu(A.tocsr().tocsc()).solve(b)
+        # Solve — routed through solve_linear so MONO_SOLVER/DEVICE select
+        # the backend (splu host | cudss GPU-direct | fused GPU-BiCGStab).
+        # Matrix changes every step (Picard convection): no cache_key.
+        Acsr = A.tocsr()
+        if mono_solver == "splu":
+            x_cur = splu(Acsr.tocsc()).solve(b)      # legacy path, bit-for-bit
+        else:
+            x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
+                                 device=device)
 
         # Extract velocity for next step
         u_new = x_cur.reshape(nfree, ndof)[:, :dim]
@@ -568,6 +584,8 @@ if __name__ == "__main__":
     plate_zc     = float(os.environ.get("PLATE_ZC", "0.5"))
     plate_half_y = float(os.environ.get("PLATE_HALF_Y", "0.125"))
     plate_half_z = float(os.environ.get("PLATE_HALF_Z", "0.125"))
+    mono_solver = os.environ.get("MONO_SOLVER", "splu")
+    device      = os.environ.get("DEVICE", "cpu")
 
     re_approx = int(round(U_inf / nu)) if nu > 0 else 0
     if refine_level:
@@ -582,6 +600,8 @@ if __name__ == "__main__":
         verbose=True,
         refine_to=refine_level,
         _return_fields=True,
+        mono_solver=mono_solver,
+        device=device,
     )
     print(f"Cd={res['cd']}")
     print(f"Cl_y={res['cl_y']}")
