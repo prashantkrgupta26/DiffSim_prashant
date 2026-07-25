@@ -242,3 +242,33 @@ def test_projection_device_assembly_parity(device="cpu"):
     res_d = run_flow_past_projection(device_assembly=True, **kw)
     assert np.allclose(res_h["cd"], res_d["cd"], rtol=1e-9, atol=1e-11), (
         f"projection device-assembly diverged: {res_h['cd']} vs {res_d['cd']}")
+
+
+def test_projection_device_assembly_predictor_parity(device="cpu"):
+    """Task 6b: device_assembly=True must now ALSO device-assemble the PREDICTOR.
+
+    CASE (d): extends CASE (c) — device_assembly routes BOTH K_p (PPE Laplacian)
+    AND the predictor (full ndof=dim+1 NS system) through DeviceNSAssembler, with
+    the SBM face block (Af_c + per-step backflow) injected via cached csr_slots.
+    The marker ``st.base._pred_asm is not None`` is asserted after a step.
+    Parity gate: Cd matches the host-path to rtol=1e-9 / atol=1e-11.
+    """
+    from p2r1a_thin_plate_flow import run_flow_past_projection
+    kw = dict(level=4, nsteps=3, dt=0.01, nu=0.1, ppe_solver="splu",
+              verbose=False, _return_stepper=True)
+    res_h = run_flow_past_projection(**kw)
+    res_d = run_flow_past_projection(device_assembly=True, **kw)
+
+    # Marker: the predictor DeviceNSAssembler must be wired (non-None)
+    st = res_d["stepper"]
+    assert hasattr(st.base, "_pred_asm"), (
+        "LerayProjectionStepper missing '_pred_asm' attribute after device march "
+        "— predictor device assembler not wired")
+    assert st.base._pred_asm is not None, (
+        "st.base._pred_asm is None after device_assembly=True march "
+        "— predictor NOT device-assembled")
+
+    # Parity: device predictor + device K_p must give the same Cd as host path
+    assert np.allclose(res_h["cd"], res_d["cd"], rtol=1e-9, atol=1e-11), (
+        f"projection device-predictor parity failed: "
+        f"host={res_h['cd']}  device={res_d['cd']}")
