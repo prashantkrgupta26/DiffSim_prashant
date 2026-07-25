@@ -13,17 +13,22 @@
 # NCCL-CG SINGLE-GPU CAPACITY on the Nova GH200 (nova-arm, aarch64, 1 GPU).
 # The GH200 partition has ONE node with ONE GPU -> no multi-GPU scaling here;
 # this measures how large a PPE fits + solve time on the GH200's coherent
-# memory (Grace LPDDR + HBM).  bootstrap.sh auto-detects aarch64; AMGX is
-# skipped on ARM, so we use --precond jacobi.  world_size=1 (gloo avoids any
-# 1-rank NCCL quirk; comm is trivial for a single rank).
+# memory (Grace LPDDR + HBM).
+#
+# ARM (aarch64): the GH200 needs its OWN venv (.venv-nova-arm) — the x86
+# .venv-nova python cannot exec here (Exec format error). Use bootstrap_arm.sh
+# + the RPM python3.11 lib path. AMGX is skipped on ARM, so --precond jacobi.
+# world_size=1 (gloo avoids any 1-rank NCCL quirk).
 #
 # NB the host assemble_csr path (scipy) is the build bottleneck at large L
 # (~minutes at L7); L8+ needs the device assembler (follow-up).
 set -uo pipefail
 cd "$SLURM_SUBMIT_DIR"
 echo "== host $(hostname)  $(uname -m)  $(date)"
-bash cluster/bootstrap.sh
-PY=.venv-nova/bin
+RPM_DIR=/work/mech-ai/baskarg/python311-arm
+export LD_LIBRARY_PATH="$RPM_DIR/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+bash cluster/bootstrap_arm.sh
+PY=.venv-nova-arm/bin
 mkdir -p cluster/results
 $PY/python -c "import torch;print('torch',torch.__version__,'cuda',torch.cuda.is_available())"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
