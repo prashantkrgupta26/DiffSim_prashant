@@ -106,6 +106,7 @@ from diffsim.sbm.vector import (
 from diffsim.api.ns_bricks import assemble_linear_ns
 from diffsim.physics.poisson import gauss_points
 from diffsim.solvers.timestepping import bdf_coeffs
+from diffsim.solvers.linsolve import solve_linear
 from diffsim.steppers.leray_sbm import LeraySBMShellStepper
 
 
@@ -132,7 +133,7 @@ def _make_plate(x_c, y_c, L):
 
 
 def _build_shell(level, x_c, y_c, L, dim=2,
-                 refine_to=None, wake_refine=None, band_cells=2):
+                 refine_to=None, wake_refine=None, band_cells=2, device="cpu"):
     """Build the two-sided shell surrogate for a finite vertical plate.
 
     Uses Segment for classification (finite plate extent) and Plane for
@@ -164,7 +165,7 @@ def _build_shell(level, x_c, y_c, L, dim=2,
         n_excluded = amr["n_excluded"]
         extra = dict(n_nodes=amr["n_nodes"], n_hanging=amr["n_hanging"],
                      build_time=amr["build_time"])
-    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=dim), "cpu")
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=dim), device)
     (sfp, gp), (sfm, gm) = extract_two_sided_surrogate(
         ret, plane, face_tables(1, dim))
     return dict(dm=dm, mesh=mesh, cons=cons, sfp=sfp, gp=gp, sfm=sfm, gm=gm,
@@ -371,6 +372,8 @@ def run_flow_past(
     _return_fields=False,  # internal flag: True => also return mesh + node fields
     pert_eps=None,     # symmetry-breaking kick: fraction of U_inf (None or 0.0 = off)
     pert_t_end=1.0,    # time (physical) at which the kick is switched off
+    mono_solver="splu",  # monolithic solver backend (splu | cudss | fused)
+    device="cpu",      # device for non-splu backends (cpu | cuda | hip)
 ):
     """Run flow past a finite thin plate with transient BDF2 march.
 
@@ -392,6 +395,12 @@ def run_flow_past(
     pert_t_end : float
         Physical time at which the kick is switched off (default 1.0).
         After this the inflow reverts to pure streamwise (u_y = 0).
+    mono_solver : str
+        Monolithic solve backend: "splu" (host LU), "cudss" (GPU direct),
+        or "fused" (GPU BiCGStab). Default "splu" preserves legacy behavior.
+    device : str
+        Device for non-splu backends: "cpu" or "cuda"/"hip" for GPU.
+        Default "cpu".
 
     Returns a dict with:
       'cd'       : np.ndarray [nsteps] — drag coefficient history
@@ -410,7 +419,7 @@ def run_flow_past(
     # ---- geometry + mesh ----------------------------------------------------
     fx = _build_shell(level, plate_xc, plate_yc, plate_L, dim=dim,
                       refine_to=refine_to, wake_refine=wake_refine,
-                      band_cells=band_cells)
+                      band_cells=band_cells, device=device)
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
 
     if verbose:
@@ -512,8 +521,15 @@ def run_flow_past(
         # Pressure pin
         A.rows[p_pin] = [p_pin]; A.data[p_pin] = [1.0]; b[p_pin] = 0.0
 
-        # Solve
-        x_cur = splu(A.tocsr().tocsc()).solve(b)
+        # Solve — routed through solve_linear so MONO_SOLVER/DEVICE select
+        # the backend (splu host | cudss GPU-direct | fused GPU-BiCGStab).
+        # Matrix changes every step (Picard convection + kick rows): no cache_key.
+        Acsr = A.tocsr()
+        if mono_solver == "splu":
+            x_cur = splu(Acsr.tocsc()).solve(b)      # legacy path, bit-for-bit
+        else:
+            x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
+                                 device=device)
 
         # Extract velocity for next step
         u_new = x_cur.reshape(nfree, ndof)[:, :dim]
@@ -1047,6 +1063,8 @@ if __name__ == "__main__":
     _pert_eps_env = os.environ.get("PERT_EPS", "")
     pert_eps = float(_pert_eps_env) if _pert_eps_env else None
     pert_t_end = float(os.environ.get("PERT_T_END", "1.0"))
+    mono_solver = os.environ.get("MONO_SOLVER", "splu")
+    device      = os.environ.get("DEVICE", "cpu")
     # Physical plate length: plate_L is the octree-normalized length (divided by
     # domain height H=16).  St = f*L/U uses the PHYSICAL plate length, so we
     # multiply back by 16 to denormalize.  For the default smoke run (plate_L=0.25,
@@ -1078,6 +1096,7 @@ if __name__ == "__main__":
             plate_xc=plate_xc, plate_yc=plate_yc, plate_L=plate_L,
             refine_to=refine_to, wake_refine=wake_refine, band_cells=band_cells,
             pert_eps=pert_eps, pert_t_end=pert_t_end,
+            mono_solver=mono_solver, device=device,
             ppe_solver=ppe_solver,
         )
         print(f"[p2r1a] monolithic: Cd_mean={out['mono']['cd_mean']:.4f}  "
@@ -1097,6 +1116,8 @@ if __name__ == "__main__":
         _return_fields=True,
         pert_eps=pert_eps,
         pert_t_end=pert_t_end,
+        mono_solver=mono_solver,
+        device=device,
     )
     print(f"Cd={res['cd']}")
     print(f"Cl={res['cl']}")

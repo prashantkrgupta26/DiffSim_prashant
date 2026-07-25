@@ -170,3 +170,14 @@ def test_perturbation_breaks_symmetry():
     assert ratio > 10.0, (
         f"ON/OFF std ratio={ratio:.1f} < 10 — kick not clearly breaking symmetry"
     )
+
+
+def test_mono_solver_routing_parity():
+    """Routing the monolithic solve through solve_linear(solver="splu")
+    must reproduce the legacy inline-splu march exactly (same host LU)."""
+    from p2r1a_thin_plate_flow import run_flow_past
+    kw = dict(level=4, nsteps=3, dt=0.01, nu=0.1, U_inf=1.0, verbose=False)
+    res_legacy = run_flow_past(**kw)                       # default path
+    res_routed = run_flow_past(mono_solver="splu", device="cpu", **kw)
+    assert np.allclose(res_legacy["cd"], res_routed["cd"], rtol=0, atol=1e-12), (
+        f"routed splu diverged from legacy: {res_legacy['cd']} vs {res_routed['cd']}")
