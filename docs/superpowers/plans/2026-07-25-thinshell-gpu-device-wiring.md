@@ -552,6 +552,32 @@ EOF
 
 ---
 
+### Task 6b: Full device predictor + face-block-in-pattern (projection stepper)
+
+> Added 2026-07-25 by Baskar's directive: pursue the device predictor now, not as R2 follow-on. Runs between the Task-7 preflight (BEFORE baseline) and the production launch.
+
+**Files:**
+- Read: `src/diffsim/steppers/leray.py` `_predict` (~:781-:835) — how the predictor operator is assembled per step, how `extra_block=(A_extra, b_extra)` is added, how strong/Dirichlet rows are applied, and the exact system block structure (full (u,p) ndof=dim+1 vs velocity-only) — DO NOT GUESS, read it
+- Read: Tasks 4/5's device-assembly wiring in `tests/p2r1a_thin_plate_flow.py` / `tests/p2r1c_thin_plate_flow_3d.py` (the proven pattern: DeviceNSAssembler + csr_slots extra_matrix + set_strong_rows; adapter from the oracle test)
+- Read: `src/diffsim/steppers/leray_sbm.py` `LeraySBMShellStepper._extra_block` (Af_c cached + per-step backflow increment — the VALUES change per step, the face PATTERN should not)
+- Modify: `src/diffsim/steppers/leray.py` (extend the `device_assembly=True` branch to cover the predictor assembly)
+- Modify: `src/diffsim/steppers/leray_sbm.py` (only if the shell stepper must pass pattern hints; prefer zero changes)
+- Test: `tests/test_p2r1a_thin_plate_flow_projection.py`
+
+**Interfaces:**
+- Consumes: `DeviceNSAssembler(dm, ndof=…)` exactly as Tasks 4/5 proved (flat pv-keyed adapter, `extra_matrix=(slots_d, vals_d)`, `extra_rhs`, `set_strong_rows`/`strong_b_vals`, csr_slots→BackendError honesty net, slots `asm._idx_np`, rhs dofs wp.int32)
+- Produces: `device_assembly=True` on `LerayProjectionStepper`/`LeraySBMShellStepper` now covers BOTH the PPE Laplacian (existing) AND the predictor assembly; public API unchanged (no new knobs)
+
+- [ ] **Step 1: Failing test** — extend `test_projection_device_assembly_parity` expectations: with `device_assembly=True` the march must produce the SAME Cd (rtol=1e-9/atol=1e-11) AND a marker that the predictor used the device assembler (e.g. spy/attribute `st.base._pred_asm is not None` after a step). Write the test asserting the marker; RED because the attribute doesn't exist.
+- [ ] **Step 2: Implement** — in `_predict`'s device_assembly branch: lazily build `self._pred_asm = DeviceNSAssembler(dm)` once; per predict-call assemble the predictor operator on device with the SAME per-step inputs the host path uses; inject `extra_block`'s A via cached `csr_slots` (slots computed on FIRST call from the extra CSR's nonzero pattern; per-call assert `nnz` unchanged then refresh VALUES only — the backflow increment changes values, not faces; if the pattern DOES change, fall back to host addition for that step honestly (log once) rather than erroring the march); b_extra via extra_rhs (int32 dofs); strong rows per the host path's row set/values. Keep the host path bit-for-bit when `device_assembly=False`.
+- [ ] **Step 3: Parity + full projection gates** — `.venv/bin/python -m pytest tests/test_p2r1a_thin_plate_flow_projection.py tests/test_p2r0_projection_sbm.py -q` all green (p2r0 untouched). Both parity tests (base + adaptive if applicable) green.
+- [ ] **Step 4: Commit** — message: `feat(leray): device-assembled predictor + SBM face block in the device pattern` + standard trailer. Explicit paths only.
+- [ ] **Step 5 (controller): AFTER preflight re-run** — controller re-runs the Task-7 preflight with the same config to measure the speedup (BEFORE vs AFTER s/step recorded in the runbook).
+
+**Honesty gates:** if `_predict`'s system structure makes the DeviceNSAssembler operator inapplicable (e.g. different stabilization terms assembled than `assemble_linear_ns` covers — check `make_linear_ns_Ae` vs what `_predict` builds), STOP and report BLOCKED with the exact structural difference; do not approximate the operator. Parity at rtol=1e-9 on CPU Warp is the arbiter.
+
+---
+
 ### Task 7: Re=250 2-D both-solver GPU validation on gpubox (THE ACCEPTANCE GATE)
 
 **Files:**
