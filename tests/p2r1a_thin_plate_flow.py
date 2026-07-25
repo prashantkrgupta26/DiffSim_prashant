@@ -331,12 +331,67 @@ def run_flow_past_one_sided(**kwargs):
     return run_flow_past(**kwargs)
 
 
+# ---------------------------------------------------------------------------
+# Re=250 full-resolution configuration (ThinShell.pdf §4.3)
+# Run on gpubox ONLY — see docs/dev/p2r1a-thin-plate-runbook.md
+# ---------------------------------------------------------------------------
+#
+# Domain: [0, 36] x [0, 16] (unit octree: all coords normalized to [0,1]).
+# Note: octree native domain is [0,1]^2; physical coords = octree_coord * max_dim.
+# The plate at physical (5, 8) => octree (5/36, 8/16) = (0.1389, 0.5).
+# Plate length L = 1.0 (physical units); normalized L_norm = 1.0 / 16 = 0.0625.
+# (L=1 matches Najjar & Balachandar 1995, domain H=16D with D=plate length=L).
+# Re = U_inf * L / nu = 250 => nu = U_inf * L / 250 = 1.0 * 1.0 / 250 = 0.004.
+# U_inf = 1.0, L = 1.0 (physical).
+# Base mesh: level 7 (128^2 octree); wake refined to L9; plate cells to L9-11.
+# Adaptive refinement: use refine_elements() + balance2to1() (not yet wired
+# into run_flow_past; see runbook for the --adaptive flag).
+# dt = 5e-5 (physical), march until t >= 50 (50+ shedding periods expected at St~0.15).
+# t_start for averaging: 20.0 (post-transient).
+# Expected (Table 1, ThinShell.pdf): Cd ~ 3.29-3.45, St ~ 0.15.
+RE250_CONFIG = dict(
+    level=7,
+    nsteps=1_000_000,  # not actually run in CI; document only
+    dt=5e-5,
+    U_inf=1.0,
+    nu=1.0 / 250.0,    # Re=U_inf*L/nu=250, L=1 (physical plate length)
+    alpha=50.0,
+    plate_xc=5.0 / 36.0,   # physical x=5 in [0,36] domain
+    plate_yc=8.0 / 16.0,   # physical y=8 in [0,16] domain
+    plate_L=1.0 / 16.0,    # L=1 physical, normalized by domain height 16
+    dim=2,
+)
+
+
 if __name__ == "__main__":
     import os
+    from diffsim.postproc.shedding import time_avg_cd, strouhal
+
     level = int(os.environ.get("LEVEL", "5"))
     nsteps = int(os.environ.get("NSTEPS", "10"))
     dt = float(os.environ.get("DT", "0.01"))
     nu = float(os.environ.get("NU", "0.1"))
-    res = run_flow_past(level=level, nsteps=nsteps, dt=dt, nu=nu, verbose=True)
+    U_inf = float(os.environ.get("U_INF", "1.0"))
+    plate_xc = float(os.environ.get("PLATE_XC", "0.375"))
+    plate_yc = float(os.environ.get("PLATE_YC", "0.5"))
+    plate_L = float(os.environ.get("PLATE_L", "0.25"))
+    # Physical plate length: in the unit-square domain, plate_L is already
+    # normalized.  For nondimensionalization, use plate_L (normalized) as the
+    # reference length (consistent with how Cd/Cl are computed in run_flow_past).
+    plate_L_physical = plate_L
+
+    res = run_flow_past(
+        level=level, nsteps=nsteps, dt=dt, nu=nu, U_inf=U_inf,
+        plate_xc=plate_xc, plate_yc=plate_yc, plate_L=plate_L,
+        verbose=True,
+    )
     print(f"Cd={res['cd']}")
     print(f"Cl={res['cl']}")
+
+    t_arr = np.linspace(0, nsteps * dt, nsteps)
+    cd_mean = time_avg_cd(t_arr, res["cd"])
+    try:
+        St, freq = strouhal(t_arr, res["cl"], U_inf, plate_L_physical)
+        print(f"Cd_mean={cd_mean:.4f}  St={St:.4f}  freq={freq:.4f}")
+    except ValueError as exc:
+        print(f"Cd_mean={cd_mean:.4f}  St=N/A (too short: {exc})")

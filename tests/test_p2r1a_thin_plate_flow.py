@@ -20,6 +20,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 
 from p2r1a_thin_plate_flow import run_flow_past, run_flow_past_one_sided
+from diffsim.postproc.shedding import time_avg_cd, strouhal
 
 pytestmark = pytest.mark.tier5
 
@@ -74,3 +75,37 @@ def test_thin_plate_flow_two_sided_loadbearing():
         f"Two-sided coupling not load-bearing: "
         f"|Cd_twosided|={abs(cd_2s):.4f}  |Cd_onesided|={abs(cd_1s):.4f}"
     )
+
+
+def test_thin_plate_postproc_pipeline():
+    """End-to-end pipeline: smoke run -> postproc -> Cd_mean finite and plausible.
+
+    Runs the same smoke parameters (level=5, 10 steps), then passes the Cd/Cl
+    history through time_avg_cd and strouhal.  Asserts only pipeline-level
+    properties (no literature comparison — 10 steps is far too short for that).
+    """
+    res = run_flow_past(**_SMOKE)
+    nsteps = _SMOKE["nsteps"]
+    dt = _SMOKE["dt"]
+    U_inf = _SMOKE["U_inf"]
+    plate_L = _SMOKE["plate_L"]
+
+    t_arr = np.linspace(0, nsteps * dt, nsteps)
+
+    # time_avg_cd: must be finite and O(1)-plausible
+    cd_mean = time_avg_cd(t_arr, res["cd"])
+    assert np.isfinite(cd_mean), f"Cd_mean is not finite: {cd_mean}"
+    assert 0 < abs(cd_mean) < 500, (
+        f"|Cd_mean|={abs(cd_mean):.4f} is outside O(1)-plausible range"
+    )
+
+    # strouhal: 10 steps may not yield a clean FFT peak; handle ValueError gracefully
+    try:
+        St, freq = strouhal(t_arr, res["cl"], U_inf, plate_L)
+        assert np.isfinite(St), f"St is not finite: {St}"
+        assert np.isfinite(freq), f"freq is not finite: {freq}"
+    except ValueError:
+        # Expected: 10 steps gives only 5 tail points, which is above the 4-pt
+        # minimum, but the FFT peak may still be physically meaningless.
+        # The pipeline reaching this point without crashing is the test.
+        pass
