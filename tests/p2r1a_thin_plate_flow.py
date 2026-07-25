@@ -375,10 +375,12 @@ if __name__ == "__main__":
     plate_xc = float(os.environ.get("PLATE_XC", "0.375"))
     plate_yc = float(os.environ.get("PLATE_YC", "0.5"))
     plate_L = float(os.environ.get("PLATE_L", "0.25"))
-    # Physical plate length: in the unit-square domain, plate_L is already
-    # normalized.  For nondimensionalization, use plate_L (normalized) as the
-    # reference length (consistent with how Cd/Cl are computed in run_flow_past).
-    plate_L_physical = plate_L
+    # Physical plate length: plate_L is the octree-normalized length (divided by
+    # domain height H=16).  St = f*L/U uses the PHYSICAL plate length, so we
+    # multiply back by 16 to denormalize.  For the default smoke run (plate_L=0.25,
+    # unit-square domain) this gives plate_L_physical=4.0; for the RE250 gpubox
+    # run (plate_L=1/16=0.0625) this gives plate_L_physical=1.0 (physical units).
+    plate_L_physical = plate_L * 16.0  # *16: domain-height denormalization
 
     res = run_flow_past(
         level=level, nsteps=nsteps, dt=dt, nu=nu, U_inf=U_inf,
@@ -388,7 +390,9 @@ if __name__ == "__main__":
     print(f"Cd={res['cd']}")
     print(f"Cl={res['cl']}")
 
-    t_arr = np.linspace(0, nsteps * dt, nsteps)
+    # t_arr: step k lands at time (k+1)*dt since step 0 is the first BDF step
+    # (t=dt).  np.linspace(0, nsteps*dt, nsteps) gives wrong effective dt.
+    t_arr = np.arange(1, nsteps + 1) * dt
     cd_mean = time_avg_cd(t_arr, res["cd"])
     try:
         St, freq = strouhal(t_arr, res["cl"], U_inf, plate_L_physical)

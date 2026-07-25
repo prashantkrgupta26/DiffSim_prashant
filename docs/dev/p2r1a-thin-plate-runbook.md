@@ -59,12 +59,13 @@ from diffsim.postproc.shedding import time_avg_cd, strouhal
 
 data = np.load("p2r1a_re250_history.npz")
 cd_mean = time_avg_cd(data["t"], data["cd"], t_start=20.0)
-St, freq = strouhal(data["t"], data["cl"], U=1.0, L=1.0/16.0)
+St, freq = strouhal(data["t"], data["cl"], U=1.0, L=1.0)
 print(f"Cd_mean={cd_mean:.4f}  St={St:.4f}  freq={freq:.4f}")
 ```
 
-Note: `L=1.0/16.0` is the normalized plate length in the octree [0,1]² domain
-(the reference length used in force nondimensionalization).
+Note: `L=1.0` is the PHYSICAL plate length (St = f·L/U uses physical units).
+The octree-normalized value (0.0625 = 1/16) must NOT be used here — that would
+yield St 16× too small.
 
 ## Output logs
 

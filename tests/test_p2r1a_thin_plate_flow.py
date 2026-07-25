@@ -90,7 +90,9 @@ def test_thin_plate_postproc_pipeline():
     U_inf = _SMOKE["U_inf"]
     plate_L = _SMOKE["plate_L"]
 
-    t_arr = np.linspace(0, nsteps * dt, nsteps)
+    # t_arr: step k lands at time (k+1)*dt since step 0 is the first BDF step
+    # (t=dt).  np.linspace(0, nsteps*dt, nsteps) gives wrong effective dt.
+    t_arr = np.arange(1, nsteps + 1) * dt
 
     # time_avg_cd: must be finite and O(1)-plausible
     cd_mean = time_avg_cd(t_arr, res["cd"])
@@ -99,13 +101,14 @@ def test_thin_plate_postproc_pipeline():
         f"|Cd_mean|={abs(cd_mean):.4f} is outside O(1)-plausible range"
     )
 
-    # strouhal: 10 steps may not yield a clean FFT peak; handle ValueError gracefully
+    # strouhal: defensive try/except guards against configs with < 4 tail points;
+    # at 10 steps (5 tail points, above the 4-pt minimum) it won't raise, but the
+    # recovered St value is physically meaningless (far too few steps for shedding).
     try:
         St, freq = strouhal(t_arr, res["cl"], U_inf, plate_L)
         assert np.isfinite(St), f"St is not finite: {St}"
         assert np.isfinite(freq), f"freq is not finite: {freq}"
     except ValueError:
-        # Expected: 10 steps gives only 5 tail points, which is above the 4-pt
-        # minimum, but the FFT peak may still be physically meaningless.
+        # Defensive: only reached when tail has < 4 points (not this smoke config).
         # The pipeline reaching this point without crashing is the test.
         pass
