@@ -11,25 +11,40 @@ factorization — the escape from the host splu wall at L9-near-plate scale
 (nonsymmetric Oseen) still uses splu; for full L9 scaling, predictor_solver
 can be "fused" or AMGX (deferred follow-on).
 
-⚠️ 3-D PHYSICS CAVEAT (read before trusting the Cd):
-    This driver lands SCALABLE INFRASTRUCTURE, not yet faithful 3-D physics.
-    The lagged-pressure projection split has a DOCUMENTED 3-D defect: with an
-    open outflow, the momentum predictor cannot build the driving stagnation
-    pressure from rest, so the split settles into a weak/wrong steady state
-    (the monolithic steady state is NOT a fixed point of the lagged-p* split;
-    ‖L - K_p‖/‖K_p‖ ≈ 0.67 — projection K_p and monolithic PSPG enforce
-    different discrete incompressibility). The 3-D Cd produced here is FINITE
-    but NOT PHYSICALLY FAITHFUL (it can be wrong-signed and grow under the
-    startup transient). The correct 3-D engine is the MONOLITHIC SBM-NS saddle
-    (tests/p2r1c_thin_plate_flow_3d.py). The projection path's physics fix
-    (consistent PPE operator + outflow-BC / pressure-correction p' co-design)
-    is a SEPARATE research track — see the `p2-r2a-monolithic-pivot` memory
-    verdict and docs/dev/2026-07-23-projection-ladder-verdict.md. The gpu_cg
-    PPE lever wired here is exactly what that fix will scale on.
+OUTFLOW-BC p′-SCHEME FIX (2026-07-25, projection-pprime-outflow-fix-spec):
+    This driver now wires the validated incremental van-Kan p′-scheme outflow
+    BCs into the 3-D thin-plate projection path:
+      - the WHOLE outflow face x=x_max gets the PPE p′=0 Dirichlet
+        (``pressure_outflow_nodes`` = the outlet face node set, Eq. 68d) —
+        NOT the single enclosed-flow corner pin, which left the outflow
+        pressure floating and drove the incremental p* to drift (wrong-signed,
+        diverging Cd, leray.py:215-221),
+      - ``consistent_projection=True`` (PSPG-consistent PPE + rotational
+        incremental update + backflow), ``inner_iterate=True`` (the stabilized
+        within-step predictor↔PPE fixed point), and ``rotational_pin_wall=True``
+        (FN4 — pin the rotational -nu*q correction on the plate shell nodes so
+        the plate-surface stagnation pressure jump develops with the right
+        sign).
+    RESULT: the 3-D Cd is now POSITIVE and NON-DIVERGING (decaying startup
+    transient of the correct shape) — a real fix over the wrong-signed,
+    diverging baseline.
+
+    ⚠️ RESIDUAL GAP (honest): the split's CONVERGED fixed-point Cd is still
+    ~40% BELOW the monolithic on the same tiny mesh (e.g. L3 uniform, dt=0.01,
+    nu=0.1: projection Cd → +27.6 vs monolithic → +45.6). The plate-surface
+    pressure jump is now the RIGHT SIGN but too small in magnitude. Pushing the
+    inner iteration harder (imax 8→25, Anderson) does NOT close it — it is a
+    STRUCTURAL difference between the split's fixed point and the monolithic
+    SBM-NS saddle for the two-sided immersed shell (the deeper
+    ``p2-r2a-monolithic-pivot`` defect, NOT the outflow-BC wiring gap). The
+    monolithic SBM-NS saddle (tests/p2r1c_thin_plate_flow_3d.py) remains the
+    quantitatively faithful 3-D engine; this projection path delivers the
+    correct-signed, non-diverging, SCALABLE (gpu_cg PPE) drag whose magnitude
+    is ~40% low.
 
 WHAT THIS DRIVER GUARANTEES (and its smoke gate asserts):
     - runs end-to-end on a two-sided thin-plate shell,
-    - produces a FINITE Cd,
+    - produces a POSITIVE, NON-DIVERGING Cd (the outflow-BC p′-scheme fix),
     - the PPE ran on gpu_cg and converged,
     - the two-sided shell coupling is load-bearing (two-sided ≠ one-sided).
 
@@ -97,16 +112,32 @@ def _outer_bc_masks_3d(mesh, cons, U_inf):
     """Strong outer BCs for 3-D flow past a plate, in the free-node-major
     (strong_mask, u_inf) convention LeraySBMShellStepper expects:
       - inflow (x=x_min) + 4 lateral walls: u = (U_inf, 0, 0) [freestream]
-      - outflow (x=x_max): do-nothing (not in the strong set)
+      - outflow (x=x_max): do-nothing (not in the strong set; velocity FREE,
+        natural n.(-nu grad u)=0, with backflow stabilization on the face)
 
-    Returns (strong_mask [n_free] bool, u_inf [n_free, 3] float, pin_node int)
-    where pin_node is the free-node index of the outflow-low-back corner used
-    to pin the pressure correction (p'=0) in the PPE.
+    Returns (strong_mask [n_free] bool, u_inf [n_free, 3] float,
+             outflow_nodes [k] int) where ``outflow_nodes`` is the FREE-node
+    index set of the ENTIRE outflow face ``x = x_max`` (a 2-D sheet of nodes
+    in 3-D). These carry the PPE p'=0 Dirichlet (Eq. 68d, p-p*=0 on the
+    outflow face) — the incremental van-Kan p'-scheme's outflow BC.
+
+    THE FIX (2026-07-25, projection-pprime-outflow-fix-spec): the PPE is an
+    open external flow with a free outflow face; pinning a SINGLE corner node
+    (the monolithic saddle's enclosed-flow gauge) leaves the outflow pressure
+    floating, so the incremental p* drifts and the predictor never builds the
+    driving pressure -> wrong-signed / diverging Cd (leray.py:215-221). Pinning
+    the WHOLE outflow face to p'=0 imposes the physical Dirichlet outlet
+    pressure (Eq. 68d) and fixes the drift. The plate/shell gets NO pressure
+    Dirichlet (phi natural-Neumann there, Eq. 68 body BC).
+
+    The inflow and all four lateral walls are velocity-Dirichlet (u_inf), so
+    they correctly carry the natural ``grad(phi).n=0`` PPE BC; only ``x=x_max``
+    is the outlet.
     """
     dim = 3
     coords = mesh.node_coords[cons.free_nodes]
     tol = 1e-10
-    x_min = coords[:, 0].min()
+    x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
     y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
     z_min, z_max = coords[:, 2].min(), coords[:, 2].max()
     inflow = np.abs(coords[:, 0] - x_min) < tol
@@ -119,9 +150,14 @@ def _outer_bc_masks_3d(mesh, cons, U_inf):
     strong_mask = inflow | walls
     u_inf = np.zeros((len(coords), dim))
     u_inf[strong_mask, 0] = U_inf                    # freestream u_x = U_inf
-    # outflow-low-back corner (max x, min y, min z) for the pressure pin
-    pin_node = int(np.argmax(coords[:, 0] - coords[:, 1] - coords[:, 2]))
-    return strong_mask, u_inf, pin_node
+    # outflow FACE x = x_max: the FREE nodes (post-constraint numbering the PPE
+    # solves) on the outlet plane get the p'=0 Dirichlet (the whole face, not a
+    # single corner). Exclude any node also carried strongly by a lateral wall
+    # edge (those are velocity-Dirichlet -> natural grad(phi).n=0); the pure
+    # outflow face interior + its own boundary ring is what pins the pressure.
+    outflow_face = np.abs(coords[:, 0] - x_max) < tol
+    outflow_nodes = np.where(outflow_face)[0].astype(np.int64)
+    return strong_mask, u_inf, outflow_nodes
 
 
 def run_flow_past_3d_projection(
@@ -143,6 +179,11 @@ def run_flow_past_3d_projection(
     predictor_solver="splu",
     picard_iters=2,
     order=2,
+    consistent_projection=True,
+    inner_iterate=True,
+    inner_max=8,
+    inner_relax=0.5,
+    rotational_pin_wall=True,
     _two_sided=True,
     _return_fields=False,
     _return_stepper=False,
@@ -186,6 +227,22 @@ def run_flow_past_3d_projection(
         Picard iterations for the predictor (default 2).
     order : int
         BDF order target (default 2).
+    consistent_projection : bool
+        PSPG-consistent PPE + rotational incremental update + backflow (the
+        2026-07-23 coherent Helmholtz-Leray set). Default True — required for
+        the correct-signed 3-D drag (the outflow-BC p′-scheme).
+    inner_iterate : bool
+        Stabilized within-step predictor↔PPE fixed-point iteration. Default
+        True — without it the consistent-projection Cd oscillates step-to-step
+        (weak fixed point). ``inner_max``/``inner_relax`` tune it.
+    inner_max : int
+        Max inner predictor↔PPE iterations per step (default 8).
+    inner_relax : float
+        Damped-relaxation factor in (0,1] for the inner iteration (default 0.5).
+    rotational_pin_wall : bool
+        Pin the rotational -nu*q correction on the plate shell nodes (FN4).
+        Default True — needed for the plate-surface stagnation pressure jump to
+        develop with the right sign (positive drag).
     _two_sided : bool
         Internal — False assembles only Gamma~- (drops Gamma~+); the
         anti-vacuity lever for the load-bearing smoke check.
@@ -203,8 +260,9 @@ def run_flow_past_3d_projection(
       'nsteps'     : int — steps taken
       'ppe_solver' : str — the PPE solver used (confirms gpu_cg was requested)
 
-    ⚠️ The Cd here is FINITE but NOT physically faithful in 3-D — see the
-    module docstring's projection-split caveat.
+    ⚠️ The Cd here is POSITIVE and NON-DIVERGING (the outflow-BC p′-scheme
+    fix) but its MAGNITUDE is ~40% below the monolithic on the same mesh — the
+    residual deeper-defect gap. See the module docstring.
     """
     dim = 3
     ndof = dim + 1
@@ -225,7 +283,8 @@ def run_flow_past_3d_projection(
               f"ppe_solver={ppe_solver}", flush=True)
 
     # ---- BCs in the (strong_mask, u_inf) free-node convention --------------
-    strong_mask, u_inf_arr, pin_node = _outer_bc_masks_3d(mesh, cons, U_inf)
+    strong_mask, u_inf_arr, outflow_nodes = _outer_bc_masks_3d(
+        mesh, cons, U_inf)
 
     def f_fn(x, t):
         return np.zeros((len(x), dim))
@@ -248,7 +307,11 @@ def run_flow_past_3d_projection(
         order=order, picard_iters=picard_iters,
         solver=predictor_solver, ppe_solver=ppe_solver,
         alpha=alpha, beta_backflow=1.0,
-        pressure_outflow_nodes=np.array([pin_node]),
+        pressure_outflow_nodes=outflow_nodes,
+        consistent_projection=consistent_projection,
+        inner_iterate=inner_iterate, inner_max=inner_max,
+        inner_relax=inner_relax,
+        rotational_pin_wall=rotational_pin_wall,
         verbose=verbose,
     )
     st.set_initial(lambda coords: np.zeros((len(coords), dim)))
@@ -274,8 +337,9 @@ def run_flow_past_3d_projection(
     elapsed = time.time() - t0
     if verbose:
         print(f"[p2r1c-3d-proj] done in {elapsed:.1f}s  "
-              f"Cd[-1]={cd_hist[-1]:+.4f}  (FINITE but not physically "
-              f"faithful — see module caveat)", flush=True)
+              f"Cd[-1]={cd_hist[-1]:+.4f}  (positive+non-diverging via the "
+              f"outflow-BC p′-scheme; magnitude ~40% low vs monolithic — see "
+              f"module caveat)", flush=True)
 
     result = dict(
         cd=cd_hist,
@@ -317,7 +381,9 @@ def run_flow_past_3d_projection_one_sided(**kwargs):
 # ---------------------------------------------------------------------------
 # Same config as the monolithic driver's GH200_CONFIG, but marched via the
 # projection stepper with gpu_cg on the PPE — the scalable path the monolithic
-# host-splu cannot reach at L9-near-plate. Physics caveat still applies.
+# host-splu cannot reach at L9-near-plate. The outflow-BC p′-scheme fix makes
+# the Cd positive + non-diverging; the ~40%-low magnitude gap (deeper defect)
+# still applies.
 GH200_CONFIG = dict(
     level=6,
     nsteps=200,
@@ -369,8 +435,9 @@ if __name__ == "__main__":
     print(f"Cl_y={res['cl_y']}")
     print(f"Cl_z={res['cl_z']}")
     print(f"PPE solver used: {res['ppe_solver']}")
-    print("NOTE: 3-D projection Cd is FINITE but not physically faithful "
-          "(projection-split defect — see module docstring caveat).")
+    print("NOTE: 3-D projection Cd is POSITIVE + non-diverging (outflow-BC "
+          "p′-scheme fix); magnitude ~40% below monolithic (deeper defect — "
+          "see module docstring caveat).")
 
     t_arr = np.arange(1, nsteps + 1) * dt
     body = triangulate_finite_sheet(plate_xc, plate_yc, plate_zc,

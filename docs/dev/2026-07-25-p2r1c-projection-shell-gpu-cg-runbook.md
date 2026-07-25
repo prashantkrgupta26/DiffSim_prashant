@@ -1,7 +1,9 @@
 # P2-R1c — 3-D thin-plate PROJECTION + two-sided shell + gpu_cg PPE (runbook)
 
 **Date:** 2026-07-25
-**Status:** scalable infrastructure LANDED; 3-D physics fix pending (separate track).
+**Status:** scalable infrastructure LANDED; outflow-BC p′-scheme fix APPLIED
+(Cd now positive + non-diverging); residual ~40% magnitude gap vs monolithic
+(deeper defect) remains.
 
 ## What landed
 
@@ -24,43 +26,68 @@ The scalable projection path for the 3-D thin-plate case:
 - `tests/test_p2r1c_thin_plate_flow_3d_projection.py` — the physics-honest
   smoke gate (see below).
 
-## ⚠️ Physics caveat — READ THIS
+## Outflow-BC p′-scheme fix (2026-07-25) — what changed
 
-**The 3-D projection Cd produced here is FINITE but NOT physically faithful.**
+The wrong-signed / diverging 3-D Cd is **fixed** by wiring the validated
+incremental van-Kan p′-scheme outflow BCs into the projection driver
+(`docs/superpowers/specs/2026-07-25-projection-pprime-outflow-fix-spec.md`):
 
-The lagged-pressure projection split has a **documented 3-D defect**: with an
-open outflow, the momentum predictor cannot build the driving stagnation
-pressure from rest, so the split settles into a weak / wrong steady state (the
-monolithic steady state is NOT a fixed point of the lagged-p\* split;
-‖L − K_p‖/‖K_p‖ ≈ 0.67 — the projection K_p and the monolithic PSPG enforce
-different discrete incompressibility). On the tiny L3 smoke the projection Cd is
-wrong-signed and grows under the startup transient, while the monolithic driver
-on the identical geometry gives correct positive drag.
+- **Whole outflow-FACE p′=0 Dirichlet** (Eq. 68d): `pressure_outflow_nodes` is
+  now the FREE-node set of the entire outlet plane `x = x_max` (a 2-D sheet of
+  nodes in 3-D) — NOT the single enclosed-flow corner pin the driver used
+  before. The single-corner pin left the open-outflow pressure floating, so the
+  incremental p\* drifted and the predictor never built the driving pressure
+  (wrong-signed, diverging Cd — `leray.py:215-221`).
+- **`consistent_projection=True`** (PSPG-consistent PPE + rotational
+  incremental update + backflow) — makes the monolithic steady state a fixed
+  point of the split's incompressibility.
+- **`inner_iterate=True`** (stabilized within-step predictor↔PPE fixed point) —
+  without it the consistent-projection Cd OSCILLATES step-to-step (weak fixed
+  point); with it the Cd decays cleanly.
+- **`rotational_pin_wall=True`** (FN4) — now forwarded through
+  `LeraySBMShellStepper` to the base; pins the rotational `−ν q` correction on
+  the plate shell nodes so the plate-surface stagnation pressure jump develops
+  with the RIGHT SIGN (positive drag). Without it the plate pressure jump is
+  reversed and the drag is a near-total cancellation → ~0.
 
-- **Correct 3-D engine:** the MONOLITHIC SBM-NS saddle solve
-  (`tests/p2r1c_thin_plate_flow_3d.py`). Use it for any faithful 3-D Cd.
-- **This projection path:** delivers the SCALABLE gpu_cg PPE lever (the escape
-  from the host-splu wall at L9-near-plate, ~186k nodes) ahead of the physics
-  fix — the fix is exactly what will scale on this lever.
-- **The physics fix** (consistent PPE operator + outflow-BC / pressure-
-  correction p′ co-design — Baskar's scheme) is a **separate research track**.
-  See the `p2-r2a-monolithic-pivot` memory verdict and
-  `docs/dev/2026-07-23-projection-ladder-verdict.md`.
+**RESULT (L3 uniform, dt=0.01, nu=0.1, splu==gpu_cg):** the projection Cd is now
+POSITIVE and DECAYING (e.g. 229 → 27.6 over 12 steps), tracking the monolithic
+startup transient (237 → 45.8) in sign and shape.
+
+### ⚠️ Residual gap (honest) — deeper defect, NOT the outflow-BC wiring
+
+The split's **converged** fixed-point Cd is still **~40% below** the monolithic
+on the same mesh (proj → +27.6 vs mono → +45.8; ratio ≈ 0.60). The plate-surface
+pressure jump is now the right sign but too small in magnitude. Pushing the
+inner iteration harder (inner_max 8→25, Anderson, tol 1e-10) does NOT close it —
+it converges to the SAME 27.6. This is a **structural** difference between the
+split's fixed point and the monolithic SBM-NS saddle for the two-sided immersed
+shell (the deeper `p2-r2a-monolithic-pivot` defect), NOT the outflow-BC wiring
+gap that this fix closed.
+
+- **Quantitatively faithful 3-D engine:** the MONOLITHIC SBM-NS saddle
+  (`tests/p2r1c_thin_plate_flow_3d.py`). Use it for a magnitude-accurate Cd.
+- **This projection path:** now gives the correct-SIGN, non-diverging, SCALABLE
+  (gpu_cg PPE) drag whose magnitude is ~40% low — the residual magnitude fix is
+  the remaining `p2-r2a` research item.
 
 ## Smoke gate — what it asserts (and deliberately does NOT)
 
-`tests/test_p2r1c_thin_plate_flow_3d_projection.py` (L3 uniform, 3 steps, fast
-on Mac CPU) asserts ONLY the wiring guarantees:
+`tests/test_p2r1c_thin_plate_flow_3d_projection.py` (L3 uniform, fast on Mac CPU)
+now asserts the real physics the fix delivers:
 
-1. **runs end-to-end + FINITE Cd** — `np.isfinite`, not `Cd > 0`.
+1. **positive + non-diverging Cd** — every step `> 0` and `Cd[-1] <= Cd[0]`
+   (decaying, not diverging), PLUS the projection final Cd is the SAME SIGN as
+   the monolithic reference on the same mesh and within a generous band
+   (0.3× .. 1.2×) — sign + shape agreement.
 2. **PPE provably ran on gpu_cg AND converged** — spies on
    `diffsim.solvers.dist_cg.pcg`, asserts it was called and every call reported
-   `converged=True` (measured: 3 calls, ~47–48 CG iterations each).
+   `converged=True`.
 3. **two-sided coupling is load-bearing** — the two-sided force differs
    materially from the one-sided (drop-Γ̃+) force (measured rel-diff ≫ 5%).
 
-It does NOT assert `Cd > 0` or projection ≈ monolithic — both are blocked by
-the projection-split defect above.
+It does NOT assert tight magnitude agreement (projection ≈ monolithic) — the
+~40% gap above is expected and is the deeper defect, not a wiring failure.
 
 ## Run commands
 
@@ -89,8 +116,12 @@ BASE_LEVEL=6 REFINE_LEVEL=9 NSTEPS=200 DT=0.005 NU=0.004 PPE_SOLVER=gpu_cg \
 
 ## Open follow-ons
 
-- **Predictor scalability:** the Oseen predictor still uses `splu`. At L9 the
-  predictor becomes the bottleneck; port it to `fused` (device BiCGStab) or
-  AMGX. The PPE gpu_cg lever removes only the PPE factorization wall.
-- **3-D physics fix:** the pressure-correction (p′) / outflow-BC scheme — the
-  separate research track that makes the projection Cd faithful.
+- **Predictor scalability (still splu-bound):** the Oseen predictor still uses
+  `splu`. ONLY the PPE scales via gpu_cg; at L9 the predictor becomes the
+  bottleneck — port it to `fused` (device BiCGStab) or AMGX (the L9 predictor
+  follow-on). The PPE gpu_cg lever removes only the PPE factorization wall.
+- **Residual ~40% magnitude gap (deeper `p2-r2a` defect):** the outflow-BC
+  p′-scheme fixed the SIGN + divergence; the split's converged fixed-point Cd
+  magnitude is still ~40% below the monolithic for the two-sided immersed shell.
+  This is the remaining research item (the split's fixed point ≠ the monolithic
+  saddle) — NOT closable by harder inner iteration.

@@ -522,19 +522,26 @@ class LeraySBMShellStepper:
     per-face in ``mode="shell"``), so classification/extraction do not run
     here.
 
-    ⚠️ 3-D PHYSICS CAVEAT: the lagged-pressure projection split has a
-    DOCUMENTED 3-D defect — with an open outflow, the momentum predictor
-    cannot build the driving stagnation pressure from rest, so the split
-    settles into a weak/wrong steady state (the monolithic steady state is
-    NOT a fixed point of the lagged-p* split). This stepper therefore
-    delivers a SCALABLE (gpu_cg PPE) but NOT-YET-PHYSICAL 3-D drag: the Cd
-    is finite but not faithful. The monolithic SBM-NS saddle
-    (``tests/p2r1c_thin_plate_flow_3d.py``) is the correct 3-D engine. The
-    projection path's physics fix (consistent PPE operator + outflow-BC /
-    pressure-correction p' co-design) is a separate research track — see
-    the ``p2-r2a-monolithic-pivot`` verdict and
-    ``docs/dev/2026-07-23-projection-ladder-verdict.md``. This class lands
-    the scalable infrastructure ahead of that fix.
+    3-D DRAG STATUS (2026-07-25, outflow-BC p′-scheme fix): with the
+    incremental van-Kan p′-scheme outflow BCs wired in — the WHOLE outflow-face
+    p′=0 Dirichlet (``pressure_outflow_nodes`` = the outlet plane node set,
+    NOT a single corner pin) + ``consistent_projection=True`` +
+    ``inner_iterate=True`` + ``rotational_pin_wall=True`` — the 3-D Cd is now
+    POSITIVE and NON-DIVERGING, tracking the monolithic startup transient in
+    sign and shape. See ``tests/p2r1c_thin_plate_flow_3d_projection.py`` (the
+    driver wires exactly this set) and
+    ``docs/dev/2026-07-25-p2r1c-projection-shell-gpu-cg-runbook.md``.
+
+    ⚠️ RESIDUAL GAP: the split's CONVERGED fixed-point Cd is still ~40% below
+    the monolithic on the same mesh (plate-surface pressure jump right-signed
+    but too small); this does NOT close under harder inner iteration — a
+    structural difference between the split's fixed point and the monolithic
+    SBM-NS saddle for the two-sided immersed shell (the deeper
+    ``p2-r2a-monolithic-pivot`` defect, NOT the outflow-BC wiring gap this fix
+    closed). The monolithic SBM-NS saddle
+    (``tests/p2r1c_thin_plate_flow_3d.py``) remains the quantitatively faithful
+    3-D engine; this stepper delivers the correct-signed, SCALABLE (gpu_cg PPE)
+    drag whose magnitude is ~40% low.
 
     PREDICTOR sub-solve: still ``solver=`` (default ``"splu"``,
     nonsymmetric Oseen, not SPD; ``gpu_cg`` is SPD-only). At L4-L6 smoke
@@ -572,7 +579,18 @@ class LeraySBMShellStepper:
                  inner_iterate=False, inner_max=8, inner_tol=1e-6,
                  inner_relax=1.0, inner_accel="none", inner_anderson_m=3,
                  consistent_ppe=False, consistent_projection=False,
+                 rotational_pin_wall=False,
                  verbose=False):
+        # ``rotational_pin_wall`` (FN4, 2026-07-23) — pin the rotational
+        # -nu*q correction to 0 on the IMMERSED SHELL (sbm) nodes. At a weak
+        # Nitsche wall the predictor carries O(1) penetration divergence in the
+        # wall cells, so the Timmermans -nu*q term writes a refinement-growing
+        # pressure error onto the plate nodes the drag integral reads; pinning
+        # q=0 there is the documented immersed-body drag fix (leray.py FN4
+        # note). The base ``step`` already pins q on ``sbm_nodes`` (the shell
+        # face nodes this stepper passes) when the flag is on. Only meaningful
+        # with a rotational pressure update (``consistent_projection`` or
+        # ``pressure_update="rotational"``). Default False => bit-for-bit.
         self.sf_plus = sf_plus
         self.geo_plus = geo_plus
         self.sf_minus = sf_minus
@@ -605,7 +623,8 @@ class LeraySBMShellStepper:
             inner_tol=inner_tol, inner_relax=inner_relax,
             inner_accel=inner_accel, inner_anderson_m=inner_anderson_m,
             consistent_ppe=consistent_ppe,
-            consistent_projection=consistent_projection)
+            consistent_projection=consistent_projection,
+            rotational_pin_wall=rotational_pin_wall)
         base.dir_nodes = self._strong_nodes
         self.base = base
         self.n_free = base.n_free
