@@ -186,3 +186,83 @@ def slab_partition(dims: tuple[int, int, int], n_ranks: int) -> list[SlabPart]:
         )
 
     return partition_list
+
+
+def extract_local_block(K_global_csr, part: SlabPart):
+    """Extract a rank's local operator block from a global CSR matrix.
+
+    Given the global (n x n) CSR matrix and a SlabPart, return the local
+    operator with ``n_owned`` rows and ``n_owned + n_ghost`` columns.  Each
+    column global id appearing in an owned row is remapped to its local index
+    via ``part.local_index``.
+
+    The 1-plane halo (``part.ghost``) covers the full p1 hex 27-point stencil
+    because: interior node ``(i0, i1, i2)`` couples to all
+    ``(i0+di0, i1+di1, i2+di2)`` with ``di0 in {-1, 0, 1}`` — axis-0 changes
+    by at most 1, so the ±1 axis-0 planes are exactly what the halo provides.
+    Axis-1 and axis-2 changes stay within the slab's owned nodes.
+
+    Parameters
+    ----------
+    K_global_csr : scipy.sparse.csr_matrix
+        Square (n x n) global stiffness matrix in CSR format.
+    part : SlabPart
+        Partition metadata for one rank.
+
+    Returns
+    -------
+    scipy.sparse.csr_matrix
+        Local matrix of shape ``(n_owned, n_owned + n_ghost)`` in fp64 CSR.
+        Column j corresponds to ``(owned ++ ghost)[j]`` (local flat index).
+
+    Raises
+    ------
+    AssertionError
+        If any column global id appearing in an owned row is NOT in
+        ``owned ∪ ghost`` (i.e., the halo is insufficient).
+    """
+    import scipy.sparse
+
+    owned_ids = part.owned          # global ids, shape (n_owned,)
+    ghost_ids = part.ghost          # global ids, shape (n_ghost,)
+    n_owned = len(owned_ids)
+    n_ghost = len(ghost_ids)
+    n_local = n_owned + n_ghost
+
+    # Build inverse map: global id -> local column index
+    local_col_map = {}
+    for loc, gid in enumerate(owned_ids):
+        local_col_map[int(gid)] = loc
+    for loc, gid in enumerate(ghost_ids):
+        local_col_map[int(gid)] = n_owned + loc
+
+    # Slice owned rows from the global CSR
+    # K_global_csr[owned_ids, :] extracts rows in one shot
+    owned_row_block = K_global_csr[owned_ids, :]  # shape (n_owned, n_global)
+
+    # Build the local CSR by remapping column indices
+    src = owned_row_block.tocsr()
+    src.sort_indices()
+
+    rows_out, cols_out, vals_out = [], [], []
+    for loc_row in range(n_owned):
+        row_start = src.indptr[loc_row]
+        row_end   = src.indptr[loc_row + 1]
+        for ptr in range(row_start, row_end):
+            gcol = int(src.indices[ptr])
+            val  = float(src.data[ptr])
+            assert gcol in local_col_map, (
+                f"rank {part.rank}: owned row {loc_row} (gid={owned_ids[loc_row]}) "
+                f"has column gid={gcol} not in owned∪ghost — halo too narrow"
+            )
+            rows_out.append(loc_row)
+            cols_out.append(local_col_map[gcol])
+            vals_out.append(val)
+
+    A_local = scipy.sparse.csr_matrix(
+        (np.array(vals_out, dtype=np.float64),
+         (np.array(rows_out, dtype=np.int32),
+          np.array(cols_out, dtype=np.int32))),
+        shape=(n_owned, n_local),
+    )
+    return A_local
