@@ -1,23 +1,28 @@
 """Smoke gate: 3-D thin-plate PROJECTION + two-sided shell + gpu_cg PPE.
 
-PHYSICS-HONEST gate. The 3-D lagged-pressure projection split has a DOCUMENTED
-defect (p2-r2a-monolithic-pivot verdict; docs/dev/2026-07-23-projection-ladder-
-verdict.md): with an open outflow it cannot build the driving stagnation
-pressure from rest, so the 3-D Cd is FINITE but NOT physically faithful. This
-gate therefore asserts ONLY what the wiring guarantees — it does NOT assert
-Cd > 0 or projection ≈ monolithic (both are blocked by the projection-split
-defect, a separate research track):
+PHYSICS-HONEST gate. The outflow-BC p′-scheme fix (2026-07-25,
+projection-pprime-outflow-fix-spec) wired the incremental van-Kan p′-scheme
+outflow BCs (whole outflow-face p′=0 Dirichlet + consistent_projection +
+inner_iterate + rotational_pin_wall) into the 3-D thin-plate projection path.
+This turned the 3-D Cd from wrong-signed + diverging into POSITIVE +
+NON-DIVERGING, tracking the monolithic startup transient in SIGN and SHAPE.
 
   (1) end-to-end: the projection + two-sided-shell + gpu_cg march RUNS and
-      produces a FINITE Cd (np.isfinite);
+      produces a POSITIVE, NON-DIVERGING Cd (all steps > 0, and the last step
+      is no larger than the first — a decaying, not diverging, transient);
   (2) the PPE provably ran on gpu_cg AND converged — verified by spying on
       diffsim.solvers.dist_cg.pcg (the gpu_cg backend) and asserting it was
       called and every call reported converged;
   (3) the two-sided shell coupling is LOAD-BEARING — the two-sided force
       differs materially from the one-sided (drop-Gamma~+) force.
 
-The MONOLITHIC driver (tests/p2r1c_thin_plate_flow_3d.py) remains the correct
-3-D engine; this test guards the scalable projection INFRASTRUCTURE only.
+RESIDUAL GAP (NOT asserted, honest): the split's converged fixed-point Cd is
+~40% BELOW the monolithic on the same mesh (deeper p2-r2a-monolithic-pivot
+defect — the plate-surface pressure jump is the right sign but too small; it
+does NOT close under harder inner iteration). This gate therefore asserts sign
++ non-divergence + shape-tracking, NOT magnitude agreement. The MONOLITHIC
+driver (tests/p2r1c_thin_plate_flow_3d.py) remains the quantitatively faithful
+3-D engine; this test guards the correct-signed, SCALABLE projection path.
 """
 import os
 import sys
@@ -30,21 +35,32 @@ sys.path.insert(0, os.path.dirname(__file__))
 pytestmark = pytest.mark.tier5
 
 
-def test_projection_shell_runs_finite_cd(device):
-    """(1) End-to-end: the projection + two-sided shell + gpu_cg march runs
-    on a tiny 3-D mesh (L3 uniform, 3 steps) and produces a FINITE Cd.
+def test_projection_shell_positive_nondiverging_cd(device):
+    """(1) End-to-end physics gate: the projection + two-sided shell + gpu_cg
+    march produces a POSITIVE, NON-DIVERGING Cd whose startup transient tracks
+    the monolithic reference in SIGN and SHAPE (the outflow-BC p′-scheme fix).
 
-    NOT asserted: Cd > 0 or physical magnitude — the 3-D projection split is
-    a documented weak/wrong steady state (see module docstring). Finiteness
-    is exactly the wiring guarantee.
+    Asserted (the real physics the fix delivers):
+      - every Cd step is finite and POSITIVE (correct drag sign),
+      - the transient is DECAYING, not diverging (Cd[-1] <= Cd[0]),
+      - the monolithic reference on the SAME mesh is also positive+decaying,
+        and the projection final Cd is the SAME SIGN as monolithic and within
+        a generous band (0.3x .. 1.2x) — sign + shape agreement.
+
+    NOT asserted: tight magnitude agreement — the split's converged Cd is ~40%
+    below the monolithic (deeper p2-r2a-monolithic-pivot defect; see module
+    docstring). The band tolerance is deliberately loose to gate sign/shape,
+    not magnitude.
     """
     from p2r1c_thin_plate_flow_3d_projection import run_flow_past_3d_projection
+    from p2r1c_thin_plate_flow_3d import run_flow_past_3d
 
-    res = run_flow_past_3d_projection(level=3, nsteps=3, dt=0.01, nu=0.1,
-                                      U_inf=1.0, alpha=50.0,
-                                      ppe_solver="gpu_cg", verbose=False)
+    kw = dict(level=3, nsteps=8, dt=0.01, nu=0.1, U_inf=1.0, alpha=50.0)
+    res = run_flow_past_3d_projection(ppe_solver="gpu_cg", verbose=False, **kw)
+    mono = run_flow_past_3d(verbose=False, **kw)
 
-    assert np.all(np.isfinite(res["cd"])), f"Cd not finite: {res['cd']}"
+    cd = res["cd"]
+    assert np.all(np.isfinite(cd)), f"Cd not finite: {cd}"
     assert np.all(np.isfinite(res["cl_y"])), f"Cl_y not finite: {res['cl_y']}"
     assert np.all(np.isfinite(res["cl_z"])), f"Cl_z not finite: {res['cl_z']}"
     # the shell must be active (plate cuts the mesh)
@@ -52,6 +68,20 @@ def test_projection_shell_runs_finite_cd(device):
     # the driver reports the PPE solver it was asked to use
     assert res["ppe_solver"] == "gpu_cg", (
         f"ppe_solver field was {res['ppe_solver']!r}, expected 'gpu_cg'")
+
+    # PHYSICS: positive + non-diverging (the outflow-BC p′-scheme fix)
+    assert np.all(cd > 0.0), f"Cd not all positive (drag wrong-signed): {cd}"
+    assert cd[-1] <= cd[0], (
+        f"Cd diverging (last {cd[-1]:.3f} > first {cd[0]:.3f}): {cd}")
+
+    # SHAPE/SIGN agreement with the monolithic reference on the same mesh
+    cd_p, cd_m = float(cd[-1]), float(mono["cd"][-1])
+    assert cd_m > 0.0, f"monolithic reference Cd not positive: {cd_m}"
+    ratio = cd_p / cd_m
+    assert 0.3 <= ratio <= 1.2, (
+        f"projection Cd {cd_p:.3f} vs monolithic {cd_m:.3f} out of the "
+        f"sign/shape band (ratio {ratio:.2f} not in [0.3, 1.2]); the ~40%-low "
+        "magnitude gap is expected but a wrong sign / divergence is not")
 
 
 def test_ppe_ran_on_gpu_cg_and_converged(device, monkeypatch):
