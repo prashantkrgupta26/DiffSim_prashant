@@ -692,6 +692,7 @@ def run_flow_past_projection(
     _return_stepper=False,
     pert_eps=None,           # symmetry-breaking kick: fraction of U_inf (None/0 = off)
     pert_t_end=1.0,          # physical time at which the kick is switched off
+    device="cpu",            # device for the DeviceMesh build (cpu | cuda:0)
 ):
     """Run 2-D flow past a finite thin plate via the PROJECTION stepper.
 
@@ -724,7 +725,7 @@ def run_flow_past_projection(
     # ---- geometry + two-sided surrogate (SAME two-oracle workaround) --------
     fx = _build_shell(level, plate_xc, plate_yc, plate_L, dim=dim,
                       refine_to=refine_to, wake_refine=wake_refine,
-                      band_cells=band_cells)
+                      band_cells=band_cells, device=device)
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
 
     if verbose:
@@ -894,8 +895,10 @@ def compare_solvers(t_start=None, plate_L_physical=None, **cfg):
             proj_only[k] = cfg.pop(k)
 
     # Which monolithic knobs to pull out of cfg (leave the rest for both).
+    # NOTE: "device" stays in cfg so BOTH legs see it (projection also accepts
+    # device= since Task 3 threads it to its DeviceMesh build).
     mono_only = {}
-    for k in ("mono_solver", "device"):
+    for k in ("mono_solver",):
         if k in cfg:
             mono_only[k] = cfg.pop(k)
 
