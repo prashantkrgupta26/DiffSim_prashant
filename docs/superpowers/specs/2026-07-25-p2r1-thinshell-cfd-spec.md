@@ -106,3 +106,44 @@ the CG solve (torch.sparse SpMV + Jacobi + reductions).
 LEVERS to push assembly on-device: (1) parallelize + int64-widen the symbolic
 slot-map; (2) **drop the scipy round-trip** — CG consumes the assembler's
 zero-copy `device_op()`/`CSROperator` instead of `to_csr()`+re-upload.
+
+## Device-residency roadmap (T2b → full device: mesh + assembly + solve)
+Goal (Baskar, 2026-07-25): push **as much of the step-loop device-side as
+possible** — mesh, assembly, AND solve — because full device-residency is the
+*enabler* of the 100M-DOF hero run, not merely an optimization.
+
+**GH200 reframing (drives the priorities below).** On a PCIe box (gpubox),
+device-residency is mostly about *avoiding host↔device transfers*. On the
+**GH200 it is not** — Grace-Hopper coherent memory (NVLink-C2C ~900 GB/s,
+unified address space) makes those transfers cheap. So on GH200 the payoff of
+device-residency is **(a) compute the Grace CPU is slow at, and (b) capacity at
+hero scale** — not transfer-avoidance. Attack slow host *compute* first; treat
+transfer-elimination (the scipy round-trip) as a smaller GH200 win.
+
+**Stage verdicts + ordering (highest ROI first):**
+1. **Assembly symbolic slot-map on-device** *(do first — measured wall).* The
+   numeric fill is already device (warp); the **symbolic slot-map is the L7/L8
+   host hang + L9 int32 assert**, and assembly is **per-step** (NS matrix tracks
+   the advection field) so any host cost is paid every step. Levers: parallelize
+   + int64-widen the slot-map (sort-based assembly); drop the scipy round-trip
+   via zero-copy `device_op()`/`CSROperator`. *Con:* irregular hash-map-like
+   pattern is harder than fill, but tractable.
+2. **Predictor solve on-device** *(second — kills the L9 predictor wall, carries
+   convergence risk).* PPE is already `gpu_cg` (device, SPD-safe); the
+   **predictor is non-symmetric** advection-diffusion → `gpu_cg` does not apply.
+   Two paths: (a) device **GMRES/BiCGStab + preconditioner** (GPU ILU is hard;
+   Jacobi/block-Jacobi may converge poorly for advection-dominated flow), or
+   (b) **IMEX** — explicit advection + implicit diffusion → SPD → reuse `gpu_cg`,
+   at the cost of a CFL `dt` constraint. **Guardrail:** any device predictor MUST
+   be validated against the host `splu` reference at small scale — this is where
+   device-residency can silently cost correctness.
+3. **Mesh (octree/AMR/constraints) on-device** *(defer — lowest ROI).* Octree
+   build + 2:1 balance + hanging-node constraints are pointer-chasing/branchy
+   (worst SIMT fit; parallel balanced-octree is research-grade), it is a
+   one-time/every-N-step **amortized** cost (host built L9-adaptive in 3.87 s),
+   and GH200 coherent memory makes the host-built-mesh upload near-free anyway.
+   **GH200 shortcut:** make host-built mesh structures *device-accessible* via
+   unified/managed memory ("device-accessible" without "device-built") — GH200-
+   only; does not port to gpubox/PCIe or Nova A100. Invest in a true device
+   octree-build only if we move to frequent remeshing (moving geometry) or become
+   host-capacity-bound at hero scale.
