@@ -194,6 +194,7 @@ def run_flow_past(
     dim=2,
     verbose=False,
     _two_sided=True,   # internal flag: False => one-sided anti-vacuity test
+    _return_fields=False,  # internal flag: True => also return mesh + node fields
 ):
     """Run flow past a finite thin plate with transient BDF2 march.
 
@@ -202,6 +203,11 @@ def run_flow_past(
       'cl'       : np.ndarray [nsteps] — lift coefficient history
       'n_excluded': int — number of excluded octree cells (non-zero confirms plate active)
       'nsteps'   : int — number of steps actually taken
+
+    When _return_fields=True, also returns:
+      'mesh'     : the DiffSim Mesh object (full octree connectivity)
+      'node_fields': dict with 'velocity_magnitude' [Nn] and 'pressure' [Nn]
+                     extracted from the final time step's solution
     """
     ndof = dim + 1
     t0 = time.time()
@@ -316,12 +322,28 @@ def run_flow_past(
         print(f"[p2r1a] done in {elapsed:.1f}s  "
               f"Cd[-1]={cd_hist[-1]:+.4f}  Cl[-1]={cl_hist[-1]:+.4f}", flush=True)
 
-    return dict(
+    result = dict(
         cd=cd_hist,
         cl=cl_hist,
         n_excluded=fx["n_excluded"],
         nsteps=nsteps,
     )
+
+    if _return_fields:
+        # Extract node-level fields from the final step's x_all.
+        # x_all is [Nn * ndof] node-major: node 0 has [u_x, u_y, p],
+        # node 1 has [u_x, u_y, p], etc.
+        x_nodes = np.asarray(x_all).reshape(-1, ndof)   # [Nn, ndof]
+        u_node = x_nodes[:, :dim]                        # [Nn, dim]
+        p_node = x_nodes[:, dim]                         # [Nn]
+        vel_mag = np.linalg.norm(u_node, axis=1)         # [Nn]
+        result["mesh"] = mesh
+        result["node_fields"] = {
+            "velocity_magnitude": vel_mag,
+            "pressure": p_node,
+        }
+
+    return result
 
 
 def run_flow_past_one_sided(**kwargs):
@@ -366,6 +388,7 @@ RE250_CONFIG = dict(
 if __name__ == "__main__":
     import os
     from diffsim.postproc.shedding import time_avg_cd, strouhal
+    from diffsim.viz.results import save_flow_run
 
     level = int(os.environ.get("LEVEL", "5"))
     nsteps = int(os.environ.get("NSTEPS", "10"))
@@ -382,10 +405,18 @@ if __name__ == "__main__":
     # run (plate_L=1/16=0.0625) this gives plate_L_physical=1.0 (physical units).
     plate_L_physical = plate_L * 16.0  # *16: domain-height denormalization
 
+    # Re number for the case name (dimensionless: Re = U_inf / nu for L=1)
+    re_approx = int(round(U_inf / nu)) if nu > 0 else 0
+    case_name = f"p2r1a_re{re_approx}_L{level}"
+
+    # Run with _return_fields=True so we get mesh + node fields for VTU export.
+    # The CI smoke test calls run_flow_past() directly without _return_fields,
+    # so it is completely unaffected by this flag.
     res = run_flow_past(
         level=level, nsteps=nsteps, dt=dt, nu=nu, U_inf=U_inf,
         plate_xc=plate_xc, plate_yc=plate_yc, plate_L=plate_L,
         verbose=True,
+        _return_fields=True,
     )
     print(f"Cd={res['cd']}")
     print(f"Cl={res['cl']}")
@@ -399,3 +430,20 @@ if __name__ == "__main__":
         print(f"Cd_mean={cd_mean:.4f}  St={St:.4f}  freq={freq:.4f}")
     except ValueError as exc:
         print(f"Cd_mean={cd_mean:.4f}  St=N/A (too short: {exc})")
+
+    # ---- Export visualization artifacts to results/ (Dropbox-synced) ----------
+    # Body: the thin plate is a 2-D line segment, which cannot be represented as
+    # a valid triangle mesh (needs >= 3 non-collinear vertices with area > 0).
+    # save_flow_run detects this and skips the body export with a clear message.
+    t_hist = t_arr
+    written = save_flow_run(
+        case_name,
+        mesh=res.get("mesh"),
+        node_fields=res.get("node_fields"),
+        histories={"Cd": (t_hist, res["cd"]), "Cl": (t_hist, res["cl"])},
+        body=None,   # 2-D line plate: no valid surface mesh — skip body export
+    )
+    if written:
+        print(f"[p2r1a] Results written: {list(written.values())}")
+    else:
+        print("[p2r1a] No results written (viz deps missing or export failed)")
