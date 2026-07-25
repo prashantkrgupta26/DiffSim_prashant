@@ -73,7 +73,8 @@ import scipy.sparse as sp
 
 from ..mesh.faces import face_tables
 from ..sbm.surrogate import (classify_lambda, extract_surrogate, GeometryData)
-from ..sbm.vector import sbm_vector_dirichlet, surrogate_traction
+from ..sbm.vector import (sbm_vector_dirichlet, sbm_vector_dirichlet_twosided,
+                          surrogate_traction)
 from ..solvers.timestepping import bdf_coeffs, bdf_order_now
 from .leray import LerayProjectionStepper
 
@@ -499,3 +500,367 @@ class LeraySBMStepper:
                 net += w * ((ftab.N[f][q] @ un) @ n)
                 area += w
         return net / area, net, area
+
+
+class LeraySBMShellStepper:
+    """Two-sided co-dim-1 thin-shell SBM projection stepper.
+
+    Mirrors ``LeraySBMStepper`` but drives the immersed body with the
+    TWO-SIDED shifted-Nitsche assembly (``sbm_vector_dirichlet_twosided``,
+    both Γ̃+ and Γ̃−) instead of the one-sided ``sbm_vector_dirichlet``.
+
+    The caller pre-builds the two-sided surrogate from
+    ``extract_two_sided_surrogate`` and passes the four geometry objects
+    ``(sf_plus, geo_plus, sf_minus, geo_minus)`` directly — the per-epoch
+    pipeline (classify + extract) has already run. The PPE sub-solve uses
+    ``ppe_solver=`` (default ``"gpu_cg"``, the SPD Jacobi-CG on device)
+    which is the scalable lever for L9-near-plate scale (~186k nodes).
+
+    PREDICTOR sub-solve: still ``solver=`` (default ``"splu"``,
+    nonsymmetric Oseen, not SPD; ``gpu_cg`` is SPD-only). At L4-L6 smoke
+    scales splu is fine. For near-L9 scales the predictor becomes the
+    bottleneck — FGMRES (device #49 or AMGX) is the follow-on work.
+
+    PPE sub-solve: ``ppe_solver="gpu_cg"`` routes through
+    ``solve_linear(..., sym=True)`` -> ``dist_cg.pcg + SerialComm``
+    (torch.sparse_csr_tensor CG on device, Jacobi preconditioned). No
+    factorization; no matrix caching. The convergence info is logged when
+    ``verbose=True``.
+
+    Two-sided coupling in the PPE: the surrogate-consistent PPE flux
+    (T6 or homogeneous Neumann) is applied on BOTH sides by summing the
+    two side contributions (same loop structure as the one-sided T6 but
+    iterating over both ``(sf_plus, geo_plus)`` and ``(sf_minus, geo_minus)``).
+    The homogeneous-Neumann default leaves the natural BC on both sides
+    — identical to the one-sided case.
+
+    All one-sided public methods and behaviours are preserved:
+    - ``set_initial``, ``step``, ``divergence_l2``, ``t``.
+    - ``surrogate_traction``: sums Fp + Fm (both sides).
+    - ``surrogate_normal_flux``: sums net flux over both sides.
+    """
+
+    def __init__(self, sf_plus, geo_plus, sf_minus, geo_minus,
+                 dm, nu, dt, f_fn, *, u_inf, strong_mask,
+                 lam=0.5, domain="outside", order=2, picard_iters=2,
+                 solver="splu", ppe_solver="gpu_cg",
+                 ppe_finescale=False, alpha=10.0,
+                 beta_backflow=1.0, velocity_update="consistent",
+                 graddiv_scale=1.0, pressure_update="standard",
+                 ppe_fine_scale=False, pressure_outflow_nodes=None,
+                 sbm_pressure_coupling=False,
+                 inner_iterate=False, inner_max=8, inner_tol=1e-6,
+                 inner_relax=1.0, inner_accel="none", inner_anderson_m=3,
+                 consistent_ppe=False, consistent_projection=False,
+                 verbose=False):
+        self.sf_plus = sf_plus
+        self.geo_plus = geo_plus
+        self.sf_minus = sf_minus
+        self.geo_minus = geo_minus
+        self.dm = dm
+        self.nu = nu
+        self.dt = dt
+        self.dim = dm.dim
+        self.ndof = dm.dim + 1
+        self.alpha = alpha
+        self.beta_backflow = beta_backflow
+        self.sbm_pressure_coupling = bool(sbm_pressure_coupling)
+        self.verbose = verbose
+
+        u_inf = np.asarray(u_inf, dtype=np.float64)
+        strong_mask = np.asarray(strong_mask, dtype=bool)
+        self.strong_mask = strong_mask
+        self.u_inf = u_inf
+        self._strong_nodes = np.where(strong_mask)[0]
+
+        # Base projection stepper — predictor uses solver, PPE uses ppe_solver.
+        base = LerayProjectionStepper(
+            dm, nu, dt, f_fn, self._g_box, order=order,
+            picard_iters=picard_iters, solver=solver, ppe_solver=ppe_solver,
+            ppe_finescale=ppe_finescale,
+            velocity_update=velocity_update, graddiv_scale=graddiv_scale,
+            pressure_update=pressure_update, ppe_fine_scale=ppe_fine_scale,
+            pressure_outflow_nodes=pressure_outflow_nodes,
+            inner_iterate=inner_iterate, inner_max=inner_max,
+            inner_tol=inner_tol, inner_relax=inner_relax,
+            inner_accel=inner_accel, inner_anderson_m=inner_anderson_m,
+            consistent_ppe=consistent_ppe,
+            consistent_projection=consistent_projection)
+        base.dir_nodes = self._strong_nodes
+        self.base = base
+        self.n_free = base.n_free
+
+        # Constraint prolongation matrices
+        T = dm.constraints.T.tocsr()
+        self._T_vec = sp.kron(T, sp.identity(self.ndof, format="csr"),
+                              format="csr")
+        self._g_body = lambda y: np.zeros((len(y), self.dim))  # no-slip
+
+        # TWO-SIDED geometry block assembled ONCE (sum of + and - sides)
+        Af_raw, bf_raw = sbm_vector_dirichlet_twosided(
+            dm, sf_plus, geo_plus, sf_minus, geo_minus,
+            self._g_body, nu, self.ndof, alpha=alpha,
+            a_face_plus=None, a_face_minus=None,
+            beta_backflow=beta_backflow)
+        self.Af_c = (self._T_vec.T @ Af_raw @ self._T_vec).tocsr()
+        self.bf_c = np.asarray(self._T_vec.T @ bf_raw)
+
+        # Per-step backflow GP tables for BOTH sides
+        self._bf_setup_twosided()
+
+        # SBM-governed free nodes: union of both sides' surrogate-face nodes
+        self._sbm_nodes = self._compute_sbm_nodes_twosided()
+
+    def _g_box(self, coords_at_dir, t):
+        return self.u_inf[self._strong_nodes]
+
+    def _compute_sbm_nodes_twosided(self):
+        """Union of surrogate-face nodes from both shell sides."""
+        dm = self.dm
+        mesh = dm.mesh
+
+        def _face_nodes(sf):
+            if sf.elem.size == 0:
+                return np.array([], dtype=np.int64)
+            conn = mesh.conn_of[1][np.searchsorted(mesh.bins[1], sf.elem)]
+            return np.unique(conn.ravel())
+
+        glob_p = _face_nodes(self.sf_plus)
+        glob_m = _face_nodes(self.sf_minus)
+        glob = np.unique(np.concatenate([glob_p, glob_m]))
+        # Map to free-node indices
+        free_idx = dm.constraints.free_nodes
+        free_of = np.full(dm.n_nodes, -1, dtype=np.int64)
+        free_of[free_idx] = np.arange(len(free_idx))
+        fn = free_of[glob]
+        return fn[fn >= 0]
+
+    def _bf_setup_twosided(self):
+        """Cache surrogate-face GP tables for BOTH sides for backflow."""
+        dm = self.dm
+        mesh = dm.mesh
+
+        def _setup_side(sf):
+            if sf.elem.size == 0:
+                return 1, face_tables(1, self.dim), np.empty((0,), dtype=np.int64)
+            pv = int(np.unique(np.asarray(mesh.p_elem)[sf.elem])[0])
+            ftab = face_tables(pv, self.dim)
+            conn = mesh.conn_of[pv][np.searchsorted(mesh.bins[pv], sf.elem)]
+            return pv, ftab, conn
+
+        pv_p, ftab_p, conn_p = _setup_side(self.sf_plus)
+        _pv_m, _ftab_m, conn_m = _setup_side(self.sf_minus)
+        # Both sides share the same polynomial order on octree P1 meshes
+        self._bf_pv = pv_p
+        self._bf_ftab = ftab_p
+        self._bf_conn_p = conn_p
+        self._bf_conn_m = conn_m
+
+    def _a_face_side(self, u_free, sf, conn):
+        """Advecting field at the surrogate-face GPs for one side."""
+        dm = self.dm
+        u_full = np.asarray(dm.constraints.T @ u_free)
+        ftab = self._bf_ftab
+        nqf = ftab.nqf
+        af = np.empty((len(sf.elem) * nqf, self.dim))
+        for fi in range(len(sf.elem)):
+            f = int(sf.face[fi])
+            un = u_full[conn[fi]]
+            for q in range(nqf):
+                af[fi * nqf + q] = ftab.N[f][q] @ un
+        return af
+
+    def _backflow_block_twosided(self, u_free):
+        """Per-step backflow matrix increment for the two-sided shell.
+
+        Calls ``sbm_vector_dirichlet_twosided`` with the current advecting
+        field on each side and differences against the cached geometry-only
+        block (the Task-2 caching invariant from the one-sided path).
+        """
+        if self.beta_backflow == 0.0:
+            return None
+        af_p = self._a_face_side(u_free, self.sf_plus, self._bf_conn_p)
+        af_m = self._a_face_side(u_free, self.sf_minus, self._bf_conn_m)
+        if not np.any(af_p) and not np.any(af_m):
+            return None
+        Af_bf_raw, _ = sbm_vector_dirichlet_twosided(
+            self.dm, self.sf_plus, self.geo_plus,
+            self.sf_minus, self.geo_minus,
+            self._g_body, self.nu, self.ndof, alpha=self.alpha,
+            a_face_plus=af_p, a_face_minus=af_m,
+            beta_backflow=self.beta_backflow)
+        Ab = ((self._T_vec.T @ Af_bf_raw @ self._T_vec).tocsr()
+              - self.Af_c)
+        return Ab
+
+    def _extra_block(self, u_free):
+        """Predictor SBM extra-block: cached geometry block + backflow."""
+        Ab = self._backflow_block_twosided(u_free)
+        A = self.Af_c if Ab is None else (self.Af_c + Ab).tocsr()
+        b = self.bf_c
+        return (A, b)
+
+    def _t6_nopenetration_flux_twosided(self, uhat):
+        """T6 surrogate-consistent PPE flux summed over BOTH shell sides.
+
+        Mirrors ``LeraySBMStepper._t6_nopenetration_flux`` but iterates
+        over (sf_plus, geo_plus) then (sf_minus, geo_minus) and sums the
+        two contributions. The sign convention is identical: n_hat = -geo.n
+        (outward from the fluid, INTO the shell) for each side, and the
+        shifted normal velocity n_hat . u_tilde drives the continuity
+        constraint.
+        """
+        dm = self.dm
+        mesh = dm.mesh
+        dim = self.dim
+        ftab = self._bf_ftab
+        nqf = ftab.nqf
+        h_p = mesh.tree.h()[self.sf_plus.elem]
+        h_m = mesh.tree.h()[self.sf_minus.elem]
+        dscale_p = 2.0 / h_p
+        dscale_m = 2.0 / h_m
+        from ..solvers.timestepping import bdf_coeffs, bdf_order_now
+        b0, _b1, _b2 = bdf_coeffs(
+            bdf_order_now(self.base.t + self.dt, self.dt, self.base.order,
+                          have_history=self.base.hist.have(2)), self.dt)
+        sigma = b0 / self.dt
+        u_full = np.asarray(dm.constraints.T @ uhat)
+        rhs = np.zeros(dm.n_nodes)
+
+        def _side(sf, geo, conn, h, dscale):
+            jacS = (h / 2.0) ** (dim - 1)
+            dvec = geo.d.reshape(len(sf.elem), nqf, dim)
+            for fi in range(len(sf.elem)):
+                f = int(sf.face[fi])
+                un = u_full[conn[fi]]
+                for q in range(nqf):
+                    w = ftab.w[q] * jacS[fi] * geo.corr[fi * nqf + q]
+                    n_hat = -geo.n[fi * nqf + q]
+                    Nq = ftab.N[f][q]
+                    gradu = (ftab.dN[f][q] * dscale[fi]).T @ un
+                    u_gp = Nq @ un
+                    u_tilde = u_gp + gradu @ dvec[fi, q]
+                    un_tilde = u_tilde @ n_hat
+                    rhs[conn[fi]] += Nq * (sigma * w * un_tilde)
+
+        _side(self.sf_plus, self.geo_plus, self._bf_conn_p, h_p, dscale_p)
+        _side(self.sf_minus, self.geo_minus, self._bf_conn_m, h_m, dscale_m)
+        return rhs
+
+    # ---- public ergonomics ----
+    def set_initial(self, u0_fn):
+        self.base.set_initial(u0_fn)
+
+    def divergence_l2(self):
+        return self.base.divergence_l2()
+
+    @property
+    def t(self):
+        return self.base.t
+
+    def _current_a_free(self):
+        if self.base.hist.pre1 is None:
+            return np.zeros((self.n_free, self.dim))
+        return self.base._uvec(self.base.hist.pre1)
+
+    def _predict(self, return_matrix=False):
+        return self.base._predict(
+            extra_block=self._extra_block(self._current_a_free()),
+            sbm_nodes=self._sbm_nodes, return_matrix=return_matrix)
+
+    def step(self, surrogate_consistent=True):
+        """One projection step with the two-sided shell PPE + correction.
+
+        PPE surrogate BC: same homogeneous-Neumann convention as the
+        one-sided stepper (Suresh Remark 3.9). When ``sbm_pressure_coupling``
+        is True, T6 is applied on BOTH shell sides (see
+        ``_t6_nopenetration_flux_twosided``).
+        """
+        if not surrogate_consistent:
+            flux = self._ppe_break_flux_twosided
+        elif self.sbm_pressure_coupling:
+            flux = self._t6_nopenetration_flux_twosided
+        else:
+            flux = None  # homogeneous Neumann (correct default)
+        return self.base.step(
+            extra_block=self._extra_block(self._current_a_free()),
+            sbm_nodes=self._sbm_nodes, ppe_surrogate_flux=flux)
+
+    def _ppe_break_flux_twosided(self, uhat):
+        """Planted-break flux summed over both shell sides (anti-vacuity)."""
+        dm = self.dm
+        mesh = dm.mesh
+        dim = self.dim
+        ftab = self._bf_ftab
+        nqf = ftab.nqf
+        from ..solvers.timestepping import bdf_coeffs, bdf_order_now
+        b0, _b1, _b2 = bdf_coeffs(
+            bdf_order_now(self.base.t + self.dt, self.dt, self.base.order,
+                          have_history=self.base.hist.have(2)), self.dt)
+        sigma = b0 / self.dt
+        u_full = np.asarray(dm.constraints.T @ uhat)
+        rhs = np.zeros(dm.n_nodes)
+
+        def _side(sf, geo, conn):
+            h = mesh.tree.h()[sf.elem]
+            jacS = (h / 2.0) ** (dim - 1)
+            for fi in range(len(sf.elem)):
+                f = int(sf.face[fi])
+                un = u_full[conn[fi]]
+                for q in range(nqf):
+                    w = ftab.w[q] * jacS[fi] * geo.corr[fi * nqf + q]
+                    n = geo.n[fi * nqf + q]
+                    uq_n = (ftab.N[f][q] @ un) @ n
+                    rhs[conn[fi]] += ftab.N[f][q] * (sigma * w * uq_n)
+
+        _side(self.sf_plus, self.geo_plus, self._bf_conn_p)
+        _side(self.sf_minus, self.geo_minus, self._bf_conn_m)
+        return rhs
+
+    def surrogate_traction(self):
+        """Two-sided traction: Fp + Fm."""
+        if self.base.hist.pre1 is None:
+            return np.zeros(self.dim)
+        u = self.base._uvec(self.base.hist.pre1)
+        xfree = np.zeros(self.n_free * self.ndof)
+        xv = xfree.reshape(self.n_free, self.ndof)
+        xv[:, :self.dim] = u
+        xv[:, self.dim] = self.base.p_star
+        x_full = np.asarray(self._T_vec @ xfree)
+        Fp = surrogate_traction(self.dm, self.sf_plus, self.geo_plus,
+                                x_full, self.nu, self.ndof)
+        Fm = surrogate_traction(self.dm, self.sf_minus, self.geo_minus,
+                                x_full, self.nu, self.ndof)
+        return Fp + Fm
+
+    def surrogate_normal_flux(self, u_free=None):
+        """Area-averaged normal flux summed over both shell sides."""
+        dm = self.dm
+        mesh = dm.mesh
+        dim = self.dim
+        ftab = self._bf_ftab
+        nqf = ftab.nqf
+        if u_free is None:
+            u_free = self.base._uvec(self.base.hist.pre1)
+        u_full = np.asarray(dm.constraints.T @ u_free)
+
+        def _flux(sf, geo, conn):
+            h = mesh.tree.h()[sf.elem]
+            jacS = (h / 2.0) ** (dim - 1)
+            net, area = 0.0, 0.0
+            for fi in range(len(sf.elem)):
+                f = int(sf.face[fi])
+                un = u_full[conn[fi]]
+                for q in range(nqf):
+                    w = ftab.w[q] * jacS[fi] * geo.corr[fi * nqf + q]
+                    n = geo.n[fi * nqf + q]
+                    net += w * ((ftab.N[f][q] @ un) @ n)
+                    area += w
+            return net, area
+
+        net_p, area_p = _flux(self.sf_plus, self.geo_plus, self._bf_conn_p)
+        net_m, area_m = _flux(self.sf_minus, self.geo_minus, self._bf_conn_m)
+        net = net_p + net_m
+        area = area_p + area_m
+        mean_un = net / area if area > 0 else 0.0
+        return mean_un, net, area
