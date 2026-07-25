@@ -46,3 +46,6 @@ previous_codes/
 
 # Reference C++/MPI group codes (Dendrite-kt), large binaries — parity anchors, not tracked
 local_code_old/
+
+# Simulation/viz outputs — sync to home mac via Dropbox, not tracked
+results/
