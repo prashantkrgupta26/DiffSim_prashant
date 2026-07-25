@@ -91,7 +91,8 @@ from scipy.sparse.linalg import splu
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from diffsim.octree.build import build_uniform
+from diffsim.octree.build import build_uniform, refine_elements
+from diffsim.octree.balance import balance2to1
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
 from diffsim.mesh.basis import basis_tables
@@ -130,22 +131,133 @@ def _make_plate(x_c, y_c, L):
     return segment, plane
 
 
-def _build_shell(level, x_c, y_c, L, dim=2):
+def _build_shell(level, x_c, y_c, L, dim=2,
+                 refine_to=None, wake_refine=None, band_cells=2):
     """Build the two-sided shell surrogate for a finite vertical plate.
 
     Uses Segment for classification (finite plate extent) and Plane for
     surrogate face extraction (correct signed psi for Newton projection).
-    Returns a dict with all mesh/shell data needed for the march."""
+
+    ``refine_to=None`` -> uniform octree at ``level`` (unchanged legacy path).
+    ``refine_to=int``  -> ADAPTIVE octree: uniform base at ``level``, refined
+                          near the plate to ``refine_to`` and (optionally) in a
+                          downstream WAKE band to ``wake_refine`` — via
+                          ``build_adaptive_plate_mesh_2d``.
+
+    Returns a dict with all mesh/shell data needed for the march.  When adaptive
+    it also carries n_nodes/n_hanging/build_time for logging."""
     segment, plane = _make_plate(x_c, y_c, L)
-    tree = build_uniform(level, dim=dim)
-    ret, intercepted = classify_shell_intercepted(tree, segment)
-    mesh = build_mesh(ret, p=1)
-    cons = build_constraints(mesh)
+    extra = {}
+    if refine_to is None:
+        tree = build_uniform(level, dim=dim)
+        ret, intercepted = classify_shell_intercepted(tree, segment)
+        mesh = build_mesh(ret, p=1)
+        cons = build_constraints(mesh)
+        n_excluded = int(intercepted.sum())
+    else:
+        amr = build_adaptive_plate_mesh_2d(
+            level, refine_to, segment, x_c=x_c, y_c=y_c, L=L,
+            wake_refine=wake_refine, band_cells=band_cells)
+        mesh = amr["mesh"]
+        cons = amr["cons"]
+        ret = amr["ret"]
+        n_excluded = amr["n_excluded"]
+        extra = dict(n_nodes=amr["n_nodes"], n_hanging=amr["n_hanging"],
+                     build_time=amr["build_time"])
     dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=dim), "cpu")
     (sfp, gp), (sfm, gm) = extract_two_sided_surrogate(
         ret, plane, face_tables(1, dim))
     return dict(dm=dm, mesh=mesh, cons=cons, sfp=sfp, gp=gp, sfm=sfm, gm=gm,
-                n_excluded=int(intercepted.sum()))
+                n_excluded=n_excluded, **extra)
+
+
+def build_adaptive_plate_mesh_2d(base_level, refine_to, plate_geom,
+                                 x_c=0.375, y_c=0.5, L=0.25,
+                                 wake_refine=None, band_cells=2):
+    """Build an adaptive 2-D quadtree mesh graded near a Segment plate + wake.
+
+    2-D mirror of ``p2r1c_thin_plate_flow_3d.build_adaptive_plate_mesh``.
+
+    Starting from a uniform quadtree at ``base_level``, iterates level by level
+    from ``base_level+1`` up to ``refine_to``.  At each pass it refines cells
+    whose center is within ``band_cells * h_local`` of the plate (measured by
+    ``plate_geom.psi()`` — the Segment's unsigned distance — on element
+    centers), then applies ``balance2to1`` (2:1 balance).  Optionally a
+    downstream WAKE band (x >= x_c, |y - y_c| <= L/2 + a few cells) is also
+    refined, capped at ``wake_refine`` (typically one level coarser than the
+    plate target).  After all passes, ``classify_shell_intercepted`` excludes
+    plate-cut cells, then the FEM mesh + hanging-node constraints are built on
+    the post-exclusion tree.
+
+    Parameters
+    ----------
+    base_level : int
+        Starting uniform quadtree level (e.g. 7 = 128^2 cells).
+    refine_to : int
+        Target refinement level immediately around the plate (>= base_level).
+    plate_geom : Segment
+        Plate geometry; ``psi()`` (unsigned distance) is called on element
+        centers to measure distance to the finite plate.
+    x_c, y_c, L : float
+        Plate center-x, center-y, and length (define the wake band extent).
+    wake_refine : int or None
+        Cap level for the downstream wake band (e.g. one below ``refine_to``).
+        None => no separate wake refinement (only the plate band is graded).
+    band_cells : int
+        Half-width of each refinement band in units of the LOCAL cell size at
+        the level being applied.  Default 2 keeps bands thin.
+
+    Returns
+    -------
+    dict with keys:
+      'mesh'        : the built FEM mesh (post plate-cell exclusion)
+      'cons'        : hanging-node constraints (post-exclusion)
+      'ret'         : classified tree from classify_shell_intercepted
+      'n_nodes'     : total node count (actual solver mesh)
+      'n_hanging'   : number of hanging nodes
+      'n_excluded'  : number of plate-intercepted cells excluded
+      'build_time'  : wall-clock seconds for the entire mesh build
+    """
+    import torch
+    t0 = time.time()
+    tree = build_uniform(base_level, dim=2)
+    y_lo, y_hi = y_c - L / 2.0, y_c + L / 2.0
+    for lvl in range(base_level + 1, refine_to + 1):
+        centers = tree.centers()                        # [N, 2] in [0,1]^2
+        pts_t = torch.tensor(centers, dtype=torch.float64)
+        psi_vals = plate_geom.psi(pts_t).detach().numpy()   # [N] unsigned dist
+        h_local = tree.h()                              # [N] current cell sizes
+        # PLATE band: cells within band_cells * h of the plate segment.
+        mask = psi_vals < band_cells * h_local
+        # WAKE band: a downstream strip behind the plate, capped at wake_refine.
+        if wake_refine is not None and lvl <= wake_refine:
+            pad = band_cells * h_local
+            in_wake = (
+                (centers[:, 0] >= x_c) &
+                (centers[:, 1] >= (y_lo - pad)) &
+                (centers[:, 1] <= (y_hi + pad))
+            )
+            mask = mask | in_wake
+        if not mask.any():
+            break
+        tree = refine_elements(tree, mask)
+        tree = balance2to1(tree)
+    # Exclude plate-intercepted cells so counts reflect the actual solver mesh.
+    ret, intercepted = classify_shell_intercepted(tree, plate_geom)
+    mesh = build_mesh(ret, p=1)
+    cons = build_constraints(mesh)
+    n_nodes = len(mesh.node_coords)
+    n_hanging = int(cons.hanging.sum())
+    build_time = time.time() - t0
+    return dict(
+        mesh=mesh,
+        cons=cons,
+        ret=ret,
+        n_nodes=n_nodes,
+        n_hanging=n_hanging,
+        n_excluded=int(intercepted.sum()),
+        build_time=build_time,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +364,9 @@ def run_flow_past(
     plate_L=0.25,
     dim=2,
     verbose=False,
+    refine_to=None,    # None => uniform mesh; int => adaptive plate-graded mesh
+    wake_refine=None,  # optional wake-band cap level (adaptive only)
+    band_cells=2,      # refinement-band half-width in local cell sizes
     _two_sided=True,   # internal flag: False => one-sided anti-vacuity test
     _return_fields=False,  # internal flag: True => also return mesh + node fields
     pert_eps=None,     # symmetry-breaking kick: fraction of U_inf (None or 0.0 = off)
@@ -293,11 +408,17 @@ def run_flow_past(
     t0 = time.time()
 
     # ---- geometry + mesh ----------------------------------------------------
-    fx = _build_shell(level, plate_xc, plate_yc, plate_L, dim=dim)
+    fx = _build_shell(level, plate_xc, plate_yc, plate_L, dim=dim,
+                      refine_to=refine_to, wake_refine=wake_refine,
+                      band_cells=band_cells)
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
 
     if verbose:
-        print(f"[p2r1a] level={level}  n_excluded={fx['n_excluded']}  "
+        mode = (f"adaptive(base={level},plate->{refine_to},wake->{wake_refine})"
+                if refine_to else f"uniform(L{level})")
+        _n = f"  n_nodes={fx.get('n_nodes')}  n_hanging={fx.get('n_hanging')}" \
+             if refine_to else ""
+        print(f"[p2r1a] mesh={mode}  n_excluded={fx['n_excluded']}{_n}  "
               f"sfp={fx['sfp'].elem.size}  sfm={fx['sfm'].elem.size}  "
               f"nsteps={nsteps}  dt={dt}  nu={nu}", flush=True)
 
@@ -538,6 +659,9 @@ def run_flow_past_projection(
     plate_L=0.25,
     dim=2,
     verbose=False,
+    refine_to=None,          # None => uniform mesh; int => adaptive plate-graded
+    wake_refine=None,        # optional wake-band cap level (adaptive only)
+    band_cells=2,            # refinement-band half-width in local cell sizes
     ppe_solver="splu",       # splu on CPU (Mac); gpu_cg on GPU (gpubox/GH200)
     predictor_solver="splu",
     picard_iters=2,
@@ -582,11 +706,17 @@ def run_flow_past_projection(
     t0 = time.time()
 
     # ---- geometry + two-sided surrogate (SAME two-oracle workaround) --------
-    fx = _build_shell(level, plate_xc, plate_yc, plate_L, dim=dim)
+    fx = _build_shell(level, plate_xc, plate_yc, plate_L, dim=dim,
+                      refine_to=refine_to, wake_refine=wake_refine,
+                      band_cells=band_cells)
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
 
     if verbose:
-        print(f"[p2r1a-proj] level={level}  n_excluded={fx['n_excluded']}  "
+        mode = (f"adaptive(base={level},plate->{refine_to},wake->{wake_refine})"
+                if refine_to else f"uniform(L{level})")
+        _n = f"  n_nodes={fx.get('n_nodes')}  n_hanging={fx.get('n_hanging')}" \
+             if refine_to else ""
+        print(f"[p2r1a-proj] mesh={mode}  n_excluded={fx['n_excluded']}{_n}  "
               f"sfp={fx['sfp'].elem.size}  sfm={fx['sfm'].elem.size}  "
               f"nsteps={nsteps}  dt={dt}  nu={nu}  "
               f"ppe_solver={ppe_solver}", flush=True)
@@ -840,12 +970,71 @@ RE250_CONFIG = dict(
 )
 
 
+def report_adaptive_sizes_2d(
+    base_level=7,
+    refine_levels=(9, 11),
+    wake_refine=9,
+    plate_xc=5.0 / 36.0,
+    plate_yc=8.0 / 16.0,
+    plate_L=1.0 / 16.0,
+    band_cells=2,
+):
+    """Build-only node/element-count probe for the adaptive 2-D plate mesh.
+
+    2-D mirror of ``p2r1c_thin_plate_flow_3d.report_adaptive_sizes``.  For each
+    ``refine_to`` in ``refine_levels`` builds the adaptive plate+wake mesh (no
+    solve) and prints refine_to, n_nodes, n_elems, n_hanging, cells-across-plate
+    (2^refine_to * plate_L, the number of plate-target cells spanning the plate
+    length), and build_time.  The defaults are the intended RE250 mesh
+    (base L7, wake L9, plate L9 and L11).  Returns a list of dicts.
+
+    Example::
+
+        python -c "from p2r1a_thin_plate_flow import report_adaptive_sizes_2d; report_adaptive_sizes_2d()"
+    """
+    segment, _ = _make_plate(plate_xc, plate_yc, plate_L)
+    print(f"base_level={base_level}  wake_refine={wake_refine}  "
+          f"plate_L(norm)={plate_L:.5f}")
+    print(f"{'refine_to':>10}  {'n_nodes':>10}  {'n_elems':>10}  "
+          f"{'n_hanging':>10}  {'cells/plate':>12}  {'build(s)':>10}")
+    print("-" * 72)
+    rows = []
+    for refine_to in refine_levels:
+        try:
+            r = build_adaptive_plate_mesh_2d(
+                base_level, refine_to, segment,
+                x_c=plate_xc, y_c=plate_yc, L=plate_L,
+                wake_refine=wake_refine, band_cells=band_cells)
+            n_elems = len(r["ret"])
+            cells_across = plate_L * (2 ** refine_to)
+            print(f"{refine_to:>10}  {r['n_nodes']:>10}  {n_elems:>10}  "
+                  f"{r['n_hanging']:>10}  {cells_across:>12.1f}  "
+                  f"{r['build_time']:>10.2f}")
+            rows.append(dict(refine_to=refine_to, n_nodes=r["n_nodes"],
+                             n_elems=n_elems, n_hanging=r["n_hanging"],
+                             cells_across_plate=cells_across,
+                             build_time=r["build_time"]))
+        except Exception as exc:
+            print(f"{refine_to:>10}  ERROR: {exc}")
+            rows.append(dict(refine_to=refine_to, error=str(exc)))
+    return rows
+
+
 if __name__ == "__main__":
     import os
     from diffsim.postproc.shedding import time_avg_cd, strouhal
     from diffsim.viz.results import save_flow_run
 
     level = int(os.environ.get("LEVEL", "5"))
+    # Adaptive-mesh env vars (mirror the 3-D driver's BASE_LEVEL/REFINE_LEVEL).
+    # BASE_LEVEL defaults to LEVEL; REFINE_LEVEL (plate target) and WAKE_LEVEL
+    # (wake-band cap) enable the graded adaptive mesh when REFINE_LEVEL is set.
+    base_level = int(os.environ.get("BASE_LEVEL", str(level)))
+    _refine_str = os.environ.get("REFINE_LEVEL", "")
+    refine_to = int(_refine_str) if _refine_str else None
+    _wake_str = os.environ.get("WAKE_LEVEL", "")
+    wake_refine = int(_wake_str) if _wake_str else None
+    band_cells = int(os.environ.get("BAND_CELLS", "2"))
     nsteps = int(os.environ.get("NSTEPS", "10"))
     dt = float(os.environ.get("DT", "0.01"))
     nu = float(os.environ.get("NU", "0.1"))
@@ -867,7 +1056,11 @@ if __name__ == "__main__":
 
     # Re number for the case name (dimensionless: Re = U_inf / nu for L=1)
     re_approx = int(round(U_inf / nu)) if nu > 0 else 0
-    case_name = f"p2r1a_re{re_approx}_L{level}"
+    if refine_to:
+        case_name = (f"p2r1a_re{re_approx}_L{base_level}_plate{refine_to}"
+                     + (f"_wake{wake_refine}" if wake_refine else ""))
+    else:
+        case_name = f"p2r1a_re{re_approx}_L{level}"
 
     # ---- BOTH-SOLVER comparison mode (SOLVER=both or COMPARE=1) ------------
     # Runs monolithic AND projection on the SAME config and prints the
@@ -881,8 +1074,9 @@ if __name__ == "__main__":
         t_start = float(_t_start_env) if _t_start_env else None
         out = compare_solvers(
             t_start=t_start, plate_L_physical=plate_L_physical,
-            level=level, nsteps=nsteps, dt=dt, nu=nu, U_inf=U_inf,
+            level=base_level, nsteps=nsteps, dt=dt, nu=nu, U_inf=U_inf,
             plate_xc=plate_xc, plate_yc=plate_yc, plate_L=plate_L,
+            refine_to=refine_to, wake_refine=wake_refine, band_cells=band_cells,
             pert_eps=pert_eps, pert_t_end=pert_t_end,
             ppe_solver=ppe_solver,
         )
@@ -896,8 +1090,9 @@ if __name__ == "__main__":
     # The CI smoke test calls run_flow_past() directly without _return_fields,
     # so it is completely unaffected by this flag.
     res = run_flow_past(
-        level=level, nsteps=nsteps, dt=dt, nu=nu, U_inf=U_inf,
+        level=base_level, nsteps=nsteps, dt=dt, nu=nu, U_inf=U_inf,
         plate_xc=plate_xc, plate_yc=plate_yc, plate_L=plate_L,
+        refine_to=refine_to, wake_refine=wake_refine, band_cells=band_cells,
         verbose=True,
         _return_fields=True,
         pert_eps=pert_eps,
