@@ -34,7 +34,7 @@ from ..solvers.timestepping import bdf_coeffs, bdf_order_now, History
 
 class LerayProjectionStepper:
     def __init__(self, dm, nu, dt, f_fn, g_fn, order=2, picard_iters=2,
-                 solver="splu",
+                 solver="splu", ppe_solver=None,
                  timestab=True, ppe_finescale=False, predictor="picard",
                  velocity_update="consistent", graddiv_scale=1.0,
                  pressure_update="standard", ppe_fine_scale=False,
@@ -279,6 +279,10 @@ class LerayProjectionStepper:
         # linear-solve backend for ALL three sub-solves (predictor: nonsym;
         # PPE + mass updates: SPD): "splu" | "fused" | "amgx"
         self.solver = solver
+        # Optional separate solver for the SPD sub-problems (PPE + mass correction).
+        # When None, falls back to self.solver for all sub-solves (backward compatible).
+        # Enables e.g. solver="splu" (predictor) + ppe_solver="gpu_cg" (PPE).
+        self._ppe_solver = ppe_solver if ppe_solver is not None else solver
         self._solver_cache = {}
         self.f_fn, self.g_fn = f_fn, g_fn
         self.ndof = dm.dim + 1
@@ -1095,7 +1099,7 @@ class LerayProjectionStepper:
             # pin: node-0 (enclosed flow) OR the outflow Dirichlet nodes.
             Kp, rhs_free = self._apply_pin_lil(Kp, rhs_free)
             from ..solvers.linsolve import solve_linear
-            phi = solve_linear(Kp.tocsr(), rhs_free, solver=self.solver,
+            phi = solve_linear(Kp.tocsr(), rhs_free, solver=self._ppe_solver,
                                sym=True, device=self.dm.device,
                                cache=self._solver_cache)
         else:
@@ -1111,7 +1115,7 @@ class LerayProjectionStepper:
             # it only for the default node-0 pin (unchanged fast path).
             cache_key = ("ppe" if (self.pressure_outflow_nodes is None
                                    and not self.consistent_ppe) else None)
-            phi = solve_linear(Kp.tocsr(), rhs_free, solver=self.solver,
+            phi = solve_linear(Kp.tocsr(), rhs_free, solver=self._ppe_solver,
                                sym=True, device=self.dm.device,
                                cache=self._solver_cache, cache_key=cache_key)
         # The PPE unknown is the pressure INCREMENT phi = p_hat - p*: the
@@ -1130,7 +1134,7 @@ class LerayProjectionStepper:
             else:
                 bt_uhat = rhs_free / sigma     # rhs_free = sigma * B^T u_hat
             from ..solvers.linsolve import solve_linear
-            q = solve_linear(self.M, bt_uhat, solver=self.solver, sym=True,
+            q = solve_linear(self.M, bt_uhat, solver=self._ppe_solver, sym=True,
                              device=self.dm.device, cache=self._solver_cache,
                              cache_key="mass")   # SAME key as velocity update
             # F3b cure: pin the rotational correction q to 0 on the SAME outflow
