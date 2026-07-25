@@ -1206,6 +1206,7 @@ if __name__ == "__main__":
     pert_eps = float(_pert_eps_env) if _pert_eps_env else None
     pert_t_end = float(os.environ.get("PERT_T_END", "1.0"))
     mono_solver = os.environ.get("MONO_SOLVER", "splu")
+    pred_solver = os.environ.get("PRED_SOLVER", "splu")
     device      = os.environ.get("DEVICE", "cpu")
     assembly    = os.environ.get("ASSEMBLY", "host")
     # ASSEMBLY=device -> device_assembly=True for the PROJECTION leg (K_p via
@@ -1244,7 +1245,8 @@ if __name__ == "__main__":
             refine_to=refine_to, wake_refine=wake_refine, band_cells=band_cells,
             pert_eps=pert_eps, pert_t_end=pert_t_end,
             mono_solver=mono_solver, device=device, assembly=assembly,
-            ppe_solver=ppe_solver, device_assembly=device_assembly,
+            ppe_solver=ppe_solver, predictor_solver=pred_solver,
+            device_assembly=device_assembly,
         )
         print(f"[p2r1a] monolithic: Cd_mean={out['mono']['cd_mean']:.4f}  "
               f"St={out['mono']['St']:.4f}")

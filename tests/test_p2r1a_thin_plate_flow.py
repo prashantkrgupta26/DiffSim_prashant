@@ -189,7 +189,8 @@ def test_compare_solvers_accepts_mono_knobs():
     Passes assembly="device" so the mono_only routing of assembly is exercised."""
     from p2r1a_thin_plate_flow import compare_solvers
     out = compare_solvers(level=4, nsteps=3, dt=0.01, nu=0.1, U_inf=1.0,
-                          mono_solver="splu", device="cpu", assembly="device")
+                          mono_solver="splu", device="cpu", assembly="device",
+                          predictor_solver="splu")
     assert np.all(np.isfinite(out["mono"]["cd_mean"]))
     assert np.all(np.isfinite(out["proj"]["cd_mean"]))
 
