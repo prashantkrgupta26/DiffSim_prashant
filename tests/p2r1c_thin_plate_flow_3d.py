@@ -94,29 +94,27 @@ def _build_shell_3d(level, x_c, y_c, z_c, half_y, half_z,
     and (when adaptive) n_nodes, n_hanging, build_time.
     """
     sheet = _make_sheet(x_c, y_c, z_c, half_y, half_z)
+    extra = {}
     if refine_to is None:
         tree = build_uniform(level, dim=3)
         ret, intercepted = classify_shell_intercepted(tree, sheet)
         mesh = build_mesh(ret, p=1)
         cons = build_constraints(mesh)
+        n_excluded = int(intercepted.sum())
     else:
         amr = build_adaptive_plate_mesh(level, refine_to, sheet,
                                         band_cells=band_cells)
         mesh = amr["mesh"]
         cons = amr["cons"]
-        # classify on the (already-built) tree stored in the mesh
-        ret, intercepted = classify_shell_intercepted(mesh.tree, sheet)
-        mesh = build_mesh(ret, p=1)
-        cons = build_constraints(mesh)
+        ret = amr["ret"]
+        n_excluded = amr["n_excluded"]
+        extra = dict(n_nodes=amr["n_nodes"], n_hanging=amr["n_hanging"],
+                     build_time=amr["build_time"])
     dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3), "cpu")
     ftab = face_tables(1, 3)
     (sfp, gp), (sfm, gm) = extract_two_sided_surrogate(ret, sheet, ftab)
-    extra = {}
-    if refine_to is not None:
-        extra = dict(n_nodes=amr["n_nodes"], n_hanging=amr["n_hanging"],
-                     build_time=amr["build_time"])
     return dict(dm=dm, mesh=mesh, cons=cons, sfp=sfp, gp=gp, sfm=sfm, gm=gm,
-                n_excluded=int(intercepted.sum()), **extra)
+                n_excluded=n_excluded, **extra)
 
 
 def build_adaptive_plate_mesh(base_level, refine_to, plate_geom, band_cells=2):
@@ -126,7 +124,9 @@ def build_adaptive_plate_mesh(base_level, refine_to, plate_geom, band_cells=2):
     from ``base_level+1`` up to ``refine_to``, each time refining cells whose
     center is within ``band_cells * h_local`` of the plate (measured by
     ``plate_geom.psi()`` on element centers), then applies ``balance2to1``.
-    After all refinement passes, builds the FEM mesh and constraints.
+    After all refinement passes, runs ``classify_shell_intercepted`` to exclude
+    plate-intercepted cells, then builds the FEM mesh and constraints on the
+    post-exclusion tree.
 
     Parameters
     ----------
@@ -144,18 +144,18 @@ def build_adaptive_plate_mesh(base_level, refine_to, plate_geom, band_cells=2):
     Returns
     -------
     dict with keys:
-      'mesh'       : the built FEM mesh
-      'cons'       : hanging-node constraints
-      'n_nodes'    : total node count
-      'n_hanging'  : number of hanging nodes
-      'build_time' : wall-clock seconds for the entire mesh build
+      'mesh'        : the built FEM mesh (on post-exclusion tree)
+      'cons'        : hanging-node constraints (on post-exclusion tree)
+      'ret'         : classified tree (post cell-exclusion) from classify_shell_intercepted
+      'n_nodes'     : total node count (post-exclusion — actual solver mesh)
+      'n_hanging'   : number of hanging nodes (post-exclusion)
+      'n_excluded'  : number of plate-intercepted cells excluded
+      'build_time'  : wall-clock seconds for the entire mesh build
     """
     import torch
     t0 = time.time()
     tree = build_uniform(base_level, dim=3)
-    for target_level in range(base_level + 1, refine_to + 1):
-        # local cell size at the level we're about to refine INTO
-        h_target = 2.0 ** (-target_level)
+    for _ in range(base_level + 1, refine_to + 1):
         centers = tree.centers()                        # [N, 3] in [0,1]^3
         # psi() expects a torch tensor
         pts_t = torch.tensor(centers, dtype=torch.float64)
@@ -167,7 +167,9 @@ def build_adaptive_plate_mesh(base_level, refine_to, plate_geom, band_cells=2):
             break
         tree = refine_elements(tree, mask)
         tree = balance2to1(tree)
-    mesh = build_mesh(tree, p=1)
+    # Exclude plate-intercepted cells so n_nodes/n_hanging reflect the actual solver mesh
+    ret, intercepted = classify_shell_intercepted(tree, plate_geom)
+    mesh = build_mesh(ret, p=1)
     cons = build_constraints(mesh)
     n_nodes = len(mesh.node_coords)
     n_hanging = int(cons.hanging.sum())
@@ -175,8 +177,10 @@ def build_adaptive_plate_mesh(base_level, refine_to, plate_geom, band_cells=2):
     return dict(
         mesh=mesh,
         cons=cons,
+        ret=ret,
         n_nodes=n_nodes,
         n_hanging=n_hanging,
+        n_excluded=int(intercepted.sum()),
         build_time=build_time,
     )
 
@@ -569,7 +573,7 @@ if __name__ == "__main__":
     if refine_level:
         case_name = f"p2r1c_3d_re{re_approx}_L{base_level}_r{refine_level}"
     else:
-        case_name = f"p2r1c_3d_re{re_approx}_L{level}"
+        case_name = f"p2r1c_3d_re{re_approx}_L{base_level}"
 
     res = run_flow_past_3d(
         level=base_level, nsteps=nsteps, dt=dt, nu=nu, U_inf=U_inf,
