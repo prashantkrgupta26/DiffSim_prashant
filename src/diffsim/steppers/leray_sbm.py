@@ -516,6 +516,26 @@ class LeraySBMShellStepper:
     ``ppe_solver=`` (default ``"gpu_cg"``, the SPD Jacobi-CG on device)
     which is the scalable lever for L9-near-plate scale (~186k nodes).
 
+    Unlike ``LeraySBMStepper``, there are NO ``lam`` / ``domain`` parameters:
+    the shell surrogate geometry is pre-built by the caller (there is no
+    single domain side for a co-dim-1 shell — both sides are fluid, oriented
+    per-face in ``mode="shell"``), so classification/extraction do not run
+    here.
+
+    ⚠️ 3-D PHYSICS CAVEAT: the lagged-pressure projection split has a
+    DOCUMENTED 3-D defect — with an open outflow, the momentum predictor
+    cannot build the driving stagnation pressure from rest, so the split
+    settles into a weak/wrong steady state (the monolithic steady state is
+    NOT a fixed point of the lagged-p* split). This stepper therefore
+    delivers a SCALABLE (gpu_cg PPE) but NOT-YET-PHYSICAL 3-D drag: the Cd
+    is finite but not faithful. The monolithic SBM-NS saddle
+    (``tests/p2r1c_thin_plate_flow_3d.py``) is the correct 3-D engine. The
+    projection path's physics fix (consistent PPE operator + outflow-BC /
+    pressure-correction p' co-design) is a separate research track — see
+    the ``p2-r2a-monolithic-pivot`` verdict and
+    ``docs/dev/2026-07-23-projection-ladder-verdict.md``. This class lands
+    the scalable infrastructure ahead of that fix.
+
     PREDICTOR sub-solve: still ``solver=`` (default ``"splu"``,
     nonsymmetric Oseen, not SPD; ``gpu_cg`` is SPD-only). At L4-L6 smoke
     scales splu is fine. For near-L9 scales the predictor becomes the
@@ -542,7 +562,7 @@ class LeraySBMShellStepper:
 
     def __init__(self, sf_plus, geo_plus, sf_minus, geo_minus,
                  dm, nu, dt, f_fn, *, u_inf, strong_mask,
-                 lam=0.5, domain="outside", order=2, picard_iters=2,
+                 order=2, picard_iters=2,
                  solver="splu", ppe_solver="gpu_cg",
                  ppe_finescale=False, alpha=10.0,
                  beta_backflow=1.0, velocity_update="consistent",
