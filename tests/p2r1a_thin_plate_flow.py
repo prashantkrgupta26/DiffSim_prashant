@@ -29,6 +29,55 @@ Domain: unit square [0,1]^2 (the octree's native domain).
 Plate (smoke default): vertical segment centered at (0.375, 0.5), L=0.25,
   i.e. from (0.375, 0.375) to (0.375, 0.625).
 
+Symmetry-breaking perturbation
+-------------------------------
+A perfectly symmetric flow-past-a-symmetric-plate rides the unstable symmetric
+branch and NEVER spontaneously sheds vortices on a symmetric mesh.  To trigger
+shedding at Re >= ~100, a small transverse (cross-flow) velocity is injected at
+the inflow nodes for early time t < pert_t_end:
+
+    u_y|_{inflow} = pert_eps * U_inf    for t < pert_t_end
+    u_y|_{inflow} = 0.0                 for t >= pert_t_end
+
+This mirrors the cylinder shedding driver (tests/test_cylinder_strouhal.py:
+``vkick = 0.05 * U_IN if t_new < 0.5 else 0.0``).
+
+Parameters (passed to run_flow_past):
+  pert_eps    : float | None  — transverse kick amplitude as fraction of U_inf.
+                  None or 0.0 => no perturbation (default for CI smoke).
+                  ~0.02–0.05 is sufficient for Re >= 100 on a plate.
+  pert_t_end  : float         — time at which kick is switched off (default 1.0).
+
+For the Re=250 gpubox run set pert_eps=0.03, pert_t_end=1.0.
+For CI smoke (Re=10, 10 steps) leave pert_eps=None — deterministic & fast.
+
+Outlet BC note
+--------------
+The outflow boundary (x=x_max) uses a "do-nothing" / natural outlet: no velocity
+Dirichlet is imposed there, and the surface integral from IBP is simply dropped
+(equivalent to a zero-traction, zero-stress condition sigma.n=0).  A single
+pressure node is pinned (p=0 at the outflow–bottom corner) to remove the
+pressure null-space.
+
+Assessment: this is acceptable for the Re=250 shedding run PROVIDED the domain
+is long enough that vortices are sufficiently diffused before reaching the
+outlet.  For the unit-square smoke domain the plate-to-outlet distance is only
+~0.625 plate lengths — marginal.  For the RE250_CONFIG the physical domain is
+[0,36]x[0,16] with the plate at x=5, giving 31 plate-lengths of wake — well
+beyond the ~20L recommended.
+
+Reflection risk: do-nothing sets sigma.n=0, i.e. p - nu(grad u).n = 0.  When a
+vortex convects through, this imposes a transient pressure that back-drives a
+small spurious velocity.  In a long domain the vortex is weak by the time it
+hits the outlet; in the unit-square smoke the wake never reaches the outlet in
+10 steps (convection time L/U = 0.625 >> 0.1 s total march).  For Re=250 the
+wake structures are coherent; if reflection artefacts appear (Cl oscillation
+phase-locking to outlet convection time) the recommended fix is convective
+(advective) outlet: u_t + U_inf * u_x = 0 applied weakly, or Robin BC
+p - nu(grad u).n = U_inf * u.n.  This is a stepper rewrite and is deferred.
+Baskar should watch for outlet-phase-locking signatures in the Re=250 Cl(t)
+spectrum (a spurious peak at f = U_inf / L_wake).
+
 Quick smoke run:
     .venv/bin/python tests/p2r1a_thin_plate_flow.py
 """
@@ -107,21 +156,30 @@ def _outer_bc(mesh, cons, ndof, dim, U_inf):
       - inflow (x=0): u=(U_inf, 0)
       - top/bottom walls: u=(U_inf, 0)  [free-stream-like: u1=U_inf, u2=0]
       - outflow (x=x_max): do-nothing (not constrained here)
-    Returns (rows, vals) in free-node DOF space."""
+
+    Returns (rows, vals, inflow_vy_rows) in free-node DOF space.
+      rows, vals         : base BCs (u_x=U_inf, u_y=0 everywhere forced)
+      inflow_vy_rows     : np.int64 array of the u_y DOF rows for INFLOW nodes
+                           only — used by the march loop to inject the
+                           symmetry-breaking transverse kick (pert_eps * U_inf)
+                           for early time.  Empty array if no inflow nodes.
+    """
     coords = mesh.node_coords[cons.free_nodes]
     x_min = coords[:, 0].min()
-    x_max = coords[:, 0].max()
     y_min = coords[:, 1].min()
     y_max = coords[:, 1].max()
-    inflow = np.abs(coords[:, 0] - x_min) < 1e-10
+    inflow_mask = np.abs(coords[:, 0] - x_min) < 1e-10
     walls = (np.abs(coords[:, 1] - y_min) < 1e-10) | \
             (np.abs(coords[:, 1] - y_max) < 1e-10)
-    forced = inflow | walls
+    forced = inflow_mask | walls
     rows, vals = [], []
     for i in np.where(forced)[0]:
         rows.append(i * ndof + 0); vals.append(U_inf)   # u_x = U_inf
         rows.append(i * ndof + 1); vals.append(0.0)     # u_y = 0
-    return np.asarray(rows, np.int64), np.asarray(vals)
+    # Collect the u_y DOF indices for inflow nodes only (for the kick)
+    inflow_vy_rows = np.array(
+        [i * ndof + 1 for i in np.where(inflow_mask)[0]], dtype=np.int64)
+    return np.asarray(rows, np.int64), np.asarray(vals), inflow_vy_rows
 
 
 def _pressure_pin(mesh, cons, ndof, dim):
@@ -195,8 +253,29 @@ def run_flow_past(
     verbose=False,
     _two_sided=True,   # internal flag: False => one-sided anti-vacuity test
     _return_fields=False,  # internal flag: True => also return mesh + node fields
+    pert_eps=None,     # symmetry-breaking kick: fraction of U_inf (None or 0.0 = off)
+    pert_t_end=1.0,    # time (physical) at which the kick is switched off
 ):
     """Run flow past a finite thin plate with transient BDF2 march.
+
+    Parameters
+    ----------
+    level, nsteps, dt, U_inf, nu, alpha, plate_xc, plate_yc, plate_L, dim :
+        Standard geometry/physics parameters (see module docstring).
+    verbose : bool
+        Print per-step Cd/Cl.
+    _two_sided : bool
+        Internal flag — False => one-sided anti-vacuity test only.
+    _return_fields : bool
+        Internal flag — True => also return mesh + node fields dict.
+    pert_eps : float | None
+        Symmetry-breaking transverse kick amplitude as a fraction of U_inf.
+        Applied at INFLOW nodes (u_y = pert_eps * U_inf) for t < pert_t_end,
+        then switched off.  None or 0.0 => no perturbation (default for CI
+        smoke so the smoke is deterministic and fast).  Use 0.03 for Re=250.
+    pert_t_end : float
+        Physical time at which the kick is switched off (default 1.0).
+        After this the inflow reverts to pure streamwise (u_y = 0).
 
     Returns a dict with:
       'cd'       : np.ndarray [nsteps] — drag coefficient history
@@ -226,8 +305,16 @@ def run_flow_past(
     nfree = T.shape[1]
 
     # ---- BCs ----------------------------------------------------------------
-    bc_rows, bc_vals = _outer_bc(mesh, cons, ndof, dim, U_inf)
+    bc_rows, bc_vals, inflow_vy_rows = _outer_bc(mesh, cons, ndof, dim, U_inf)
     p_pin = _pressure_pin(mesh, cons, ndof, dim)
+
+    # Symmetry-breaking perturbation setup
+    # pert_eps=None or 0.0 => no kick (CI smoke path — deterministic)
+    _pert_active = (pert_eps is not None) and (float(pert_eps) != 0.0)
+    _pert_vkick = float(pert_eps) * U_inf if _pert_active else 0.0
+    if _pert_active and verbose:
+        print(f"[p2r1a] perturbation ON: eps={pert_eps}, v_kick={_pert_vkick:.4f}, "
+              f"t_end={pert_t_end}, n_inflow_nodes={len(inflow_vy_rows)}", flush=True)
 
     # ---- SBM face terms (pre-assembled; geometry is fixed) ------------------
     noslip = lambda y: np.zeros((len(y), dim))
@@ -260,6 +347,7 @@ def run_flow_past(
         order = 1 if step == 0 else 2
         b0, b1, b2 = bdf_coeffs(order, dt)
         sigma = b0 / dt
+        t_new = (step + 1) * dt   # time at the END of this step
 
         # Advecting velocity at Gauss points (linearization around u^n)
         aq, dq = _gp_field(dm, mesh, T, u_pre1, dim)
@@ -284,6 +372,20 @@ def run_flow_past(
         # Apply strong Dirichlet BCs
         for r, v in zip(bc_rows, bc_vals):
             A.rows[r] = [int(r)]; A.data[r] = [1.0]; b[r] = v
+
+        # Symmetry-breaking perturbation: override inflow u_y for t < pert_t_end.
+        # This mirrors test_cylinder_strouhal.py's kick:
+        #   ``vkick = 0.05 * U_IN if t_new < 0.5 else 0.0``
+        # The kick imposes a small constant transverse velocity at the inflow
+        # for early time, breaking the perfect up-down symmetry so the wake
+        # destabilises to the von Karman / bluff-body shedding branch.
+        # After t >= pert_t_end the inflow reverts to pure streamwise (u_y = 0),
+        # already set by the base bc_rows loop above (no additional action).
+        if _pert_active and t_new < pert_t_end:
+            vkick = _pert_vkick
+            for r in inflow_vy_rows:
+                ri = int(r)
+                A.rows[ri] = [ri]; A.data[ri] = [1.0]; b[ri] = vkick
 
         # Pressure pin
         A.rows[p_pin] = [p_pin]; A.data[p_pin] = [1.0]; b[p_pin] = 0.0
@@ -382,6 +484,14 @@ RE250_CONFIG = dict(
     plate_yc=8.0 / 16.0,   # physical y=8 in [0,16] domain
     plate_L=1.0 / 16.0,    # L=1 physical, normalized by domain height 16
     dim=2,
+    # --- Symmetry-breaking perturbation (ON for Re=250 gpubox run) -----------
+    # A small transverse kick at the inflow for t < pert_t_end breaks the
+    # perfect up-down symmetry so the wake can destabilise to vortex shedding.
+    # eps=0.03 => v_kick = 0.03 * U_inf = 0.03.  Duration: 1.0 physical time
+    # unit = 20,000 steps at dt=5e-5.  After that, pure streamwise inflow.
+    # This mirrors the cylinder shedding driver (test_cylinder_strouhal.py).
+    pert_eps=0.03,
+    pert_t_end=1.0,
 )
 
 
@@ -398,6 +508,11 @@ if __name__ == "__main__":
     plate_xc = float(os.environ.get("PLATE_XC", "0.375"))
     plate_yc = float(os.environ.get("PLATE_YC", "0.5"))
     plate_L = float(os.environ.get("PLATE_L", "0.25"))
+    # Symmetry-breaking perturbation (env-var knob for CLI runs):
+    #   PERT_EPS=0.03 PERT_T_END=1.0  (default: no perturbation for smoke)
+    _pert_eps_env = os.environ.get("PERT_EPS", "")
+    pert_eps = float(_pert_eps_env) if _pert_eps_env else None
+    pert_t_end = float(os.environ.get("PERT_T_END", "1.0"))
     # Physical plate length: plate_L is the octree-normalized length (divided by
     # domain height H=16).  St = f*L/U uses the PHYSICAL plate length, so we
     # multiply back by 16 to denormalize.  For the default smoke run (plate_L=0.25,
@@ -417,6 +532,8 @@ if __name__ == "__main__":
         plate_xc=plate_xc, plate_yc=plate_yc, plate_L=plate_L,
         verbose=True,
         _return_fields=True,
+        pert_eps=pert_eps,
+        pert_t_end=pert_t_end,
     )
     print(f"Cd={res['cd']}")
     print(f"Cl={res['cl']}")

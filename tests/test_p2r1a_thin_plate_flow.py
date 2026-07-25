@@ -10,6 +10,9 @@ Assertions:
   4. O(1)-plausible drag: 0 < |Cd[-1]| < 500.
   5. Load-bearing (anti-vacuity): drop Gamma~- only => force collapses relative
      to two-sided run (mirrors the blocked-channel gate pattern).
+  6. Symmetry-breaking perturbation: with pert_eps=0.03 the Cl signal departs
+     from ~0; without it Cl stays near-zero (ON/OFF ratio > 10x in Cl_std).
+     Uses Re=100, level=5, 200 steps, dt=0.02 — runs in ~12 s on Mac CPU.
 """
 import os
 import sys
@@ -21,6 +24,12 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from p2r1a_thin_plate_flow import run_flow_past, run_flow_past_one_sided
 from diffsim.postproc.shedding import time_avg_cd, strouhal
+
+# Perturbation validation parameters: Re=100, level=5, 200 steps, dt=0.02.
+# Wall time: ~12 s on Mac CPU M-series (2x 6-s runs).
+# This is fast enough to include in the CI tier-5 suite.
+_PERT = dict(level=5, nsteps=200, dt=0.02, nu=1.0/100.0, U_inf=1.0,
+             alpha=50.0, plate_xc=0.375, plate_yc=0.5, plate_L=0.25)
 
 pytestmark = pytest.mark.tier5
 
@@ -112,3 +121,52 @@ def test_thin_plate_postproc_pipeline():
         # Defensive: only reached when tail has < 4 points (not this smoke config).
         # The pipeline reaching this point without crashing is the test.
         pass
+
+
+def test_perturbation_breaks_symmetry():
+    """Symmetry-breaking perturbation makes Cl depart from ~0.
+
+    Two runs at Re=100, level=5, 200 steps, dt=0.02 (t_end=4.0):
+      ON : pert_eps=0.03 — the small transverse kick at the inflow for t<1.0
+           seeds asymmetry; Cl develops nonzero std (> 1e-3).
+      OFF: pert_eps=None — perfect symmetry maintained; Cl stays near-zero
+           (std < 1e-4, i.e. 10x smaller than ON).
+
+    The ratio ON/OFF > 10 is the minimum bar; measured values are ~700x.
+    This confirms the kick mechanism works before the full Re=250 gpubox run.
+
+    Note: at level=5 (coarse mesh, ~32^2 effective) the shedding instability
+    is numerically damped — Cl never grows to limit-cycle amplitude in 200
+    steps, but the ASYMMETRY seeded by the kick is clearly visible.  The test
+    is a symmetry-breaking gate, not a shedding amplitude gate.
+
+    Wall time: ~12 s on Mac CPU (2x 6-s runs).
+    """
+    res_on  = run_flow_past(**_PERT, pert_eps=0.03, pert_t_end=1.0)
+    res_off = run_flow_past(**_PERT, pert_eps=None)
+
+    cl_on  = res_on["cl"]
+    cl_off = res_off["cl"]
+
+    std_on  = float(np.std(cl_on))
+    std_off = float(np.std(cl_off))
+
+    # Both arrays must be finite (sanity guard)
+    assert np.all(np.isfinite(cl_on)),  f"Cl (pert ON) contains non-finite"
+    assert np.all(np.isfinite(cl_off)), f"Cl (pert OFF) contains non-finite"
+
+    # ON: Cl must depart clearly from zero (perturbation seeded asymmetry)
+    assert std_on > 1e-3, (
+        f"pert ON: Cl_std={std_on:.6f} <= 1e-3 — perturbation not breaking symmetry"
+    )
+
+    # OFF: Cl must stay near-zero (symmetric branch)
+    assert std_off < 1e-4, (
+        f"pert OFF: Cl_std={std_off:.6f} >= 1e-4 — unexpected asymmetry without kick"
+    )
+
+    # Ratio must be > 10x (measured ~700x; 10x is a very conservative gate)
+    ratio = std_on / (std_off + 1e-12)
+    assert ratio > 10.0, (
+        f"ON/OFF std ratio={ratio:.1f} < 10 — kick not clearly breaking symmetry"
+    )
