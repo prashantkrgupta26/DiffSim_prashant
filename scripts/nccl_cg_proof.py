@@ -342,11 +342,6 @@ def make_partitioned_spmv(A_local_csr, n_owned: int, n_ghost: int, comm, device:
     """
     n_local = n_owned + n_ghost
 
-    # Convert the local CSR to torch sparse for efficient matvec
-    # Use dense conversion for small systems; for large, keep scipy
-    # and convert buffers to numpy on the fly (CPU-safe path).
-    _use_scipy = True  # always safe; GPU path would use torch.sparse
-
     padded = torch.zeros(n_local, dtype=torch.float64, device=device)
 
     def spmv(p_owned: torch.Tensor) -> torch.Tensor:
