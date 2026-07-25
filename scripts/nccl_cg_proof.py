@@ -17,12 +17,16 @@ Two processes (gloo on CPU)::
 
 Arguments
 ---------
---stage     Only "synthetic" is implemented in Task 3a.
---backend   torch.distributed backend: "gloo" (CPU) or "nccl" (GPU).
---precond   Preconditioner: "jacobi" (always-on) or "amgx" (Task 3b, GPU).
---dims      NX,NY,NZ grid node counts (e.g. 8,4,4).
---rtol      Solver relative tolerance (default 1e-10).
---rhs       RHS mode: "mms" (manufactured solution, default) or "random".
+--stage       Only "synthetic" is implemented in Task 3a.
+--backend     torch.distributed backend: "gloo" (CPU) or "nccl" (GPU).
+--precond     Preconditioner: "jacobi" (always-on) or "amgx" (Task 3b, GPU).
+--dims        NX,NY,NZ grid node counts (e.g. 8,4,4).
+--rtol        Solver relative tolerance (default 1e-10).
+--rhs         RHS mode: "mms" (manufactured solution, default) or "random".
+--host-spmv   Use the legacy scipy CPU SpMV (debug / correctness comparison).
+--assembler   {host,device} — which K_p assembler to use for --stage real
+              (default: device). "device" calls assemble_csr_device(dm);
+              "host" calls the original assemble_csr(dm).
 
 Manufactured solution (--rhs mms)
 ----------------------------------
@@ -328,31 +332,109 @@ def assemble_local_poisson(
 # Partitioned SpMV wrapper
 # ---------------------------------------------------------------------------
 
-def make_partitioned_spmv(A_local_csr, n_owned: int, n_ghost: int, comm, device: torch.device):
+def make_partitioned_spmv(
+    A_local_csr,
+    n_owned: int,
+    n_ghost: int,
+    comm,
+    device: torch.device,
+    *,
+    host_spmv: bool = False,
+):
     """Build a partitioned spmv callable for pcg().
 
     The spmv:
       1. Receives p_owned (length n_owned) from pcg.
       2. Copies it into a padded buffer (length n_owned + n_ghost).
-      3. Calls comm.exchange_halo to fill the ghost tail.
-      4. Performs the local matvec on owned rows.
-      5. Returns Ap_owned (length n_owned).
+      3. Calls comm.exchange_halo to fill the ghost tail (ON-DEVICE — padded
+         lives on `device` so the exchange never touches the host).
+      4. Performs the local matvec ON DEVICE via a pre-built torch.sparse_csr_tensor
+         (default) or the legacy scipy path (--host-spmv).
+      5. Returns Ap_owned (length n_owned, on `device`).
 
-    The ghost-padded buffer is allocated once and reused.
+    The ghost-padded buffer and the torch sparse tensor are allocated once and
+    reused across all CG iterations so there is NO per-iteration host round-trip
+    in the default path.
+
+    Parameters
+    ----------
+    A_local_csr : scipy.sparse.csr_matrix, shape (n_owned, n_owned + n_ghost)
+        Local operator.  Used to build the torch sparse tensor once at
+        construction time; the scipy object is NOT used per-iteration (unless
+        host_spmv=True).
+    n_owned : int
+    n_ghost : int
+    comm : TorchDistComm (or SerialComm)
+    device : torch.device
+    host_spmv : bool, default False
+        When True fall back to the legacy scipy CPU path (padded.cpu().numpy()
+        → A_local_csr @ p_np) for debugging / correctness comparison.
     """
     n_local = n_owned + n_ghost
 
+    # Allocate the padded buffer ON DEVICE once — reused every CG iteration.
+    # The halo exchange fills the ghost tail in-place on the same device buffer
+    # so there is zero host traffic per iteration.
     padded = torch.zeros(n_local, dtype=torch.float64, device=device)
 
+    if host_spmv:
+        # ------------------------------------------------------------------
+        # LEGACY PATH: scipy CPU matvec (kept behind --host-spmv flag)
+        # ------------------------------------------------------------------
+        def spmv(p_owned: torch.Tensor) -> torch.Tensor:
+            padded[:n_owned].copy_(p_owned)
+            comm.exchange_halo(padded)
+            p_np = padded.cpu().numpy()
+            Ap_np = np.asarray(A_local_csr @ p_np, dtype=np.float64)
+            return torch.tensor(Ap_np, dtype=torch.float64, device=device)
+
+        return spmv
+
+    # ------------------------------------------------------------------
+    # DEFAULT PATH: GPU-RESIDENT torch.sparse_csr_tensor matvec
+    #
+    # Build the sparse tensor ONCE from A_local_csr.  torch.sparse_csr_tensor
+    # requires:
+    #   crow_indices : int32 or int64  (length n_owned + 1)
+    #   col_indices  : int32 or int64  (length nnz)
+    #   values       : float64
+    #   size         : (n_owned, n_local)
+    #
+    # We always use int64 for indices because:
+    #   - L7/L8/L9 systems can exceed 2^31 nnz per rank, so int32 is unsafe
+    #     on GPU (PyTorch SpCSR matvec validates at nnz<2^31 for int32)
+    #   - int64 is unconditionally safe and the one-time overhead is negligible
+    #
+    # The matvec is A_t @ padded; torch returns a 1-D tensor of length n_owned
+    # (the number of rows) directly on `device`.
+    # ------------------------------------------------------------------
+    crow = torch.tensor(
+        A_local_csr.indptr.astype(np.int64),
+        dtype=torch.int64, device=device,
+    )
+    col = torch.tensor(
+        A_local_csr.indices.astype(np.int64),
+        dtype=torch.int64, device=device,
+    )
+    val = torch.tensor(
+        np.ascontiguousarray(A_local_csr.data, dtype=np.float64),
+        dtype=torch.float64, device=device,
+    )
+    # torch.sparse_csr_tensor: layout=torch.sparse_csr is the default when
+    # crow/col/val are provided with a 2-D size tuple.
+    A_t = torch.sparse_csr_tensor(crow, col, val,
+                                  size=(n_owned, n_local),
+                                  dtype=torch.float64, device=device)
+
     def spmv(p_owned: torch.Tensor) -> torch.Tensor:
-        # 1. Copy owned entries into padded buffer
+        # 1. Place owned values into the on-device padded buffer
         padded[:n_owned].copy_(p_owned)
-        # 2. Fill ghost tail via halo exchange
+        # 2. Halo exchange fills ghost tail on device (no host copy)
         comm.exchange_halo(padded)
-        # 3. Local matvec (scipy, CPU) → convert to/from numpy
-        p_np = padded.cpu().numpy()
-        Ap_np = np.asarray(A_local_csr @ p_np, dtype=np.float64)
-        return torch.tensor(Ap_np, dtype=torch.float64, device=device)
+        # 3. On-device sparse-CSR matvec → result is length n_owned on device
+        #    torch.mv(A_t, padded) and A_t @ padded are equivalent; we use
+        #    torch.mv which is the recommended API for (sparse, dense-1D).
+        return torch.mv(A_t, padded)
 
     return spmv
 
@@ -381,11 +463,11 @@ def serial_reference_solve(dims: tuple[int, int, int], rhs_mode: str = "mms") ->
 # Real K_p operator: octree scalar-Poisson stiffness (Stage 2)
 # ---------------------------------------------------------------------------
 
-def build_real_K_spd(level: int):
+def build_real_K_spd(level: int, assembler: str = "device"):
     """Build the global SPD scalar-Poisson stiffness K_p for a uniform 3-D mesh.
 
-    Assembles the real octree-based FEM stiffness matrix (assemble_csr) and
-    SPD-ifies it via Dirichlet identity rows/cols on boundary nodes.
+    Assembles the real octree-based FEM stiffness matrix and SPD-ifies it via
+    Dirichlet identity rows/cols on boundary nodes.
 
     The resulting K_spd is strictly SPD: all interior rows retain the FEM
     stencil (up to 27-point for p1 hex) and all boundary rows are identity.
@@ -395,6 +477,18 @@ def build_real_K_spd(level: int):
     level : int
         Octree refinement level.  Node count per axis = 2^level + 1.
         dims = (2^level+1,)^3.
+    assembler : {"device", "host"}, default "device"
+        Which assembly path to use:
+
+        "device" (default)
+            Uses ``assemble_csr_device(dm)`` — the device-resident K_p
+            assembler that eliminates the host COO->CSR wall.  On CPU-only
+            machines (Mac venv) warp runs on warp-CPU so the result is
+            identical but may be slower for large levels.
+
+        "host"
+            Uses the original ``assemble_csr(dm)`` (host COO->CSR) — kept
+            for debugging / correctness comparison.
 
     Returns
     -------
@@ -422,7 +516,7 @@ def build_real_K_spd(level: int):
     from diffsim.mesh.nodes import build_mesh
     from diffsim.mesh.constraints import build_constraints
     from diffsim.mesh.basis import basis_tables
-    from diffsim.assembly.operators import DeviceMesh, assemble_csr
+    from diffsim.assembly.operators import DeviceMesh, assemble_csr, assemble_csr_device
 
     n_per_axis = 2**level + 1
     dims = (n_per_axis, n_per_axis, n_per_axis)
@@ -431,7 +525,11 @@ def build_real_K_spd(level: int):
     mesh = build_mesh(tree, p=1)
     cons = build_constraints(mesh)
     dm   = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3), "cpu")
-    K    = assemble_csr(dm).tocsr().astype(np.float64)
+
+    if assembler == "device":
+        K = assemble_csr_device(dm).tocsr().astype(np.float64)
+    else:
+        K = assemble_csr(dm).tocsr().astype(np.float64)
 
     n = K.shape[0]
     bn = mesh.boundary_nodes      # bool array, shape (n,)
@@ -461,6 +559,7 @@ def build_real_local_system(
     level: int,
     part,
     device: torch.device,
+    assembler: str = "device",
 ):
     """Build the local (per-rank) partitioned system for the real K_p operator.
 
@@ -475,6 +574,8 @@ def build_real_local_system(
         This rank's partition metadata.
     device : torch.device
         Target device for torch tensors.
+    assembler : {"device", "host"}, default "device"
+        Passed through to build_real_K_spd to select the K_p assembly path.
 
     Returns
     -------
@@ -493,7 +594,7 @@ def build_real_local_system(
     """
     from diffsim.mesh.partition import extract_local_block
 
-    K_spd, b_global, dims, mesh = build_real_K_spd(level)
+    K_spd, b_global, dims, mesh = build_real_K_spd(level, assembler=assembler)
     A_local_csr = extract_local_block(K_spd, part)
 
     owned_ids = part.owned
@@ -554,6 +655,16 @@ def parse_args():
                          "comparison (which does not scale past ~L5). Reports "
                          "iters + solve_time only — for large-N scaling/timing "
                          "runs where correctness is already established."))
+    p.add_argument("--host-spmv", action="store_true",
+                   help=("Use the legacy scipy CPU SpMV (padded.cpu().numpy() → "
+                         "A_local_csr @ p_np) instead of the default on-device "
+                         "torch.sparse_csr_tensor matvec. Useful for debugging "
+                         "or correctness comparison against the new GPU path."))
+    p.add_argument("--assembler", default="device", choices=["device", "host"],
+                   help=("K_p assembler for --stage real: 'device' (default) uses "
+                         "assemble_csr_device(dm) — the device-resident path that "
+                         "eliminates the host COO->CSR wall; 'host' uses the "
+                         "original assemble_csr(dm) for debugging / comparison."))
     return p.parse_args()
 
 
@@ -644,7 +755,7 @@ def main():
         rhs_mode = "random"   # real stage always uses fixed-seed random RHS
         if rank == 0:
             print(f"[rank 0] stage=real, level={level}, dims={dims}, "
-                  f"n_total={nx*ny*nz}")
+                  f"n_total={nx*ny*nz}, assembler={args.assembler}")
     else:
         # Synthetic: dims from --dims argument
         dims_str = args.dims.replace(" ", "")
@@ -683,9 +794,10 @@ def main():
     t0 = time.perf_counter()
 
     if args.stage == "real":
-        # Real K_p: use extract_local_block on the FEM stiffness
+        # Real K_p: use extract_local_block on the FEM stiffness.
+        # --assembler selects device (default) or host K_p assembly.
         A_local_csr, b_local, diag_local, K_spd_global, b_global, _ = (
-            build_real_local_system(level, part, device)
+            build_real_local_system(level, part, device, assembler=args.assembler)
         )
     else:
         # Synthetic: per-rank 7-point FD Poisson assembly
@@ -704,7 +816,13 @@ def main():
     # Build comm + spmv + precond
     # ----------------------------------------------------------------
     comm = TorchDistComm(part, device, dtype=torch.float64)
-    spmv = make_partitioned_spmv(A_local_csr, n_owned, n_ghost, comm, device)
+    spmv_mode = "host-scipy" if args.host_spmv else "device-torch-sparse-csr"
+    if rank == 0:
+        print(f"[rank 0] spmv_mode={spmv_mode}")
+    spmv = make_partitioned_spmv(
+        A_local_csr, n_owned, n_ghost, comm, device,
+        host_spmv=args.host_spmv,
+    )
 
     if args.precond == "amgx":
         # Block-Jacobi: AMGX on owned diagonal block (shared construction)
