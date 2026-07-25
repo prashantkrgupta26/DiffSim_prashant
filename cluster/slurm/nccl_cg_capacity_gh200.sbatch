@@ -7,21 +7,16 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:gh200:1
 #SBATCH --cpus-per-task=6
-#SBATCH --mem=200G
-#SBATCH --time=02:00:00
+#SBATCH --mem=400G
+#SBATCH --time=04:00:00
 #SBATCH --output=cluster/results/%x-%j.out
 # NCCL-CG SINGLE-GPU CAPACITY on the Nova GH200 (nova-arm, aarch64, 1 GPU).
-# The GH200 partition has ONE node with ONE GPU -> no multi-GPU scaling here;
-# this measures how large a PPE fits + solve time on the GH200's coherent
-# memory (Grace LPDDR + HBM).
+# GPU-RESIDENT path: --assembler device (warp GPU K_p assembly, kills the ~1000s
+# host assemble_csr wall) + on-device torch.sparse SpMV. This is what pushes a
+# single GH200 past L7 toward L8/L9 (135M nodes) on its 480GB coherent memory.
+# jacobi precond (AMGX skipped on ARM). world_size=1.
 #
-# ARM (aarch64): the GH200 needs its OWN venv (.venv-nova-arm) — the x86
-# .venv-nova python cannot exec here (Exec format error). Use bootstrap_arm.sh
-# + the RPM python3.11 lib path. AMGX is skipped on ARM, so --precond jacobi.
-# world_size=1 (gloo avoids any 1-rank NCCL quirk).
-#
-# NB the host assemble_csr path (scipy) is the build bottleneck at large L
-# (~minutes at L7); L8+ needs the device assembler (follow-up).
+# ARM: use bootstrap_arm.sh + .venv-nova-arm + the RPM python3.11 lib path.
 set -uo pipefail
 cd "$SLURM_SUBMIT_DIR"
 echo "== host $(hostname)  $(uname -m)  $(date)"
@@ -31,16 +26,20 @@ bash cluster/bootstrap_arm.sh
 PY=.venv-nova-arm/bin
 mkdir -p cluster/results
 $PY/python -c "import torch;print('torch',torch.__version__,'cuda',torch.cuda.is_available())"
+# Does warp see the GH200 GPU? (device assembler needs warp CUDA; else it falls
+# back to the host scipy path and L8/L9 will hit the assembly wall.)
+$PY/python -c "import warp as wp; wp.init(); print('warp cuda devices:', wp.get_cuda_device_count())" 2>&1 | grep -iE "cuda devices|error 100" | head -2
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
-echo "### GH200 single-GPU capacity (world_size=1, jacobi) ###"
-for L in 5 6 7; do
-  echo "===== L=$L  (nodes=(2^L+1)^3) ====="
-  timeout 1200 $PY/torchrun --standalone --nproc_per_node=1 \
+echo "### GH200 single-GPU capacity, GPU-resident (device assembler + torch.sparse SpMV) ###"
+for L in 6 7 8 9; do
+  nodes=$(python3 -c "print((2**$L+1)**3)" 2>/dev/null)
+  echo "===== L=$L  (nodes=$nodes) ====="
+  /usr/bin/time -v timeout 3000 $PY/torchrun --standalone --nproc_per_node=1 \
     scripts/nccl_cg_proof.py --stage real --level $L --backend gloo \
-    --precond jacobi --rhs random --no-verify 2>&1 \
-    | grep -E "SCALE|PCG:|CUDA out of memory|Error|Traceback" | tail -4 \
+    --precond jacobi --rhs random --assembler device --no-verify 2>&1 \
+    | grep -E "SCALE|PCG:|CUDA out of memory|Warp CUDA error|Error|Traceback|Maximum resident|Elapsed" | tail -6 \
     || echo "  (L=$L failed/OOM)"
 done
 
-echo "== nccl-cg gh200 capacity done  $(date) =="
+echo "== nccl-cg gh200 capacity (GPU-resident) done  $(date) =="
