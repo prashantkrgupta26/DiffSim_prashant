@@ -383,36 +383,217 @@ def serial_reference_solve(dims: tuple[int, int, int], rhs_mode: str = "mms") ->
 
 
 # ---------------------------------------------------------------------------
+# Real K_p operator: octree scalar-Poisson stiffness (Stage 2)
+# ---------------------------------------------------------------------------
+
+def build_real_K_spd(level: int):
+    """Build the global SPD scalar-Poisson stiffness K_p for a uniform 3-D mesh.
+
+    Assembles the real octree-based FEM stiffness matrix (assemble_csr) and
+    SPD-ifies it via Dirichlet identity rows/cols on boundary nodes.
+
+    The resulting K_spd is strictly SPD: all interior rows retain the FEM
+    stencil (up to 27-point for p1 hex) and all boundary rows are identity.
+
+    Parameters
+    ----------
+    level : int
+        Octree refinement level.  Node count per axis = 2^level + 1.
+        dims = (2^level+1,)^3.
+
+    Returns
+    -------
+    K_spd : scipy.sparse.csr_matrix, shape (n, n), fp64
+        SPD-ified stiffness matrix.
+    b : np.ndarray, shape (n,), fp64
+        RHS: interior nodes get fixed-seed standard normal (rng(0) indexed
+        by global node id), boundary nodes get 0.0.
+    dims : tuple[int, int, int]
+        Grid dimensions (same on all 3 axes for a uniform mesh).
+    mesh : diffsim.mesh.nodes.Mesh
+        The assembled FEM mesh (used for boundary_nodes).
+
+    Notes
+    -----
+    The node ordering is axis-0-slowest lexicographic (verified at level 2):
+    node id = i0*(ny*nz) + i1*nz + i2.  This matches slab_partition's
+    convention exactly.
+
+    Both this function and the distributed build use identical K_spd and b
+    (same seed, same boundary treatment) so that rel_err between the distributed
+    CG solution and the serial reference measures only solver accuracy.
+    """
+    from diffsim.octree.build import build_uniform
+    from diffsim.mesh.nodes import build_mesh
+    from diffsim.mesh.constraints import build_constraints
+    from diffsim.mesh.basis import basis_tables
+    from diffsim.assembly.operators import DeviceMesh, assemble_csr
+
+    n_per_axis = 2**level + 1
+    dims = (n_per_axis, n_per_axis, n_per_axis)
+
+    tree = build_uniform(level, dim=3)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm   = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3), "cpu")
+    K    = assemble_csr(dm).tocsr().astype(np.float64)
+
+    n = K.shape[0]
+    bn = mesh.boundary_nodes      # bool array, shape (n,)
+    bn_idx = np.where(bn)[0]
+    in_idx = np.where(~bn)[0]
+
+    # SPD-ify: zero off-diagonal on boundary rows AND cols, set K[k,k]=1
+    K = K.tolil()
+    for k in bn_idx:
+        K[k, :] = 0.0
+        K[:, k] = 0.0
+        K[k, k] = 1.0
+    K = K.tocsr()
+    K.eliminate_zeros()
+
+    # RHS: fixed-seed standard normal for interior, 0 for boundary
+    # Use rng(0) with global node id indexing (same convention as --rhs random)
+    rhs_full = np.random.default_rng(0).standard_normal(n)
+    b = np.zeros(n, dtype=np.float64)
+    b[in_idx] = rhs_full[in_idx]   # interior: fixed-seed random
+    # boundary: 0.0 (homogeneous Dirichlet)
+
+    return K, b, dims, mesh
+
+
+def build_real_local_system(
+    level: int,
+    part,
+    device: torch.device,
+):
+    """Build the local (per-rank) partitioned system for the real K_p operator.
+
+    All ranks call this.  The global K_spd and RHS are built identically on
+    every rank (same seed, same level), then the owned block is extracted.
+
+    Parameters
+    ----------
+    level : int
+        Octree refinement level.
+    part : SlabPart
+        This rank's partition metadata.
+    device : torch.device
+        Target device for torch tensors.
+
+    Returns
+    -------
+    A_local_csr : scipy.sparse.csr_matrix, shape (n_owned, n_owned+n_ghost)
+        Local operator block.
+    b_local : torch.Tensor, shape (n_owned,), float64
+        Local RHS.
+    diag_local : torch.Tensor, shape (n_owned,), float64
+        Diagonal of A_local (for Jacobi precond).
+    K_spd : scipy.sparse.csr_matrix
+        Global SPD stiffness (used only by rank 0 for the reference solve).
+    b_global : np.ndarray
+        Global RHS (used only by rank 0 for the reference solve).
+    dims : tuple[int, int, int]
+        Grid dimensions.
+    """
+    from diffsim.mesh.partition import extract_local_block
+
+    K_spd, b_global, dims, mesh = build_real_K_spd(level)
+    A_local_csr = extract_local_block(K_spd, part)
+
+    owned_ids = part.owned
+    b_local_np = b_global[owned_ids]
+    diag_np    = np.array(A_local_csr[:, :len(owned_ids)].diagonal())
+
+    b_local    = torch.tensor(b_local_np, dtype=torch.float64, device=device)
+    diag_local = torch.tensor(diag_np,    dtype=torch.float64, device=device)
+
+    return A_local_csr, b_local, diag_local, K_spd, b_global, dims
+
+
+def serial_reference_solve_real(K_spd, b_global: np.ndarray) -> np.ndarray:
+    """Solve the real SPD K_p system serially with scipy.spsolve.
+
+    Parameters
+    ----------
+    K_spd : scipy.sparse.csr_matrix
+        Global SPD stiffness matrix (from build_real_K_spd).
+    b_global : np.ndarray
+        Global RHS (from build_real_K_spd).
+
+    Returns
+    -------
+    np.ndarray
+        Serial solution, shape (n,), fp64.
+    """
+    x_ref = scipy.sparse.linalg.spsolve(K_spd, b_global)
+    return x_ref.astype(np.float64)
+
+
+# ---------------------------------------------------------------------------
 # Main driver
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="NCCL-CG Proof Driver (Task 3a)")
-    p.add_argument("--stage", default="synthetic", choices=["synthetic"],
-                   help="Problem stage (only 'synthetic' in Task 3a)")
+    p = argparse.ArgumentParser(description="NCCL-CG Proof Driver (Tasks 3a + 4)")
+    p.add_argument("--stage", default="synthetic", choices=["synthetic", "real"],
+                   help=("Problem stage: 'synthetic' (Task 3a — 7-point FD Poisson) "
+                         "or 'real' (Task 4 — octree FEM scalar-Poisson K_p)"))
     p.add_argument("--backend", default="gloo", choices=["gloo", "nccl"],
                    help="torch.distributed backend")
     p.add_argument("--precond", default="jacobi", choices=["jacobi", "amgx"],
-                   help="Preconditioner (only 'jacobi' in Task 3a)")
+                   help="Preconditioner: 'jacobi' (diagonal) or 'amgx' (GPU only)")
     p.add_argument("--dims", default="8,4,4",
-                   help="Grid dimensions NX,NY,NZ (e.g. 8,4,4)")
+                   help="Grid dimensions NX,NY,NZ for --stage synthetic (e.g. 8,4,4)")
+    p.add_argument("--level", type=int, default=3,
+                   help=("Octree refinement level for --stage real. "
+                         "Node count = (2^level+1)^3 (default: 3 => 9^3=729 nodes)"))
     p.add_argument("--rtol", type=float, default=1e-10,
                    help="Solver relative tolerance")
     p.add_argument("--rhs", default="mms", choices=["mms", "random"],
-                   help=("RHS mode: 'mms' (manufactured solution, default) or "
-                         "'random' (fixed-seed standard normal, exercises many "
-                         "CG iterations via the full distributed loop)"))
+                   help=("RHS mode for --stage synthetic: 'mms' (manufactured solution, "
+                         "default) or 'random' (fixed-seed standard normal). "
+                         "--stage real always uses fixed-seed random RHS."))
     return p.parse_args()
+
+
+def _build_amgx_precond(A_local_csr, n_owned: int, device: torch.device):
+    """Build an AMGX block-Jacobi preconditioner callable.
+
+    Extracts the owned diagonal block B = A_local[:, :n_owned] and wraps
+    amgx_solve as a precond(r) -> z callable.  Shared by synthetic and real
+    stages so both stages use identical precond construction.
+
+    Parameters
+    ----------
+    A_local_csr : scipy.sparse.csr_matrix
+        Local operator (n_owned rows, n_owned+n_ghost cols).
+    n_owned : int
+        Number of owned DOFs.
+    device : torch.device
+        Target device for returned tensors.
+
+    Returns
+    -------
+    callable
+        precond(r: torch.Tensor) -> torch.Tensor
+    """
+    import scipy.sparse as _sp
+    from diffsim.solvers.amgx import amgx_solve
+
+    B_owned = _sp.csr_matrix(A_local_csr[:, :n_owned])
+    B_owned.sort_indices()
+
+    def precond(r: torch.Tensor) -> torch.Tensor:
+        r_np = r.detach().cpu().numpy().astype(np.float64)
+        z_np = amgx_solve(B_owned, r_np, sym=True, tol=1e-10, maxiter=200)
+        return torch.tensor(z_np, dtype=torch.float64, device=device)
+
+    return precond
 
 
 def main():
     args = parse_args()
-
-    dims_str = args.dims.replace(" ", "")
-    dims = tuple(int(d) for d in dims_str.split(","))
-    if len(dims) != 3:
-        sys.exit(f"--dims must be NX,NY,NZ (got {args.dims!r})")
-    nx, ny, nz = dims
 
     # ----------------------------------------------------------------
     # Initialize torch.distributed
@@ -448,11 +629,35 @@ def main():
         )
 
     # ----------------------------------------------------------------
-    # Build slab partition
+    # Resolve stage-specific dims and validate
     # ----------------------------------------------------------------
     from diffsim.mesh.partition import slab_partition
     from diffsim.solvers.dist_cg import pcg
     from diffsim.solvers.dist_cg_torch import TorchDistComm
+
+    if args.stage == "real":
+        # Real K_p: dims derived from level (uniform mesh)
+        level = args.level
+        n_per_axis = 2**level + 1
+        dims = (n_per_axis, n_per_axis, n_per_axis)
+        nx, ny, nz = dims
+        rhs_mode = "random"   # real stage always uses fixed-seed random RHS
+        if rank == 0:
+            print(f"[rank 0] stage=real, level={level}, dims={dims}, "
+                  f"n_total={nx*ny*nz}")
+    else:
+        # Synthetic: dims from --dims argument
+        dims_str = args.dims.replace(" ", "")
+        dims = tuple(int(d) for d in dims_str.split(","))
+        if len(dims) != 3:
+            if rank == 0:
+                print(f"ERROR: --dims must be NX,NY,NZ (got {args.dims!r})")
+            dist.destroy_process_group()
+            sys.exit(1)
+        nx, ny, nz = dims
+        rhs_mode = args.rhs
+        if rank == 0:
+            print(f"[rank 0] stage=synthetic, dims={dims}, rhs={rhs_mode}")
 
     if nx < world_size:
         if rank == 0:
@@ -460,23 +665,36 @@ def main():
         dist.destroy_process_group()
         sys.exit(1)
 
+    # ----------------------------------------------------------------
+    # Build slab partition
+    # ----------------------------------------------------------------
     all_parts = slab_partition(dims, world_size)
     part = all_parts[rank]
     n_owned = len(part.owned)
     n_ghost = len(part.ghost)
 
     if rank == 0:
-        print(f"[rank 0] world_size={world_size}, dims={dims}, "
-              f"n_total={nx*ny*nz}, n_owned/rank~{nx*ny*nz//world_size}")
+        print(f"[rank 0] world_size={world_size}, n_total={nx*ny*nz}, "
+              f"n_owned/rank~{nx*ny*nz//world_size}")
 
     # ----------------------------------------------------------------
-    # Assemble local system
+    # Assemble local system (stage-specific)
     # ----------------------------------------------------------------
-    rhs_mode = args.rhs
     t0 = time.perf_counter()
-    A_local_csr, b_local, diag_local, x_exact_local = assemble_local_poisson(
-        part, dims, device, rhs_mode=rhs_mode
-    )
+
+    if args.stage == "real":
+        # Real K_p: use extract_local_block on the FEM stiffness
+        A_local_csr, b_local, diag_local, K_spd_global, b_global, _ = (
+            build_real_local_system(level, part, device)
+        )
+    else:
+        # Synthetic: per-rank 7-point FD Poisson assembly
+        A_local_csr, b_local, diag_local, x_exact_local = assemble_local_poisson(
+            part, dims, device, rhs_mode=rhs_mode
+        )
+        K_spd_global = None   # not used for synthetic (serial_reference_solve builds it)
+        b_global = None
+
     t_assemble = time.perf_counter() - t0
 
     if rank == 0:
@@ -489,26 +707,8 @@ def main():
     spmv = make_partitioned_spmv(A_local_csr, n_owned, n_ghost, comm, device)
 
     if args.precond == "amgx":
-        # Block-Jacobi preconditioner: each rank preconditions with an AMGX
-        # solve on its OWNED diagonal block B = A_local[:, :n_owned] (drop the
-        # ghost columns → NO cross-rank coupling → block-Jacobi). B is a
-        # principal submatrix of the global SPD operator, hence SPD. Each rank
-        # holds exactly one block, so AMGX's process-global singleton (cached
-        # per (sym,tol,maxiter)) is reused across all CG iterations. We solve
-        # each block to a tight tolerance so M^{-1} ≈ B^{-1} is a FIXED linear
-        # operator (required for standard CG; a fixed-V-cycle apply is the
-        # cheaper follow-up). The per-apply host<->device copy of the owned
-        # vector is acceptable for this correctness proof.
-        import scipy.sparse
-        from diffsim.solvers.amgx import amgx_solve
-
-        B_owned = scipy.sparse.csr_matrix(A_local_csr[:, :n_owned])
-        B_owned.sort_indices()
-
-        def precond(r: torch.Tensor) -> torch.Tensor:
-            r_np = r.detach().cpu().numpy().astype(np.float64)
-            z_np = amgx_solve(B_owned, r_np, sym=True, tol=1e-10, maxiter=200)
-            return torch.tensor(z_np, dtype=torch.float64, device=device)
+        # Block-Jacobi: AMGX on owned diagonal block (shared construction)
+        precond = _build_amgx_precond(A_local_csr, n_owned, device)
     else:
         # Jacobi (diagonal)
         def precond(r: torch.Tensor) -> torch.Tensor:
@@ -559,8 +759,8 @@ def main():
                 for _ in range(world_size)]
     dist.all_gather(gathered, x_pad)
     if rank == 0:
-        parts = [gathered[r][:all_n_owned_list[r]] for r in range(world_size)]
-        x_dist = torch.cat(parts).cpu().numpy()
+        slab_parts = [gathered[r][:all_n_owned_list[r]] for r in range(world_size)]
+        x_dist = torch.cat(slab_parts).cpu().numpy()
     else:
         x_dist = None
 
@@ -571,7 +771,16 @@ def main():
         print(f"\n{'='*60}")
         print(f"Reference solve (scipy.spsolve)...")
         t0 = time.perf_counter()
-        x_ref = serial_reference_solve(dims, rhs_mode=rhs_mode)
+        if args.stage == "real":
+            # Use the SAME K_spd_global and b_global that every rank built
+            # (same seed, same SPD-ification) so the comparison is exact.
+            x_ref = serial_reference_solve_real(K_spd_global, b_global)
+            n_total = nx * ny * nz
+            stage_desc = f"real (level={level})"
+        else:
+            x_ref = serial_reference_solve(dims, rhs_mode=rhs_mode)
+            n_total = nx * ny * nz
+            stage_desc = f"synthetic"
         t_ref = time.perf_counter() - t0
         print(f"Reference solve: {t_ref:.3f}s")
 
@@ -580,9 +789,11 @@ def main():
         rel_err = float(np.max(err) / (np.max(np.abs(x_ref)) + 1e-300))
 
         print(f"\n--- VALIDATION RESULTS ---")
+        print(f"stage      : {stage_desc}")
         print(f"world_size : {world_size}")
-        print(f"dims       : {dims}  (n_total={nx*ny*nz})")
-        print(f"rhs_mode   : {rhs_mode}")
+        print(f"dims       : {dims}  (n_total={n_total})")
+        if args.stage == "synthetic":
+            print(f"rhs_mode   : {rhs_mode}")
         print(f"iters      : {info['iters']}")
         print(f"rel_err    : {rel_err:.3e}  (||x_dist - x_ref||_inf / ||x_ref||_inf)")
         print(f"converged  : {info['converged']}")
