@@ -45,7 +45,8 @@ from scipy.sparse.linalg import splu
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from diffsim.octree.build import build_uniform
+from diffsim.octree.build import build_uniform, refine_elements
+from diffsim.octree.balance import balance2to1
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
 from diffsim.mesh.basis import basis_tables
@@ -81,21 +82,103 @@ def _make_sheet(x_c, y_c, z_c, half_y, half_z):
     )
 
 
-def _build_shell_3d(level, x_c, y_c, z_c, half_y, half_z):
-    """Build dim=3 uniform octree + two-sided shell surrogate for the finite sheet.
+def _build_shell_3d(level, x_c, y_c, z_c, half_y, half_z,
+                    refine_to=None, band_cells=2):
+    """Build dim=3 octree (uniform or adaptive) + two-sided shell surrogate.
 
-    Returns a dict with dm, mesh, cons, sfp, gp, sfm, gm, n_excluded.
+    refine_to=None  -> uniform octree at ``level`` (current behavior, unchanged).
+    refine_to=int   -> adaptive octree: uniform base at ``level``, progressively
+                       refined near the FiniteSheet plate to ``refine_to``.
+
+    Returns a dict with dm, mesh, cons, sfp, gp, sfm, gm, n_excluded,
+    and (when adaptive) n_nodes, n_hanging, build_time.
     """
     sheet = _make_sheet(x_c, y_c, z_c, half_y, half_z)
-    tree = build_uniform(level, dim=3)
-    ret, intercepted = classify_shell_intercepted(tree, sheet)
-    mesh = build_mesh(ret, p=1)
-    cons = build_constraints(mesh)
+    if refine_to is None:
+        tree = build_uniform(level, dim=3)
+        ret, intercepted = classify_shell_intercepted(tree, sheet)
+        mesh = build_mesh(ret, p=1)
+        cons = build_constraints(mesh)
+    else:
+        amr = build_adaptive_plate_mesh(level, refine_to, sheet,
+                                        band_cells=band_cells)
+        mesh = amr["mesh"]
+        cons = amr["cons"]
+        # classify on the (already-built) tree stored in the mesh
+        ret, intercepted = classify_shell_intercepted(mesh.tree, sheet)
+        mesh = build_mesh(ret, p=1)
+        cons = build_constraints(mesh)
     dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3), "cpu")
     ftab = face_tables(1, 3)
     (sfp, gp), (sfm, gm) = extract_two_sided_surrogate(ret, sheet, ftab)
+    extra = {}
+    if refine_to is not None:
+        extra = dict(n_nodes=amr["n_nodes"], n_hanging=amr["n_hanging"],
+                     build_time=amr["build_time"])
     return dict(dm=dm, mesh=mesh, cons=cons, sfp=sfp, gp=gp, sfm=sfm, gm=gm,
-                n_excluded=int(intercepted.sum()))
+                n_excluded=int(intercepted.sum()), **extra)
+
+
+def build_adaptive_plate_mesh(base_level, refine_to, plate_geom, band_cells=2):
+    """Build an adaptive 3-D octree mesh refined near a FiniteSheet plate.
+
+    Starting from a uniform octree at ``base_level``, iterates level by level
+    from ``base_level+1`` up to ``refine_to``, each time refining cells whose
+    center is within ``band_cells * h_local`` of the plate (measured by
+    ``plate_geom.psi()`` on element centers), then applies ``balance2to1``.
+    After all refinement passes, builds the FEM mesh and constraints.
+
+    Parameters
+    ----------
+    base_level : int
+        Starting uniform octree level (e.g. 4 = 16^3 cells).
+    refine_to : int
+        Target refinement level near the plate.  Must be >= base_level.
+    plate_geom : FiniteSheet
+        Plate geometry; ``psi()`` is called on element centers to measure
+        distance.
+    band_cells : int, optional
+        Half-width of the refinement band in units of the *local* cell size
+        at the refinement level being applied.  Default 2 keeps the band thin.
+
+    Returns
+    -------
+    dict with keys:
+      'mesh'       : the built FEM mesh
+      'cons'       : hanging-node constraints
+      'n_nodes'    : total node count
+      'n_hanging'  : number of hanging nodes
+      'build_time' : wall-clock seconds for the entire mesh build
+    """
+    import torch
+    t0 = time.time()
+    tree = build_uniform(base_level, dim=3)
+    for target_level in range(base_level + 1, refine_to + 1):
+        # local cell size at the level we're about to refine INTO
+        h_target = 2.0 ** (-target_level)
+        centers = tree.centers()                        # [N, 3] in [0,1]^3
+        # psi() expects a torch tensor
+        pts_t = torch.tensor(centers, dtype=torch.float64)
+        psi_vals = plate_geom.psi(pts_t).detach().numpy()  # [N] unsigned distance
+        h_local = tree.h()                              # [N] current cell sizes
+        # refine cells close enough to the plate
+        mask = psi_vals < band_cells * h_local
+        if not mask.any():
+            break
+        tree = refine_elements(tree, mask)
+        tree = balance2to1(tree)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    n_nodes = len(mesh.node_coords)
+    n_hanging = int(cons.hanging.sum())
+    build_time = time.time() - t0
+    return dict(
+        mesh=mesh,
+        cons=cons,
+        n_nodes=n_nodes,
+        n_hanging=n_hanging,
+        build_time=build_time,
+    )
 
 
 def triangulate_finite_sheet(x_c, y_c, z_c, half_y, half_z):
@@ -214,6 +297,8 @@ def run_flow_past_3d(
     plate_half_y=0.125,
     plate_half_z=0.125,
     verbose=False,
+    refine_to=None,
+    band_cells=2,
     _two_sided=True,
     _return_fields=False,
 ):
@@ -260,11 +345,13 @@ def run_flow_past_3d(
 
     # ---- geometry + mesh ----------------------------------------------------
     fx = _build_shell_3d(level, plate_xc, plate_yc, plate_zc,
-                         plate_half_y, plate_half_z)
+                         plate_half_y, plate_half_z,
+                         refine_to=refine_to, band_cells=band_cells)
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
 
     if verbose:
-        print(f"[p2r1c-3d] level={level}  n_excluded={fx['n_excluded']}  "
+        mode = f"adaptive(base={level},refine_to={refine_to})" if refine_to else f"uniform(L{level})"
+        print(f"[p2r1c-3d] mesh={mode}  n_excluded={fx['n_excluded']}  "
               f"sfp={fx['sfp'].elem.size}  sfm={fx['sfm'].elem.size}  "
               f"nsteps={nsteps}  dt={dt}  nu={nu}", flush=True)
 
@@ -422,10 +509,52 @@ GH200_CONFIG = dict(
 )
 
 
+def report_adaptive_sizes(
+    base_level=4,
+    refine_levels=(5, 6, 7, 8, 9),
+    plate_xc=0.375,
+    plate_yc=0.5,
+    plate_zc=0.5,
+    plate_half_y=0.125,
+    plate_half_z=0.125,
+    band_cells=2,
+):
+    """Build-only node-count probe for adaptive meshes near the plate.
+
+    For each refine_to in refine_levels, builds the adaptive mesh (no solve)
+    and prints a table of refine_to, n_nodes, n_hanging, build_time.
+    Returns a list of dicts with those fields.
+
+    Example::
+
+        python -c "from p2r1c_thin_plate_flow_3d import report_adaptive_sizes; report_adaptive_sizes()"
+    """
+    sheet = _make_sheet(plate_xc, plate_yc, plate_zc, plate_half_y, plate_half_z)
+    print(f"{'refine_to':>10}  {'n_nodes':>10}  {'n_hanging':>10}  {'build_time(s)':>14}")
+    print("-" * 52)
+    rows = []
+    for refine_to in refine_levels:
+        try:
+            r = build_adaptive_plate_mesh(base_level, refine_to, sheet,
+                                          band_cells=band_cells)
+            print(f"{refine_to:>10}  {r['n_nodes']:>10}  {r['n_hanging']:>10}  "
+                  f"{r['build_time']:>14.2f}")
+            rows.append(dict(refine_to=refine_to, n_nodes=r["n_nodes"],
+                             n_hanging=r["n_hanging"],
+                             build_time=r["build_time"]))
+        except Exception as exc:
+            print(f"{refine_to:>10}  ERROR: {exc}")
+            rows.append(dict(refine_to=refine_to, error=str(exc)))
+    return rows
+
+
 if __name__ == "__main__":
     from diffsim.viz.results import save_flow_run
 
     level        = int(os.environ.get("LEVEL", "4"))
+    base_level   = int(os.environ.get("BASE_LEVEL", str(level)))
+    refine_level_str = os.environ.get("REFINE_LEVEL", "")
+    refine_level = int(refine_level_str) if refine_level_str else None
     nsteps       = int(os.environ.get("NSTEPS", "5"))
     dt           = float(os.environ.get("DT", "0.01"))
     nu           = float(os.environ.get("NU", "0.1"))
@@ -437,13 +566,17 @@ if __name__ == "__main__":
     plate_half_z = float(os.environ.get("PLATE_HALF_Z", "0.125"))
 
     re_approx = int(round(U_inf / nu)) if nu > 0 else 0
-    case_name = f"p2r1c_3d_re{re_approx}_L{level}"
+    if refine_level:
+        case_name = f"p2r1c_3d_re{re_approx}_L{base_level}_r{refine_level}"
+    else:
+        case_name = f"p2r1c_3d_re{re_approx}_L{level}"
 
     res = run_flow_past_3d(
-        level=level, nsteps=nsteps, dt=dt, nu=nu, U_inf=U_inf,
+        level=base_level, nsteps=nsteps, dt=dt, nu=nu, U_inf=U_inf,
         plate_xc=plate_xc, plate_yc=plate_yc, plate_zc=plate_zc,
         plate_half_y=plate_half_y, plate_half_z=plate_half_z,
         verbose=True,
+        refine_to=refine_level,
         _return_fields=True,
     )
     print(f"Cd={res['cd']}")
