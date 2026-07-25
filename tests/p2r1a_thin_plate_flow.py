@@ -893,6 +893,12 @@ def compare_solvers(t_start=None, plate_L_physical=None, **cfg):
         if k in cfg:
             proj_only[k] = cfg.pop(k)
 
+    # Which monolithic knobs to pull out of cfg (leave the rest for both).
+    mono_only = {}
+    for k in ("mono_solver", "device"):
+        if k in cfg:
+            mono_only[k] = cfg.pop(k)
+
     t_arr = np.arange(1, nsteps + 1) * dt
     ts = t_arr[len(t_arr) // 2] if t_start is None else t_start
 
@@ -904,7 +910,7 @@ def compare_solvers(t_start=None, plate_L_physical=None, **cfg):
             St, freq = float("nan"), float("nan")
         return cd_mean, St, freq
 
-    res_m = run_flow_past(**cfg)
+    res_m = run_flow_past(**cfg, **mono_only)
     cd_m, st_m, f_m = _reduce(res_m)
 
     res_p = run_flow_past_projection(**cfg, **proj_only)

@@ -181,3 +181,13 @@ def test_mono_solver_routing_parity():
     res_routed = run_flow_past(mono_solver="splu", device="cpu", **kw)
     assert np.allclose(res_legacy["cd"], res_routed["cd"], rtol=0, atol=1e-12), (
         f"routed splu diverged from legacy: {res_legacy['cd']} vs {res_routed['cd']}")
+
+
+def test_compare_solvers_accepts_mono_knobs():
+    """compare_solvers must route mono_solver/device to the monolithic leg
+    ONLY — the projection leg does not accept them (reviewer-found TypeError)."""
+    from p2r1a_thin_plate_flow import compare_solvers
+    out = compare_solvers(level=4, nsteps=3, dt=0.01, nu=0.1, U_inf=1.0,
+                          mono_solver="splu", device="cpu")
+    assert np.all(np.isfinite(out["mono"]["cd_mean"]))
+    assert np.all(np.isfinite(out["proj"]["cd_mean"]))
