@@ -171,3 +171,76 @@ Task 8b (GH200 ladder, nova) maps the same envelope at 95 GiB with uniform L4→
 the monolithic cudss ceiling and the fused-BiCGSTAB alternative. The GH200's larger VRAM pushes the cudss
 wall to ~812K DOF (confirmed); gpubox's cuDSS wall at L6 is anticipated but not confirmed (fused was tested
 instead as the HONEST GATE rung).
+
+## 2026-07-26: GH200 Large-DOF Ladder (Task 8b, nova job 11764437)
+
+Three-phase capacity ladder on the nova GH200 (95 GiB HBM3, `--mem=200G`,
+4 h): Phase 1 UNIFORM bluff-body cube-in-channel (host assembly + cuDSS),
+Phase 1b ADAPTIVE band-refined cube (`tests/adaptive_cube_channel.py`,
+CPU-gated), Phase 2 thin-plate adaptive (device assembly + cuDSS). Driver:
+`tests/gpu_gh200_ladder.py` via `cluster/slurm/thinshell_gh200_ladder.sbatch`.
+Full report: `.superpowers/sdd/task-8b-report.md`.
+
+### Rung Table
+
+Phase 1 — uniform cube (10 steps, dt=0.02, Re=40, offset=0.05):
+
+| rung | n_nodes | saddle DOF | s/step | Cd[10] | smi | status |
+|------|---------|------------|--------|--------|-----|--------|
+| L4 | 4,877 | 19,508 | 0.54 | +2.076 | 748 MiB | OK |
+| L5 | 35,545 | 142,180 | 2.89 | +2.710 | 1.3 GiB | OK |
+| L6 | 271,025 | 1,084,100 | 26.12 | +3.379 | 3.2 GiB after (transient ~51 GiB during factor) | OK |
+| L7 | 2,115,937 | 8,463,748 | — | — | ~35 GiB at failure | WALL cuDSS ALLOC_FAILED(2) |
+
+Phase 1b — adaptive band-refined cube (same march):
+
+| rung | h_fine | n_nodes (hanging) | saddle DOF | s/step | Cd[10] | smi | status |
+|------|--------|-------------------|------------|--------|--------|-----|--------|
+| a5r8 | 1/256 | 189,605 (32,976) | 626,516 | 17.71 | +4.366 | 9.8 GiB after (~23 GiB transient) | OK |
+| a6r9 | 1/512 | 844,049 (113,616) | 2,921,732 | — | — | 78,338 MiB peak then fail | WALL cuDSS ALLOC_FAILED(2) |
+| a6r10 | 1/1024 | — | — | — | — | — | skipped (wall) |
+
+a5r8 reaches near-wall h=1/256 (uniform-L8 territory, ~67M DOF) at 626K DOF —
+the adaptive lever buys ~2 orders of magnitude on near-wall resolution per DOF.
+
+Phase 2 — thin-plate adaptive (10 steps, dt=0.005, nu=0.004, device assembly):
+
+| rung | n_excluded | s/step | Cd | smi | status |
+|------|------------|--------|----|-----|--------|
+| r5b8 | 8,712 | 3.36 | +7.268 | 3.9 GiB | OK |
+| r6b9 | 33,800 | 22.21 | +6.721 | 13.7 GiB | OK |
+| r7b9 | — | — | — | GPU flat 13.5 GiB | HOST-OOM (200G cgroup) — job killed |
+
+### Three-Wall Analysis (95 GiB GH200)
+
+1. **GPU cuDSS factorization wall:** fits at 1.08M saddle DOF (uniform L6,
+   ~51 GiB transient factor peak); fails at 2.92M (a6r9, after climbing to
+   78.3 GiB resident — closest measured approach to the ceiling) and at 8.46M
+   (L7, early fail at ~35 GiB resident). Measured wall: **between ~1.1M and
+   ~2.9M DOF** for this 3-D P1 saddle. This REFINES the earlier "~812K DOF
+   GH200 cuDSS wall" note in the cross-reference above: 1.08M DOF factorized
+   cleanly — the wall is fill/bandwidth-dependent, not a fixed DOF count.
+2. **Host mesh-build wall (new failure class):** r7b9 (base-L7 tree + band-L9
+   refinement) exceeded the **200G host cgroup** during the HOST-side
+   octree/mesh/constraints build — SLURM oom_kill (sacct MaxRSS 209.7 GB, exit
+   137), GPU idle at 13.5 GiB. Mitigation: raise `--mem` toward Grace's 480 GB
+   and/or slim the host mesh-build intermediates.
+3. **Not run:** the projection secondary legs, final summary table, and the
+   `GH200-LADDER-OK` sentinel never printed — the host OOM ended the job inside
+   the r7b9 build. All rungs through r6b9 completed and are recorded above.
+
+Oversubscription decision: the film's `--managed` lever
+(`wp.set_device_allocator` + `CudaManagedAllocator`) governs Warp-owned arrays
+only; cuDSS allocates its factors internally (nvmath), so the lever does NOT
+transfer. Observed C2C behavior at the wall: **clean fast-fail ALLOC_FAILED, no
+spill, no crawl** — GH200+cuDSS is binary fit/no-fit under default allocation.
+A true managed probe needs cuDSS's `cudssDeviceMemHandler` wired to a managed
+pool (solver-path change, out of 8b scope).
+
+### Cross-reference
+
+Complements the 2026-07-26 gpubox (48 GiB) ladder section above: gpubox
+established cuDSS-at-L5 + fused-BiCGSTAB-at-L6 on the thin-plate driver; the
+GH200 run bounds the cuDSS direct-factor envelope at 95 GiB on both uniform and
+adaptive bluff-body meshes and adds the host-RAM mesh-build ceiling as the
+binding constraint for base-L7 adaptive builds.
