@@ -39,10 +39,11 @@ DEV = os.environ.get("DEVICE", "cuda:0")
 REFINE = int(os.environ.get("REFINE", "9"))    # plate-band target level
 WAKE = int(os.environ.get("WAKE", "9"))        # wake-band target level
 
-L = 1.0 / 16.0
+L_INV = float(os.environ.get("L_INV", "16"))  # plate = 1/L_INV of domain
+L = 1.0 / L_INV
 U = 1.0
 NU = U * L / RE
-X_C = 5.0 / 16.0
+X_C = 5.0 / L_INV
 t_start = T_START_LU * L / U   # averaging start, octree time
 
 print(f"[re-corrected] Re={RE:.0f} nu={NU:.3e} L={L} x_c={X_C} "
@@ -65,7 +66,7 @@ cl = np.asarray(r["cl"])
 t = np.arange(1, NSTEPS + 1) * DT
 assert np.all(np.isfinite(cd)), f"Cd not finite: {cd[-5:]}"
 
-out = f"results/re{RE:.0f}_r{REFINE}_corrected_hist.npz"
+out = f"results/re{RE:.0f}_r{REFINE}_Linv{L_INV:.0f}_corrected_hist.npz"
 os.makedirs("results", exist_ok=True)
 np.savez(out, t=t, cd=cd, cl=cl, nu=NU, dt=DT, L=L)
 
