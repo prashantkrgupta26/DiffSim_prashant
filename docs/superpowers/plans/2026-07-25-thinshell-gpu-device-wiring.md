@@ -663,7 +663,8 @@ EOF
 
 ### Task 8b: GH200 large-DOF adaptive NS-SBM ladder + oversubscription probe
 
-> Added 2026-07-25 (Baskar): DOF-ladder the adaptive 3-D thin-plate on the GH200 to the cuDSS wall at 95 GiB, then ONE rung past it under the Grace-Hopper unified-memory regime. Runs on nova (independent of gpubox).
+> Added 2026-07-25 (Baskar): DOF-ladder on the GH200 to the cuDSS wall at 95 GiB, then ONE rung past it under the Grace-Hopper unified-memory regime. Runs on nova (independent of gpubox).
+> AMENDED (Baskar): **bluff-body FIRST** — for a capacity probe the physics must be the most-trusted machinery so failures attribute to SCALE, not new code. Phase 1 (primary): volumetric-SBM cube-in-channel via `ladder_rung3d_cube.py` fixtures (offset/rung-C' shift, `march_monolithic_3d` host-assembly + device-cudss solve — host assembly is expected and stated), UNIFORM L4→L5→L6 (~1.1M dof wall zone)→L7 (~8.9M dof past-wall probe). Phase 2 (secondary, time-permitting): the adaptive thin-plate rung table below.
 
 **Files:**
 - Create: `tests/gpu_gh200_ladder.py` (ladder driver: loops adaptive configs over `run_flow_past_3d(mono_solver="cudss", assembly="device", device="cuda:0", refine_to=…)`, ~10 steps each, printing per-rung: n_nodes/DOF, build time, s/step, peak GPU mem (`nvidia-smi` sample or torch.cuda.max_memory_allocated), Cd finite check; catches the cudss ALLOC/ConvergenceError to record THE WALL rung and continues to report)
