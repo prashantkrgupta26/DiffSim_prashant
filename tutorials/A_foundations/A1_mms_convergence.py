@@ -40,8 +40,8 @@ from diffsim import default_device
 import warp as wp
 
 DEVICE = default_device()
-u_star = lambda x: np.sin(np.pi * x[:, 0]) * np.sin(np.pi * x[:, 1])
-f_star = lambda x: 2 * np.pi ** 2 * u_star(x)
+u_star = lambda x: x[:, 0] ** 2 + x[:, 1] ** 2
+f_star = lambda x: -4.0 * np.ones(len(x))
 
 
 def solve(level: int, p: int) -> float:
