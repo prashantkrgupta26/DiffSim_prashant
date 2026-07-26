@@ -218,3 +218,81 @@ gpu_cg touches multi-GPU).
   exactly the question this run settles.
 - St ≈ 0.15 expected for both (shedding frequency is a wake property, less
   solver-sensitive than Cd magnitude).
+
+> **⚠ SUPERSEDED by 2026-07-26 GPU campaign** — the commands and configurations
+> in this section use `NU=0.004`, which is the miscalibrated (paper-physical) value.
+> See the "2026-07-26 GPU Campaign" section below for the corrected recipe and results.
+> The commands above are preserved for reference only.
+
+---
+
+## 2026-07-26 GPU Campaign: Unit Bug + Corrected Recipe + Results
+
+**Branch:** thinshell-gpu. **Solvers validated on:** gpubox RTX 6000 Ada 48 GiB,
+nova A100-PCIE 39 GiB, nova GH200 95 GiB (smoke OK all targets).
+
+See [`docs/dev/thinshell-gpu-runbook.md`](thinshell-gpu-runbook.md) for the full
+consolidated operator's guide. This section records the campaign-specific findings.
+
+### The Unit Bug (RE250_CONFIG miscalibration)
+
+The `RE250_CONFIG` block in `tests/p2r1a_thin_plate_flow.py` used `nu=0.004` with
+`PLATE_L=0.0625` (octree units). The effective plate Re is:
+
+```
+Re_eff = U * L_octree / nu = 1.0 * 0.0625 / 0.004 = 15.6
+```
+
+At Re≈16, the wake is steady. The O1 production run (100k steps, dt=5e-4) correctly
+produced no shedding: Cl decayed to 1e-9, Cd=6.70 (steady symmetric branch — CORRECT
+physics at Re~16).
+
+### Corrected Recipe
+
+```python
+nu   = U * L_octree / Re = 1.0 * (1/16) / 250 = 2.5e-4
+x_c  = 5/16 = 0.3125          # plate center in [0,1]²
+dt   = 5e-4                    # 10× speedup vs dt=5e-5
+St   = f * L_octree / U        # Strouhal number in octree units
+```
+
+Runner: `tests/gpu_re250_corrected.py` (commit e2c2675).
+
+```bash
+ssh gpubox "cd /home/bglab/Baskar/DiffSim && \
+    LD_LIBRARY_PATH=/usr/lib/wsl/lib:\$LD_LIBRARY_PATH \
+    DEVICE=cuda:0 MONO_SOLVER=cudss ASSEMBLY=device \
+    BASE_LEVEL=7 REFINE_LEVEL=9 WAKE_LEVEL=9 \
+    NSTEPS=16000 DT=5e-4 NU=2.5e-4 U_INF=1.0 \
+    PLATE_XC=0.3125 PLATE_L=0.0625 \
+    PERT_EPS=0.03 PERT_T_END=0.5 T_START=3.0 \
+    .venv/bin/python tests/gpu_re250_corrected.py 2>&1 | tee logs/re250-corrected-\$(date +%Y%m%d-%H%M%S).log"
+```
+
+### Re=250 Monolithic GPU Results (corrected config)
+
+| Run | Cd_mean | St | t_avg window | Shedding | Notes |
+|-----|---------|----|-----------|-----------| ------|
+| MISCALIBRATED (O1, NU=0.004) | 6.70 | 2.0 (artifact) | t=[0,50] | NO | RE_eff=15.6; steady physics correct |
+| r9 longstats (NU=2.5e-4, 16k steps) | 5.47 | 0.203 | t≥3, ~17 periods | YES (Cl_std 3e-2) | Window-insensitive |
+| r10 (REFINE_LEVEL=10) | 5.72 | 0.203 | ~same | YES | +4.6% vs r9; mesh-converged |
+| L_INV=32 confinement (blockage 3.1%) | 5.09 | 0.1875 | ~same | YES | Move toward lit; residual +51% |
+
+**Literature:** Cd=3.36, St=0.14–0.15 (Najjar & Balachandar 1995; ThinShell.pdf Table 1 band [3.29,3.45]).
+
+**Verdict:** Shedding robust. Resolution-converged (r9→r10). Confinement measurable but not dominant.
+Residual gap primary suspect: SBM-force systematic (alpha=50 leak-drag / traction bias). Discriminating
+diagnostic: momentum-deficit CV drag vs `surrogate_traction` on the saved `results/re250_*_hist.npz`.
+
+### Projection Status (GPU)
+
+The 2-D projection leg **diverges structurally** at Re=250/L9 under BOTH the miscalibrated and
+the corrected configs. This is NOT a unit bug. Research-track suspects:
+- p'-outflow scheme completeness in the 2-D LeraySBMShellStepper path
+- Lagged-p* split non-convergence at Re=250 (backflow beta=0.5 tuned at Re=100)
+- Inner iteration divergence under consistent_projection=True on the large adaptive mesh
+
+The fused predictor (BiCGStab) also diverges at step 1 (relres 2.3e15, rho breakdown).
+The cudss predictor runs but the projection coupling itself diverges. Both-solver@Re250
+stays monolithic-only on GPU; projection = research track. See
+[`docs/dev/thinshell-gpu-runbook.md §5`](thinshell-gpu-runbook.md) for the full diagnosis.
