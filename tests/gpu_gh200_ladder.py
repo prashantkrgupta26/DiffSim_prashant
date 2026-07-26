@@ -18,8 +18,20 @@ PHASE 1 (primary): BLUFF-BODY cube-in-channel at UNIFORM levels L4→L5→L6→L
     pages may help if the CUDA driver opts into C2C coherence at OOM, but we do
     not force it).  The first failing rung's timing and error class ARE the result.
 
-PHASE 2 (secondary, time-permitting): the original thin-plate adaptive rungs from
-  the Task 8b plan table — if the 4h window allows after Phase 1.
+PHASE 1b (adaptive bluff, scope increment 2026-07-25): band-refined cube-channel
+  rungs (base L5, band r8), (base L6, band r9), and — only if still under the
+  wall — (base L6, band r10).  Same 10-step protocol/measurements via the same
+  march (fixture: tests/adaptive_cube_channel.py, CPU-gated by
+  tests/test_adaptive_cube_channel.py).  The adaptive rungs reach high near-wall
+  resolution at far lower DOF than uniform; DOF is reported alongside the
+  effective finest h so the uniform-vs-adaptive comparison is explicit in the
+  summary table.
+
+PHASE 2 (secondary, time-permitting): thin-plate adaptive rungs — TRIMMED to
+  (5,8), (6,9), (7,9): Phase 1b outranks Phase 2 in the 4h window; the small
+  sanity rungs are covered by the GPU smoke + Phase 1.  Skipped entirely if
+  >3h have elapsed, so the summary table + sentinel always print before the
+  wall-clock kill.
 
 Run:
     CUDA_VISIBLE_DEVICES=0 \\
@@ -52,9 +64,10 @@ print(f"[ladder] CUDA OK: {_cuda_dev}  "
 # ---------------------------------------------------------------------------
 import numpy as np
 
-# Phase 1 imports: bluff-body cube
+# Phase 1 imports: bluff-body cube (uniform + adaptive band-refined)
 from ladder_fixtures import build_cube_channel_3d, U_IN
 from ladder_rung3d_cube import march_monolithic_3d, ALPHA, FN1_GRADDIV_GAMMA
+from adaptive_cube_channel import build_adaptive_cube_channel_3d
 
 # Phase 2 imports: thin-plate adaptive
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
@@ -299,15 +312,124 @@ def run_phase1():
 
 
 # ---------------------------------------------------------------------------
+# Phase 1b: ADAPTIVE bluff-body cube ladder (band-refined octree)
+# ---------------------------------------------------------------------------
+
+PHASE1B_RUNGS = [
+    # (base, refine_to, label, note, only_if_under_wall)
+    (5, 8, "a5r8", "adaptive band r8 (h_fine=1/256)", False),
+    (6, 9, "a6r9", "adaptive band r9 (h_fine=1/512)", False),
+    (6, 10, "a6r10", "adaptive band r10 — only if still under the wall", True),
+]
+
+
+def run_phase1b():
+    """Adaptive band-refined cube-channel ladder (scope increment): high
+    near-wall resolution at far lower DOF than the uniform Phase-1 rungs.
+    Stops at first hard failure; the (6,10) rung runs only if no wall yet."""
+    print("\n" + "="*72, flush=True)
+    print(" PHASE 1b: ADAPTIVE bluff-body cube ladder "
+          "(band-refined, HOST assembly + cuDSS solve)")
+    print(" DOF is reported alongside the effective finest h for the explicit")
+    print(" uniform-vs-adaptive comparison.")
+    print("="*72 + "\n", flush=True)
+
+    rows = []
+    wall_label = None
+
+    for base, refine_to, label, note, only_if_under_wall in PHASE1B_RUNGS:
+        if wall_label is not None:
+            # stop at first hard failure; the only_if_under_wall rung (6,10)
+            # is by definition also skipped once the wall is hit.
+            print(f"\n--- Phase 1b rung {label} SKIPPED "
+                  f"(wall already hit at {wall_label}) ---", flush=True)
+            continue
+
+        h_fine = 1.0 / 2**refine_to
+        print(f"\n--- Phase 1b rung {label} (base=L{base}, band=r{refine_to}, "
+              f"h_fine={h_fine:.6f}) [{note}] ---", flush=True)
+
+        _reset_torch_peak()
+        smi_used_before, smi_total = _gpu_mem_mib()
+        t_start = time.time()
+        row = dict(phase="1b", label=label, base=base, refine_to=refine_to,
+                   h_fine=h_fine, note=note, host_assembly=True,
+                   solver=PHASE1_SOLVER)
+        try:
+            t_build = time.time()
+            fx = build_adaptive_cube_channel_3d(
+                base_level=base, refine_to=refine_to,
+                Re=PHASE1_RE, half=PHASE1_HALF, offset=PHASE1_OFFSET,
+                device=PHASE1_DEVICE)
+            build_time = time.time() - t_build
+            n_nodes = fx["n_nodes"]
+            n_hanging = fx["n_hanging"]
+            n_fluid_cells = fx["n_fluid_cells"]
+            saddle_dof = _saddle_dof(fx)
+            print(f"    mesh built in {build_time:.1f}s  n_nodes={n_nodes}  "
+                  f"n_hanging={n_hanging}  n_fluid_cells={n_fluid_cells}  "
+                  f"saddle_dof={saddle_dof}  h_fine={h_fine:.6f}", flush=True)
+
+            t_march = time.time()
+            result = march_monolithic_3d(
+                fx, dt=PHASE1_DT, nsteps=PHASE1_NSTEPS,
+                rate_tol=None, log_every=5,
+                solver=PHASE1_SOLVER, device=PHASE1_DEVICE,
+                strong_obstacle=False, alpha=ALPHA,
+                graddiv_gamma=FN1_GRADDIV_GAMMA, backflow_beta=0.5)
+            march_time = time.time() - t_march
+            steps_done = result["steps"]
+            s_per_step = march_time / steps_done if steps_done > 0 else float("nan")
+            cd_final = result["cd"]
+            cd_finite = np.isfinite(cd_final)
+
+            smi_used_after, _ = _gpu_mem_mib()
+            torch_peak = _torch_peak_mib()
+            elapsed = time.time() - t_start
+            row.update(dict(
+                n_nodes=n_nodes, n_hanging=n_hanging,
+                n_fluid_cells=n_fluid_cells, saddle_dof=saddle_dof,
+                build_time_s=round(build_time, 2),
+                s_per_step=round(s_per_step, 2), steps_done=steps_done,
+                cd_final=round(float(cd_final), 5) if cd_finite else None,
+                cd_finite=cd_finite,
+                smi_used_before_mib=smi_used_before,
+                smi_used_after_mib=smi_used_after,
+                smi_total_mib=smi_total,
+                torch_peak_mib=torch_peak,
+                elapsed_s=round(elapsed, 1),
+                status="OK" if cd_finite else "NAN-CD",
+            ))
+            print(f"    => Cd={cd_final:+.5f}  s/step={s_per_step:.2f}  "
+                  f"smi_after={smi_used_after}MiB  torch_peak={torch_peak}MiB  "
+                  f"elapsed={elapsed:.1f}s  status={row['status']}", flush=True)
+        except Exception as exc:
+            elapsed = time.time() - t_start
+            exc_class = type(exc).__name__
+            exc_msg = str(exc)[:200]
+            print(f"    WALL at {label}: {exc_class}: {exc_msg}", flush=True)
+            print(traceback.format_exc()[-400:], flush=True)
+            row.update(dict(
+                status="WALL", exc_class=exc_class, exc_msg=exc_msg,
+                elapsed_s=round(elapsed, 1),
+            ))
+            if wall_label is None:
+                wall_label = label
+        finally:
+            rows.append(row)
+
+    return rows, wall_label
+
+
+# ---------------------------------------------------------------------------
 # Phase 2: thin-plate adaptive ladder (time-permitting)
 # ---------------------------------------------------------------------------
+# TRIMMED (scope increment): Phase 1b outranks Phase 2 in the 4h window; the
+# small sanity rungs (4,6)/(5,7)/(6,8) are covered by the GPU smoke + Phase 1.
 
 PHASE2_RUNGS = [
     # (base, refine_to, label, note)
-    (4, 6, "r4b6", "sanity"),
-    (5, 7, "r5b7", "~50k cells"),
     (5, 8, "r5b8", "~100k+"),
-    (6, 8, "r6b8", "~300k+, past gpubox wall"),
     (6, 9, "r6b9", "~1M-2M DOF, expected 95 GiB wall zone"),
     (7, 9, "r7b9", "PAST-WALL probe"),
 ]
@@ -468,22 +590,42 @@ def _fmt_row(r):
     el_str = f"{el:.1f}s" if el else "?"
     exc = r.get("exc_class", "")
     exc_str = f" [{exc}]" if exc else ""
-    return (f"  Ph{ph}  {lb:8s}  status={status:12s}  Cd={cd_str:10s}  "
-            f"s/step={sps_str:7s}  smi={mem_str:12s}  torch_peak={tp_str:12s}  "
+    # DOF + effective finest h (the uniform-vs-adaptive comparison columns)
+    dof = r.get("saddle_dof")
+    dof_str = f"{dof}" if dof else "N/A"
+    hf = r.get("h_fine")
+    hf_str = f"{hf:.6f}" if hf else (f"{1.0/2**r['level']:.6f}"
+                                     if r.get("level") else "N/A")
+    return (f"  Ph{ph}  {lb:8s}  status={status:12s}  dof={dof_str:9s}  "
+            f"h_fine={hf_str:9s}  Cd={cd_str:10s}  s/step={sps_str:7s}  "
+            f"smi={mem_str:12s}  torch_peak={tp_str:12s}  "
             f"elapsed={el_str}{exc_str}")
 
 
-def _print_summary(p1_rows, p1_wall, p2_rows, p2_wall):
+def _print_summary(p1_rows, p1_wall, p1b_rows, p1b_wall, p2_rows, p2_wall,
+                   p2_skipped_reason=None):
     print("\n" + "#"*72, flush=True)
     print(" GH200 LADDER SUMMARY TABLE", flush=True)
     print("#"*72, flush=True)
-    print("  PHASE 1: bluff-body cube-in-channel (HOST assembly + cuDSS solve)", flush=True)
+    print("  PHASE 1: UNIFORM bluff-body cube-in-channel (HOST assembly + cuDSS solve)", flush=True)
     for r in p1_rows:
         print(_fmt_row(r), flush=True)
     if p1_wall:
         print(f"  PHASE 1 WALL: first hard failure at level {p1_wall}", flush=True)
     else:
         print("  PHASE 1 WALL: none (all rungs completed)", flush=True)
+
+    print("", flush=True)
+    print("  PHASE 1b: ADAPTIVE bluff-body (band-refined; same march, "
+          "lower DOF per finest h)", flush=True)
+    for r in p1b_rows:
+        print(_fmt_row(r), flush=True)
+    if p1b_wall:
+        print(f"  PHASE 1b WALL: first hard failure at rung {p1b_wall}", flush=True)
+    elif p1b_rows:
+        print("  PHASE 1b WALL: none (all rungs completed)", flush=True)
+    else:
+        print("  PHASE 1b: NOT RUN", flush=True)
 
     print("", flush=True)
     if p2_rows:
@@ -494,8 +636,10 @@ def _print_summary(p1_rows, p1_wall, p2_rows, p2_wall):
             print(f"  PHASE 2 WALL: first hard failure at rung {p2_wall}", flush=True)
         else:
             print("  PHASE 2 WALL: none (all rungs completed)", flush=True)
+    elif p2_skipped_reason:
+        print(f"  PHASE 2: SKIPPED — {p2_skipped_reason}", flush=True)
     else:
-        print("  PHASE 2: NOT RUN (time budget exhausted after Phase 1)", flush=True)
+        print("  PHASE 2: NOT RUN", flush=True)
 
     print("", flush=True)
     print(_OSUB_DECISION, flush=True)
@@ -507,16 +651,34 @@ def _print_summary(p1_rows, p1_wall, p2_rows, p2_wall):
 # Main
 # ---------------------------------------------------------------------------
 
+# Skip Phase 2 if this much wall-clock has elapsed (sbatch limit is 4h; leave
+# headroom so the summary table + sentinel always print before the kill).
+PHASE2_TIME_BUDGET_S = 3.0 * 3600
+
+
 def main():
     t_total = time.time()
 
-    # Phase 1
+    # Phase 1: uniform bluff-body ladder (+ L7 past-wall probe)
     p1_rows, p1_wall = run_phase1()
 
-    # Phase 2 (always attempt; if time has run out the sbatch wall-clock kills us)
-    p2_rows, p2_wall = run_phase2()
+    # Phase 1b: adaptive band-refined bluff-body ladder (outranks Phase 2)
+    p1b_rows, p1b_wall = run_phase1b()
 
-    _print_summary(p1_rows, p1_wall, p2_rows, p2_wall)
+    # Phase 2: thin-plate adaptive (secondary) — only if time remains
+    elapsed = time.time() - t_total
+    p2_skipped_reason = None
+    if elapsed > PHASE2_TIME_BUDGET_S:
+        p2_rows, p2_wall = [], None
+        p2_skipped_reason = (f"time budget: {elapsed/3600:.2f}h elapsed > "
+                             f"{PHASE2_TIME_BUDGET_S/3600:.1f}h cutoff "
+                             f"(Phase 1b outranks Phase 2)")
+        print(f"\n[ladder] SKIPPING Phase 2 — {p2_skipped_reason}", flush=True)
+    else:
+        p2_rows, p2_wall = run_phase2()
+
+    _print_summary(p1_rows, p1_wall, p1b_rows, p1b_wall, p2_rows, p2_wall,
+                   p2_skipped_reason=p2_skipped_reason)
     print(f"\n[ladder] total elapsed: {(time.time()-t_total)/60:.1f} min", flush=True)
 
 
