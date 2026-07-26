@@ -101,3 +101,73 @@ for the full discussion of reflection risk and convective outlet options).
 |------------|-----------------------------------------------------------------------------------|
 | CI (Mac)   | 2 pytest tests green; Cd finite, nonzero, |Cd| < 1000; load-bearing check passes |
 | GH200 hero | Cd > 0; |Cl_y|, |Cl_z| < |Cd| (symmetry); VTU+VTP written; no NaN in fields    |
+
+---
+
+## 2026-07-26: 3-D Both-Solver GPU Ladder on gpubox (L4–L6)
+
+**Box:** gpubox — 2x NVIDIA RTX 6000 Ada Generation, 48 GiB VRAM each, sm_89 (WSL2/CUDA 12.9, Driver 13.2).
+**Branch:** thinshell-gpu, HEAD e2c2675.
+**Config:** DEVICE=cuda:0, DT=0.005, NU=0.004 (Re≈250), NSTEPS=10 (L4/L5) or 3 (L6 mono-attempt).
+
+### Rung Table
+
+| Rung | Solver config | Cells / est. DOF | Steps | Elapsed | s/step | Peak GPU MiB (est.) | Cd[-1] | Outcome |
+|------|--------------|-----------------|-------|---------|--------|---------------------|--------|---------|
+| L4 mono | MONO_SOLVER=cudss ASSEMBLY=device | 4096 / ~17K | 10 | 3.8s | 0.38 | <500 MiB | +12.49 | PASS — finite, positive, decaying |
+| L4 proj | PPE_SOLVER=gpu_cg PRED_SOLVER=fused* | 4096 / ~17K | 10 | 527.5s | 52.8 | <500 MiB | +102.7 | PASS (runs end-to-end) — Cd positive but oscillates; cpu-splu predictor bottleneck dominates; 52.8 s/step vs 0.38 s/step for mono reveals predictor scale problem |
+| L5 mono | MONO_SOLVER=cudss ASSEMBLY=device | 32768 / ~131K | 10 | 22.2s | 2.22 | ~1.5 GiB (est.) | +10.09 | PASS — under cuDSS wall, fits in 48 GiB |
+| L5 proj | PPE_SOLVER=gpu_cg PRED_SOLVER=fused* | 32768 / ~131K | — | KILLED at 22 min | n/a | <500 MiB (CPU-bound) | — | KILLED (0 steps in budget) — assembly for step 0 still running at 22 min; cpu-splu predictor scales far worse than O(N) |
+| L6 proj | PPE_SOLVER=gpu_cg PRED_SOLVER=fused* | 262144 / ~1M | — | KILLED at 2 min | n/a | <500 MiB (CPU-bound) | — | KILLED (0 steps in budget) — same cpu-splu predictor bottleneck, worse at 8x DOF |
+| L6 mono-attempt | MONO_SOLVER=fused ASSEMBLY=device | 262144 / ~1M | 3 | 39.4s | 13.1 | ~3–5 GiB (est., device BiCGSTAB) | +22.79 | PASS — UNEXPECTED: fused iterative (BiCGSTAB, fused GPU kernels) converged for the nonsymmetric saddle at α=50; finite, positive Cd |
+
+*NOTE: PRED_SOLVER env var is not wired in p2r1c_thin_plate_flow_3d_projection.py — the driver always uses
+predictor_solver="splu" (CPU scipy sparse LU) regardless of PRED_SOLVER setting. The PPE is gpu_cg (GPU CG,
+working), but the predictor is CPU splu at all scales.
+
+**Log files on gpubox:**
+- L4 mono: `/home/bglab/Baskar/DiffSim/logs/l4-mono-20260726-013920-71335.log`
+- L4 proj: `/home/bglab/Baskar/DiffSim/logs/l4-proj-20260726-013943-71787.log`
+- L5 mono: `/home/bglab/Baskar/DiffSim/logs/l5-mono-20260726-014852-73045.log`
+- L5 proj: `/home/bglab/Baskar/DiffSim/logs/l5-proj-20260726-014939-73510.log` (killed at 22 min, 11 lines)
+- L6 proj: `/home/bglab/Baskar/DiffSim/logs/l6-proj-20260726-021337-76462.log` (killed at 2 min, 11 lines)
+- L6 mono-attempt: `/home/bglab/Baskar/DiffSim/logs/l6-mono-attempt-20260726-021543-79843.log`
+
+### Wall Analysis on 48 GiB gpubox
+
+**Monolithic cuDSS wall (not directly tested at L6 — fused iterative tested instead):**
+The brief anticipated an ALLOC_FAILED at L6 (~1M DOF) for monolithic cudss on gpubox (48 GiB), mirroring the
+GH200 (95 GiB) where the wall was confirmed at ~812K DOF uniform L7. At L6 uniform (~1M DOF), the cuDSS
+direct factorization of the 4x4M nonsymmetric saddle would require >10 GiB of fill — ALLOC_FAIL expected but
+not confirmed in this run series (L6 rung used fused iterative instead).
+
+**Monolithic fused-BiCGSTAB (L6, THIS RUN):**
+MONO_SOLVER=fused with ASSEMBLY=device passed at L6 in 39.4s for 3 steps (13.1 s/step). The device-assembled
+nonsymmetric saddle was solved iteratively by fused BiCGSTAB without ALLOC_FAIL. This contradicts the initial
+brief expectation of convergence failure for the saddle system with α=50 — the result is HONEST: fused
+BiCGSTAB converges here, making L6 monolithic-fused a viable (if slower) path beyond the cuDSS wall.
+
+**Projection predictor wall (UNEXPECTED BOTTLENECK):**
+The projection driver's scalable path at L6+ is blocked not by the PPE (gpu_cg works), but by the
+predictor solver: the driver hardcodes predictor_solver="splu" (CPU scipy sparse LU), and PRED_SOLVER env var
+is ignored. At L5 (~131K DOF), step-0 assembly still running at 22 min (killed). At L6 (~1M DOF), killed at
+2 min during assembly (same pattern, 64x worse DOF). The "projection scalable path" requires wiring a
+device-side predictor (device FGMRES or AMGX) — this is the R2b block-preconditioner track, NOT available
+in the current driver.
+
+### Summary of Boundaries
+
+| Path | Practical ceiling on gpubox (48 GiB) | Next step |
+|------|--------------------------------------|-----------|
+| Monolithic cuDSS | L5 (~131K DOF) confirmed; L6 cudss NOT tested (would likely ALLOC_FAIL — see GH200 wall at 812K DOF for reference) | cuDSS wall probe deferred |
+| Monolithic fused-BiCGSTAB | L6 (~1M DOF) PASSES in 13.1 s/step — viable iterative path beyond cuDSS | Convergence quality / iteration count study needed |
+| Projection gpu_cg PPE | PPE itself scales; L4 runs (52.8 s/step) — bottleneck is predictor, not PPE | Wire device predictor (R2b track) |
+| Projection cpu-splu predictor | Dies at L5 (22 min for step 0, killed) — NOT a viable L5+ path | R2b block-preconditioner / FGMRES |
+
+### Cross-reference
+
+Task 8b (GH200 ladder, nova) maps the same envelope at 95 GiB with uniform L4→L7 volumetric-SBM cube-in-channel
+(bluff-body first, most-trusted machinery). The gpubox runs here establish the 48 GiB reference points for
+the monolithic cudss ceiling and the fused-BiCGSTAB alternative. The GH200's larger VRAM pushes the cudss
+wall to ~812K DOF (confirmed); gpubox's cuDSS wall at L6 is anticipated but not confirmed (fused was tested
+instead as the HONEST GATE rung).
