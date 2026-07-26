@@ -419,6 +419,7 @@ if __name__ == "__main__":
     plate_half_y = float(os.environ.get("PLATE_HALF_Y", "0.125"))
     plate_half_z = float(os.environ.get("PLATE_HALF_Z", "0.125"))
     ppe_solver   = os.environ.get("PPE_SOLVER", "gpu_cg")
+    pred_solver  = os.environ.get("PRED_SOLVER", "splu")
 
     re_approx = int(round(U_inf / nu)) if nu > 0 else 0
     if refine_level:
@@ -431,7 +432,7 @@ if __name__ == "__main__":
         plate_xc=plate_xc, plate_yc=plate_yc, plate_zc=plate_zc,
         plate_half_y=plate_half_y, plate_half_z=plate_half_z,
         verbose=True, refine_to=refine_level, ppe_solver=ppe_solver,
-        _return_fields=True,
+        predictor_solver=pred_solver, _return_fields=True,
     )
     print(f"Cd={res['cd']}")
     print(f"Cl_y={res['cl_y']}")
