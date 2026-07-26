@@ -32,7 +32,6 @@ r = run_flow_past_3d(level=3, nsteps=2, dt=0.01, nu=0.1,
                      mono_solver="cudss", device=DEV, verbose=False)
 assert np.all(np.isfinite(r["cd"])), r["cd"]; ok.append("3d-mono")
 # 3-D projection fused + gpu_cg
-sys.path.insert(0, os.path.dirname(__file__))
 from p2r1c_thin_plate_flow_3d_projection import run_flow_past_3d_projection
 r = run_flow_past_3d_projection(level=3, nsteps=2, ppe_solver="gpu_cg",
                                 predictor_solver="fused", device=DEV,

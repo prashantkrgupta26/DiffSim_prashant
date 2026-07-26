@@ -116,7 +116,7 @@ def test_mono3d_solver_routing_parity():
     assert np.allclose(res_legacy["cd"], res_routed["cd"], rtol=0, atol=1e-12)
 
 
-def test_device_assembly_parity_cpu_3d(device):
+def test_device_assembly_parity_cpu_3d():
     """assembly="device" matches assembly="host" on the 3-D monolithic march.
 
     DeviceNSAssembler volume fill + two-sided SBM face system (Af_c) via
@@ -131,7 +131,7 @@ def test_device_assembly_parity_cpu_3d(device):
         f"device-assembly 3-D Cd diverged: {res_h['cd']} vs {res_d['cd']}")
 
 
-def test_device_assembly_parity_cpu_3d_adaptive(device):
+def test_device_assembly_parity_cpu_3d_adaptive():
     """assembly="device" works on the adaptive 3-D mesh and matches assembly="host".
 
     Mirrors test_device_assembly_parity_cpu_adaptive (2-D): confirms the

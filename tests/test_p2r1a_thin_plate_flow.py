@@ -191,8 +191,8 @@ def test_compare_solvers_accepts_mono_knobs():
     out = compare_solvers(level=4, nsteps=3, dt=0.01, nu=0.1, U_inf=1.0,
                           mono_solver="splu", device="cpu", assembly="device",
                           predictor_solver="splu")
-    assert np.all(np.isfinite(out["mono"]["cd_mean"]))
-    assert np.all(np.isfinite(out["proj"]["cd_mean"]))
+    assert np.isfinite(out["mono"]["cd_mean"])
+    assert np.isfinite(out["proj"]["cd_mean"])
 
 
 def test_device_assembly_parity_cpu(device):

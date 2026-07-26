@@ -225,7 +225,7 @@ def test_two_sided_coupling_load_bearing():
         "Gamma~+ side is inert")
 
 
-def test_projection_device_assembly_parity(device="cpu"):
+def test_projection_device_assembly_parity():
     """Projection with device_assembly=True must match the host-assembly
     projection march (CPU Warp device: deterministic, tight tolerance).
 
@@ -240,6 +240,7 @@ def test_projection_device_assembly_parity(device="cpu"):
               verbose=False)
     res_h = run_flow_past_projection(**kw)
     res_d = run_flow_past_projection(device_assembly=True, **kw)
+    assert np.all(np.isfinite(res_d["cd"]))
     assert np.allclose(res_h["cd"], res_d["cd"], rtol=1e-9, atol=1e-11), (
         f"projection device-assembly diverged: {res_h['cd']} vs {res_d['cd']}")
 

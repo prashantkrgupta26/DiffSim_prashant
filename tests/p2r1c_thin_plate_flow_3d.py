@@ -513,7 +513,8 @@ def run_flow_past_3d(
             # Pressure pin
             _val_of[int(p_pin)] = 0.0
             # Build strong_b_vals in sorted unique row order (_strong_rows)
-            _sb = np.array([_val_of.get(int(_r), 0.0) for _r in _strong_rows])
+            # every strong row is bc_rows or the pin — fail loudly if not
+            _sb = np.array([_val_of[int(_r)] for _r in _strong_rows])
 
             # Af_c is geometry-cached (assembled once before the loop); its
             # value array is constant each step.  Use the pre-uploaded
