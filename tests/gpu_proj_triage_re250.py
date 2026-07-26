@@ -25,8 +25,13 @@ assert torch.cuda.is_available(), (
 print(f"[triage] CUDA device: {torch.cuda.get_device_name(0)}", flush=True)
 
 # ── local imports ─────────────────────────────────────────────────────────────
-sys.path.insert(0, "src")          # works from /work/mech-ai/baskarg/DiffSim
-from tests.p2r1a_thin_plate_flow import run_flow_past_projection
+# Add both src/ (for diffsim package) and tests/ (for the driver modules).
+# This script is run from the repo root: python tests/gpu_proj_triage_re250.py
+import os as _os
+_repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+sys.path.insert(0, _os.path.join(_repo, "src"))
+sys.path.insert(0, _os.path.join(_repo, "tests"))
+from p2r1a_thin_plate_flow import run_flow_past_projection
 from diffsim.postproc.shedding import strouhal
 
 # ── corrected Re=250 config ───────────────────────────────────────────────────
