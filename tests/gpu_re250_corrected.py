@@ -36,6 +36,8 @@ DT = float(os.environ.get("DT", "5e-4"))
 NSTEPS = int(os.environ.get("NSTEPS", "8000"))
 T_START_LU = float(os.environ.get("T_START_LU", "20"))
 DEV = os.environ.get("DEVICE", "cuda:0")
+REFINE = int(os.environ.get("REFINE", "9"))    # plate-band target level
+WAKE = int(os.environ.get("WAKE", "9"))        # wake-band target level
 
 L = 1.0 / 16.0
 U = 1.0
@@ -49,7 +51,7 @@ print(f"[re-corrected] Re={RE:.0f} nu={NU:.3e} L={L} x_c={X_C} "
 
 t0 = time.time()
 r = run_flow_past(
-    level=7, refine_to=9, wake_refine=9,
+    level=7, refine_to=REFINE, wake_refine=WAKE,
     nsteps=NSTEPS, dt=DT, nu=NU, U_inf=U,
     plate_xc=X_C, plate_yc=0.5, plate_L=L,
     pert_eps=float(os.environ.get("PERT_EPS", "0.03")), pert_t_end=0.5,
@@ -63,7 +65,7 @@ cl = np.asarray(r["cl"])
 t = np.arange(1, NSTEPS + 1) * DT
 assert np.all(np.isfinite(cd)), f"Cd not finite: {cd[-5:]}"
 
-out = f"results/re{RE:.0f}_corrected_hist.npz"
+out = f"results/re{RE:.0f}_r{REFINE}_corrected_hist.npz"
 os.makedirs("results", exist_ok=True)
 np.savez(out, t=t, cd=cd, cl=cl, nu=NU, dt=DT, L=L)
 
