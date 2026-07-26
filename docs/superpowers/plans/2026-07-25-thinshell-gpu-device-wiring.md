@@ -661,6 +661,31 @@ EOF
 
 ---
 
+### Task 8b: GH200 large-DOF adaptive NS-SBM ladder + oversubscription probe
+
+> Added 2026-07-25 (Baskar): DOF-ladder the adaptive 3-D thin-plate on the GH200 to the cuDSS wall at 95 GiB, then ONE rung past it under the Grace-Hopper unified-memory regime. Runs on nova (independent of gpubox).
+
+**Files:**
+- Create: `tests/gpu_gh200_ladder.py` (ladder driver: loops adaptive configs over `run_flow_past_3d(mono_solver="cudss", assembly="device", device="cuda:0", refine_to=…)`, ~10 steps each, printing per-rung: n_nodes/DOF, build time, s/step, peak GPU mem (`nvidia-smi` sample or torch.cuda.max_memory_allocated), Cd finite check; catches the cudss ALLOC/ConvergenceError to record THE WALL rung and continues to report)
+- Create: `cluster/slurm/thinshell_gh200_ladder.sbatch` (pattern: `thinshell_gh200_smoke.sbatch`, `--time=04:00:00`, background `nvidia-smi --query-gpu=memory.used` sampling loop → smi.log per the `gh200_osub.sh` pattern)
+- Read first: `cluster/gh200_osub.sh` + `benchmarks/gh200_capacity_probe.py` (how --managed/oversubscription was engaged for the film; reuse the mechanism ONLY if it applies to our torch/cuDSS path — otherwise the oversubscription probe is simply the first rung whose factorization EXCEEDS 95 GiB, measuring whether GH200's NVLink-C2C hybrid mode stays usable vs the gpubox 48 GB crawl)
+
+**Rungs (stop ladder at first hard failure, then run exactly one past-the-wall rung):**
+| rung | base | plate refine | est. cells | note |
+|---|---|---|---|---|
+| 1 | L4 | r6 | sanity | seconds |
+| 2 | L5 | r7 | ~50k | |
+| 3 | L5 | r8 | ~100k+ | |
+| 4 | L6 | r8 | ~300k+ | past gpubox wall territory |
+| 5 | L6 | r9 | ~1M-2M DOF | expected 95 GiB wall zone |
+| 6 | L7 | r9 | past wall | THE oversubscription probe rung |
+
+- Projection secondary leg (gpu_cg PPE + cudss predictor + device_assembly) at the 2-3 largest rungs that fit, reported with the documented ~40% 3-D gap caveat.
+- Record per-rung table + smi.log peaks + the wall location in the runbook (Task 10). Honest: if the past-wall rung crawls unusably (>20 min/factorization), kill it and record the timing — that IS the result.
+- Constraints: nova only (never gpubox — production in flight there); ≤4 concurrent GPU jobs; explicit-path commits; standard trailer.
+
+---
+
 ### Task 9: Nova bring-up — reconcile, sync, A100 + GH200 smokes
 
 **Files:**
