@@ -119,7 +119,7 @@ for the full discussion of reflection risk and convective outlet options).
 | L5 mono | MONO_SOLVER=cudss ASSEMBLY=device | 32768 / ~131K | 10 | 22.2s | 2.22 | ~1.5 GiB (est.) | +10.09 | PASS — under cuDSS wall, fits in 48 GiB |
 | L5 proj | PPE_SOLVER=gpu_cg PRED_SOLVER=fused* | 32768 / ~131K | — | KILLED at 22 min | n/a | <500 MiB (CPU-bound) | — | KILLED (0 steps in budget) — assembly for step 0 still running at 22 min; cpu-splu predictor scales far worse than O(N) |
 | L6 proj | PPE_SOLVER=gpu_cg PRED_SOLVER=fused* | 262144 / ~1M | — | KILLED at 2 min | n/a | <500 MiB (CPU-bound) | — | KILLED (0 steps in budget) — same cpu-splu predictor bottleneck, worse at 8x DOF |
-| L6 mono-attempt | MONO_SOLVER=fused ASSEMBLY=device | 262144 / ~1M | 3 | 39.4s | 13.1 | ~3–5 GiB (est., device BiCGSTAB) | +22.79 | PASS — UNEXPECTED: fused iterative (BiCGSTAB, fused GPU kernels) converged for the nonsymmetric saddle at α=50; finite, positive Cd |
+| L6 mono-attempt | MONO_SOLVER=fused ASSEMBLY=device | 262144 / ~1M | 3 | 39.4s | 13.1 | ~3–5 GiB (est., device BiCGSTAB) | +22.79 | PASS — UNEXPECTED: fused iterative (BiCGSTAB, fused GPU kernels) converged for the nonsymmetric saddle at α=50; finite, positive Cd (3-step march only; long-march stability unconfirmed) |
 
 *NOTE: PRED_SOLVER env var is not wired in p2r1c_thin_plate_flow_3d_projection.py — the driver always uses
 predictor_solver="splu" (CPU scipy sparse LU) regardless of PRED_SOLVER setting. The PPE is gpu_cg (GPU CG,
@@ -160,7 +160,7 @@ in the current driver.
 | Path | Practical ceiling on gpubox (48 GiB) | Next step |
 |------|--------------------------------------|-----------|
 | Monolithic cuDSS | L5 (~131K DOF) confirmed; L6 cudss NOT tested (would likely ALLOC_FAIL — see GH200 wall at 812K DOF for reference) | cuDSS wall probe deferred |
-| Monolithic fused-BiCGSTAB | L6 (~1M DOF) PASSES in 13.1 s/step — viable iterative path beyond cuDSS | Convergence quality / iteration count study needed |
+| Monolithic fused-BiCGSTAB | L6 (~1M DOF) PASSES in 13.1 s/step — viable iterative path beyond cuDSS (3-step march only; long-march stability unconfirmed) | Convergence quality / iteration count study needed |
 | Projection gpu_cg PPE | PPE itself scales; L4 runs (52.8 s/step) — bottleneck is predictor, not PPE | Wire device predictor (R2b track) |
 | Projection cpu-splu predictor | Dies at L5 (22 min for step 0, killed) — NOT a viable L5+ path | R2b block-preconditioner / FGMRES |
 
