@@ -296,3 +296,56 @@ The fused predictor (BiCGStab) also diverges at step 1 (relres 2.3e15, rho break
 The cudss predictor runs but the projection coupling itself diverges. Both-solver@Re250
 stays monolithic-only on GPU; projection = research track. See
 [`docs/dev/thinshell-gpu-runbook.md §5`](thinshell-gpu-runbook.md) for the full diagnosis.
+
+### 2026-07-27 Leak-drag discriminator — VERDICT
+
+**Instrument trail** (GPU legs on gpubox RTX 6000 Ada, `tests/gpu_leakdrag_discriminator.py`):
+
+(a) **3-leg α sweep** (8000 steps/leg, log `leakdrag-20260726-232649-53567.log`, ~45–53 min/leg):
+
+| alpha | Cd_surr | CV(4L) | \|leak\| | St |
+|-------|---------|--------|----------|-----|
+| 20 | 4.228 | 2.619 | 7.7e-3 | 0.1875 |
+| 50 | 5.437 | 3.090 | 4.7e-3 | 0.2188 |
+| 100 | 5.982 | 3.565 | 5.0e-3 | 0.2188 |
+
+Original {4,6,8}L box columns **withheld** — 6L/8L were off-domain (upstream caps at 5L for
+x_c=5/16; probe-design bug — zero-meaned columns tripped the spread self-check exactly as
+designed). Only the 4L column is valid.
+
+(b) **Corrected-box leg** (α=50, margins {2,3,4}L): CV = 2.855 / 2.954 / 3.090 — spread 7.9%
+(>5% gate), monotone in box size.
+
+(c) **Double-window leg** (16k steps, ~2.9× window): CV = 2.853 / 2.980 / 3.209 — spread 11.8%,
+**WORSE** ⇒ unsteady-residual hypothesis **REFUTED**; line-quadrature CV hit its method limit
+on the stabilized weak-divergence field (real CV integration systematic).
+
+(d) **FINAL verdict leg** (LD-5 consistent-reaction arbiter, α=50, 8000 steps,
+log `leakdrag-verdict-20260727-091605-26155.log`): **Cd_reaction = 2.3440** on both
+plate-enclosing indicator sets (agreement 7.01e-15 ≤ 1e-6, **gate PASSED**),
+**Cd_surr = 5.4369**, **St = 0.2188**. Printed verdict line:
+`VERDICT: observable-overestimates+alpha-insensitive`, `LEAKDRAG-OK`.
+
+**VERDICT: observable-overestimates** — the `surrogate_traction` observable reads **2.3×** the
+variationally-consistent Nitsche reaction; the physics-carrying instruments (reaction 2.34,
+CV 2.9–3.2) sit at/below literature 3.36. Two mandatory caveats: (i) the printed
+"alpha-insensitive" tag is an artifact of the single-α verdict leg — the 3-leg sweep measured
+**alpha-SENSITIVE** (+41% surr, +36% CV over α 20→100), which is the standing label;
+(ii) the agreement gate is a mechanics self-check (zero by construction, per the documented
+scoping in the probe), not set-independence.
+
+**Follow-ups:** (a) traction-observable dissection — shifted-face σ·n integration vs the
+consistent Nitsche functional; decompose the 2.3× gap (candidate terms: penalty virtual work,
+adjoint-consistency, staircase-face area weighting) — the immediate next work; (b) the
+reaction-vs-CV ~25% gap (penalty virtual work vs divergence-error flux) as a secondary
+reconciliation item; (c) α-scaling investigation (α~Pe·p² vs fixed 50) stands.
+
+**Instrument-development cost (honest):** the probe shipped with a box-margin design bug
+({4,6,8}L against a 5L upstream cap — caught by its own spread self-check, margins corrected
+to {2,3,4}L, commit 969f391) and a printer KeyError (hardcoded tags) that crashed the final
+table on two legs (results recovered from npz; printer fixed dynamically). Both fixed; neither
+affected the physics numbers.
+
+This resolves the "Residual gap primary suspect: SBM-force systematic" line above: the +51%
+Cd excess vs literature is attributed to the traction observable, not to leak drag or real
+flow physics.
