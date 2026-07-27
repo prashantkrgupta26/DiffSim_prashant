@@ -349,3 +349,91 @@ affected the physics numbers.
 This resolves the "Residual gap primary suspect: SBM-force systematic" line above: the +51%
 Cd excess vs literature is attributed to the traction observable, not to leak drag or real
 flow physics.
+
+### 2026-07-27 Traction dissection — term attribution + resolution/blockage verdict
+
+**Probe:** `tests/gpu_traction_dissect.py` (commit 802590e), gpubox RTX 6000 Ada,
+log `tractdissect-20260727-121213-49595.log`. All four legs GREEN, `TRACTDISSECT-OK`.
+Per-leg npz on the box: `results/tractdissect_D{1..4}.npz`.
+
+**Per-leg term table (verbatim from the probe):**
+
+```
+ Tag   Cd_rxn  consistency+adjoint              penalty             backflow  Cd_surr   bridge      St        dt       s
+  D1   2.5996             0.070377             2.529259             0.000000   5.4369  77.2537  0.2188  5.00e-04  2042.4
+  D2   2.8098             0.114229             2.695620             0.000000   5.8385  51.1125  0.2188  5.00e-04  2166.9
+  D3   3.0483             0.129051             2.919280             0.000000   6.3351  49.0900  0.1875  5.00e-04  2028.9
+  D4   2.4336             0.065880             2.367731             0.000000   5.0844  77.1765  0.1875  2.50e-04  2130.4
+```
+
+Legs: D1 = r9/α=50 baseline (L_inv=16, blockage 6.25%); D2 = r10; D3 = r11;
+D4 = L/32 plate at 32 cells/plate (r10-matched), blockage halved to 3.125%.
+**dt_used per leg:** D1/D2/D3 = 5e-4 (D3 needed **NO dt fallback** at r11), D4 = 2.5e-4
+(by design). **Partition gates:** the in-march per-step gate `1e-12·max(1,|Cd_total|)`
+held on every leg; post-hoc max abs residuals from the npz: D1 9.18e-13, D2 1.13e-12,
+D3 1.14e-12, D4 1.12e-12 (the values above 1e-12 absolute are within the enforced
+relative gate at |Cd| ≈ 2.4–3.0).
+
+**HEADLINE — the PENALTY term carries the force.** On every leg the α=50 penalty
+block contributes ~96–97% of the consistent reaction (e.g. D1: 2.5293 of 2.5996);
+the consistency+adjoint class is nearly inert (2.7–4.2%); backflow is identically
+zero. Numerically, the "variationally-consistent reaction" at this configuration
+IS penalty virtual work.
+
+**Bridge ratio (bare σ·n vs consistency class):** 77.25 / 51.11 / 49.09 / 77.18 —
+FAR from 1 on every leg. Bare σ·n does NOT approximate the consistency-class term,
+so the 2.3× surrogate excess cannot be read as "consistency-carried force plus
+penalty/adjoint virtual work on top". Per the design's interpretation rule, the
+shifted-face σ·n integration itself is implicated: at α=50 the surrogate and the
+reaction measure essentially different functionals.
+
+**Resolution trend (spec decision rule applied verbatim):** Cd_rxn(r9→r10→r11) =
+2.5996 → 2.8098 → 3.0483; increments +0.2102, then +0.2385. The sequence is
+MONOTONE toward 3.36 but the increments are NOT shrinking (they grew ~13%). The
+spec rule — "monotone toward 3.36 with shrinking increments ⇒ deficit = resolution,
+extrapolated value recorded; flat/oscillating ⇒ resolution exonerated ⇒ formulation
+under the microscope" — has NEITHER branch obtain: the sequence is pre-asymptotic.
+No valid extrapolation exists and mesh-convergence is NOT demonstrated; but the
+trend is monotone toward literature, not flat/oscillating, so resolution is NOT
+exonerated either.
+
+**Blockage direction (D4 vs D2, against the CV trend):** halving blockage at matched
+cells/plate moves Cd_rxn 2.8098 → 2.4336 (−13.4%) and Cd_surr 5.8385 → 5.0844
+(−12.9%) — the SAME direction and similar magnitude as the 2026-07-26 confinement
+probe (Cd 5.72 → 5.09, −11%). Confinement inflates both observables by ~13%;
+removing it DEEPENS the reaction's literature deficit (2.4336 at 3.1% blockage =
+27.6% below 3.36). St = 0.1875 at both D3 and D4 (literature ~0.15).
+
+**Arbiter reproducibility — OPEN:** D1's Cd_rxn = 2.5996 differs 11% from the LD-5
+verdict leg's 2.3440 at the nominally IDENTICAL config (r9, α=50, dt=5e-4, 8000
+steps, t_start=1.5), while Cd_surr matches to 4 decimals (5.4369 both) —
+trajectory-identical yet reaction-differing: NOT chaotic divergence; UNEXPLAINED.
+Leading suspect: a code delta in the reaction path — the LD leg ran at commit
+4acaae1 (pre-TD-2), D1 runs post-4472cf2 where TD-2 restructured the reaction
+computation; TD-2's parity test pinned only `reaction_terms=False` against its own
+base, not `reaction_hist` against the LD-era code. Diagnostic (filed as follow-up,
+not done): re-run the LD verdict config on current code and/or diff the two
+reaction computations. The headline is robust to it (5.44/2.60 = 2.1× vs
+5.44/2.34 = 2.3×).
+
+**OBSERVABLE DECISION — ESCALATED to Baskar (no adoption).** The spec adopts the
+consistent reaction as the canonical force observable only "if the reaction
+mesh-converges toward literature". Mesh-convergence is NOT demonstrated (monotone
+but non-shrinking increments), so no adoption is recorded; the decision escalates
+with the term table in hand. For Baskar: (i) the reaction is ~96% penalty virtual
+work at α=50 — the "consistent reaction" is here an α-scaled penalty functional,
+which connects directly to the standing α-sensitivity finding (+36–41% over
+α 20→100) and the α-scaling follow-up; (ii) St ALSO moved toward literature at r11
+(0.2188 → 0.1875) — resolution is helping the physics broadly, so the sequence may
+still converge beyond r11; (iii) the obvious next probe is a D3b leg at
+refine_to=12 (256 cells/plate; 2-D fits the 48 GiB box; dt likely 2.5e-4 at that h;
+~1–2 h wall) to test whether the increments start shrinking — Baskar's call, not
+run in this campaign; (iv) if r12 still fails to shrink the increments, the
+two-sided-shell formulation (α-scaling, penalty-dominated reaction) moves under the
+microscope as the systematic.
+
+**Follow-ups filed:** (1) arbiter reproducibility diagnostic (LD-era vs TD-2-era
+reaction path, above); (2) D3b r12 resolution probe (offered; Baskar's call);
+(3) α-scaling investigation (α~Pe·p² vs fixed 50) — stands, now sharpened by
+penalty-dominance; (4) canonical-observable adoption — BLOCKED on the escalation
+decision, NOT implemented.
