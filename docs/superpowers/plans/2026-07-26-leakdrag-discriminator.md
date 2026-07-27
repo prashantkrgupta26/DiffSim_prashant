@@ -509,6 +509,16 @@ EOF
 
 ---
 
+### Task 5 (LD-5, added 2026-07-27): Consistent-reaction force arbiter
+
+> Added after the CV instrument hit its method limit (box systematic 7.9%→11.8% under window doubling ⇒ real integration systematic on the stabilized field, likely divergence-error flux; ledger 2026-07-27). Baskar's decision: FEM-native arbiter.
+
+**Method (the variational identity):** the discrete solution satisfies `R_vol(w) + R_sbm(w) = 0` for every free test function `w`. Choose `w_h` = x-unit indicator on a node set enclosing the plate (1 on the set's u_x dofs, 0 elsewhere, zero on outer-Dirichlet rows). Then the plate's variationally-consistent x-force is `F_x = w_hᵀ (A_vol x − b_vol)` computed from the step's VOLUME system (`assemble_linear_ns` output BEFORE `Af_c/bf_c` addition and before any row surgery). Properties: box-free, quadrature-exact at the discrete level, and INDEPENDENT of the node-set choice — two different valid sets must agree to ~machine precision (the self-check; disagreement ⇒ implementation bug, not physics).
+
+**Files:** Modify `tests/p2r1a_thin_plate_flow.py` (optional `reaction_sets=None` kwarg: list of node-index arrays; when set, per-step compute `f_x[k] = w_kᵀ(A_vol x_cur − b_vol)` for each set BEFORE Af/row surgery, append to a returned `reaction_hist` [nsteps, nsets]); extend `tests/gpu_leakdrag_discriminator.py` (build TWO plate-enclosing node sets — e.g. nodes within 1.5L and 2.5L of the plate center, excluding outer-boundary nodes — pass via reaction_sets, accumulate time-averaged Cd_reaction per set + their agreement, add to the table/verdict: the reaction pair replaces the box-spread gate: |set1−set2|/|mean| ≤ 1e-6 ⇒ instrument valid); CPU gate in `tests/test_leakdrag_probe_cpu.py` (tiny config: reaction_hist finite, TWO sets agree ≤1e-6 — the self-check IS the gate) + a `run_flow_past` default-None parity test.
+- Verdict logic amended: instrument gate = reaction-set agreement (≤1e-6) instead of box spread; CV boxes stay reported as corroborating context. CV-vs-surr threshold applies to Cd_reaction vs Cd_surr (10%).
+- GPU: one α=50 leg (8000 steps) → if sets agree: FORMAL VERDICT issues from Cd_reaction; record everything (incl. the CV instrument-limit finding) per Task 4's recording contract.
+
 ## Self-Review Against Spec
 
 1. ✅ `cv_drag_box` signature, sampling, viscous FD, sign convention, node-line requirement (raises) — Task 1.

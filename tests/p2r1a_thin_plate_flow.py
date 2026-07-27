@@ -375,6 +375,8 @@ def run_flow_past(
     mono_solver="splu",  # monolithic solver backend (splu | cudss | fused)
     device="cpu",      # device for non-splu backends (cpu | cuda | hip)
     assembly="host",   # assembly backend: "host" (default, bit-for-bit) | "device"
+    on_step=None,      # optional per-step callback: on_step(step, t, u_full, p_full, cd_step)
+    reaction_sets=None,  # list of free-node index arrays for reaction-force arbiter (LD-5)
 ):
     """Run flow past a finite thin plate with transient BDF2 march.
 
@@ -407,12 +409,38 @@ def run_flow_past(
         "device" (DeviceNSAssembler; symbolic pattern once per mesh epoch,
         numeric fill on device per step, SBM face system via cached slots).
         "host" default keeps all existing tests bit-for-bit unchanged.
+    on_step : callable or None
+        Optional per-step callback invoked AFTER each step's traction evaluation
+        as ``on_step(step, t_new, u_full, p_full, cd_step)`` where ``u_full``
+        is [n_nodes, 2] velocity, ``p_full`` is [n_nodes] pressure (full-mesh
+        constraint-expanded nodal fields, same construction as ``_return_fields``),
+        and ``cd_step`` is that step's surrogate-traction Cd (float). Default
+        None => bit-for-bit identical march with no overhead.
+    reaction_sets : list of np.ndarray or None
+        Optional list of FREE-NODE index arrays for the variational reaction-force
+        arbiter (LD-5). Each entry ``s_k`` is an array of free-node indices; the
+        arbiter builds ``w_k`` as the u_x-DOF indicator over s_k (1 on u_x DOFs of
+        those nodes, 0 elsewhere) and computes per step:
+            F_x[k] = w_kᵀ (A_vol x_cur − b_vol)
+        using path (b): for the device assembly path, algebraically equivalent to
+            w_kᵀ (A_full x − b_full) − w_kᵀ (Af_c x − bf_c)
+        since A_full = A_vol + Af_c, and w_k has zero weight on every surgery row
+        (strong-BC/kick/pin rows) making the subtraction exact.
+        Sign convention: F_x > 0 is force ON THE FLUID FROM THE PLATE, i.e.
+        opposing the flow. Cd_reaction = F_x / (0.5 * U_inf^2 * L) is POSITIVE
+        for downstream drag (same sign as surrogate-traction Cd).
+        Default None => no reaction evaluation, no 'reaction_hist' key, zero overhead
+        (bit-for-bit identical to the legacy march).
 
     Returns a dict with:
       'cd'       : np.ndarray [nsteps] — drag coefficient history
       'cl'       : np.ndarray [nsteps] — lift coefficient history
       'n_excluded': int — number of excluded octree cells (non-zero confirms plate active)
       'nsteps'   : int — number of steps actually taken
+
+    When reaction_sets is not None, also returns:
+      'reaction_hist' : np.ndarray [nsteps, nsets] — per-step reaction Cd per set
+                        (Cd_reaction = F_x / (0.5*U_inf^2*L), same sign as cd_surr)
 
     When _return_fields=True, also returns:
       'mesh'     : the DiffSim Mesh object (full octree connectivity)
@@ -544,6 +572,81 @@ def run_flow_past(
                             np.array([int(p_pin)], np.int64)]))
         _dev_asm.set_strong_rows(_strong_rows)
 
+    # ---- Full-mesh field expansion helper -----------------------------------
+    # Used by BOTH the per-step on_step callback and the end-of-run _return_fields
+    # export path (one construction, no divergent copies).
+    # x_cur : [nfree*ndof] free-dof interleaved (u_x, u_y, p)
+    # Returns (u_full [n_nodes, dim], p_full [n_nodes]).
+    def _full_fields(x_cur_f):
+        x_all_f = np.asarray(T_vec @ x_cur_f)
+        x_nodes_f = x_all_f.reshape(-1, ndof)
+        return x_nodes_f[:, :dim], x_nodes_f[:, dim]
+
+    # ---- Reaction-force arbiter setup (LD-5; reaction_sets=None => no overhead) -
+    # Variational identity: for a free test function w_k (zero on all surgery rows),
+    # the discrete NS residual gives:
+    #    w_kᵀ R_vol(x) + w_kᵀ R_sbm(x) = 0
+    # => plate x-force = w_kᵀ (A_vol x − b_vol)
+    #
+    # Path (b): avoid a second volume assembly each step by observing
+    #    A_vol = A_full − Af_c,  b_vol = b_full − bf_c
+    # so:
+    #    w_kᵀ (A_vol x − b_vol) = w_kᵀ (A_full x − b_full) − w_kᵀ (Af_c x − bf_c)
+    # This holds EXACTLY provided w_k has zero weight on every surgery row
+    # (strong-BC, kick, and pressure-pin rows) — the assertion below enforces this.
+    # On the HOST path, A_vol and b_vol are available cheaply right after
+    # assemble_linear_ns, so we use them directly rather than the subtraction.
+    # On the DEVICE path (A_full assembled in one shot with extra_matrix), we use
+    # the path-(b) subtraction with the cached host Af_c/bf_c.
+    #
+    # Sign convention: w_kᵀ (A_vol x − b_vol) equals −w_kᵀ(Af_c x − bf_c).
+    # The SBM term Af_c x − bf_c is the Nitsche/SBM PENALTY residual that DECELERATES
+    # the fluid near the plate (force on fluid in −x direction for a bluff body in
+    # forward flow). Hence w_kᵀ (A_vol x − b_vol) is NEGATIVE for forward drag.
+    # To match the surrogate-traction Cd sign convention (positive = drag ON THE PLATE
+    # from the fluid = drag in the +x direction on the plate = fluid force in +x on
+    # the plate = plate reacts in −x on fluid), we NEGATE:
+    #   Cd_reaction = −F_raw / ref_force    where F_raw = w_kᵀ (A_vol x − b_vol)
+    # This yields Cd_reaction > 0 for downstream drag — same sign as Cd_surr.
+    # (Verified on the tiny CPU gate: Cd_surr ~ +4.8, Cd_reaction ~ +2.8; see task-5-report.md.)
+    _rxn_active = reaction_sets is not None and len(reaction_sets) > 0
+    _rxn_nsets = 0
+    _rxn_w = []         # list of dense [nfree*ndof] indicator vectors (one per set)
+    _rxn_Afc_w = []     # list of Af_c.T @ w_k (for device path subtraction)
+    _rxn_bfc_dot = []   # list of bf_c @ w_k (for device path subtraction)
+
+    if _rxn_active:
+        _rxn_nsets = len(reaction_sets)
+        # Collect all surgery rows (strong-BC + kick + pressure-pin) for the assert.
+        _surgery_rows = set(int(r) for r in bc_rows)
+        _surgery_rows.update(int(r) for r in inflow_vy_rows)
+        _surgery_rows.add(int(p_pin))
+
+        for s_k in reaction_sets:
+            # w_k: indicator on the u_x DOF (index 0 in each node's ndof block)
+            # for free-node indices in s_k.  All other DOFs are 0.
+            w_k = np.zeros(nfree * ndof)
+            for ni in np.asarray(s_k, dtype=np.intp):
+                dof_ux = int(ni) * ndof + 0   # u_x DOF
+                w_k[dof_ux] = 1.0
+
+            # Assert: w_k has zero weight on every surgery row.
+            # This makes the variational-identity path (b) algebraically exact.
+            for r in _surgery_rows:
+                assert w_k[r] == 0.0, (
+                    f"reaction_sets: free-node set contains DOF {r} which is a "
+                    f"surgery row (strong-BC / kick / pressure-pin).  The w_k "
+                    f"indicator MUST be zero on all surgery rows for the "
+                    f"variational identity to hold exactly.  "
+                    f"Remove node {r // ndof} from reaction_sets[k]."
+                )
+            _rxn_w.append(w_k)
+
+            # Pre-compute Af_c.T @ w_k and bf_c · w_k for the device path.
+            # (Af_c is symmetric in practice but we use .T for correctness.)
+            _rxn_Afc_w.append(np.asarray(Af_c.T @ w_k))
+            _rxn_bfc_dot.append(float(bf_c @ w_k))
+
     # ---- BDF2 march ---------------------------------------------------------
     # Initialize: u=0 everywhere
     x_cur = np.zeros(nfree * ndof)
@@ -552,6 +655,8 @@ def run_flow_past(
 
     cd_hist = np.zeros(nsteps)
     cl_hist = np.zeros(nsteps)
+    if _rxn_active:
+        _rxn_hist = np.zeros((nsteps, _rxn_nsets))
 
     ref_force = 0.5 * U_inf ** 2 * plate_L    # nondim denominator
 
@@ -623,8 +728,18 @@ def run_flow_past(
 
         else:
             # ---- Host assembly path (default; bit-for-bit unchanged) --------
-            # Assemble monolithic NS
+            # Assemble monolithic NS — capture A_vol, b_vol BEFORE adding Af_c/bf_c.
+            # The reaction arbiter uses these directly (no subtraction needed on host).
             A, b = assemble_linear_ns(dm, aq, dq, fq_raw, nu, sigma=sigma)
+
+            # Capture pre-SBM volume system for the reaction arbiter (host path).
+            # Done AFTER assemble_linear_ns and BEFORE adding Af_c/surgery.
+            # w_k has zero weight on surgery rows (asserted at setup), so the
+            # captured A_vol/b_vol yield exact variational reaction forces.
+            if _rxn_active:
+                _A_vol_csr = A.tocsr()     # A_vol: PRE-SBM, PRE-surgery CSR
+                _b_vol = b.copy()          # b_vol: PRE-SBM, PRE-surgery RHS
+
             A = (A + Af_c).tolil()
             b = b + bf_c
 
@@ -659,6 +774,43 @@ def run_flow_past(
                 x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
                                      device=device)
 
+        # ---- Reaction-force arbiter (LD-5) per step ---------------------------
+        # Computed AFTER the solve so x_cur is the step's solution.
+        # HOST path: F_x[k] = w_kᵀ (A_vol x_cur − b_vol) directly.
+        # DEVICE path (path b): F_x[k] = w_kᵀ (A_full x_cur − b_full)
+        #   − w_kᵀ (Af_c x_cur − bf_c)
+        # where A_full = A_vol + Af_c, b_full = b_vol + bf_c, so the difference
+        # equals w_kᵀ (A_vol x_cur − b_vol) exactly (since w_k ⊥ surgery rows).
+        # Cd_reaction = F_x / ref_force (positive = drag on the plate, same sign as Cd_surr).
+        if _rxn_active:
+            if assembly == "device":
+                # Path (b): F_raw = w_kᵀ A_vol x − w_kᵀ b_vol
+                #                  = w_kᵀ (A_full − Af_c) x − (b_full − bf_c) w_k
+                #                  = (w_kᵀ A_full x − w_kᵀ b_full)
+                #                    − (w_kᵀ Af_c x − w_kᵀ bf_c)
+                # where Acsr/b here are A_full/b_full (device path includes Af_c).
+                # Sign: negate F_raw to get Cd_reaction in the same sign as Cd_surr.
+                _b_numpy = np.asarray(b) if not isinstance(b, np.ndarray) else b
+                for k in range(_rxn_nsets):
+                    w_k = _rxn_w[k]
+                    Afull_T_w = np.asarray(Acsr.T @ w_k)
+                    wT_Afull_x = float(Afull_T_w @ x_cur)
+                    wT_bfull   = float(w_k @ _b_numpy)
+                    wT_Afc_x = float(_rxn_Afc_w[k] @ x_cur)
+                    wT_bfc   = _rxn_bfc_dot[k]
+                    F_raw = (wT_Afull_x - wT_bfull) - (wT_Afc_x - wT_bfc)
+                    # Negate: Cd_reaction > 0 = downstream drag (same sign as Cd_surr)
+                    _rxn_hist[step, k] = -F_raw / ref_force
+            else:
+                # HOST path: use A_vol, b_vol captured before SBM addition.
+                # Sign: negate F_raw to match Cd_surr sign convention.
+                for k in range(_rxn_nsets):
+                    w_k = _rxn_w[k]
+                    Avol_T_w = np.asarray(_A_vol_csr.T @ w_k)
+                    F_raw = float(Avol_T_w @ x_cur) - float(w_k @ _b_vol)
+                    # Negate: Cd_reaction > 0 = downstream drag (same sign as Cd_surr)
+                    _rxn_hist[step, k] = -F_raw / ref_force
+
         # Extract velocity for next step
         u_new = x_cur.reshape(nfree, ndof)[:, :dim]
 
@@ -676,6 +828,11 @@ def run_flow_past(
 
         cd_hist[step] = F[0] / ref_force   # drag (streamwise = x)
         cl_hist[step] = F[1] / ref_force   # lift (transverse = y)
+
+        # Per-step callback (on_step=None => zero overhead)
+        if on_step is not None:
+            u_full_cb, p_full_cb = _full_fields(x_cur)
+            on_step(step, t_new, u_full_cb, p_full_cb, float(cd_hist[step]))
 
         # Rotate history
         u_pre2 = u_pre1.copy()
@@ -697,13 +854,14 @@ def run_flow_past(
         nsteps=nsteps,
     )
 
+    # Reaction-force arbiter results (LD-5): only present when reaction_sets != None.
+    if _rxn_active:
+        result["reaction_hist"] = _rxn_hist   # [nsteps, nsets] Cd_reaction per set
+
     if _return_fields:
-        # Extract node-level fields from the final step's x_all.
-        # x_all is [Nn * ndof] node-major: node 0 has [u_x, u_y, p],
-        # node 1 has [u_x, u_y, p], etc.
-        x_nodes = np.asarray(x_all).reshape(-1, ndof)   # [Nn, ndof]
-        u_node = x_nodes[:, :dim]                        # [Nn, dim]
-        p_node = x_nodes[:, dim]                         # [Nn]
+        # Extract node-level fields from the final step's solution via the shared
+        # _full_fields helper (same expansion used by the on_step callback).
+        u_node, p_node = _full_fields(x_cur)
         vel_mag = np.linalg.norm(u_node, axis=1)         # [Nn]
         result["mesh"] = mesh
         result["node_fields"] = {
