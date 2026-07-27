@@ -375,6 +375,7 @@ def run_flow_past(
     mono_solver="splu",  # monolithic solver backend (splu | cudss | fused)
     device="cpu",      # device for non-splu backends (cpu | cuda | hip)
     assembly="host",   # assembly backend: "host" (default, bit-for-bit) | "device"
+    on_step=None,      # optional per-step callback: on_step(step, t, u_full, p_full, cd_step)
 ):
     """Run flow past a finite thin plate with transient BDF2 march.
 
@@ -407,6 +408,13 @@ def run_flow_past(
         "device" (DeviceNSAssembler; symbolic pattern once per mesh epoch,
         numeric fill on device per step, SBM face system via cached slots).
         "host" default keeps all existing tests bit-for-bit unchanged.
+    on_step : callable or None
+        Optional per-step callback invoked AFTER each step's traction evaluation
+        as ``on_step(step, t_new, u_full, p_full, cd_step)`` where ``u_full``
+        is [n_nodes, 2] velocity, ``p_full`` is [n_nodes] pressure (full-mesh
+        constraint-expanded nodal fields, same construction as ``_return_fields``),
+        and ``cd_step`` is that step's surrogate-traction Cd (float). Default
+        None => bit-for-bit identical march with no overhead.
 
     Returns a dict with:
       'cd'       : np.ndarray [nsteps] — drag coefficient history
@@ -544,6 +552,16 @@ def run_flow_past(
                             np.array([int(p_pin)], np.int64)]))
         _dev_asm.set_strong_rows(_strong_rows)
 
+    # ---- Full-mesh field expansion helper -----------------------------------
+    # Used by BOTH the per-step on_step callback and the end-of-run _return_fields
+    # export path (one construction, no divergent copies).
+    # x_cur : [nfree*ndof] free-dof interleaved (u_x, u_y, p)
+    # Returns (u_full [n_nodes, dim], p_full [n_nodes]).
+    def _full_fields(x_cur_f):
+        x_all_f = np.asarray(T_vec @ x_cur_f)
+        x_nodes_f = x_all_f.reshape(-1, ndof)
+        return x_nodes_f[:, :dim], x_nodes_f[:, dim]
+
     # ---- BDF2 march ---------------------------------------------------------
     # Initialize: u=0 everywhere
     x_cur = np.zeros(nfree * ndof)
@@ -677,6 +695,11 @@ def run_flow_past(
         cd_hist[step] = F[0] / ref_force   # drag (streamwise = x)
         cl_hist[step] = F[1] / ref_force   # lift (transverse = y)
 
+        # Per-step callback (on_step=None => zero overhead)
+        if on_step is not None:
+            u_full_cb, p_full_cb = _full_fields(x_cur)
+            on_step(step, t_new, u_full_cb, p_full_cb, float(cd_hist[step]))
+
         # Rotate history
         u_pre2 = u_pre1.copy()
         u_pre1 = u_new.copy()
@@ -698,12 +721,9 @@ def run_flow_past(
     )
 
     if _return_fields:
-        # Extract node-level fields from the final step's x_all.
-        # x_all is [Nn * ndof] node-major: node 0 has [u_x, u_y, p],
-        # node 1 has [u_x, u_y, p], etc.
-        x_nodes = np.asarray(x_all).reshape(-1, ndof)   # [Nn, ndof]
-        u_node = x_nodes[:, :dim]                        # [Nn, dim]
-        p_node = x_nodes[:, dim]                         # [Nn]
+        # Extract node-level fields from the final step's solution via the shared
+        # _full_fields helper (same expansion used by the on_step callback).
+        u_node, p_node = _full_fields(x_cur)
         vel_mag = np.linalg.norm(u_node, axis=1)         # [Nn]
         result["mesh"] = mesh
         result["node_fields"] = {

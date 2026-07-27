@@ -225,3 +225,27 @@ def test_device_assembly_parity_cpu_adaptive(device):
     res_d = run_flow_past(assembly="device", **kw)
     assert np.allclose(res_h["cd"], res_d["cd"], rtol=1e-9, atol=1e-11), (
         f"device-assembly adaptive Cd diverged: {res_h['cd']} vs {res_d['cd']}")
+
+
+def test_on_step_default_parity():
+    """on_step=None must be bit-for-bit identical to the legacy march."""
+    from p2r1a_thin_plate_flow import run_flow_past
+    kw = dict(level=4, nsteps=3, dt=0.01, nu=0.1, U_inf=1.0, verbose=False)
+    res_a = run_flow_past(**kw)
+    res_b = run_flow_past(on_step=None, **kw)
+    assert np.allclose(res_a["cd"], res_b["cd"], rtol=0, atol=1e-14)
+
+def test_on_step_callback_contract():
+    """Callback fires once per step with full-mesh fields + that step's Cd."""
+    from p2r1a_thin_plate_flow import run_flow_past
+    calls = []
+    def spy(step, t, u_full, p_full, cd_step):
+        calls.append((step, t, u_full.shape, p_full.shape, cd_step))
+    res = run_flow_past(level=4, nsteps=3, dt=0.01, nu=0.1, U_inf=1.0,
+                        verbose=False, on_step=spy)
+    assert len(calls) == 3
+    n = calls[0][2][0]
+    assert calls[0][2] == (n, 2) and calls[0][3] == (n,)
+    # cd passed to the callback matches the returned history per step
+    for k, (step, t, _, _, cd_step) in enumerate(calls):
+        assert step == k and np.isclose(cd_step, res["cd"][k], rtol=0, atol=1e-14)
