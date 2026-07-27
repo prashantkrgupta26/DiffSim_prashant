@@ -201,6 +201,14 @@ def run_discriminator_with_reaction(alpha, nsteps, level=7, refine_to=9,
     The reaction Cd is the variational-identity estimate of the plate drag
     (plate x-force / ref_force).  Two different sets MUST agree to ≤ 1e-6
     relative — this agreement is the LD-5 instrument gate.
+    HONEST SCOPE (final review 2026-07-27): with both sets SBM-core-
+    augmented, agreement is zero BY CONSTRUCTION (Af_c rows identical in
+    both indicators; residual zero elsewhere). The gate therefore
+    certifies the RESIDUAL/SUBTRACTION MECHANICS + surgery-row exclusion
+    — a self-check of the instrument's wiring, NOT an independent
+    set-independence test. The Cd_reaction VALUE itself is the
+    variationally-consistent Nitsche weak-form reaction — a genuinely
+    independent third functional vs surrogate traction and CV drag.
 
     Parameters: same as ``run_discriminator`` plus:
     reaction_radii : tuple of float
@@ -461,7 +469,9 @@ def run_discriminator(alpha, nsteps, level=7, refine_to=9, wake_refine=9,
 
 if __name__ == "__main__":
     # LD-5 GPU protocol: one α=50 leg with reaction arbiter + alpha sweep for CV context.
-    # The reaction instrument gate (set-agreement ≤ 1e-6) replaces the box-spread gate.
+    # The reaction instrument gate (set-agreement ≤ 1e-6) replaces the box-spread
+    # gate. NOTE: agreement is a mechanics SELF-CHECK (zero by construction with
+    # SBM-core-augmented sets), not set-independence — see run_discriminator_with_reaction.
     # CV boxes stay as corroborating context; the formal verdict issues from Cd_reaction.
     alphas = [float(a) for a in os.environ.get("ALPHAS", "20,50,100").split(",")]
     nsteps = int(os.environ.get("NSTEPS", "8000"))
