@@ -62,3 +62,51 @@ Measured exponents:
 - **Solve:** `1.22, 1.08, 1.16, 1.28`
 
 The Warp element, load, and error kernels were loaded on `cuda:0`. The `splu` sparse solve remains CPU-based, so the solve timings are not GPU solve timings. At level 8, the solve remains the largest measured stage (`0.2433 s`), followed by assembly (`0.1501 s`).
+
+## Task A2 - Boundary Conditions: Explore (a)
+**Date:** July 27, 2026  
+**Experiment:** Changed the manufactured solution to $u^*(x,y)=\sin(\pi x)\sin(\pi y)$ while leaving the x-only case unchanged.
+
+### Observed Results
+- **Dirichlet on all faces:**
+  - Errors: `[1.606e-03, 4.015e-04, 1.004e-04]`
+  - Convergence orders: **`2.00`, `2.00`** ($\mathcal{O}(h^2)$)
+- **Dirichlet on x-faces only:**
+  - Errors: `[4.673e-01, 4.692e-01, 4.697e-01]`
+  - Convergence orders: **`-0.01`, `-0.00`** (effectively zero order)
+
+### Interpretation
+The sine manufactured solution has nonzero normal flux on the y-faces:
+
+$$
+\frac{\partial u^*}{\partial y}=\pi\sin(\pi x)\cos(\pi y).
+$$
+
+Leaving the y-faces without an explicitly assembled boundary term silently imposes zero Neumann flux, which is inconsistent with this manufactured solution. Therefore the x-only error remains near `0.47` instead of decreasing under refinement: the boundary-condition error dominates and cannot be removed by refining the mesh. Applying Dirichlet conditions on all faces remains consistent and retains second-order convergence.
+
+### Explore (b) Pinning Test — User-Provided Run
+**Observed output:**
+
+- **Dirichlet on all faces:** errors `[1.606e-03, 4.015e-04, 1.004e-04]`, orders `2.00`, `2.00`.
+- **Dirichlet on x-faces only:** errors `[4.673e-01, 4.692e-01, 4.697e-01]`, orders `-0.01`, `-0.00`.
+- **Pure Neumann with one pinned node:** errors `[2.192e+01, 2.544e+01, 2.896e+01]`, orders `-0.21`, `-0.19`.
+
+**Context:** This run used the sine manufactured solution from Explore (a). The pinned pure-Neumann case is therefore not a valid pure-Neumann MMS test, because the sine solution has nonzero normal flux on the y-faces while the code imposes zero natural flux there. The large, increasing pin-case error is consequently expected. For a meaningful pinning test, restore the original cosine solution, whose normal flux is zero on all faces, and rerun the `all`, `x-only`, and `pin` cases.
+
+### Explore (c) Dirichlet Row-Replacement Timing — User-Provided Run
+**Observed output:**
+
+| Level | DOFs (`n`) | Boundary nodes | Row-replacement time (s) |
+|---:|---:|---:|---:|
+| 5 | 1089 | 128 | 0.000223 |
+| 6 | 4225 | 256 | 0.000458 |
+| 7 | 16641 | 512 | 0.000911 |
+| 8 | 66049 | 1024 | 0.001792 |
+
+Measured exponents, computed as `log(time ratio) / log(DOF ratio)`:
+
+```text
+row replacement: 0.53  0.50  0.49
+```
+
+**Interpretation:** The row-replacement time approximately doubles whenever the boundary-node count doubles. Its scaling exponent is about `0.5` with respect to total DOFs, consistent with a 2-D boundary growing like $\sqrt{n}$. The loop remains inexpensive at these sizes, but its host-side Python cost grows and may matter for much larger meshes.
