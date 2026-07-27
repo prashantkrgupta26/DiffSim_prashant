@@ -244,6 +244,7 @@ if __name__ == "__main__":
     rows = [
         run_discriminator(
             a, nsteps,
+            t_start_lu=float(os.environ.get("T_START_LU", "24")),
             device=os.environ.get("DEVICE", "cuda:0"),
             mono_solver=os.environ.get("MONO_SOLVER", "cudss"),
             assembly=os.environ.get("ASSEMBLY", "device"),
@@ -251,15 +252,20 @@ if __name__ == "__main__":
         for a in alphas
     ]
 
+    # Dynamic over the actual box tags (the hardcoded 4L/6L/8L keys crashed
+    # the corrected-margins leg's table — KeyError; data safe in the npz).
+    _tags = list(rows[0]["cd_cv_mean"].keys())
     print(
-        f"\n{'alpha':>6} {'Cd_surr':>8} {'CV(4L)':>8} {'CV(6L)':>8} "
-        f"{'CV(8L)':>8} {'spread':>7} {'|leak|':>9} {'St':>7}"
+        f"\n{'alpha':>6} {'Cd_surr':>8} "
+        + " ".join(f"{'CV(' + t + ')':>8}" for t in _tags)
+        + f" {'spread':>7} {'|leak|':>9} {'St':>7}"
     )
     for r in rows:
         c = r["cd_cv_mean"]
         print(
-            f"{r['alpha']:6.0f} {r['cd_surr_mean']:8.3f} {c['4L']:8.3f} "
-            f"{c['6L']:8.3f} {c['8L']:8.3f} {r['box_spread']:7.3f} "
+            f"{r['alpha']:6.0f} {r['cd_surr_mean']:8.3f} "
+            + " ".join(f"{c[t]:8.3f}" for t in _tags)
+            + f" {r['box_spread']:7.3f} "
             f"{r['leak_mean_abs']:9.2e} {r['St']:7.4f}"
         )
 
