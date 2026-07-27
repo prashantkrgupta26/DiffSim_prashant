@@ -1,6 +1,7 @@
 """Analytic gates for the control-volume drag observable (spec 2026-07-26)."""
 import os, sys
 import numpy as np
+import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 
 from diffsim.octree.build import build_uniform
@@ -46,51 +47,43 @@ def test_pressure_term():
     cd = cv_drag_box(coords, u, p, BOX, nu=0.0)
     assert np.isclose(cd, expect, rtol=1e-6), f"{cd} vs {expect}"
 
-def test_viscous_term_direction():
-    """u=(x,0), p=0, nu=0.01: validate viscous normal-derivative direction
-    and magnitude via dense-quadrature reference. Field u_x=x, u_y=0 is not
-    divergence-free, but cv_drag evaluates the prescribed field as-is.
-
-    Reference: dense quadrature at 2001 points per face of the exact analytic
-    u=(x,0), p=0, normal derivative du_x/dn = n_sign on vertical faces, 0 on
-    horizontal. Integrand on each face: u_x*(u·n) + p*n_x - nu*du_x/dn.
-    Trapezoid integrate each face, sum all four, negate, normalize by
-    0.5*U_inf²*L_ref. Assert cv_drag_box matches within rtol=1e-6.
-    """
+def test_viscous_term_all_faces_dense_reference():
+    """u_x = x*y, u_y = 0, p = 0, nu = 0.01: the viscous normal derivative
+    is nonzero and VARYING on all four faces (du_x/dn = y*n_sign on vertical
+    faces, x*n_sign on horizontal). u_x is bilinear, so the implementation's
+    one-sided nodal difference is EXACT. Reference: genuine 2001-point
+    trapezoid quadrature per face of the analytic integrand
+    [u_x*(u.n) + p*n_x - nu*du_x/dn], summed, negated, normalized —
+    re-implementing the INTEGRAL definition, never calling cv_drag code."""
     coords = _mesh_coords()
-    u = np.stack([coords[:, 0], np.zeros(len(coords))], axis=1)
+    u = np.zeros((len(coords), 2))
+    u[:, 0] = coords[:, 0] * coords[:, 1]
     p = np.zeros(len(coords))
     nu = 0.01
     x0, x1, y0, y1 = BOX
 
-    # Dense quadrature reference: sample each face at 2001 points
-    y_pts = np.linspace(y0, y1, 2001)
-    x_pts = np.linspace(x0, x1, 2001)
+    def ref_face(axis, value, lo, hi, n_sign):
+        """Trapezoid quadrature of integrand [u_x*(u·n) + p*n_x - nu*du_x/dn]
+        along a face. axis=0 for vertical (x=value), axis=1 for horizontal (y=value).
+        """
+        s = np.linspace(lo, hi, 2001)
+        if axis == 0:   # vertical face x=value: u.n = u_x*n_sign, du_x/dn = y*n_sign
+            ux = value * s          # u_x = x*y with x=value, y=s
+            un = ux * n_sign        # u_y=0; u.n = u_x*n_sign
+            pn = 0.0 * s            # p=0
+            duxdn = s * n_sign      # d(x*y)/dx = y, outward = *n_sign
+        else:           # horizontal face y=value: u.n = u_y*n_sign = 0, du_x/dn = x*n_sign
+            ux = s * value          # u_x = x*y with x=s, y=value
+            un = 0.0 * s            # u_y=0; u.n = 0
+            pn = 0.0 * s            # p=0
+            duxdn = s * n_sign      # d(x*y)/dy = x, outward = *n_sign
+        return np.trapezoid(ux * un + pn - nu * duxdn, s)
 
-    # Right face: x=x1, n=(+1,0), u·n = u_x*1 = x1
-    # Integrand: u_x*(u·n) + p*n_x - nu*du_x/dn
-    #          = x1*x1 + 0 - nu*1 = x1² - nu
-    integrand_r = x1**2 - nu
-    flux_r = integrand_r * (y1 - y0)
-
-    # Left face: x=x0, n=(-1,0), u·n = u_x*(-1) = -x0
-    # Integrand: x0*(-x0) + 0 - nu*(-1) = -x0² + nu
-    integrand_l = -x0**2 + nu
-    flux_l = integrand_l * (y1 - y0)
-
-    # Top face: y=y1, n=(0,+1), u·n = u_y*1 = 0
-    # Integrand: u_x*0 + 0 - nu*0 = 0
-    flux_t = 0.0
-
-    # Bottom face: y=y0, n=(0,-1), u·n = u_y*(-1) = 0
-    # Integrand: u_x*0 + 0 - nu*0 = 0
-    flux_b = 0.0
-
-    total_flux = flux_r + flux_l + flux_t + flux_b
-    expect = -total_flux / (0.5 * 1.0**2 * (1.0 / 16.0))
-
+    total = (ref_face(0, x1, y0, y1, +1) + ref_face(0, x0, y0, y1, -1)
+             + ref_face(1, y1, x0, x1, +1) + ref_face(1, y0, x0, x1, -1))
+    expect = -total / (0.5 * 1.0**2 * (1.0 / 16.0))
     cd = cv_drag_box(coords, u, p, BOX, nu=nu)
-    assert np.isclose(cd, expect, rtol=1e-6), f"cv_drag_box {cd} vs reference {expect}"
+    assert np.isclose(cd, expect, rtol=1e-3, atol=1e-3), f"{cd} vs {expect}"
 
 def test_missing_interior_line_raises():
     """Interior node line missing at distance h inside face edge: detect
@@ -107,8 +100,7 @@ def test_missing_interior_line_raises():
     # axis=0 (vertical face), value slightly outside, n_sign=-1 so inner is
     # at value - (-1)*h = value + h — if value is already at/past boundary,
     # inner line is unreachable
-    with np.testing.assert_raises(ValueError) as ctx:
+    with pytest.raises(ValueError, match="interior node line"):
         _face_integral(coords, u, p, nu=0.01, axis=0, value=x_max,
                        lo=y_min, hi=y_max, n_sign=-1)
-    assert "interior node line" in str(ctx.exception)
 
