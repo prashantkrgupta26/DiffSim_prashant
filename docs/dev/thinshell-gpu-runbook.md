@@ -423,7 +423,7 @@ plate-enclosing indicator sets (agreement 7.01e-15 ≤ 1e-6, **gate PASSED**),
 
 **VERDICT: observable-overestimates** — the `surrogate_traction` observable reads **2.3×** the
 variationally-consistent Nitsche reaction; the physics-carrying instruments (reaction 2.34,
-CV 2.9–3.2) sit at/below literature 3.36. Two mandatory caveats: (i) the printed
+CV 2.9–3.2) sit at/below literature 3.36. OPEN QUESTION (sharp form): the consistent reaction itself is ~30% BELOW literature — the consistent observable may UNDERestimate; the traction dissection must adjudicate both directions, not only the surrogate's excess. Two mandatory caveats: (i) the printed
 "alpha-insensitive" tag is an artifact of the single-α verdict leg — the 3-leg sweep measured
 **alpha-SENSITIVE** (+41% surr, +36% CV over α 20→100), which is the standing label;
 (ii) the agreement gate is a mechanics self-check (zero by construction, per the documented
