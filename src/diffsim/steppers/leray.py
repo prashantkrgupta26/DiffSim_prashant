@@ -32,6 +32,15 @@ from ..physics.vms import tau_hbased_host
 from ..solvers.timestepping import bdf_coeffs, bdf_order_now, History
 
 
+class _DevicePredFallback(Exception):
+    """Raised inside the device predictor branch when any condition arises
+    that the device path cannot represent exactly on the fixed CSR pattern
+    (SBM nnz change, BackendError csr_slots, dynamic graddiv, gamma-block /
+    backflow unavailability).  Caught immediately by ``_predict`` to re-enter
+    the verbatim host predictor branch.  Module-private; never propagates to
+    callers."""
+
+
 class LerayProjectionStepper:
     def __init__(self, dm, nu, dt, f_fn, g_fn, order=2, picard_iters=2,
                  solver="splu", ppe_solver=None,
@@ -308,6 +317,25 @@ class LerayProjectionStepper:
         else:
             self.K_p = assemble_csr(dm)
         self._K_p_lu = None
+        # Task 6b: device predictor assembler (lazily built on first device
+        # _predict call; None => host path).  Epoch-level slot caches for the
+        # SBM face block, base outflow backflow, and static graddiv blocks are
+        # all stored here (prefixed _pred_*).
+        self._pred_asm = None             # DeviceNSAssembler, built lazily
+        self._pred_strong_rows = None     # sorted unique strong dof rows (epoch)
+        self._pred_sbm_slots_d = None     # device CSR slots for extra_block A
+        self._pred_sbm_vals_d = None      # device values for extra_block A
+        self._pred_sbm_b_dofs_d = None    # device dof indices for extra_block b
+        self._pred_sbm_b_vals_d = None    # device values for extra_block b
+        self._pred_sbm_nnz = None         # expected nnz (pattern-change guard)
+        self._pred_sbm_csr = None         # host CSR of extra_block A (last seen)
+        self._pred_bf_slots_d = None      # device CSR slots for backflow A
+        self._pred_bf_vals_d = None       # device values array for backflow A
+        self._pred_bf_nnz = None          # expected nnz for backflow
+        self._pred_gd_slots_d = None      # device slots for _graddiv_block
+        self._pred_gd_vals_d = None       # device values for _graddiv_block
+        self._pred_gdg_slots_d = None     # device slots for _graddiv_gamma_block
+        self._pred_gdg_vals_d = None      # device values for _graddiv_gamma_block
         self.M = self._mass_matrix()
         self._M_lu = None            # mass solves go through solve_linear
         # ---- CONSISTENT PPE operator L = G^T M^-1 G (ladder Task 4, Part 2) ----
@@ -730,6 +758,145 @@ class LerayProjectionStepper:
         gvals = self.g_fn(self.free_coords[self.dir_nodes], t_new)
         return b0, b1, b2, sigma, u1, u2, fq_base, gvals
 
+    def _pred_asm_init(self, strong_skip, extra_block):
+        """Task 6b: lazily build the predictor DeviceNSAssembler and cache
+        epoch-level slot maps for the SBM face block, static graddiv blocks,
+        and outflow backflow block.  Called on the FIRST device _predict call.
+
+        strong_skip: set of free-node indices governed weakly by SBM (excluded
+        from the strong velocity rows).  This is epoch-fixed (SBM geometry
+        static), so we set_strong_rows once here and never rebuild unless the
+        stepper is re-used on a new mesh epoch (not supported in R0).
+        """
+        import warp as wp
+        import logging
+        from ..assembly.device_assembly import DeviceNSAssembler
+        from ..errors import BackendError
+
+        dm = self.dm
+        dim = dm.dim
+        ndof = self.ndof
+        d = dm.device
+
+        # Build the predictor assembler (ndof = dim+1, full NS block)
+        self._pred_asm = DeviceNSAssembler(dm)
+        idx_dt = self._pred_asm._idx_dtype
+        idx_np = self._pred_asm._idx_np
+
+        # ---- Strong rows: velocity dir_nodes (excl. strong_skip) + ALL p ----
+        # Velocity: dir_nodes[k] * ndof + c for c in range(dim)
+        vel_rows = []
+        for k, i in enumerate(self.dir_nodes):
+            if int(i) in strong_skip:
+                continue
+            for c in range(dim):
+                vel_rows.append(int(i) * ndof + c)
+        # Pressure: ALL free nodes (pinned to p_star per-step)
+        p_rows = [int(i) * ndof + dim for i in range(self.n_free)]
+        strong_rows = np.array(sorted(set(vel_rows) | set(p_rows)),
+                               dtype=np.int64)
+        self._pred_strong_rows = strong_rows
+        self._pred_vel_row_set = set(vel_rows)   # for fast per-step b_val lookup
+        self._pred_asm.set_strong_rows(strong_rows)
+
+        # ---- SBM face block slots (first call with non-None extra_block) ----
+        if extra_block is not None:
+            A_sbm_c, b_sbm_c = extra_block
+            A_sbm_csr = A_sbm_c.tocsr()
+            # sort_indices ensures canonical CSR ordering: slot/data alignment
+            # must not rely on scipy's implicit column ordering from COO sums.
+            A_sbm_csr.sort_indices()
+            sbm_rows, sbm_cols = A_sbm_csr.nonzero()
+            try:
+                sbm_slots = self._pred_asm.csr_slots(sbm_rows, sbm_cols)
+            except BackendError as e:
+                logging.warning(
+                    f"[pred_asm] SBM face block has entries absent from the "
+                    f"device NS pattern; falling back to host for extra_block. "
+                    f"Error: {e}")
+                # Signal that device path is not available for extra_block
+                self._pred_sbm_slots_d = None
+                self._pred_sbm_nnz = -1   # sentinel: host-only
+            else:
+                sbm_slots_np = sbm_slots.astype(idx_np)
+                self._pred_sbm_slots_d = wp.array(
+                    sbm_slots_np, dtype=idx_dt, device=d)
+                self._pred_sbm_vals_d = wp.array(
+                    np.ascontiguousarray(A_sbm_csr.data, np.float64),
+                    dtype=wp.float64, device=d)
+                self._pred_sbm_nnz = A_sbm_csr.nnz
+                self._pred_sbm_csr = A_sbm_csr
+                # b_sbm: sparse upload (nonzero dofs only)
+                b_sbm_np = np.asarray(b_sbm_c, np.float64)
+                b_nz = np.nonzero(b_sbm_np)[0]
+                self._pred_sbm_b_dofs_d = wp.array(
+                    b_nz.astype(np.int32), dtype=wp.int32, device=d)
+                self._pred_sbm_b_vals_d = wp.array(
+                    np.ascontiguousarray(b_sbm_np[b_nz], np.float64),
+                    dtype=wp.float64, device=d)
+
+        # ---- Static graddiv block slots (assembled once in __init__) --------
+        def _slot_static(block, name):
+            if block is None:
+                return None, None
+            csr = block.tocsr()
+            rows_s, cols_s = csr.nonzero()
+            try:
+                slots = self._pred_asm.csr_slots(rows_s, cols_s)
+            except BackendError as e:
+                logging.warning(
+                    f"[pred_asm] {name} has entries absent from the device NS "
+                    f"pattern; falling back to host for this block. Error: {e}")
+                return None, None
+            slots_np = slots.astype(idx_np)
+            slots_d = wp.array(slots_np, dtype=idx_dt, device=d)
+            vals_d = wp.array(
+                np.ascontiguousarray(csr.data, np.float64),
+                dtype=wp.float64, device=d)
+            return slots_d, vals_d
+
+        gd_s, gd_v = _slot_static(self._graddiv_block, "_graddiv_block")
+        self._pred_gd_slots_d = gd_s
+        self._pred_gd_vals_d = gd_v
+        gdg_s, gdg_v = _slot_static(self._graddiv_gamma_block,
+                                     "_graddiv_gamma_block")
+        self._pred_gdg_slots_d = gdg_s
+        self._pred_gdg_vals_d = gdg_v
+
+        # ---- Outflow backflow slot setup (if backflow is active) ------------
+        # Assemble a ZERO-VELOCITY backflow block to discover the CSR pattern
+        # (the pattern is determined by the outflow face topology, not the
+        # velocity values; a zero a_node gives a zero VALUE block but the
+        # correct STRUCTURAL pattern). Cache slots and nnz.
+        if self.backflow_beta != 0.0:
+            zero_a = np.zeros((self.n_free, dim))
+            Ab_pat = self._backflow_block(zero_a)
+            if Ab_pat is not None and Ab_pat.nnz > 0:
+                Ab_csr = Ab_pat.tocsr()
+                # sort_indices: canonical ordering before slot/data reads.
+                Ab_csr.sort_indices()
+                bf_rows, bf_cols = Ab_csr.nonzero()
+                try:
+                    bf_slots = self._pred_asm.csr_slots(bf_rows, bf_cols)
+                except BackendError as e:
+                    logging.warning(
+                        f"[pred_asm] backflow block has entries absent from "
+                        f"the device NS pattern; falling back to host for "
+                        f"backflow. Error: {e}")
+                    self._pred_bf_slots_d = None
+                    self._pred_bf_nnz = -1   # host-only sentinel
+                else:
+                    bf_slots_np = bf_slots.astype(idx_np)
+                    self._pred_bf_slots_d = wp.array(
+                        bf_slots_np, dtype=idx_dt, device=d)
+                    self._pred_bf_vals_d = wp.array(
+                        np.zeros(Ab_csr.nnz, np.float64),
+                        dtype=wp.float64, device=d)
+                    self._pred_bf_nnz = Ab_csr.nnz
+                    # Cache (row, col) arrays for fast per-step value refresh
+                    self._pred_bf_rows = bf_rows
+                    self._pred_bf_cols = bf_cols
+
     def _predict(self, t_new=None, extra_block=None, sbm_nodes=None,
                  return_matrix=False, wall_traction_rhs=None):
         """Momentum predictor (Algorithm 1 Step 1) as a standalone hook.
@@ -743,6 +910,14 @@ class LerayProjectionStepper:
 
         Keeps the body-fitted path bit-identical when ``extra_block is None``
         and ``sbm_nodes is None``.
+
+        Task 6b: when ``device_assembly=True`` the predictor also assembles on
+        device via a lazily-built ``DeviceNSAssembler`` (self._pred_asm).  The
+        SBM face block is injected via pre-cached CSR slots (pattern fixed per
+        epoch; values refreshed per step).  Static graddiv blocks and the
+        outflow backflow block are also injected via slots when feasible
+        (host-fallback if pattern exceeds the element graph, logged once).
+        The host path (``device_assembly=False``) is bit-for-bit unchanged.
 
         Returns ``uhat`` (or the assembled csr matrix when
         ``return_matrix`` is True — for composition tests). Does NOT advance
@@ -758,6 +933,12 @@ class LerayProjectionStepper:
         p_node_full = self.p_star
         strong_skip = (set() if sbm_nodes is None
                        else set(int(i) for i in np.asarray(sbm_nodes)))
+
+        # Task 6b: lazy first-call setup for the device predictor assembler.
+        # Keyed on strong_skip (epoch-fixed per SBM geometry): rebuild if the
+        # SBM node set changes (rare; defensive only).
+        if self.device_assembly and self._pred_asm is None:
+            self._pred_asm_init(strong_skip, extra_block)
 
         a_node = 2.0 * u1 - u2 if u2 is not None else u1.copy()
         uhat = None
@@ -778,58 +959,296 @@ class LerayProjectionStepper:
                 fq_it = {pv: fq_base[pv] + conv_a[pv] for pv in aq}
             else:
                 fq_it = fq_base
-            A, b = assemble_linear_ns(
-                dm, aq, dq, fq_it, self.nu, sigma=sigma,
-                sig2tau=((2.0 * sigma) ** 2 if self.timestab else 0.0),
-                gaq_by_bin=(gaq_flat if newton else None), newton=newton)
-            # SBM face block: add the constrained shifted-Nitsche vector
-            # Dirichlet into the momentum system BEFORE strong-row overwrite.
-            if extra_block is not None:
-                A_sbm_c, b_sbm_c = extra_block
-                A = (A + A_sbm_c)
-                b = b + np.asarray(b_sbm_c)
-            # FN1 fix term (2): lagged wall pressure-traction <p* n, v>_Gamma on
-            # the surrogate faces (Dokken eq. 4.16). Constrained node-major RHS,
-            # precomputed by the caller from the CURRENT p*. Added to the
-            # predictor RHS before the strong-row overwrite. None => omitted
-            # (bit-for-bit).
-            if wall_traction_rhs is not None:
-                b = b + np.asarray(wall_traction_rhs)
-            # P2-R0 "graddiv" variant: add the cached extra grad-div (LSIC)
-            # penalty to the momentum system (RHS unchanged — homogeneous
-            # penalty). No-op for the other variants (block is None).
-            # FN4 graddiv_dynamic: reassemble at the CURRENT advecting field
-            # with the FULL (advective+diffusive) tau_C — the Re-robust
-            # VMS-continuity grad-div.
-            if (self.velocity_update == "graddiv" and self.graddiv_dynamic
-                    and self.graddiv_scale != 0.0):
-                A = (A + self._graddiv_tauc_block(aq))
-            elif self._graddiv_block is not None:
-                A = (A + self._graddiv_block)
-            # F3b constant-gamma grad-div penalty (robust divergence cure).
-            # RHS unchanged (homogeneous). No-op when block is None (default).
-            if self._graddiv_gamma_block is not None:
-                A = (A + self._graddiv_gamma_block)
-            # Backflow stabilization (#6): add the outflow directional-do-nothing
-            # block, linearized (Picard) at the current advecting iterate
-            # ``a_node``. beta=0 => a structural zero (bit-for-bit OFF).
-            if self.backflow_beta != 0.0:
-                A = (A + self._backflow_block(a_node))
-            A = A.tolil()
-            for k, i in enumerate(self.dir_nodes):
-                if int(i) in strong_skip:      # SBM-governed: stays weak
-                    continue
-                for c in range(dim):
-                    r = i * ndof + c
+
+            # Device predictor path (Task 6b): Picard only.
+            # Newton mode uses the host path (DeviceNSAssembler hardcodes
+            # newton=0 — gaq is not consumed on device).
+            _use_device_pred = (self.device_assembly
+                                and self._pred_asm is not None
+                                and not newton)
+
+            if _use_device_pred:
+                # ---- Device predictor path (Task 6b) -----------------------
+                # Mirror the host addition order exactly:
+                #   vol_fill → extra_block A → graddiv → backflow → strong rows
+                # Use assemble_fill (no strong rows applied internally) so we
+                # can interleave the additional matrix additions before the
+                # strong-row sweep.
+                #
+                # ANY non-representable condition (SBM nnz change, BackendError
+                # sentinel, dynamic graddiv, gamma-block / backflow unavailable)
+                # raises _DevicePredFallback which is caught BELOW to re-enter
+                # the verbatim host path (log-once per stepper instance). This
+                # removes all per-term vals_d.assign() patching — absent on
+                # ChunkedArray (large-mesh crash) and unsound when the fallback
+                # CSR outgrows the fixed pattern. The HAPPY path (static
+                # geometry, static graddiv, Picard) is unchanged.
+                try:
+                    import warp as wp
+                    asm = self._pred_asm
+                    sig2tau_v = (2.0 * sigma) ** 2 if self.timestab else 0.0
+
+                    # (1) Volume fill on device (zeros vals_d / F_d first).
+                    # Temporarily clear _strong so apply_strong_rows is NOT called
+                    # inside assemble_fill — we call it explicitly after all
+                    # additions (matching the host order: additions before surgery).
+                    saved_strong = getattr(asm, '_strong', None)
+                    asm._strong = None
+                    try:
+                        # DeviceNSAssembler.assemble does not accept gaq_by_bin;
+                        # Newton mode is hardcoded 0 on device (Picard only here).
+                        asm.assemble_fill(aq, dq, fq_it, self.nu, sigma,
+                                          sig2tau=sig2tau_v)
+                    finally:
+                        asm._strong = saved_strong
+
+                    # (2) SBM face block (extra_block) — device slot scatter.
+                    # If the cached slots are absent (BackendError sentinel
+                    # _pred_sbm_nnz == -1) or the nnz changed, the fixed pattern
+                    # cannot represent the result -> fall back to host path.
+                    if extra_block is not None:
+                        A_sbm_c, b_sbm_c = extra_block
+                        if (self._pred_sbm_slots_d is None
+                                or self._pred_sbm_nnz == -1):
+                            # Slots absent (BackendError at init): host required
+                            import logging
+                            if not getattr(self,
+                                           '_pred_sbm_fallback_logged', False):
+                                logging.warning(
+                                    "[pred_asm] SBM face block slots absent; "
+                                    "re-entering host predictor (log-once)")
+                                self._pred_sbm_fallback_logged = True
+                            raise _DevicePredFallback(
+                                "SBM slots absent (BackendError sentinel)")
+                        A_sbm_csr = A_sbm_c.tocsr()
+                        A_sbm_csr.sort_indices()
+                        if A_sbm_csr.nnz != self._pred_sbm_nnz:
+                            import logging
+                            if not getattr(self,
+                                           '_pred_sbm_nnz_fallback_logged',
+                                           False):
+                                logging.warning(
+                                    "[pred_asm] SBM face block nnz changed "
+                                    f"({A_sbm_csr.nnz} vs "
+                                    f"{self._pred_sbm_nnz}); re-entering host "
+                                    "predictor (log-once)")
+                                self._pred_sbm_nnz_fallback_logged = True
+                            raise _DevicePredFallback(
+                                f"SBM nnz changed: {A_sbm_csr.nnz} vs "
+                                f"{self._pred_sbm_nnz}")
+                        # Fast path: refresh vals array, scatter into pattern.
+                        # _pred_sbm_vals_d is a regular wp.array (not ChunkedArray);
+                        # wp.copy updates it in-place without reallocation.
+                        wp.copy(self._pred_sbm_vals_d,
+                                wp.array(
+                                    np.ascontiguousarray(A_sbm_csr.data,
+                                                         np.float64),
+                                    dtype=wp.float64, device=dm.device))
+                        asm.add_matrix_values(self._pred_sbm_slots_d,
+                                              self._pred_sbm_vals_d)
+                        # b_sbm: refresh and add to F_d
+                        b_sbm_np = np.asarray(b_sbm_c, np.float64)
+                        b_nz = np.nonzero(b_sbm_np)[0]
+                        if len(b_nz) > 0:
+                            b_dofs_d = wp.array(
+                                b_nz.astype(np.int32), dtype=wp.int32,
+                                device=dm.device)
+                            b_vals_d = wp.array(
+                                np.ascontiguousarray(b_sbm_np[b_nz],
+                                                     np.float64),
+                                dtype=wp.float64, device=dm.device)
+                            asm.add_rhs_values(b_dofs_d, b_vals_d)
+
+                    # (3) wall_traction_rhs: host array → add to F_d
+                    if wall_traction_rhs is not None:
+                        wtr = np.asarray(wall_traction_rhs, np.float64)
+                        wtr_nz = np.nonzero(wtr)[0]
+                        if len(wtr_nz) > 0:
+                            asm.add_rhs_values(
+                                wp.array(wtr_nz.astype(np.int32),
+                                         dtype=wp.int32, device=dm.device),
+                                wp.array(np.ascontiguousarray(wtr[wtr_nz],
+                                                              np.float64),
+                                         dtype=wp.float64, device=dm.device))
+
+                    # (4) Graddiv blocks: device slots only; host-only conditions
+                    # (dynamic, or static-unavailable) fall back to host path.
+                    if (self.velocity_update == "graddiv"
+                            and self.graddiv_dynamic
+                            and self.graddiv_scale != 0.0):
+                        # Dynamic graddiv requires per-iteration reassembly with
+                        # the FULL tau_C (velocity-dependent) — not slot-cached.
+                        import logging
+                        if not getattr(self,
+                                       '_pred_gddyn_fallback_logged', False):
+                            logging.warning(
+                                "[pred_asm] graddiv_dynamic cannot be "
+                                "represented on the fixed device pattern; "
+                                "re-entering host predictor (log-once)")
+                            self._pred_gddyn_fallback_logged = True
+                        raise _DevicePredFallback("graddiv_dynamic=True")
+                    elif self._pred_gd_slots_d is not None:
+                        asm.add_matrix_values(self._pred_gd_slots_d,
+                                              self._pred_gd_vals_d)
+                    elif self._graddiv_block is not None:
+                        # Static graddiv block present but slots unavailable
+                        import logging
+                        if not getattr(self,
+                                       '_pred_gdstatic_fallback_logged',
+                                       False):
+                            logging.warning(
+                                "[pred_asm] static graddiv slots unavailable; "
+                                "re-entering host predictor (log-once)")
+                            self._pred_gdstatic_fallback_logged = True
+                        raise _DevicePredFallback(
+                            "static graddiv slots unavailable")
+                    if self._pred_gdg_slots_d is not None:
+                        asm.add_matrix_values(self._pred_gdg_slots_d,
+                                              self._pred_gdg_vals_d)
+                    elif self._graddiv_gamma_block is not None:
+                        import logging
+                        if not getattr(self,
+                                       '_pred_gdg_fallback_logged', False):
+                            logging.warning(
+                                "[pred_asm] graddiv_gamma slots unavailable; "
+                                "re-entering host predictor (log-once)")
+                            self._pred_gdg_fallback_logged = True
+                        raise _DevicePredFallback(
+                            "graddiv_gamma slots unavailable")
+
+                    # (5) Outflow backflow block (Picard-linearized at a_node).
+                    # nnz change or missing slots: fall back to host path.
+                    if self.backflow_beta != 0.0:
+                        Ab = self._backflow_block(a_node)
+                        if Ab is not None and Ab.nnz > 0:
+                            Ab_csr = Ab.tocsr()
+                            Ab_csr.sort_indices()
+                            if (self._pred_bf_slots_d is None
+                                    or self._pred_bf_nnz == -1):
+                                import logging
+                                if not getattr(self,
+                                               '_pred_bf_fallback_logged',
+                                               False):
+                                    logging.warning(
+                                        "[pred_asm] backflow slots absent; "
+                                        "re-entering host predictor (log-once)")
+                                    self._pred_bf_fallback_logged = True
+                                raise _DevicePredFallback(
+                                    "backflow slots absent")
+                            if Ab_csr.nnz != self._pred_bf_nnz:
+                                import logging
+                                if not getattr(self,
+                                               '_pred_bf_nnz_fallback_logged',
+                                               False):
+                                    logging.warning(
+                                        "[pred_asm] backflow nnz changed "
+                                        f"({Ab_csr.nnz} vs "
+                                        f"{self._pred_bf_nnz}); re-entering "
+                                        "host predictor (log-once)")
+                                    self._pred_bf_nnz_fallback_logged = True
+                                raise _DevicePredFallback(
+                                    f"backflow nnz changed: {Ab_csr.nnz} vs "
+                                    f"{self._pred_bf_nnz}")
+                            # Refresh vals and scatter.
+                            # _pred_bf_vals_d is a regular wp.array; use wp.copy.
+                            wp.copy(self._pred_bf_vals_d,
+                                    wp.array(
+                                        np.ascontiguousarray(Ab_csr.data,
+                                                             np.float64),
+                                        dtype=wp.float64, device=dm.device))
+                            asm.add_matrix_values(self._pred_bf_slots_d,
+                                                  self._pred_bf_vals_d)
+
+                    # (6) Strong rows: per-step b_vals (velocity Dirichlet + p_star)
+                    # Build the ordered b_vals array matching _pred_strong_rows.
+                    # velocity row values come from gvals; pressure rows from p_star.
+                    vel_row_set = self._pred_vel_row_set
+                    strong_rows = self._pred_strong_rows
+                    sb = np.empty(len(strong_rows), np.float64)
+                    for si, r in enumerate(strong_rows):
+                        if r in vel_row_set:
+                            # Velocity Dirichlet: find which dir_node and component
+                            node_idx = r // ndof
+                            comp = r % ndof
+                            k_node = np.searchsorted(self.dir_nodes, node_idx)
+                            sb[si] = float(gvals[k_node, comp])
+                        else:
+                            # Pressure row: pin to p_star value
+                            p_node_idx = r // ndof
+                            sb[si] = float(p_node_full[p_node_idx])
+                    asm.apply_strong_rows(sb)
+
+                    # (7) Pull host CSR and RHS
+                    Acsr = sp.csr_matrix(
+                        (asm.vals_d.numpy(), asm.indices, asm.indptr),
+                        shape=(asm.Nfull, asm.Nfull))
+                    b = asm.F_d.numpy()
+
+                except _DevicePredFallback:
+                    # ---- Device-predictor host fallback (review Important) ---
+                    # A non-representable condition was detected above.  Re-enter
+                    # the COMPLETE verbatim host predictor (the else-branch
+                    # below).  This guarantees the fallback is exactly the proven
+                    # host operator with no partial-device state contamination.
+                    _use_device_pred = False
+
+            if not _use_device_pred:
+                # ---- Host path (default; also Newton fallback; also device
+                # fallback via _DevicePredFallback) --------------------------
+                # Bit-for-bit unchanged from the pre-6b implementation.
+                A, b = assemble_linear_ns(
+                    dm, aq, dq, fq_it, self.nu, sigma=sigma,
+                    sig2tau=((2.0 * sigma) ** 2 if self.timestab else 0.0),
+                    gaq_by_bin=(gaq_flat if newton else None), newton=newton)
+                # SBM face block: add the constrained shifted-Nitsche vector
+                # Dirichlet into the momentum system BEFORE strong-row overwrite.
+                if extra_block is not None:
+                    A_sbm_c, b_sbm_c = extra_block
+                    A = (A + A_sbm_c)
+                    b = b + np.asarray(b_sbm_c)
+                # FN1 fix term (2): lagged wall pressure-traction <p* n, v>_Gamma
+                # on the surrogate faces (Dokken eq. 4.16). Constrained
+                # node-major RHS, precomputed by the caller from the CURRENT p*.
+                # Added to the predictor RHS before the strong-row overwrite.
+                # None => omitted (bit-for-bit).
+                if wall_traction_rhs is not None:
+                    b = b + np.asarray(wall_traction_rhs)
+                # P2-R0 "graddiv" variant: add the cached extra grad-div (LSIC)
+                # penalty to the momentum system (RHS unchanged — homogeneous
+                # penalty). No-op for the other variants (block is None).
+                # FN4 graddiv_dynamic: reassemble at the CURRENT advecting field
+                # with the FULL (advective+diffusive) tau_C — the Re-robust
+                # VMS-continuity grad-div.
+                if (self.velocity_update == "graddiv" and self.graddiv_dynamic
+                        and self.graddiv_scale != 0.0):
+                    A = (A + self._graddiv_tauc_block(aq))
+                elif self._graddiv_block is not None:
+                    A = (A + self._graddiv_block)
+                # F3b constant-gamma grad-div penalty (robust divergence cure).
+                # RHS unchanged (homogeneous). No-op when block is None (default).
+                if self._graddiv_gamma_block is not None:
+                    A = (A + self._graddiv_gamma_block)
+                # Backflow stabilization (#6): add the outflow directional-do-nothing
+                # block, linearized (Picard) at the current advecting iterate
+                # ``a_node``. beta=0 => a structural zero (bit-for-bit OFF).
+                if self.backflow_beta != 0.0:
+                    A = (A + self._backflow_block(a_node))
+                A = A.tolil()
+                for k, i in enumerate(self.dir_nodes):
+                    if int(i) in strong_skip:      # SBM-governed: stays weak
+                        continue
+                    for c in range(dim):
+                        r = i * ndof + c
+                        A.rows[r] = [int(r)]
+                        A.data[r] = [1.0]
+                        b[r] = gvals[k, c]
+                for i in range(self.n_free):           # pin ALL pressure DOFs
+                    r = i * ndof + dim
                     A.rows[r] = [int(r)]
                     A.data[r] = [1.0]
-                    b[r] = gvals[k, c]
-            for i in range(self.n_free):           # pin ALL pressure DOFs
-                r = i * ndof + dim
-                A.rows[r] = [int(r)]
-                A.data[r] = [1.0]
-                b[r] = p_node_full[i]
-            Acsr = A.tocsr()
+                    b[r] = p_node_full[i]
+                Acsr = A.tocsr()
+
             from ..solvers.linsolve import solve_linear
             x = solve_linear(Acsr, b, solver=self.solver, sym=False,
                              device=self.dm.device,

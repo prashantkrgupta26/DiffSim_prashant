@@ -80,7 +80,7 @@ from p2r1c_thin_plate_flow_3d import (
 
 
 def _build_shell_proj_3d(level, x_c, y_c, z_c, half_y, half_z,
-                         refine_to=None, band_cells=2):
+                         refine_to=None, band_cells=2, device="cpu"):
     """Build dim=3 octree + two-sided shell surrogate for the projection driver.
 
     Mirrors _build_shell_3d from the monolithic driver: uniform octree at
@@ -101,7 +101,7 @@ def _build_shell_proj_3d(level, x_c, y_c, z_c, half_y, half_z,
         cons = amr["cons"]
         ret = amr["ret"]
         n_excluded = amr["n_excluded"]
-    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3), "cpu")
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3), device)
     ftab = face_tables(1, 3)
     (sfp, gp), (sfm, gm) = extract_two_sided_surrogate(ret, sheet, ftab)
     return dict(dm=dm, mesh=mesh, cons=cons, sfp=sfp, gp=gp, sfm=sfm, gm=gm,
@@ -187,6 +187,7 @@ def run_flow_past_3d_projection(
     _two_sided=True,
     _return_fields=False,
     _return_stepper=False,
+    device="cpu",            # device for the DeviceMesh build (cpu | cuda:0)
 ):
     """Run 3-D flow past a finite thin plate via the PROJECTION stepper.
 
@@ -271,7 +272,8 @@ def run_flow_past_3d_projection(
     # ---- geometry + two-sided surrogate ------------------------------------
     fx = _build_shell_proj_3d(level, plate_xc, plate_yc, plate_zc,
                               plate_half_y, plate_half_z,
-                              refine_to=refine_to, band_cells=band_cells)
+                              refine_to=refine_to, band_cells=band_cells,
+                              device=device)
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
 
     if verbose:
@@ -417,6 +419,7 @@ if __name__ == "__main__":
     plate_half_y = float(os.environ.get("PLATE_HALF_Y", "0.125"))
     plate_half_z = float(os.environ.get("PLATE_HALF_Z", "0.125"))
     ppe_solver   = os.environ.get("PPE_SOLVER", "gpu_cg")
+    pred_solver  = os.environ.get("PRED_SOLVER", "splu")
 
     re_approx = int(round(U_inf / nu)) if nu > 0 else 0
     if refine_level:
@@ -429,7 +432,7 @@ if __name__ == "__main__":
         plate_xc=plate_xc, plate_yc=plate_yc, plate_zc=plate_zc,
         plate_half_y=plate_half_y, plate_half_z=plate_half_z,
         verbose=True, refine_to=refine_level, ppe_solver=ppe_solver,
-        _return_fields=True,
+        predictor_solver=pred_solver, _return_fields=True,
     )
     print(f"Cd={res['cd']}")
     print(f"Cl_y={res['cl_y']}")
