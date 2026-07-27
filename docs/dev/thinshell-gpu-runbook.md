@@ -421,6 +421,8 @@ plate-enclosing indicator sets (agreement 7.01e-15 ≤ 1e-6, **gate PASSED**),
 **Cd_surr = 5.4369**, **St = 0.2188**. Printed verdict line:
 `VERDICT: observable-overestimates+alpha-insensitive`, `LEAKDRAG-OK`.
 
+**RESOLVED (final review 2026-07-27): the 2.5996-vs-2.3440 difference is an averaging-window asymmetry, NOT a code delta: the LD-5 verdict leg averaged the reaction over ALL 8000 steps (incl. the from-rest transient; its own comment says 'for gate') while its Cd_surr used the post-t_start window — the TD probe windows BOTH post-t_start. Ratio 2.5996/2.3440 = 1.109 matches the discrepancy exactly; git diff 4acaae1..0c8243f -- src/ is empty (no code delta). The developed-window value (2.5996) is the physically appropriate one. The earlier 'code-delta suspect' text above is superseded by this finding; the filed re-run diagnostic is unnecessary.**
+
 **VERDICT: observable-overestimates** — the `surrogate_traction` observable reads **2.3×** the
 variationally-consistent Nitsche reaction; the physics-carrying instruments (reaction 2.34,
 CV 2.9–3.2) sit at/below literature 3.36. OPEN QUESTION (sharp form): the consistent reaction itself is ~30% BELOW literature — the consistent observable may UNDERestimate; the traction dissection must adjudicate both directions, not only the surrogate's excess. Two mandatory caveats: (i) the printed
