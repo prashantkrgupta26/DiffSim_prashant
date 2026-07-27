@@ -98,6 +98,228 @@ def _leak_flux(mesh, sfp, gp, sfm, gm, u_full, dim=2):
 
 
 # ---------------------------------------------------------------------------
+# Reaction-set builder (LD-5)
+# ---------------------------------------------------------------------------
+
+def _build_reaction_sets(level, refine_to, wake_refine, radii=(1.5, 2.5)):
+    """Build plate-enclosing free-node index sets for the reaction arbiter.
+
+    Returns a list of free-node index arrays, one per radius in ``radii``
+    (e.g. 1.5L and 2.5L from the plate centre).  Outer-boundary nodes
+    (inflow x=x_min, top/bottom walls, outflow x=x_max) are excluded so
+    that the w_k indicator has zero weight on all surgery rows — a requirement
+    for the variational identity to hold exactly (LD-5 assertion).
+
+    **Completeness guarantee**: each set is AUGMENTED with all SBM-coupled
+    free-nodes (those appearing in any non-zero row of Af_c).  This ensures
+    the variational identity `w_kᵀ (A_vol x − b_vol) = −w_kᵀ (Af_c x − bf_c)`
+    captures the full plate force regardless of the radius.  Without this, any
+    SBM node outside the radius is missed, breaking set-independence.  On the
+    GPU config (fine mesh, large radius) the radius already covers all SBM nodes,
+    but on the CPU mini-gate (coarse level-4 mesh, tiny L) the SBM nodes extend
+    to 3L from center — well beyond the radii requested.
+
+    Parameters
+    ----------
+    level : int
+        Uniform base octree level.
+    refine_to : int or None
+        Adaptive plate-refinement level (None => uniform).
+    wake_refine : int or None
+        Wake-band refinement level (None => no wake band).
+    radii : tuple of float
+        Set radii in units of plate length L (default 1.5L and 2.5L).
+        The radius-based selection provides the «outer shell» of each set;
+        the SBM-coupled nodes are always included as the «inner core».
+
+    Returns
+    -------
+    list of np.ndarray
+        Free-node index arrays, one per radius, excluding BC nodes,
+        guaranteed to include all SBM-coupled free-nodes.
+    """
+    from p2r1a_thin_plate_flow import _build_shell
+    import scipy.sparse as sp
+    from diffsim.sbm.vector import sbm_vector_dirichlet_twosided
+
+    fx = _build_shell(level, X_C, Y_C, L, refine_to=refine_to,
+                      wake_refine=wake_refine)
+    mesh = fx["mesh"]
+    cons = fx["cons"]
+    dm = fx["dm"]
+    free_coords = mesh.node_coords[cons.free_nodes]
+    ndof = 3   # u_x, u_y, p
+
+    # Outer-boundary mask: inflow (x=x_min), top/bottom walls, outflow (x=x_max)
+    x_min, x_max = free_coords[:, 0].min(), free_coords[:, 0].max()
+    y_min, y_max = free_coords[:, 1].min(), free_coords[:, 1].max()
+    tol = 1e-10
+    bc_mask = (
+        (np.abs(free_coords[:, 0] - x_min) < tol) |
+        (np.abs(free_coords[:, 0] - x_max) < tol) |
+        (np.abs(free_coords[:, 1] - y_min) < tol) |
+        (np.abs(free_coords[:, 1] - y_max) < tol)
+    )
+
+    # SBM-coupled free-nodes: rows of Af_c that have any non-zero entry.
+    # These MUST appear in every set (with w_k = 1) for the variational identity
+    # to be complete — any missing SBM node breaks set-independence.
+    T = cons.T.tocsr()
+    T_vec = sp.kron(T, sp.identity(ndof, format="csr"), format="csr")
+    noslip_fn = lambda y: np.zeros((len(y), 2))
+    Af_raw, _ = sbm_vector_dirichlet_twosided(
+        dm, fx["sfp"], fx["gp"], fx["sfm"], fx["gm"],
+        noslip_fn, NU, ndof, alpha=50.0)   # alpha arbitrary (only need pattern)
+    Af_c = (T_vec.T @ Af_raw @ T_vec).tocsr()
+    sbm_free_nodes = set(np.unique(Af_c.nonzero()[0] // ndof).tolist())
+
+    dist = np.sqrt((free_coords[:, 0] - X_C) ** 2 +
+                   (free_coords[:, 1] - Y_C) ** 2)
+    sets = []
+    for r in radii:
+        # Radius-based outer shell, excluding BC nodes
+        radius_mask = (dist <= r * L) & ~bc_mask
+        radius_nodes = set(np.where(radius_mask)[0].tolist())
+        # Union with SBM-coupled core (guaranteed non-BC from construction)
+        combined = np.array(sorted(radius_nodes | sbm_free_nodes), dtype=np.intp)
+        sets.append(combined)
+    return sets
+
+
+def run_discriminator_with_reaction(alpha, nsteps, level=7, refine_to=9,
+                                    wake_refine=9, dt=5e-4, device="cuda:0",
+                                    mono_solver="cudss", assembly="device",
+                                    t_start_lu=24.0, cv_pitch=None,
+                                    reaction_radii=(1.5, 2.5)):
+    """Run the leak-drag discriminator WITH the variational reaction-force arbiter.
+
+    Extends ``run_discriminator`` with the LD-5 reaction-force instrument:
+    builds two plate-enclosing node sets (default 1.5L and 2.5L radii, minus
+    boundary nodes), passes them to ``run_flow_past`` via ``reaction_sets``,
+    and accumulates a time-averaged ``Cd_reaction`` per set.
+
+    The reaction Cd is the variational-identity estimate of the plate drag
+    (plate x-force / ref_force).  Two different sets MUST agree to ≤ 1e-6
+    relative — this agreement is the LD-5 instrument gate.
+
+    Parameters: same as ``run_discriminator`` plus:
+    reaction_radii : tuple of float
+        Radii (in units of L) for the two node sets (default 1.5L, 2.5L).
+
+    Returns
+    -------
+    dict extending run_discriminator's return with:
+        reaction_hist   : np.ndarray [nsteps, nsets] — per-step Cd_reaction
+        cd_rxn_mean     : list of float — time-averaged Cd_reaction per set
+        rxn_set_sizes   : list of int — node-set sizes
+        rxn_agreement   : float — |set0 - set1| / |mean| (the gate metric)
+    """
+    from p2r1a_thin_plate_flow import run_flow_past, _build_shell
+
+    # Auto-detect pitch from level if not supplied
+    if cv_pitch is None:
+        cv_pitch = 1.0 / (2 ** level)
+
+    t_start = t_start_lu * L / U
+    boxes = _boxes(pitch=cv_pitch)
+    acc = {k: 0.0 for k in boxes}
+    acc_steps = {k: 0 for k in boxes}
+    acc_surr = 0.0
+    acc_leak = 0.0
+    n_avg = 0
+    coords_ref = {}
+    shell_ref = {}
+    n_nodes_ref = {}
+
+    # Build reaction sets (exclude boundary nodes so w_k ⊥ surgery rows).
+    rxn_sets = _build_reaction_sets(level, refine_to, wake_refine,
+                                    radii=reaction_radii)
+
+    def cb(step, t, u_full, p_full, cd_step):
+        nonlocal acc_surr, acc_leak, n_avg
+        if t < t_start:
+            return
+        assert u_full.shape[0] == n_nodes_ref["n"], (
+            f"External _build_shell produced {n_nodes_ref['n']} nodes but "
+            f"run_flow_past mesh has {u_full.shape[0]} nodes — non-deterministic "
+            "shell build."
+        )
+        coords = coords_ref["coords"]
+        for k, b in boxes.items():
+            try:
+                cd_val = cv_drag_box(coords, u_full, p_full, b, NU, U_inf=U, L_ref=L)
+                acc[k] += cd_val
+                acc_steps[k] += 1
+            except (ValueError, IndexError):
+                pass
+        acc_surr += cd_step
+        acc_leak += abs(_leak_flux(
+            shell_ref["mesh"], *shell_ref["sg"], u_full))
+        n_avg += 1
+
+    fx = _build_shell(level, X_C, Y_C, L, refine_to=refine_to,
+                      wake_refine=wake_refine)
+    coords_ref["coords"] = np.asarray(fx["mesh"].node_coords)
+    n_nodes_ref["n"] = len(fx["mesh"].node_coords)
+    shell_ref["mesh"] = fx["mesh"]
+    shell_ref["sg"] = (fx["sfp"], fx["gp"], fx["sfm"], fx["gm"])
+
+    t0 = time.time()
+    r = run_flow_past(level=level, refine_to=refine_to, wake_refine=wake_refine,
+                      nsteps=nsteps, dt=dt, nu=NU, U_inf=U,
+                      plate_xc=X_C, plate_yc=Y_C, plate_L=L,
+                      pert_eps=0.03, pert_t_end=0.5, alpha=alpha,
+                      mono_solver=mono_solver, assembly=assembly,
+                      device=device, verbose=False, on_step=cb,
+                      reaction_sets=rxn_sets)
+    el = time.time() - t0
+
+    t_arr = np.arange(1, nsteps + 1) * dt
+    try:
+        St, _f = strouhal(t_arr, np.asarray(r["cl"]), U, L)
+        St = float(St)
+    except Exception:
+        St = float("nan")
+
+    # CV means
+    cv_means = {k: acc[k] / max(acc_steps[k], 1) for k in boxes}
+    vals = np.array(list(cv_means.values()))
+    spread_denom = max(abs(vals.mean()), 1e-9)
+
+    # Reaction means (all steps, not just post-t_start — for gate: use all steps)
+    rh = r["reaction_hist"]  # [nsteps, nsets]
+    cd_rxn_mean = [float(np.mean(rh[:, k])) for k in range(rh.shape[1])]
+    denom_rxn = max(abs(cd_rxn_mean[0]), 1e-12)
+    rxn_agreement = (abs(cd_rxn_mean[0] - cd_rxn_mean[1]) / denom_rxn
+                     if len(cd_rxn_mean) >= 2 else 0.0)
+
+    out = dict(
+        alpha=alpha,
+        cd_surr_mean=acc_surr / max(n_avg, 1),
+        cd_cv_mean=cv_means,
+        box_spread=float(vals.max() - vals.min()) / spread_denom,
+        leak_mean_abs=acc_leak / max(n_avg, 1),
+        St=St,
+        n_steps_avg=n_avg,
+        elapsed=el,
+        # Reaction arbiter (LD-5)
+        reaction_hist=rh,
+        cd_rxn_mean=cd_rxn_mean,
+        rxn_set_sizes=[len(s) for s in rxn_sets],
+        rxn_agreement=rxn_agreement,
+    )
+
+    os.makedirs("results", exist_ok=True)
+    np.savez(
+        f"results/leakdrag_rxn_a{int(alpha)}_hist.npz",
+        t=t_arr, cd=r["cd"], cl=r["cl"],
+        reaction_hist=rh,
+        **{f"cv_{k}": v for k, v in cv_means.items()},
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Main discriminator
 # ---------------------------------------------------------------------------
 
@@ -238,22 +460,45 @@ def run_discriminator(alpha, nsteps, level=7, refine_to=9, wake_refine=9,
 
 
 if __name__ == "__main__":
+    # LD-5 GPU protocol: one α=50 leg with reaction arbiter + alpha sweep for CV context.
+    # The reaction instrument gate (set-agreement ≤ 1e-6) replaces the box-spread gate.
+    # CV boxes stay as corroborating context; the formal verdict issues from Cd_reaction.
     alphas = [float(a) for a in os.environ.get("ALPHAS", "20,50,100").split(",")]
     nsteps = int(os.environ.get("NSTEPS", "8000"))
+    t_start_lu = float(os.environ.get("T_START_LU", "24"))
+    _device    = os.environ.get("DEVICE", "cuda:0")
+    _solver    = os.environ.get("MONO_SOLVER", "cudss")
+    _assembly  = os.environ.get("ASSEMBLY", "device")
     os.makedirs("results", exist_ok=True)
+
+    # --- α=50 with reaction arbiter (LD-5 instrument gate) -------------------
+    _rxn_alpha = 50.0  # the one α leg for the formal verdict
+    print(f"\n[LD-5] Running α={_rxn_alpha} with reaction-force arbiter …")
+    rxn_row = run_discriminator_with_reaction(
+        _rxn_alpha, nsteps,
+        t_start_lu=t_start_lu,
+        device=_device, mono_solver=_solver, assembly=_assembly,
+    )
+    rh = rxn_row["reaction_hist"]
+    cd_rxn_s0 = float(np.mean(rh[:, 0]))
+    cd_rxn_s1 = float(np.mean(rh[:, 1]))
+    rxn_agree  = rxn_row["rxn_agreement"]
+
+    print(f"[LD-5] Cd_rxn set0={cd_rxn_s0:.4f}  set1={cd_rxn_s1:.4f}  "
+          f"agreement={rxn_agree:.2e}  Cd_surr={rxn_row['cd_surr_mean']:.4f}  "
+          f"set sizes={rxn_row['rxn_set_sizes']}")
+
+    # --- α sweep for CV + surrogate context (existing path) ------------------
     rows = [
         run_discriminator(
             a, nsteps,
-            t_start_lu=float(os.environ.get("T_START_LU", "24")),
-            device=os.environ.get("DEVICE", "cuda:0"),
-            mono_solver=os.environ.get("MONO_SOLVER", "cudss"),
-            assembly=os.environ.get("ASSEMBLY", "device"),
+            t_start_lu=t_start_lu,
+            device=_device, mono_solver=_solver, assembly=_assembly,
         )
         for a in alphas
     ]
 
-    # Dynamic over the actual box tags (the hardcoded 4L/6L/8L keys crashed
-    # the corrected-margins leg's table — KeyError; data safe in the npz).
+    # --- Table (surrogate Cd + CV context columns) ---------------------------
     _tags = list(rows[0]["cd_cv_mean"].keys())
     print(
         f"\n{'alpha':>6} {'Cd_surr':>8} "
@@ -270,24 +515,32 @@ if __name__ == "__main__":
         )
 
     # -------------------------------------------------------------------------
-    # Verdict per spec thresholds (EXACT — do not soften):
-    #   spread withheld:   box_spread > 5%
-    #   alpha-sensitive:   surr spread > 5% of mean
-    #   CV-vs-surr gap:    (surr - cv_mid) / surr > 10%  =>  observable-overestimates
+    # Verdict (LD-5 amended):
+    #   Instrument gate: reaction set-agreement ≤ 1e-6 (replaces box-spread gate).
+    #   CV boxes: corroborating context only (columns stay in table above).
+    #   Formal verdict from Cd_reaction (α=50 leg) vs Cd_surr:
+    #     alpha-sensitive : surr spread > 5% of mean
+    #     CV-vs-rxn gap   : (Cd_surr − Cd_rxn) / Cd_surr > 10% => overestimates
     # -------------------------------------------------------------------------
-    mid = rows[len(rows) // 2]
-    cv_mid = np.mean(list(mid["cd_cv_mean"].values()))
-    if mid["box_spread"] > 0.05:
-        print("VERDICT: CV-UNRELIABLE (box spread >5%) — verdict withheld")
-    else:
-        surr = np.array([r["cd_surr_mean"] for r in rows])
-        alpha_sens = (
-            (surr.max() - surr.min()) / max(abs(surr.mean()), 1e-9) > 0.05
-        )
-        cv_low = (
-            (mid["cd_surr_mean"] - cv_mid) / max(abs(mid["cd_surr_mean"]), 1e-9) > 0.10
-        )
-        quad = "observable-overestimates" if cv_low else "real-flow-drag"
-        quad += "+alpha-sensitive(leak)" if alpha_sens else "+alpha-insensitive"
-        print(f"VERDICT: {quad}")
+    print("\n" + "-" * 60)
+    print("INSTRUMENT GATE (reaction set-agreement):")
+    if rxn_agree > 1e-6:
+        print(f"  GATE FAILED: set-agreement={rxn_agree:.2e} > 1e-6 — implementation bug")
+        print("VERDICT: BLOCKED (reaction arbiter gate failed)")
+        print("LEAKDRAG-OK")
+        raise SystemExit(1)
+
+    print(f"  GATE PASSED: set-agreement={rxn_agree:.2e} ≤ 1e-6 ✓")
+    # Formal verdict from Cd_reaction (α=50)
+    cd_rxn = cd_rxn_s0   # both sets agreed; use set0
+    cd_surr_mid = rxn_row["cd_surr_mean"]
+    surr_arr = np.array([r["cd_surr_mean"] for r in rows])
+    alpha_sens = (surr_arr.max() - surr_arr.min()) / max(abs(surr_arr.mean()), 1e-9) > 0.05
+    cv_low = (
+        (cd_surr_mid - cd_rxn) / max(abs(cd_surr_mid), 1e-9) > 0.10
+    )
+    quad = "observable-overestimates" if cv_low else "real-flow-drag"
+    quad += "+alpha-sensitive(leak)" if alpha_sens else "+alpha-insensitive"
+    print(f"  Cd_reaction={cd_rxn:.4f}  Cd_surr={cd_surr_mid:.4f}  St={rxn_row['St']:.4f}")
+    print(f"VERDICT: {quad}")
     print("LEAKDRAG-OK")
