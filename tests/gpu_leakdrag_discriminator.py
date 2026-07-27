@@ -56,7 +56,12 @@ def _snap(v, pitch):
 def _boxes(pitch=1.0 / 128.0):
     """Return dict tag -> (x0, x1, y0, y1) snapped to given pitch."""
     out = {}
-    for tag, m in (("4L", 4 * L), ("6L", 6 * L), ("8L", 8 * L)):
+    # Margins in plate-lengths. Default {2,3,4}L: at x_c=5/16 the upstream
+    # margin caps at 5L — the original {4,6,8}L set put 6L/8L off-domain
+    # (found by the alpha-sweep spread self-check, 2026-07-27).
+    _margs = [float(m) for m in
+              os.environ.get("MARGINS", "2,3,4").split(",")]
+    for tag, m in ((f"{m:g}L", m * L) for m in _margs):
         out[tag] = (
             _snap(X_C - m, pitch),
             _snap(X_C + m, pitch),
