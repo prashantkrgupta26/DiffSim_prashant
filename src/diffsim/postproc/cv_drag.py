@@ -33,6 +33,10 @@ def _face_integral(coords, u, p, nu, axis, value, lo, hi, n_sign):
                          "lie on mesh node lines")
     s = coords[probe, 1 - axis]
     h = np.min(np.diff(s))
+    if h <= 0:
+        raise ValueError(
+            f"duplicate node coordinates on face axis{axis}={value} — "
+            "cannot infer pitch")
     tol = _TOLF * h
     idx = _line_nodes(coords, axis, value, lo, hi, tol)
     s = coords[idx, 1 - axis]
@@ -41,6 +45,11 @@ def _face_integral(coords, u, p, nu, axis, value, lo, hi, n_sign):
     pn = p[idx] * (n_sign if axis == 0 else 0.0)   # p n_x
     # du_x/dn: one-sided toward the inside line at value - n_sign*h
     inner = _line_nodes(coords, axis, value - n_sign * h, lo, hi, tol)
+    if len(inner) < 2:
+        raise ValueError(
+            f"no interior node line at distance {h} inside face "
+            f"axis{axis}={value} — CV face too close to a refinement "
+            "transition; move the box edge")
     ux_in = np.interp(s, coords[inner, 1 - axis], u[inner, 0])
     duxdn = (ux - ux_in) / h
     integrand = ux * un + pn - nu * duxdn
