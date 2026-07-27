@@ -377,6 +377,7 @@ def run_flow_past(
     assembly="host",   # assembly backend: "host" (default, bit-for-bit) | "device"
     on_step=None,      # optional per-step callback: on_step(step, t, u_full, p_full, cd_step)
     reaction_sets=None,  # list of free-node index arrays for reaction-force arbiter (LD-5)
+    reaction_terms=False,  # (TD-2) if True, also record per-Nitsche-term reaction history
 ):
     """Run flow past a finite thin plate with transient BDF2 march.
 
@@ -438,15 +439,35 @@ def run_flow_past(
       'n_excluded': int — number of excluded octree cells (non-zero confirms plate active)
       'nsteps'   : int — number of steps actually taken
 
+    reaction_terms : bool
+        (TD-2) When True, also record per-Nitsche-term reaction force history.
+        Requires reaction_sets to be set; raises ValueError if not.
+        Default False — bit-for-bit identical to legacy march (no overhead).
+
     When reaction_sets is not None, also returns:
       'reaction_hist' : np.ndarray [nsteps, nsets] — per-step reaction Cd per set
                         (Cd_reaction = F_x / (0.5*U_inf^2*L), same sign as cd_surr)
+
+    When reaction_terms=True (requires reaction_sets), also returns:
+      'reaction_terms_hist'  : np.ndarray [nsteps, nterms] — per-step per-term
+                               reaction Cd for set 0 (the first set in reaction_sets).
+                               Terms are the TD-1 Nitsche split: consistency+adjoint,
+                               penalty, backflow (see sbm_vector_dirichlet_twosided).
+      'reaction_terms_names' : list[str] — stable term names (length nterms).
 
     When _return_fields=True, also returns:
       'mesh'     : the DiffSim Mesh object (full octree connectivity)
       'node_fields': dict with 'velocity_magnitude' [Nn] and 'pressure' [Nn]
                      extracted from the final time step's solution
     """
+    # ---- Parameter validation -----------------------------------------------
+    if reaction_terms and (reaction_sets is None or len(reaction_sets) == 0):
+        raise ValueError(
+            "reaction_terms=True requires reaction_sets to be set "
+            "(a non-empty list of free-node index arrays). "
+            "Pass reaction_sets=[...] alongside reaction_terms=True."
+        )
+
     ndof = dim + 1
     t0 = time.time()
 
@@ -493,6 +514,50 @@ def run_flow_past(
             dm, fx["sfm"], fx["gm"], noslip, nu, ndof, alpha=alpha)
     Af_c = (T_vec.T @ Af_raw @ T_vec).tocsr()
     bf_c = np.asarray(T_vec.T @ bf_raw)
+
+    # ---- Per-term SBM blocks (TD-2; reaction_terms=True only) ---------------
+    # Geometry is static (no advecting-field backflow in this driver's Af build:
+    # sbm_vector_dirichlet_twosided is called WITHOUT a_face_plus/a_face_minus),
+    # so the "backflow" term block is identically zero. We assemble ONCE with
+    # return_terms=True using the same alpha/nu/ndof arguments as above, then
+    # reduce each A_t/b_t through the same T_vec constraint reduction as Af_c.
+    # This is path-independent: A_t/b_t are host CSRs; the per-step computation
+    # only requires w₀ᵀ A_t x and w₀ᵀ b_t — no assembly per step.
+    _rt_active = reaction_terms   # True only when validated above (ValueError if no sets)
+    _term_names = []              # stable ordered list of term names
+    _term_Afc_c = []              # [nterms] list of reduced A_t CSR (host)
+    _term_bfc_c = []              # [nterms] list of reduced b_t vectors (host)
+
+    if _rt_active and _two_sided:
+        # Assemble with return_terms=True (same arguments as the Af_raw call above)
+        _, _, _raw_terms = sbm_vector_dirichlet_twosided(
+            dm, fx["sfp"], fx["gp"], fx["sfm"], fx["gm"],
+            noslip, nu, ndof, alpha=alpha, return_terms=True)
+        # Stable order: iterate dict insertion order (Python 3.7+)
+        for _tname, (_At_raw, _bt_raw) in _raw_terms.items():
+            _term_names.append(_tname)
+            _At_c = (T_vec.T @ _At_raw @ T_vec).tocsr()
+            _bt_c = np.asarray(T_vec.T @ _bt_raw)
+            _term_Afc_c.append(_At_c)
+            _term_bfc_c.append(_bt_c)
+        # Verify backflow term is zero (static geometry: no a_face_plus/a_face_minus).
+        # This is a correctness anchor: if a future caller passes advecting fields
+        # and also uses reaction_terms=True with the monolithic path, escalate.
+        _bf_idx = _term_names.index("backflow") if "backflow" in _term_names else None
+        if _bf_idx is not None:
+            _bf_At = _term_Afc_c[_bf_idx]
+            # The reduced backflow A_t must be identically zero (no advecting field).
+            assert _bf_At.nnz == 0 or abs(_bf_At).max() < 1e-14, (
+                "backflow term is non-zero but no advecting field was passed "
+                "to the driver's Af assembly. Static-geometry invariant violated. "
+                "If per-step backflow is needed, reaction_terms is a design change — "
+                "escalate BLOCKED."
+            )
+    elif _rt_active and not _two_sided:
+        raise ValueError(
+            "reaction_terms=True is only supported with _two_sided=True "
+            "(the standard monolithic driver path)."
+        )
 
     xq = gauss_points(mesh, dm.tables_by_p)
 
@@ -657,6 +722,9 @@ def run_flow_past(
     cl_hist = np.zeros(nsteps)
     if _rxn_active:
         _rxn_hist = np.zeros((nsteps, _rxn_nsets))
+    if _rt_active:
+        _nterms = len(_term_names)
+        _rxn_term_hist = np.zeros((nsteps, _nterms))
 
     ref_force = 0.5 * U_inf ** 2 * plate_L    # nondim denominator
 
@@ -811,6 +879,38 @@ def run_flow_past(
                     # Negate: Cd_reaction > 0 = downstream drag (same sign as Cd_surr)
                     _rxn_hist[step, k] = -F_raw / ref_force
 
+        # ---- Per-term reaction history (TD-2; _rt_active only) ---------------
+        # Computed using the pre-reduced host CSR term blocks (path-independent:
+        # A_t/b_t are host matrices; x_cur is always a numpy vector post-solve).
+        # Only set 0 (reaction_sets[0]) is tracked per-term.
+        #
+        # Sign convention: Cd_t = +w₀ᵀ(A_t x_cur - b_t) / ref_force.
+        # By linearity, Σ_t Cd_t = w₀ᵀ(Af_c x - bf_c) / ref_force.
+        # The LD-5 variational identity gives Cd_total = w₀ᵀ(Af_c x - bf_c) / ref_force
+        # (because -w₀ᵀ(A_vol x - b_vol) = w₀ᵀ(Af_c x - bf_c) for surgery-row-
+        # orthogonal w₀). So Σ_t Cd_t == Cd_total (same sign, same value).
+        #
+        # Partition gate: |Σ_t Cd_t - Cd_total| ≤ 1e-12·max(1,|Cd_total|).
+        if _rt_active:
+            w0 = _rxn_w[0]   # w-vector for set 0
+            for ti in range(_nterms):
+                At = _term_Afc_c[ti]   # reduced A_t CSR (host)
+                bt = _term_bfc_c[ti]   # reduced b_t vector (host)
+                # +w₀ᵀ(A_t x - b_t): no negation — Σ_t sums to Af_c contribution
+                F_raw_t = float(np.asarray(At.T @ w0) @ x_cur) - float(w0 @ bt)
+                _rxn_term_hist[step, ti] = F_raw_t / ref_force
+            # Partition gate (inline): Σ_t f_x_t == f_x_total at 1e-12
+            f_x_total = _rxn_hist[step, 0]
+            f_x_term_sum = _rxn_term_hist[step].sum()
+            _part_tol = 1e-12 * max(1.0, abs(f_x_total))
+            assert abs(f_x_term_sum - f_x_total) <= _part_tol, (
+                f"Step {step}: per-term partition error "
+                f"{abs(f_x_term_sum - f_x_total):.3e} > 1e-12·max(1,|total|) "
+                f"({_part_tol:.3e}). total={f_x_total:.8g}, "
+                f"sum_terms={f_x_term_sum:.8g}. "
+                "This is the instrument's trust anchor — partition must hold exactly."
+            )
+
         # Extract velocity for next step
         u_new = x_cur.reshape(nfree, ndof)[:, :dim]
 
@@ -857,6 +957,11 @@ def run_flow_past(
     # Reaction-force arbiter results (LD-5): only present when reaction_sets != None.
     if _rxn_active:
         result["reaction_hist"] = _rxn_hist   # [nsteps, nsets] Cd_reaction per set
+
+    # Per-term reaction history (TD-2): only present when reaction_terms=True.
+    if _rt_active:
+        result["reaction_terms_hist"] = _rxn_term_hist   # [nsteps, nterms]
+        result["reaction_terms_names"] = _term_names     # stable ordered list
 
     if _return_fields:
         # Extract node-level fields from the final step's solution via the shared
