@@ -128,14 +128,13 @@ def sbm_vector_dirichlet(dm, sf, geo, g_fn, nu, ndof, alpha=10.0,
     Aeh_ca = Aeh - Aeh_pen          # [ne_f, nbf, nbf] element matrices
 
     # scatter each term to CSR (same pattern as main assembly)
-    def _scatter(elem_mat, extra_elem_mat=None):
+    def _scatter(elem_mat):
         r2, c2, v2 = [], [], []
         for c in range(dim):
             gdof = conn_glob * ndof + c
             r2.append(np.repeat(gdof, nbf, axis=1).ravel())
             c2.append(np.tile(gdof, (1, nbf)).ravel())
-            mat = elem_mat if extra_elem_mat is None else elem_mat + extra_elem_mat
-            v2.append(mat.ravel())
+            v2.append(elem_mat.ravel())
         return sp.coo_matrix(
             (np.concatenate(v2), (np.concatenate(r2), np.concatenate(c2))),
             shape=(Nn, Nn)).tocsr()
