@@ -161,7 +161,8 @@ Within 3D only: only one point measured (L6); no second point for growth assessm
 ### 5.2 Gate verdict
 
 **UNDECIDABLE** — the 9.24M 3D-L7r9 point required for the 1M→10M growth
-measurement could not run on gpubox (OOM during mesh build) and was not submitted
+measurement could not run on gpubox (OOM in the first `run_flow_past_3d` call on
+the host-assembly path — see §4.1; the mesh build itself is WP0-exonerated) and was not submitted
 to nova (out of scope for this task — controller handles cluster submissions).
 
 **Interim evidence from 0.3M→1.1M:**

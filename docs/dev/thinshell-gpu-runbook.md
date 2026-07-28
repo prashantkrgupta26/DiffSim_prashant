@@ -635,7 +635,7 @@ cd /Users/baskarg/Dropbox/work/Projects/ClaudeCode/DiffSim && \
 | 2d-r11 | fgmres_pcd | 93,792 | N/A | N/A | **DIVERGED** |
 | 3d-L6 | fgmres_bdiag | 1,097,344 | 603.0 | 35.6 | YES |
 | 3d-L6 | fgmres_pcd | 1,097,344 | **35.4** | 38.8 | YES |
-| 3d-L7r9 | fgmres_bdiag | ~9,240,000 | N/A | N/A | OOM (mesh build) |
+| 3d-L7r9 | fgmres_bdiag | ~9,240,000 | N/A | N/A | OOM (host-assembly path; see §4.1 note) |
 | 3d-L7r9 | fgmres_pcd | ~9,240,000 | N/A | N/A | NOT RUN |
 
 ### Kill-gate verdict
