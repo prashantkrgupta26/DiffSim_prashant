@@ -319,3 +319,35 @@ def test_fgmres_pcd_beats_bdiag():
         f"PCD did NOT beat bdiag: pcd={it_pcd} bdiag={it_bd} "
         f"(the point of PCD is fewer iterations than block-Jacobi)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Task T1: PCD inner-solve telemetry
+# ---------------------------------------------------------------------------
+
+def test_fgmres_pcd_inner_stats():
+    """return_result=True must populate r.inner_stats with per-block
+    telemetry (applies, iters_total, cap_hits, max_exit_relres) for each
+    of the three PCD inner-solve blocks (F, Ap, Mp)."""
+    from diffsim.solvers.linsolve import solve_linear
+
+    from diffsim.solvers.saddle_precond import build_pcd_meta
+
+    Acsr, b, x_splu, dm, nu, sigma, p_pin = _get_system_with_meta()
+    cache = {("pcd_meta", "T1"): build_pcd_meta(dm, nu, sigma, p_pin=p_pin)}
+
+    r = solve_linear(Acsr, b, solver="fgmres_pcd", sym=False, device="cpu",
+                     tol=1e-10, cache=cache, cache_key="T1", return_result=True)
+    st = r.inner_stats
+    assert st is not None, "r.inner_stats is None — telemetry not wired up"
+    for blk in ("F", "Ap", "Mp"):
+        assert blk in st, f"block '{blk}' missing from inner_stats"
+        assert st[blk]["applies"] > 0, (
+            f"{blk}: applies={st[blk]['applies']}, expected > 0")
+        assert st[blk]["iters_total"] > 0, (
+            f"{blk}: iters_total={st[blk]['iters_total']}, expected > 0")
+        assert st[blk]["cap_hits"] >= 0, (
+            f"{blk}: cap_hits={st[blk]['cap_hits']}, expected >= 0")
+        assert 0.0 <= st[blk]["max_exit_relres"] < float("inf"), (
+            f"{blk}: max_exit_relres={st[blk]['max_exit_relres']}, "
+            f"expected finite non-negative")

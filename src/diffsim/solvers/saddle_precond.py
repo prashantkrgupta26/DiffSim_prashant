@@ -263,7 +263,7 @@ def _pin_symmetric(M, i):
     return sp.csr_matrix((data, (row, col)), shape=M.shape)
 
 
-def make_pcd_apply(A, meta, device):
+def make_pcd_apply(A, meta, device, stats=None):
     """PCD Schur preconditioner apply for the interleaved (u, p) saddle.
 
     Implements  P^{-1} = upper-block-triangular with
@@ -277,6 +277,22 @@ def make_pcd_apply(A, meta, device):
     Inner solves (PRECONDITIONER strength — the outer FGMRES is the true gate):
     Jacobi-CG on F (velocity block), on Ap and Mp (both SPD).  cg_dev on
     `device`.  Inner tol is _INNER_TOL (see constant below for rationale).
+
+    Parameters
+    ----------
+    stats : dict or None
+        T1 telemetry accumulator.  When a dict is provided each apply
+        accumulates records under keys ``"F"``, ``"Ap"``, ``"Mp"``::
+
+            {blk: {"applies": int, "iters_total": int,
+                   "cap_hits": int, "max_exit_relres": float}}
+
+        ``applies``        — number of times this block's inner CG was called
+        ``iters_total``    — cumulative CG iteration count across all applies
+        ``cap_hits``       — applies where iters reached ``_INNER_MAX``
+        ``max_exit_relres``— maximum exit relative residual across all applies
+
+        ``stats=None`` (the default) is byte-identical to the old signature.
 
     Returns ``apply_dev(v_in_wp, z_out_wp)`` — device-in/device-out closure
     (wp.array float64).  The block gather/scatter is by component mask (the
@@ -343,13 +359,32 @@ def make_pcd_apply(A, meta, device):
     # that probe was over-tightened and needlessly expensive at 9.24M-DOF scale.
     _INNER_TOL, _INNER_MAX = 1e-4, 500
 
-    def _cg(op, y, diag, tol, mx):
+    def _cg(op, y, diag, tol, mx, blk=None):
+        """Inner Jacobi-CG solve.
+
+        blk : str or None
+            When ``stats`` (outer closure variable) is a dict and ``blk`` is
+            one of "F"/"Ap"/"Mp", accumulate per-apply telemetry:
+            iters, cap-hit flag, exit relres.  Zero-rhs short-circuit is
+            NOT counted as an apply (it produces an exact zero solution with
+            no CG work).
+        """
         if not np.any(y):
             return np.zeros_like(y)
         x_, info = cg_dev(op, y, tol=tol, atol=1e-30, maxiter=mx, diag=diag,
                           check_every=10)
         # accept the truncated iterate even if the cap is hit (a smoother, not
         # an exact solve) — the outer FGMRES carries the remaining residual.
+        if stats is not None and blk is not None:
+            rec = stats[blk]
+            it = info.get("iters", 0)
+            rr = info.get("relres", 0.0)
+            rec["applies"] += 1
+            rec["iters_total"] += it
+            if it >= mx:
+                rec["cap_hits"] += 1
+            if rr > rec["max_exit_relres"]:
+                rec["max_exit_relres"] = float(rr)
         return x_
 
     def _apply_host(r):
@@ -358,15 +393,15 @@ def make_pcd_apply(A, meta, device):
         # Schur:  z_p = sigma Ap^{-1} r_p + nu Mp^{-1} r_p   (Cahouet-Chabard).
         # Ap in meta is already PINNED (SPD) when p_pin was supplied, so the
         # Jacobi-CG on Ap is well-posed (a singular Neumann Ap breaks CG).
-        z_p = (sigma * _cg(opAp, r_p, dAp, _INNER_TOL, _INNER_MAX)
-               + nu * _cg(opMp, r_p, dMp, _INNER_TOL, _INNER_MAX))
+        z_p = (sigma * _cg(opAp, r_p, dAp, _INNER_TOL, _INNER_MAX, blk="Ap")
+               + nu * _cg(opMp, r_p, dMp, _INNER_TOL, _INNER_MAX, blk="Mp"))
         if p_pin_local is not None:
             # the saddle pins this pressure dof to an identity row; make the
             # preconditioner respect it (pass the residual straight through)
             z_p[p_pin_local] = r_p[p_pin_local]
         # velocity: z_u = F^{-1} (r_u - G z_p)
         r_u_corr = r_u - G @ z_p
-        z_u = _cg(opF, r_u_corr, dF, _INNER_TOL, _INNER_MAX)
+        z_u = _cg(opF, r_u_corr, dF, _INNER_TOL, _INNER_MAX, blk="F")
         z = np.empty_like(r)
         z[u_ids] = z_u
         z[p_ids] = z_p
