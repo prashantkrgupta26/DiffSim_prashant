@@ -635,30 +635,22 @@ cd /Users/baskarg/Dropbox/work/Projects/ClaudeCode/DiffSim && \
 | 2d-r11 | fgmres_pcd | 93,792 | N/A | N/A | **DIVERGED** |
 | 3d-L6 | fgmres_bdiag | 1,097,344 | 603.0 | 35.6 | YES |
 | 3d-L6 | fgmres_pcd | 1,097,344 | **35.4** | 38.8 | YES |
-| 3d-L7r9 | fgmres_bdiag | ~9,240,000 | N/A | N/A | OOM (host-assembly path; see §4.1 note) |
-| 3d-L7r9 | fgmres_pcd | ~9,240,000 | N/A | N/A | NOT RUN |
+| 3d-L7r9 | fgmres_bdiag | ~9,240,000 | N/A | N/A | OOM on gpubox (host-assembly path; see §4.1 note) |
+| 3d-L7r9 | fgmres_bdiag | 9,080,064 | **1196.8** | 242.2 | YES (GH200, job 11772638) |
+| 3d-L7r9 | fgmres_pcd | 9,080,064 | N/A | ≥5,160 | DNF (GH200 2×walltime, jobs 11772733/11772832) |
 
-### Kill-gate verdict
+### Kill-gate verdict (FINAL, 2026-07-28)
 
-**UNDECIDABLE** — the 9.24M 3D-L7r9 point needed for the 1M→10M decade measurement
-was OOM-killed on gpubox (62 GB RAM) inside the first `run_flow_past_3d` call, before any
-solver output. **The mesh build is not the cause:** WP0 (nova GH200 job 11771926) measured
-the r7b9 mesh build itself at 3.71 GB/94 s (mesh build exonerated; the earlier 209.7 GB
-figure was cross-leg accumulation — see `docs/dev/2026-07-27-100m-gh200-readiness.md` §2.1).
-Leading hypothesis: host-assembly/constraint-projection transients at 9.24M ndof=4 exhaust
-the 62 GB before any solve begins (hypothesis; no per-stage measurement on gpubox). The GH200
-verdict leg (--mem=400G) will capture the true peak. The kill-gate cannot be decided from the
-0.3M→1.1M data alone.
-
-Interim evidence: fgmres_pcd achieves 35–46 iters at both 2D-r9 and 3D-L6 (0.3M→1.1M
-range), indicating DECREASING iteration count with mesh size in this range. However,
-PCD FAILED at 2D-r11 (same DOF count as r9 but finer mesh) — a robustness concern for
-the inner Jacobi-CG quality on finer pressure Laplacians. fgmres_bdiag converges at all
-points but requires 600–5000 iters (not scalable without the 9.24M data).
-
-**Nova GH200 required:** 3D-L7r9 with SADDLE_SOLVERS=fgmres_bdiag,fgmres_pcd,
-SADDLE_POINTS=3d-L7r9, SADDLE_NSTEPS=5, --mem=400G. This is the blocking measurement
-for the kill-gate. The controller handles nova submission.
+**TRACK A VIABLE via fgmres_bdiag.** Within-3-D decade: 603.0 iters/step at 1.097M
+→ 1196.8 at 9.08M = **1.985× growth ≤ ~2× — PASS** (late-step settled values put
+it nearer 1.6×). PCD wins iterations wherever it converges (35 at 3-D L6, 17×
+under bdiag) but is wall-time-infeasible at 9M with Jacobi-CG inners (≥86 min/step
+vs bdiag 4.0 min/step, two GH200 timeouts) and non-robust on the 2-D fine-graded
+mesh — A4 (AMGX velocity-inner) is the identified upgrade to keep PCD outer
+counts at viable apply cost. **Memory (measured):** host-assembly transients
+243–245 GB at 9.08M (mesh build 3.71 GB, WP0) ⇒ device assembly (`ASSEMBLY=device`)
+MANDATORY at ≥10M; GPU peak 36.7 GiB/95. Full record + 100M projection:
+`docs/dev/2026-07-27-r2b-saddle-campaign.md` §8.
 
 ---
 

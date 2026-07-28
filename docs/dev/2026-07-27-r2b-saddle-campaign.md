@@ -55,14 +55,18 @@ Points run in SEPARATE processes via `SADDLE_POINTS=<tag>`.
 | 2d-r11 | fgmres_pcd | 93,792¹ | — | N/A | N/A | **NO** (DIVERGED) | saddle-2dr11-pcd-20260727-234000-43808.log |
 | 3d-L6 | fgmres_bdiag | 1,097,344 | [551,805,583,565,511] | **603.0** | 35.558 | YES | saddle-3dL6-bdiag-20260727-235440-46681.log |
 | 3d-L6 | fgmres_pcd | 1,097,344 | [35,37,36,35,34] | **35.4** | 38.798 | YES | saddle-3dL6-pcd-20260727-235759-47448.log |
-| 3d-L7r9 | fgmres_bdiag | ~9,240,000 | — | N/A | N/A | **OOM-KILLED** | saddle-3dL7r9-bdiag-20260728-000149-47900.log |
-| 3d-L7r9 | fgmres_pcd | ~9,240,000 | — | N/A | N/A | NOT RUN | — |
+| 3d-L7r9 | fgmres_bdiag | ~9,240,000 | — | N/A | N/A | **OOM-KILLED** (gpubox) | saddle-3dL7r9-bdiag-20260728-000149-47900.log |
+| 3d-L7r9 | fgmres_pcd | ~9,240,000 | — | N/A | N/A | NOT RUN (gpubox) | — |
+| 3d-L7r9 | fgmres_bdiag | 9,080,064 | [1760,1274,1025,1019,906] | **1196.8** | 242.249 | YES (GH200) | nova job 11772638 |
+| 3d-L7r9 | fgmres_pcd | 9,080,064 | — | N/A | ≥5,160² | **DNF** (2× walltime) | nova jobs 11772733, 11772832 |
 
 All logs on gpubox: `/home/bglab/Baskar/DiffSim/logs/`  
 All npz artifacts on gpubox: `/home/bglab/Baskar/DiffSim/results/`
 
 ¹ The 2d-r11/fgmres_pcd run DIVERGED (no npz written; summary recorded -1 DOFs).
 The DOF count 93,792 is taken from the bdiag run on the identical r11 mesh.
+² Lower bound: job 11772832 (6 h, NSTEPS=3) spent ≥4.3 h in the march without
+completing 3 steps ⇒ ≥86 min/step ≥ 5,160 s/step. See §8.
 
 ---
 
@@ -219,3 +223,70 @@ point make any extrapolation unreliable.
 3. **3D uniform ladder within-dimension scaling**: Run 3D-L7 uniform (if it fits
    on gpubox host RAM) to get a within-3D growth measurement. L7 uniform has
    ~8.4M DOF in 3D — also likely OOM on gpubox but worth checking.
+
+---
+
+## 8. GH200 Verdict Legs (2026-07-28) — FINAL KILL-GATE VERDICT
+
+Three nova GH200 jobs (branch bundle `track-a-r2b`, sbatch kits
+`cluster/slurm/saddle_ladder_gh200{,_pcd}.sbatch`, 400G cgroup, one solver per
+process):
+
+- **Job 11772638** (2 h): bdiag leg COMPLETE — the row above. The pcd leg of the
+  same job reached Warp init before the walltime kill.
+- **Job 11772733** (3 h, pcd only, NSTEPS=5): assembly completed (MaxRSS
+  245.1 GB — same peak as the bdiag leg), then ≥1.5 h inside the march with no
+  step completed. TIMEOUT.
+- **Job 11772832** (6 h, pcd only, NSTEPS=3): ≥4.3 h in the march after ~1.7 h
+  setup; 3 steps NOT completed. TIMEOUT. Bound: **≥86 min/step**.
+
+### 8.1 Kill-gate verdict: **TRACK A VIABLE via fgmres_bdiag**
+
+The gate, verbatim: "iteration growth ≤ ~2× across the 1M→10M decade for ANY
+candidate ⇒ Track A viable (record which candidate + the projection to 100M with
+stated assumptions). Otherwise ⇒ NEGATIVE verdict with the full table."
+
+Within-3-D decade measurement (the valid within-dimension pair):
+
+```
+3d-L6    1,097,344 dof   bdiag  603.0 iters/step
+3d-L7r9  9,080,064 dof   bdiag 1196.8 iters/step   growth = 1.985x  <= ~2x  PASS
+```
+
+The per-step trend within the 9.08M leg was still improving as the transient
+settled ([1760, 1274, 1025, 1019, 906]); the late-step value (~950) puts the
+settled growth nearer 1.6×. **Candidate: fgmres_bdiag.** Marginal-pass caveats:
+(i) single decade, 5 steps, transient-influenced upper bound; (ii) the 2-D
+graded-mesh rungs show refinement-driven (not DOF-driven) iteration growth
+(3385→4842 at ~constant DOF) — h-refinement stresses the preconditioner
+independently of size; (iii) the gate is an iteration statement, not a wall-time
+statement.
+
+**PCD at 9.08M: DNF — wall-time infeasible with Jacobi-CG inners.** PCD wins
+iterations decisively where it converges (46 vs 3385 at 2-D r9; 35 vs 603 at
+3-D L6, both ~17-73×) but its apply cost at 9M (three inner Jacobi-CG solves per
+outer iteration, F-block of 9M) yields ≥86 min/step vs bdiag's 4.0 min/step —
+a ≥21× wall-time inversion. The A4 trigger condition is hereby met in its
+economic form: PCD's outer counts are worth keeping ONLY with a cheap velocity
+inner (AMGX V-cycle on the extracted velocity block — A4), which is the
+identified upgrade path, deferred per plan (A4 was conditioned on iteration
+growth; the ladder instead exposed apply cost).
+
+### 8.2 Memory record (settles the §4.1 hypothesis)
+
+- Host MaxRSS 243.2 GB (bdiag job) / 245.1 GB (pcd job) at 9.08M dof on the
+  HOST-assembly path — the host CSR-assembly/constraint-projection transients,
+  MEASURED. The mesh build alone is 3.71 GB (WP0). Hypothesis confirmed.
+- GPU peak 36.7 GiB of 95 (Warp mempool acquires within ~2 min of start).
+- Implication for 100M: host assembly extrapolates to ~2.6 TB — **device
+  assembly (`ASSEMBLY=device`, already implemented in the drivers) is MANDATORY
+  for the 100M hero**; the ladder deliberately ran the host path.
+
+### 8.3 Projection to 100M (assumptions stated)
+
+Assuming bdiag growth continues at ~2× per 1M→10M-style decade: ~2,400
+iters/step at 100M. s/step scales with iters × matvec cost; at GH200-class
+matvec throughput this is production-marginal — the practical engine at 100M
+wants either A4 (PCD outer counts at cheap apply: target ~70 iters/step at 100M
+under the same 2×/decade assumption) or Track B's projection split. Both paths
+inherit the device-assembly requirement.
