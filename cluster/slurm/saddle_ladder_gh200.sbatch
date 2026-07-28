@@ -1,11 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name=saddle-ladder-l7r9
 #SBATCH --output=/work/mech-ai/baskarg/DiffSim/cluster/results/%x-%j.out
-# A5 verdict leg: the 9.24M-DOF 3d-L7r9 ladder point (both saddle solvers).
-# gpubox (62 GB host) OOM'd this point; WP0 (job 11771926) measured the r7b9
-# mesh build itself at 3.71 GB peak on Grace, so 400G gives ample headroom for
-# build + host CSR (~16 GB) + solver working set while we capture the true peak.
-# Partition/account/qos/gres/cpus/mem/time are injected by nova-sync-submit.sh.
+# T4 gate leg (bdiag): 9.24M-DOF 3d-L7r9 with device assembly.
+# Device assembly (SADDLE_ASSEMBLY=device) removes the 243-245 GB host CSR
+# transient observed in the Track A campaign; expected setup time <10 min vs
+# ~1.5 h host-path.  Reference: host-path bdiag 3d-L7r9 1196.8 iters /
+# 242.2 s/step (9.08M), host assembly setup ~1.5 h, RSS 243-245 GB.
+# The SMI sampler captures the GPU memory peak to confirm device-assembly
+# savings.  Partition/account/qos/gres/cpus/mem/time are injected by
+# nova-sync-submit.sh.
 cd /work/mech-ai/baskarg/DiffSim
 RPM_DIR=/work/mech-ai/baskarg/python311-arm
 export LD_LIBRARY_PATH="$RPM_DIR/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -20,18 +23,15 @@ SMI_LOG="/work/mech-ai/baskarg/DiffSim/cluster/results/${SLURM_JOB_ID}-smi.log"
 SMI_PID=$!
 
 # One solver per PROCESS (cross-leg-accumulation lesson: never share a process
-# between ladder legs). Honest rows: a non-zero RC on one leg must not mask the
-# other, so RCs are captured per leg.
-RC_BDIAG=1; RC_PCD=1
-SADDLE_POINTS=3d-L7r9 SADDLE_SOLVERS=fgmres_bdiag SADDLE_DEVICE=cuda:0 SADDLE_NSTEPS=5 \
+# between ladder legs).  SADDLE_ASSEMBLY=device skips the host-side CSR build;
+# device assembly expected to cut setup time from ~1.5 h to minutes.
+RC_BDIAG=1
+SADDLE_POINTS=3d-L7r9 SADDLE_SOLVERS=fgmres_bdiag SADDLE_DEVICE=cuda:0 \
+  SADDLE_NSTEPS=5 SADDLE_ASSEMBLY=device \
   PYTHONPATH=src:tests python tests/gpu_saddle_ladder.py
 RC_BDIAG=$?
 echo "LEG_RC bdiag $RC_BDIAG"
-SADDLE_POINTS=3d-L7r9 SADDLE_SOLVERS=fgmres_pcd SADDLE_DEVICE=cuda:0 SADDLE_NSTEPS=5 \
-  PYTHONPATH=src:tests python tests/gpu_saddle_ladder.py
-RC_PCD=$?
-echo "LEG_RC pcd $RC_PCD"
 
 kill $SMI_PID 2>/dev/null
 echo "SMI_PEAK $(awk '{if(NF>=3 && $3+0>m)m=$3+0}END{print m" MiB"}' "$SMI_LOG" 2>/dev/null)"
-echo "SADDLE_L7R9_RC bdiag=$RC_BDIAG pcd=$RC_PCD"
+echo "SADDLE_L7R9_BDIAG_RC bdiag=$RC_BDIAG"
