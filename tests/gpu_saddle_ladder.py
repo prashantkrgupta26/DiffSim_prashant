@@ -143,7 +143,8 @@ ALL_POINTS = [LADDER_2D_R9, LADDER_2D_R11, LADDER_3D_L6, LADDER_3D_L7R9]
 # Core runner
 # ---------------------------------------------------------------------------
 
-def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", **cfg):
+def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
+                     **cfg):
     """March nsteps of the MONOLITHIC driver and capture per-step iteration counts.
 
     Parameters
@@ -158,6 +159,11 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", **cfg):
         Number of BDF steps to march.
     device : str
         Device string passed to the driver ("cpu", "cuda:0", etc.).
+    assembly : str or None
+        Assembly backend passed to the driver: "host" (default host path),
+        "device" (DeviceNSAssembler), or None (don't pass the kwarg —
+        preserves the driver's own default, i.e. today's behavior exactly).
+        Set via env SADDLE_ASSEMBLY.
     **cfg :
         Additional kwargs forwarded to the driver (level, refine_to, nu, dt, etc.).
 
@@ -184,11 +190,15 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", **cfg):
         kw["nsteps"] = nsteps
         kw.setdefault("verbose", False)
 
+        # assembly pass-through: only forward when caller requested it explicitly
+        asm_kw = {} if assembly is None else {"assembly": assembly}
+
         t0 = time.time()
         res = run_flow_past(
             mono_solver=solver,
             device=device,
             solver_stats=stats,
+            **asm_kw,
             **kw,
         )
         elapsed = time.time() - t0
@@ -222,11 +232,15 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", **cfg):
         kw["nsteps"] = nsteps
         kw.setdefault("verbose", False)
 
+        # assembly pass-through: only forward when caller requested it explicitly
+        asm_kw = {} if assembly is None else {"assembly": assembly}
+
         t0 = time.time()
         res = run_flow_past_3d(
             mono_solver=solver,
             device=device,
             solver_stats=stats,
+            **asm_kw,
             **kw,
         )
         elapsed = time.time() - t0
@@ -340,6 +354,10 @@ if __name__ == "__main__":
     SOLVER_ENV = os.environ.get("SADDLE_SOLVERS", "fgmres_bdiag")
     SOLVERS = [s.strip() for s in SOLVER_ENV.split(",") if s.strip()]
     NSTEPS = int(os.environ.get("SADDLE_NSTEPS", "5"))
+    # SADDLE_ASSEMBLY: "device" or "host" => forward to run_ladder_point;
+    # unset (or empty) => None, which preserves today's driver default ("host").
+    _asm_env = os.environ.get("SADDLE_ASSEMBLY", "").strip()
+    ASSEMBLY = _asm_env if _asm_env else None
 
     # SADDLE_POINTS: comma-separated subset of point tags to run in this process.
     # Used to run each ladder point in a SEPARATE PROCESS (the brief requirement:
@@ -357,7 +375,8 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     print(f"[saddle-ladder] device={DEVICE}  solvers={SOLVERS}  "
-          f"nsteps={NSTEPS}  points={[p['tag'] for p in ACTIVE_POINTS]}",
+          f"nsteps={NSTEPS}  assembly={ASSEMBLY}  "
+          f"points={[p['tag'] for p in ACTIVE_POINTS]}",
           flush=True)
     print("=" * 78, flush=True)
 
@@ -374,6 +393,7 @@ if __name__ == "__main__":
                     dim=dim,
                     nsteps=NSTEPS,
                     device=DEVICE,
+                    assembly=ASSEMBLY,
                     **{k: v for k, v in point.items()
                        if k not in ("tag", "dim", "nsteps")},
                 )
