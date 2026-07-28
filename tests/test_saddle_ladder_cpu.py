@@ -268,3 +268,81 @@ def test_ladder_assembly_none_parity():
         f"assembly=None changed iters_per_step: "
         f"{res_ref['iters_per_step']} vs {res_none['iters_per_step']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 4. T3: 3-D assembly pass-through spy-mock verification
+# ---------------------------------------------------------------------------
+
+def test_ladder_assembly_passthrough_3d():
+    """run_ladder_point dim=3 with assembly="device" pass-through — mock-only
+    spy verification that the assembly kwarg is forwarded to run_flow_past_3d
+    (the 3-D driver), and that assembly=None is NOT forwarded.
+
+    Mirrors test_ladder_device_assembly_cpu sub-check (a) but for 3-D,
+    patching run_flow_past_3d at the ladder module's namespace.
+
+    Two sub-checks:
+    (a) assembly="device" is forwarded to run_flow_past_3d.
+    (b) assembly omitted (no kwarg) means NO assembly key in driver call.
+    """
+    import unittest.mock as mock
+    import p2r1c_thin_plate_flow_3d as _drv_3d
+    from gpu_saddle_ladder import run_ladder_point
+
+    # (a) Verify assembly="device" is forwarded to run_flow_past_3d -----------
+    _orig_3d = _drv_3d.run_flow_past_3d
+    received_calls_device = []
+
+    def _spy_device(**kw):
+        received_calls_device.append(kw.get("assembly", "<NOT PASSED>"))
+        # Return minimal structure that run_ladder_point needs
+        return {
+            "cd": np.array([1.0, 2.0]),  # nsteps=1, so one value suffices; ladder only checks length
+        }
+
+    with mock.patch.object(_drv_3d, "run_flow_past_3d", side_effect=_spy_device):
+        run_ladder_point(
+            tag="t3d_device",
+            solver="fgmres_bdiag",
+            dim=3,
+            nsteps=1,
+            level=3,
+            dt=0.01,
+            nu=0.1,
+            U_inf=1.0,
+            device="cpu",
+            assembly="device",
+        )
+
+    assert received_calls_device == ["device"], (
+        f"assembly='device' was not forwarded to run_flow_past_3d (3-D); "
+        f"received: {received_calls_device}"
+    )
+
+    # (b) Verify assembly is NOT forwarded when omitted (default) ---------------
+    received_calls_none = []
+
+    def _spy_none(**kw):
+        received_calls_none.append(kw.get("assembly", "<NOT PASSED>"))
+        return {
+            "cd": np.array([1.0, 2.0]),
+        }
+
+    with mock.patch.object(_drv_3d, "run_flow_past_3d", side_effect=_spy_none):
+        run_ladder_point(
+            tag="t3d_none",
+            solver="fgmres_bdiag",
+            dim=3,
+            nsteps=1,
+            level=3,
+            dt=0.01,
+            nu=0.1,
+            U_inf=1.0,
+            device="cpu",
+            # assembly omitted (default behavior)
+        )
+
+    assert received_calls_none == ["<NOT PASSED>"], (
+        f"assembly should not be forwarded when omitted, but received: {received_calls_none}"
+    )
