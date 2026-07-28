@@ -1526,5 +1526,50 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
 
         return x_dev.numpy()
 
+    if solver == "fgmres_pcd":
+        # Task A3: PCD (pressure convection-diffusion) Schur-complement
+        # preconditioned FGMRES for the monolithic (u, p) saddle.  The
+        # preconditioner is upper-block-triangular:
+        #     z_p = S^{-1} r_p,  S^{-1} ~ sigma Ap^{-1} + nu Mp^{-1}
+        #     z_u = F^{-1} (r_u - G z_p)
+        # with F the velocity block extracted from A, G the pressure-gradient
+        # block, and Ap/Mp the pressure-space stiffness/mass assembled ONCE per
+        # mesh from dm (build_pcd_meta) and passed via the cache under
+        # ("pcd_meta", cache_key) — the backend cannot see dm.  Inner solves are
+        # loose Jacobi-CG (preconditioner strength; the outer FGMRES gates).
+        # Mirrors the fgmres_bdiag branch (same fgmres_dev, restart, cycles,
+        # iteration-sentinel plumbing).
+        from ..assembly.operators import CSROperator
+        from .fgmres_dev import fgmres_dev
+        from .saddle_precond import make_pcd_apply
+        import warp as wp
+
+        meta = (cache or {}).get(("pcd_meta", cache_key))
+        if meta is None:
+            raise ValueError(
+                "fgmres_pcd requires ('pcd_meta', cache_key) in cache — build "
+                "it once per mesh via saddle_precond.build_pcd_meta(dm, nu, "
+                "sigma) and pass cache=/cache_key=")
+
+        op = CSROperator(A, device)
+        apply_dev = make_pcd_apply(A, meta, device)
+        N = A.shape[0]
+
+        b_dev = wp.array(np.ascontiguousarray(b, np.float64),
+                         dtype=wp.float64, device=device)
+        cycles = min(200, max(1, maxiter // 60))
+        x_dev, finfo = fgmres_dev(
+            op.matvec, b_dev, apply_dev, N, device,
+            tol=tol, atol=1e-13, restart=60, maxiter=cycles)
+
+        if not finfo["converged"]:
+            raise ConvergenceError(
+                f"fgmres_pcd: not converged after {finfo['inner']} inner "
+                f"iterations ({finfo['outer']} restarts); "
+                f"relres={finfo['relres']:.3e}")
+
+        _LAST_ITERS[0] = finfo["inner"]
+        return x_dev.numpy()
+
     from ..errors import ConfigError
     raise ConfigError(f"unknown solver '{solver}'")

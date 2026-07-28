@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 # One-step saddle-system builder (mirrors run_flow_past host-assembly path)
 # ---------------------------------------------------------------------------
 
-def _one_step_system():
+def _one_step_system(return_meta=False):
     """Build a real 2-D (u,v,p) saddle system from the thin-plate driver.
 
     Replicates the host-assembly path of run_flow_past for ONE BDF1 step at
@@ -36,6 +36,11 @@ def _one_step_system():
     Interleaved dof convention: ndof=3, dofs per node are (u_x, u_y, p).
     Velocity dofs: node i -> i*3+0, i*3+1.
     Pressure dof : node i -> i*3+2.
+
+    ``return_meta=True`` additionally returns the ``dm`` DeviceMesh, the
+    scalar physical parameters ``(nu, sigma)`` and the pressure-pin dof
+    ``p_pin`` — everything Task A3's ``build_pcd_meta`` needs to assemble the
+    pressure-space PCD operators on the SAME octree/constraints as the saddle.
     """
     from diffsim.octree.build import build_uniform
     from diffsim.mesh.nodes import build_mesh
@@ -146,6 +151,8 @@ def _one_step_system():
 
     Acsr = A.tocsr()
     x_splu = splu(Acsr.tocsc()).solve(b)
+    if return_meta:
+        return Acsr, b, x_splu, dm, nu, sigma, p_pin
     return Acsr, b, x_splu
 
 
@@ -159,6 +166,16 @@ def _get_system():
     if "sys" not in _SYSTEM_CACHE:
         _SYSTEM_CACHE["sys"] = _one_step_system()
     return _SYSTEM_CACHE["sys"]
+
+
+def _get_system_with_meta():
+    """Same real level-4 saddle as _get_system, but also carrying the pieces
+    Task A3 needs to build the PCD pressure-space operators (dm, nu, sigma,
+    p_pin).  Cached separately (the extra return is only needed by the PCD
+    tests)."""
+    if "sys_meta" not in _SYSTEM_CACHE:
+        _SYSTEM_CACHE["sys_meta"] = _one_step_system(return_meta=True)
+    return _SYSTEM_CACHE["sys_meta"]
 
 
 # ---------------------------------------------------------------------------
@@ -206,4 +223,99 @@ def test_fgmres_bdiag_result_carries_iterations():
     assert result.iterations > 0, f"result.iterations={result.iterations}"
     assert np.allclose(result.x, x_splu, rtol=1e-8, atol=1e-9), (
         f"max |x - x_splu| = {np.abs(result.x - x_splu).max():.3e}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task A3: PCD (pressure convection-diffusion) Schur preconditioner
+# ---------------------------------------------------------------------------
+
+def _pcd_cache(dm, nu, sigma, p_pin):
+    """Build the ('pcd_meta', key) cache the fgmres_pcd backend reads (the
+    least-invasive plumbing: the backend cannot see dm, so the caller builds
+    meta once and passes it through the existing solve_linear cache)."""
+    from diffsim.solvers.saddle_precond import build_pcd_meta
+    meta = build_pcd_meta(dm, nu, sigma, p_pin=p_pin)
+    return {("pcd_meta", "A3"): meta}
+
+
+def _pcd_accurate(x, x_splu):
+    """PCD accuracy gate vs splu.  The MEANINGFUL metric is the norm-relative
+    error ||x - x_splu|| / ||x_splu|| < 1e-8 (measured ~8e-10; residual ~7e-11).
+
+    Unlike the bdiag path (an EXACT diagonal apply), PCD's preconditioner uses
+    truncated Krylov inner solves, so it is a flexible/inexact operator whose
+    per-ELEMENT solution-error floor on tiny (O(1e-5)) velocity/pressure
+    components is ~1e-8 absolute — larger than bdiag's near-zero floor.  So the
+    per-element guard uses atol=5e-8 (vs bdiag's 1e-9): it guards near-zero
+    entries at PCD's real accuracy floor, NOT a looser correctness bar (the
+    norm-relative 1e-8 assertion below is the correctness gate)."""
+    nrel = np.linalg.norm(x - x_splu) / np.linalg.norm(x_splu)
+    assert nrel < 1e-8, f"norm-relative ||x-x_splu||/||x_splu|| = {nrel:.3e}"
+    assert np.allclose(x, x_splu, rtol=1e-8, atol=5e-8), (
+        f"max |x - x_splu| = {np.abs(x - x_splu).max():.3e}"
+    )
+
+
+def test_fgmres_pcd_solves_real_saddle():
+    """fgmres_pcd must solve the real 2-D saddle to rtol=1e-8 vs splu."""
+    from diffsim.solvers.linsolve import solve_linear
+
+    Acsr, b, x_splu, dm, nu, sigma, p_pin = _get_system_with_meta()
+    cache = _pcd_cache(dm, nu, sigma, p_pin)
+
+    x = solve_linear(Acsr, b, solver="fgmres_pcd", sym=False,
+                     device="cpu", tol=1e-10, cache=cache, cache_key="A3")
+
+    _pcd_accurate(x, x_splu)
+
+
+def test_fgmres_pcd_result_carries_iterations():
+    """return_result=True must give LinearSolveResult with iterations > 0."""
+    from diffsim.solvers.linsolve import solve_linear
+    from diffsim.solvers.result import LinearSolveResult
+
+    Acsr, b, x_splu, dm, nu, sigma, p_pin = _get_system_with_meta()
+    cache = _pcd_cache(dm, nu, sigma, p_pin)
+
+    result = solve_linear(Acsr, b, solver="fgmres_pcd", sym=False,
+                          device="cpu", tol=1e-10, cache=cache,
+                          cache_key="A3", return_result=True)
+
+    assert isinstance(result, LinearSolveResult), type(result)
+    assert result.converged, "result.converged is False"
+    assert result.iterations is not None, "result.iterations is None"
+    assert result.iterations > 0, f"result.iterations={result.iterations}"
+    _pcd_accurate(result.x, x_splu)
+
+
+def test_fgmres_pcd_beats_bdiag():
+    """The POINT of PCD: fewer outer iterations than block-diagonal Jacobi on
+    the SAME saddle.  This is the campaign-relevant claim — if PCD does NOT
+    beat bdiag we FAIL loudly with both counts printed (a finding, not a
+    silent pass).  Iteration counts here are the module sentinel _LAST_ITERS
+    (total inner FGMRES iterations), read via return_result."""
+    from diffsim.solvers.linsolve import solve_linear
+
+    Acsr, b, x_splu, dm, nu, sigma, p_pin = _get_system_with_meta()
+    cache = _pcd_cache(dm, nu, sigma, p_pin)
+
+    r_pcd = solve_linear(Acsr, b, solver="fgmres_pcd", sym=False,
+                         device="cpu", tol=1e-10, cache=cache,
+                         cache_key="A3", return_result=True)
+    r_bd = solve_linear(Acsr, b, solver="fgmres_bdiag", sym=False,
+                        device="cpu", tol=1e-10, return_result=True)
+
+    it_pcd, it_bd = r_pcd.iterations, r_bd.iterations
+    print(f"\n[A3] PCD vs bdiag total inner FGMRES iterations: "
+          f"pcd={it_pcd} bdiag={it_bd}")
+
+    # both must be correct solutions first (PCD at its inexact-inner accuracy
+    # floor via _pcd_accurate; bdiag is an exact diagonal apply -> tight)
+    _pcd_accurate(r_pcd.x, x_splu)
+    assert np.allclose(r_bd.x, x_splu, rtol=1e-8, atol=1e-9)
+
+    assert it_pcd < it_bd, (
+        f"PCD did NOT beat bdiag: pcd={it_pcd} bdiag={it_bd} "
+        f"(the point of PCD is fewer iterations than block-Jacobi)"
     )
