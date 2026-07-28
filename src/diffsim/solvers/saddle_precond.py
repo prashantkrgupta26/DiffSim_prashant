@@ -40,6 +40,24 @@ from ..assembly.femelm import FEMElm, fe_N  # noqa: F401 (used by MassBrick)
 from ..api.equation import CEquation, assemble_brick_csr
 
 
+def amgx_solve(F, rhs, sym=False, tol=1e-10, maxiter=2000, **kw):
+    """Lazy module-level shim for the AMGX velocity-inner (Task T2).
+
+    Defined here as a thin wrapper — NOT a top-level ``from .amgx import
+    amgx_solve`` — so that importing ``saddle_precond`` on a CPU-only / CI box
+    never touches ``pyamgx`` (GPU-only).  pyamgx is imported ONLY when this
+    shim is actually CALLED, i.e. only on the ``inner="amgx"`` code path.
+
+    Being a real module attribute is what lets the CPU routing test
+    monkeypatch ``diffsim.solvers.saddle_precond.amgx_solve`` with a scipy-splu
+    stand-in to prove the F extraction without any GPU.  The HARD documented
+    constraint (AMGX only ever sees the EXTRACTED velocity block, never the raw
+    saddle) is enforced by the caller in ``make_pcd_apply``, which passes the
+    sub-CSR ``F`` here."""
+    from .amgx import amgx_solve as _real_amgx_solve
+    return _real_amgx_solve(F, rhs, sym=sym, tol=tol, maxiter=maxiter, **kw)
+
+
 def _bdiag_kernel():
     """Element-wise z[i] = dinv[i] * v[i] (reuse the Jacobi kernel pattern
     from test_fgmres_dev.py; cached so it is compiled only once)."""
@@ -201,10 +219,11 @@ class _ScalarMassBrick(CEquation):
                                               * fe_N(Ntab, fe, b) * detJxW)
 
 
-def build_pcd_meta(dm, nu, sigma, p_pin=None):
+def build_pcd_meta(dm, nu, sigma, p_pin=None, inner="jacobi"):
     """Assemble the pressure-space PCD operators ONCE per mesh from ``dm``.
 
-    Returns ``meta = {"ndof", "dim", "Mp", "Ap", "sigma", "nu", "p_pin"}``
+    Returns ``meta = {"ndof", "dim", "Mp", "Ap", "sigma", "nu", "p_pin",
+    "inner"}``
     where
 
       Mp : scalar pressure MASS   INT q p dV   (constrained T^T M T)
@@ -218,6 +237,15 @@ def build_pcd_meta(dm, nu, sigma, p_pin=None):
     ``T_vec``).  CONSTRAINT-HANDLING DECISION: reuse assemble_brick_csr's
     condensation (the exact path the driver uses for scalar bricks); no
     separate hanging-node logic.
+
+    ``inner`` (Task T2): the F-block (velocity) inner-solve backend.
+    ``"jacobi"`` (default) = today's Jacobi-CG on the velocity block, BIT-FOR-BIT
+    unchanged.  ``"amgx"`` routes the F-inner through AMGX algebraic multigrid
+    on the EXTRACTED velocity sub-CSR (never the raw saddle — documented
+    divergence).  Only the F block changes; the Ap and Mp inners are Jacobi-CG
+    in BOTH modes (they are the SPD pressure-space solves and are unaffected by
+    this task by design).  ``inner`` is a cheap flag on the meta dict; the
+    per-mesh operator assembly (Mp, Ap) is identical either way.
 
     ``p_pin`` (optional): the monolithic pressure-pin dof index.  CONSTRAINT
     on Ap (MEASURED, root-caused): the pressure STIFFNESS Ap is a pure NEUMANN
@@ -242,9 +270,12 @@ def build_pcd_meta(dm, nu, sigma, p_pin=None):
     p_pin_local = None if p_pin is None else int(p_pin) // ndof
     if p_pin_local is not None:
         Ap = _pin_symmetric(Ap, p_pin_local)
+    if inner not in ("jacobi", "amgx"):
+        raise ValueError(
+            f"build_pcd_meta: inner must be 'jacobi' or 'amgx', got {inner!r}")
     return {"ndof": ndof, "dim": dim, "Mp": Mp, "Ap": Ap,
             "sigma": float(sigma), "nu": float(nu),
-            "p_pin_local": p_pin_local}
+            "p_pin_local": p_pin_local, "inner": inner}
 
 
 def _pin_symmetric(M, i):
@@ -322,6 +353,12 @@ def make_pcd_apply(A, meta, device, stats=None):
     Ap = meta["Ap"].tocsr()
     sigma, nu = meta["sigma"], meta["nu"]
     p_pin_local = meta.get("p_pin_local")
+    # Task T2: F-block (velocity) inner-solve backend.  "jacobi" (default) =
+    # Jacobi-CG through the device Krylov stack, bit-for-bit today's behavior.
+    # "amgx" = AMGX algebraic multigrid on the EXTRACTED velocity sub-CSR F
+    # (already extracted ONCE above — never the raw saddle).  Ap/Mp are ALWAYS
+    # Jacobi-CG (SPD pressure solves; unchanged by this task, by design).
+    inner = meta.get("inner", "jacobi")
 
     # device operators + Jacobi diagonals (guard zeros / sign for robustness)
     opF = CSROperator(F, device)
@@ -358,6 +395,13 @@ def make_pcd_apply(A, meta, device, stats=None):
     # backend, which IS robustly flexible.  The 1e-8 value that followed from
     # that probe was over-tightened and needlessly expensive at 9.24M-DOF scale.
     _INNER_TOL, _INNER_MAX = 1e-4, 500
+    # Task T2: AMGX F-inner budget.  A small max_iters keeps the F-inner a cheap
+    # SMOOTHER (the flexible outer FGMRES carries the remaining residual), which
+    # is the whole point of replacing Jacobi-CG with algebraic multigrid: AMG
+    # gets close in a handful of BiCGStab+V-cycle iterations instead of the
+    # hundreds Jacobi-CG needs at scale.  _INNER_TOL is shared with the Jacobi
+    # path so the F-inner target is identical across backends.
+    _AMGX_MAX = 50
 
     def _cg(op, y, diag, tol, mx, blk=None):
         """Inner Jacobi-CG solve.
@@ -387,6 +431,48 @@ def make_pcd_apply(A, meta, device, stats=None):
                 rec["max_exit_relres"] = float(rr)
         return x_
 
+    def _amgx_F(y):
+        """AMGX F-inner: BiCGStab + classical-AMG on the EXTRACTED velocity
+        block F (sym=False — the convection makes F nonsymmetric).  ``F`` was
+        extracted ONCE at make_pcd_apply construction; AMGX's own
+        setup-reuse (see amgx.py) skips the AMG-hierarchy rebuild when the
+        sparsity is unchanged across applies/steps, so per-apply work is
+        solve-only.  Stats fed in the SAME T1 schema: iters from
+        last_solve_stats(), cap_hits=0 convention (AMGX truncates internally
+        and we accept the iterate; no repo-side cap), exit relres best-effort
+        (AMGX residual history is off by default -> 0.0)."""
+        if not np.any(y):
+            return np.zeros_like(y)
+        # module-level shim (monkeypatchable on CPU; imports pyamgx lazily on
+        # the GPU path only) — passed the sub-CSR F, NEVER the raw saddle.
+        x_ = amgx_solve(F, y, sym=False, tol=_INNER_TOL, maxiter=_AMGX_MAX)
+        if stats is not None:
+            rec = stats["F"]
+            rec["applies"] += 1
+            it, rr = 0, 0.0
+            try:
+                from .amgx import last_solve_stats
+                key = ("singleton", False, float(_INNER_TOL), int(_AMGX_MAX))
+                s = last_solve_stats().get(key)
+                if s is not None:
+                    it = int(s.get("iterations") or 0)
+                    rr = float(s.get("residual") or 0.0)
+            except Exception:
+                pass
+            rec["iters_total"] += it
+            # cap_hits=0 convention: AMGX truncates at max_iters internally and
+            # we accept the iterate; no separate repo-side cap counting.
+            if rr > rec["max_exit_relres"]:
+                rec["max_exit_relres"] = rr
+        return x_
+
+    def _solve_F(y):
+        """Dispatch the F-block (velocity) inner solve by the meta ``inner``
+        flag: Jacobi-CG (default) or AMGX on the extracted velocity block."""
+        if inner == "amgx":
+            return _amgx_F(y)
+        return _cg(opF, y, dF, _INNER_TOL, _INNER_MAX, blk="F")
+
     def _apply_host(r):
         r_u = r[u_ids]
         r_p = r[p_ids]
@@ -399,9 +485,9 @@ def make_pcd_apply(A, meta, device, stats=None):
             # the saddle pins this pressure dof to an identity row; make the
             # preconditioner respect it (pass the residual straight through)
             z_p[p_pin_local] = r_p[p_pin_local]
-        # velocity: z_u = F^{-1} (r_u - G z_p)
+        # velocity: z_u = F^{-1} (r_u - G z_p) — Jacobi-CG or AMGX per meta
         r_u_corr = r_u - G @ z_p
-        z_u = _cg(opF, r_u_corr, dF, _INNER_TOL, _INNER_MAX, blk="F")
+        z_u = _solve_F(r_u_corr)
         z = np.empty_like(r)
         z[u_ids] = z_u
         z[p_ids] = z_p

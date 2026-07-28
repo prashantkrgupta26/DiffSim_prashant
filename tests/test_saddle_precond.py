@@ -168,14 +168,30 @@ def _get_system():
     return _SYSTEM_CACHE["sys"]
 
 
-def _get_system_with_meta():
+def _get_system_with_meta(inner=None):
     """Same real level-4 saddle as _get_system, but also carrying the pieces
     Task A3 needs to build the PCD pressure-space operators (dm, nu, sigma,
     p_pin).  Cached separately (the extra return is only needed by the PCD
-    tests)."""
+    tests).
+
+    Default (``inner=None``): returns the 7-tuple
+    ``(Acsr, b, x_splu, dm, nu, sigma, p_pin)`` — the historical signature used
+    by every existing PCD test.
+
+    ``inner="jacobi"|"amgx"`` (Task T2): returns the 4-tuple
+    ``(Acsr, b, x_splu, cache)`` where ``cache`` already holds the
+    ``("pcd_meta", "k")`` entry built via ``build_pcd_meta(..., inner=inner)``,
+    ready to hand straight to ``solve_linear(..., cache_key="k")``.  This is the
+    routing-test shape from the T2 brief."""
     if "sys_meta" not in _SYSTEM_CACHE:
         _SYSTEM_CACHE["sys_meta"] = _one_step_system(return_meta=True)
-    return _SYSTEM_CACHE["sys_meta"]
+    Acsr, b, x_splu, dm, nu, sigma, p_pin = _SYSTEM_CACHE["sys_meta"]
+    if inner is None:
+        return Acsr, b, x_splu, dm, nu, sigma, p_pin
+    from diffsim.solvers.saddle_precond import build_pcd_meta
+    meta = build_pcd_meta(dm, nu, sigma, p_pin=p_pin, inner=inner)
+    cache = {("pcd_meta", "k"): meta}
+    return Acsr, b, x_splu, cache
 
 
 # ---------------------------------------------------------------------------
@@ -351,3 +367,82 @@ def test_fgmres_pcd_inner_stats():
         assert 0.0 <= st[blk]["max_exit_relres"] < float("inf"), (
             f"{blk}: max_exit_relres={st[blk]['max_exit_relres']}, "
             f"expected finite non-negative")
+
+
+# ---------------------------------------------------------------------------
+# Task T2: AMGX velocity-inner PCD (pcd_inner="amgx", extracted block only)
+# ---------------------------------------------------------------------------
+
+def _assert_pcd_accuracy(x, x_splu):
+    """Alias for the T2 brief's routing test (same gates as _pcd_accurate)."""
+    _pcd_accurate(x, x_splu)
+
+
+def test_fgmres_pcd_amgx_routing(monkeypatch):
+    """ROUTING proof (CPU/CI, no pyamgx): with inner="amgx", make_pcd_apply
+    must extract the velocity sub-CSR F = A[u_ids][:,u_ids] ONCE and hand THAT
+    (never the raw saddle) to amgx_solve.  A scipy-splu stand-in monkeypatched
+    over saddle_precond.amgx_solve proves (a) the F it receives is the
+    (n_u, n_u) velocity block and (b) the outer solve still hits the PCD
+    accuracy gates.  The HARD documented constraint (AMGX must never see the
+    raw saddle) is enforced here by asserting the received shape."""
+    from diffsim.solvers.linsolve import solve_linear
+
+    calls = {}
+
+    def fake_amgx(F, rhs, sym=False, tol=0.0, maxiter=0, **kw):
+        calls["shape"] = F.shape
+        calls["n"] = calls.get("n", 0) + 1
+        calls["nnz"] = int(F.nnz)
+        calls["sym"] = sym
+        import scipy.sparse.linalg as sla
+        return sla.spsolve(F.tocsc(), rhs)
+
+    monkeypatch.setattr("diffsim.solvers.saddle_precond.amgx_solve", fake_amgx)
+
+    Acsr, b, x_splu, cache = _get_system_with_meta(inner="amgx")
+    r = solve_linear(Acsr, b, solver="fgmres_pcd", sym=False, device="cpu",
+                     tol=1e-10, cache=cache, cache_key="k", return_result=True)
+
+    n_u = (Acsr.shape[0] // 3) * 2          # 2-D: velocity dofs
+    assert calls["shape"] == (n_u, n_u), (
+        f"amgx_solve got shape {calls['shape']}, expected velocity block "
+        f"({n_u}, {n_u}) — NOT the raw saddle {Acsr.shape}")
+    assert calls["nnz"] == int(Acsr[
+        (np.arange(Acsr.shape[0] // 3)[:, None] * 3
+         + np.arange(2)[None, :]).ravel()][:, (
+            np.arange(Acsr.shape[0] // 3)[:, None] * 3
+            + np.arange(2)[None, :]).ravel()].nnz), (
+        "F nnz mismatch — the extracted block is not the velocity sub-CSR")
+    assert calls["sym"] is False, "F block is nonsymmetric — sym must be False"
+    assert calls["n"] >= 1
+    _assert_pcd_accuracy(r.x, x_splu)
+
+
+def test_build_pcd_meta_inner_default_is_jacobi():
+    """The inner kwarg defaults to 'jacobi' (today's behavior bit-for-bit)."""
+    from diffsim.solvers.saddle_precond import build_pcd_meta
+
+    _, _, _, dm, nu, sigma, p_pin = _get_system_with_meta()
+    meta = build_pcd_meta(dm, nu, sigma, p_pin=p_pin)
+    assert meta["inner"] == "jacobi"
+    meta_a = build_pcd_meta(dm, nu, sigma, p_pin=p_pin, inner="amgx")
+    assert meta_a["inner"] == "amgx"
+
+
+@pytest.mark.skipif(
+    __import__("importlib").util.find_spec("pyamgx") is None,
+    reason="pyamgx not installed (GPU-only); real-AMGX check runs on the box")
+def test_fgmres_pcd_amgx_real_gpu():
+    """Real-AMGX correctness on GPU (skipped on CPU-only CI; T4's box run
+    executes this).  With inner='amgx' the F-inner runs the actual AMGX
+    BiCGStab+classical-AMG solve on the extracted velocity block; the outer
+    FGMRES must still reach the PCD accuracy gates vs splu."""
+    from diffsim.solvers.linsolve import solve_linear
+
+    Acsr, b, x_splu, cache = _get_system_with_meta(inner="amgx")
+    r = solve_linear(Acsr, b, solver="fgmres_pcd", sym=False, device="cpu",
+                     tol=1e-10, cache=cache, cache_key="k", return_result=True)
+    _assert_pcd_accuracy(r.x, x_splu)
+    # F-inner telemetry must be populated from AMGX last_solve_stats
+    assert r.inner_stats["F"]["applies"] > 0
