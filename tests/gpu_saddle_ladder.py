@@ -341,12 +341,28 @@ if __name__ == "__main__":
     SOLVERS = [s.strip() for s in SOLVER_ENV.split(",") if s.strip()]
     NSTEPS = int(os.environ.get("SADDLE_NSTEPS", "5"))
 
+    # SADDLE_POINTS: comma-separated subset of point tags to run in this process.
+    # Used to run each ladder point in a SEPARATE PROCESS (the brief requirement:
+    # a single-process multi-leg ladder previously accumulated cross-leg memory
+    # and OOM'd).  Empty / absent => run all points.
+    # Example: SADDLE_POINTS=2d-r9  SADDLE_POINTS=3d-L6,3d-L7r9
+    POINTS_ENV = os.environ.get("SADDLE_POINTS", "")
+    _point_tags = {t.strip() for t in POINTS_ENV.split(",") if t.strip()}
+    ACTIVE_POINTS = [p for p in ALL_POINTS
+                     if not _point_tags or p["tag"] in _point_tags]
+    if not ACTIVE_POINTS:
+        print(f"[saddle-ladder] SADDLE_POINTS={POINTS_ENV!r} matched no "
+              f"known tags {[p['tag'] for p in ALL_POINTS]} — nothing to run.",
+              flush=True)
+        raise SystemExit(1)
+
     print(f"[saddle-ladder] device={DEVICE}  solvers={SOLVERS}  "
-          f"nsteps={NSTEPS}", flush=True)
+          f"nsteps={NSTEPS}  points={[p['tag'] for p in ACTIVE_POINTS]}",
+          flush=True)
     print("=" * 78, flush=True)
 
     all_results = []
-    for point in ALL_POINTS:
+    for point in ACTIVE_POINTS:
         for solver in SOLVERS:
             tag = point["tag"]
             dim = point["dim"]
@@ -359,7 +375,7 @@ if __name__ == "__main__":
                     nsteps=NSTEPS,
                     device=DEVICE,
                     **{k: v for k, v in point.items()
-                       if k not in ("tag", "dim")},
+                       if k not in ("tag", "dim", "nsteps")},
                 )
                 _print_row(r)
                 _save_npz(r)

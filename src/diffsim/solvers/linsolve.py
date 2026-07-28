@@ -1075,7 +1075,8 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                                  backend=solver, reason="converged")
     A = A.tocsr()
     if cache is not None and cache_key is not None \
-            and solver not in ("blockch", "blockamgx"):
+            and solver not in ("blockch", "blockamgx",
+                               "fgmres_bdiag", "fgmres_pcd"):
         # cheap staleness guard (evaluation solver-review item): cached
         # factorizations are for CONSTANT matrices — catch reuse of a key
         # after the matrix changed shape/pattern (values are the caller's
@@ -1083,6 +1084,10 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         # blockch is EXEMPT: it caches meta/iteration records only and
         # rebuilds its factors per call — the host T^T K T pattern
         # legitimately flaps under multiphase noise (the S2 finding).
+        # fgmres_bdiag / fgmres_pcd are EXEMPT: the cache carries only
+        # preconditioner META (pcd_meta, ndof) assembled from the mesh
+        # once per BDF order — NOT matrix factorizations; the A changes
+        # every step (Picard convection) and that is expected.
         fp = (A.shape, A.nnz, str(A.dtype))
         old = cache.get(("fingerprint", cache_key))
         if old is None:
