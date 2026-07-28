@@ -229,6 +229,8 @@ Phase 2 — thin-plate adaptive (10 steps, dt=0.005, nu=0.004, device assembly):
    `GH200-LADDER-OK` sentinel never printed — the host OOM ended the job inside
    the r7b9 build. All rungs through r6b9 completed and are recorded above.
 
+**WP0 RESOLUTION (2026-07-27, Grace job 11771926): the adaptive mesh build is EXONERATED.** The exact r7b9 case (base L7/band r9, 2.31M nodes / 9.24 M-DOF) builds in **3.71 GB peak, 94 s** on Grace (0.40 GB/M-DOF; L6/r9: 0.89 — sublinear per-DOF). The 209.7 GB OOM was CROSS-LEG ACCUMULATION in the single-process GH200 ladder (prior legs' assembled CSRs + the failed L7-uniform cuDSS factorization's host staging), mis-attributed to the build because the job died during that leg with the GPU idle. Mesh build extrapolates to ~40-90 GB at 100M DOF — inside Grace. The streaming build reclassifies to the medium-term remeshing/mixed-p architecture; the 100M critical path is the solver (R2b saddle preconditioner / matrix-free).
+
 Oversubscription decision: the film's `--managed` lever
 (`wp.set_device_allocator` + `CudaManagedAllocator`) governs Warp-owned arrays
 only; cuDSS allocates its factors internally (nvmath), so the lever does NOT

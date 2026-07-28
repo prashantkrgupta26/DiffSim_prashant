@@ -34,6 +34,8 @@ L6-base and L7-base 3-D trees, not a linear cost. Consequences:
    targeted fix, streaming becomes the medium-term architecture rather than
    the 100M blocker-remover.
 
+**WP0 RESOLUTION (2026-07-27, Grace job 11771926): the adaptive mesh build is EXONERATED.** The exact r7b9 case (base L7/band r9, 2.31M nodes / 9.24 M-DOF) builds in **3.71 GB peak, 94 s** on Grace (0.40 GB/M-DOF; L6/r9: 0.89 — sublinear per-DOF). The 209.7 GB OOM was CROSS-LEG ACCUMULATION in the single-process GH200 ladder (prior legs' assembled CSRs + the failed L7-uniform cuDSS factorization's host staging), mis-attributed to the build because the job died during that leg with the GPU idle. Mesh build extrapolates to ~40-90 GB at 100M DOF — inside Grace. The streaming build reclassifies to the medium-term remeshing/mixed-p architecture; the 100M critical path is the solver (R2b saddle preconditioner / matrix-free).
+
 ## Architecture: streaming skeleton + closed-form chunk producer
 
 **Foundational fact (M0.5):** every constraint type in this framework is
