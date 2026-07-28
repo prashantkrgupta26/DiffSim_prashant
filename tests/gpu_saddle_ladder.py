@@ -78,14 +78,14 @@ LADDER_2D_R9 = dict(
     **_PLATE_2D,
 )
 
-# 2-D r11: level=7, refine_to=11
-# Source: gpu_traction_dissect.py D3 leg (level=7, refine_to=11)
+# 2-D r11: level=7, refine_to=11, wake_refine=9
+# Source: gpu_traction_dissect.py D3 leg (level=7, refine_to=11, wake_refine=9)
 LADDER_2D_R11 = dict(
     tag="2d-r11",
     dim=2,
     level=7,
     refine_to=11,
-    wake_refine=None,   # D3 uses only refine_to, no separate wake band
+    wake_refine=9,      # matches D3 reference leg config
     dt=5e-4,
     nsteps=5,
     **_PLATE_2D,
@@ -265,7 +265,6 @@ def _count_dofs_2d(level, nu=0.1, U_inf=1.0, alpha=50.0,
                    nsteps=5, dt=0.01, **_):
     """Count free DOFs for a 2-D plate mesh configuration."""
     from p2r1a_thin_plate_flow import _build_shell
-    from diffsim.geometry.csg import Segment
     fx = _build_shell(level, plate_xc, plate_yc, plate_L, dim=2,
                       refine_to=refine_to, wake_refine=wake_refine,
                       band_cells=band_cells)
