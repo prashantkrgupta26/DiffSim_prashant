@@ -379,6 +379,7 @@ def run_flow_past(
     reaction_sets=None,  # list of free-node index arrays for reaction-force arbiter (LD-5)
     reaction_terms=False,  # (TD-2) if True, also record per-Nitsche-term reaction history
     solver_stats=None,  # optional list to append per-step iteration counts (A2 ladder)
+    pcd_inner="jacobi",  # (T4) PCD F-block inner-solve backend: "jacobi" | "amgx"
 ):
     """Run flow past a finite thin plate with transient BDF2 march.
 
@@ -752,7 +753,7 @@ def run_flow_past(
         if mono_solver == "fgmres_pcd" and order != _pcd_last_order:
             from diffsim.solvers.saddle_precond import build_pcd_meta
             _pcd_cache[("pcd_meta", "ns2d")] = build_pcd_meta(
-                dm, nu, sigma, p_pin=p_pin)
+                dm, nu, sigma, p_pin=p_pin, inner=pcd_inner)
             _pcd_last_order = order
         t_new = (step + 1) * dt   # time at the END of this step
 

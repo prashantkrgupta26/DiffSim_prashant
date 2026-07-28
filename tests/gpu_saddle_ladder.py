@@ -144,7 +144,7 @@ ALL_POINTS = [LADDER_2D_R9, LADDER_2D_R11, LADDER_3D_L6, LADDER_3D_L7R9]
 # ---------------------------------------------------------------------------
 
 def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
-                     **cfg):
+                     pcd_inner=None, **cfg):
     """March nsteps of the MONOLITHIC driver and capture per-step iteration counts.
 
     Parameters
@@ -164,13 +164,19 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
         "device" (DeviceNSAssembler), or None (don't pass the kwarg —
         preserves the driver's own default, i.e. today's behavior exactly).
         Set via env SADDLE_ASSEMBLY.
+    pcd_inner : str or None
+        PCD F-block (velocity) inner-solve backend: "jacobi" | "amgx" | None.
+        None (default) omits the kwarg, preserving the driver's own default
+        ("jacobi"). Set via env SADDLE_PCD_INNER.  Only relevant for
+        solver="fgmres_pcd"; ignored by bdiag/cudss/etc.
     **cfg :
         Additional kwargs forwarded to the driver (level, refine_to, nu, dt, etc.).
 
     Returns
     -------
     dict with keys:
-        tag, solver, dofs, iters_per_step (list), iters_mean, s_per_step, converged
+        tag, solver, dofs, iters_per_step (list), iters_mean, s_per_step,
+        converged, inner_stats (dict or None — T1 telemetry from fgmres_pcd)
     """
     stats = []    # list to collect per-step iteration counts
 
@@ -192,6 +198,8 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
 
         # assembly pass-through: only forward when caller requested it explicitly
         asm_kw = {} if assembly is None else {"assembly": assembly}
+        # pcd_inner pass-through: only forward when explicitly set (T4 AMGX route)
+        pcd_kw = {} if pcd_inner is None else {"pcd_inner": pcd_inner}
 
         t0 = time.time()
         res = run_flow_past(
@@ -199,6 +207,7 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
             device=device,
             solver_stats=stats,
             **asm_kw,
+            **pcd_kw,
             **kw,
         )
         elapsed = time.time() - t0
@@ -234,6 +243,8 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
 
         # assembly pass-through: only forward when caller requested it explicitly
         asm_kw = {} if assembly is None else {"assembly": assembly}
+        # pcd_inner pass-through: only forward when explicitly set (T4 AMGX route)
+        pcd_kw = {} if pcd_inner is None else {"pcd_inner": pcd_inner}
 
         t0 = time.time()
         res = run_flow_past_3d(
@@ -241,6 +252,7 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
             device=device,
             solver_stats=stats,
             **asm_kw,
+            **pcd_kw,
             **kw,
         )
         elapsed = time.time() - t0
@@ -259,6 +271,16 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
     iters_mean = float(np.mean(stats)) if stats else float("nan")
     s_per_step = elapsed / nsteps if nsteps > 0 else float("nan")
 
+    # T1/T4 inner_stats: published by fgmres_pcd via _LAST_INNER_STATS global.
+    # Only populated on the fgmres_pcd path; None on bdiag/cudss/etc.
+    _inner_stats = None
+    if solver == "fgmres_pcd":
+        try:
+            from diffsim.solvers.linsolve import _LAST_INNER_STATS
+            _inner_stats = _LAST_INNER_STATS[0]
+        except Exception:
+            pass
+
     return dict(
         tag=tag,
         solver=solver,
@@ -270,6 +292,7 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
         converged=converged,
         cd_last=float(cd[-1]) if len(cd) > 0 else float("nan"),
         nsteps_done=len(cd),
+        inner_stats=_inner_stats,
     )
 
 
@@ -326,6 +349,19 @@ def _save_npz(result, out_dir="results"):
     tag = result["tag"].replace("/", "_")
     sol = result["solver"]
     path = os.path.join(out_dir, f"saddle_ladder_{tag}_{sol}.npz")
+
+    # Build extra kwargs for inner_stats (T1/T4 telemetry from fgmres_pcd).
+    # Each block (F, Ap, Mp) is stored as a flat dict-of-scalars; we prefix
+    # each key so the npz remains flat (no object dtypes or nested arrays).
+    # When inner_stats is None (bdiag/cudss paths) these kwargs are empty.
+    _ist_kw = {}
+    ist = result.get("inner_stats")
+    if ist is not None:
+        for blk in ("F", "Ap", "Mp"):
+            if blk in ist:
+                for k, v in ist[blk].items():
+                    _ist_kw[f"ist_{blk}_{k}"] = np.array(v)
+
     np.savez(
         path,
         tag=np.array(result["tag"]),
@@ -337,6 +373,7 @@ def _save_npz(result, out_dir="results"):
         s_per_step=np.array(result["s_per_step"]),
         converged=np.array(result["converged"]),
         cd_last=np.array(result["cd_last"]),
+        **_ist_kw,
     )
     print(f"    saved -> {path}", flush=True)
     return path
@@ -359,6 +396,11 @@ if __name__ == "__main__":
     _asm_env = os.environ.get("SADDLE_ASSEMBLY", "").strip()
     ASSEMBLY = _asm_env if _asm_env else None
 
+    # SADDLE_PCD_INNER: "amgx" | "jacobi" => PCD F-block inner-solve backend (T4).
+    # unset (or empty) => None, which preserves the driver's default ("jacobi").
+    _pcd_inner_env = os.environ.get("SADDLE_PCD_INNER", "").strip()
+    PCD_INNER = _pcd_inner_env if _pcd_inner_env else None
+
     # SADDLE_POINTS: comma-separated subset of point tags to run in this process.
     # Used to run each ladder point in a SEPARATE PROCESS (the brief requirement:
     # a single-process multi-leg ladder previously accumulated cross-leg memory
@@ -375,7 +417,7 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     print(f"[saddle-ladder] device={DEVICE}  solvers={SOLVERS}  "
-          f"nsteps={NSTEPS}  assembly={ASSEMBLY}  "
+          f"nsteps={NSTEPS}  assembly={ASSEMBLY}  pcd_inner={PCD_INNER}  "
           f"points={[p['tag'] for p in ACTIVE_POINTS]}",
           flush=True)
     print("=" * 78, flush=True)
@@ -394,6 +436,7 @@ if __name__ == "__main__":
                     nsteps=NSTEPS,
                     device=DEVICE,
                     assembly=ASSEMBLY,
+                    pcd_inner=PCD_INNER,
                     **{k: v for k, v in point.items()
                        if k not in ("tag", "dim", "nsteps")},
                 )
@@ -410,6 +453,7 @@ if __name__ == "__main__":
                     iters_per_step=[], iters_mean=float("nan"),
                     s_per_step=float("nan"), converged=False,
                     cd_last=float("nan"), nsteps_done=0,
+                    inner_stats=None,
                 ))
 
     # Summary table
