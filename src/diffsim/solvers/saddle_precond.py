@@ -276,8 +276,7 @@ def make_pcd_apply(A, meta, device):
 
     Inner solves (PRECONDITIONER strength — the outer FGMRES is the true gate):
     Jacobi-CG on F (velocity block), on Ap and Mp (both SPD).  cg_dev on
-    `device`.  Inner tol is 1e-8 (MEASURED — the brief's 1e-2 diverges the
-    outer; see the _INNER_TOL comment in the body).
+    `device`.  Inner tol is _INNER_TOL (see constant below for rationale).
 
     Returns ``apply_dev(v_in_wp, z_out_wp)`` — device-in/device-out closure
     (wp.array float64).  The block gather/scatter is by component mask (the
@@ -320,22 +319,29 @@ def make_pcd_apply(A, meta, device):
 
     dF, dAp, dMp = _jac(F), _jac(Ap), _jac(Mp)
 
-    # Inner-solve strengths (MEASURED, root-caused — see below).  The brief
-    # suggested a loose 1e-2; the measurement says 1e-2 DIVERGES the outer:
-    # a Jacobi-CG converged to only 2 digits makes M^{-1} a too-inexact,
-    # too-varying operator, and the flexible outer blows up (relres ~1e34).
-    # The Schur here is a SUM of two inner solves (sigma Ap^-1 + nu Mp^-1),
-    # so their errors ADD — the coupling is more error-sensitive than a single
-    # block-Jacobi apply.  Sweep at level 4 (host-lgmres outer iters, tol 1e-8):
-    #     inner 1e-2 -> DIVERGES;  1e-4 -> 5 iters;  1e-6 -> 3 iters
-    #     (bdiag baseline: 4 iters)
-    # 1e-6 already beats bdiag; we use 1e-8 for a tighter SOLUTION-accuracy
-    # floor (the inexact-inner flexible preconditioner floors the per-element
-    # solution error ~kappa*residual; 1e-8 inners give norm-relative
-    # ||x-x_splu||/||x_splu|| ~ 8e-10 at residual 7e-11).  Same 19 total inner
-    # FGMRES iterations as 1e-6 through the device backend, vs bdiag's 176.
-    # "Loose" here means 1e-8, NOT the brief's 1e-2 (which diverges).
-    _INNER_TOL, _INNER_MAX = 1e-8, 500
+    # Inner tolerance for the three Jacobi-CG solves (F, Ap, Mp) per apply.
+    #
+    # fgmres_dev is a FLEXIBLE outer (it stores the preconditioned Z-basis, not
+    # just the Krylov basis), so call-varying / inexact preconditioners are
+    # mathematically sound — FGMRES convergence theory guarantees this.
+    #
+    # Measured on the level-4 test saddle (fgmres_dev outer, tol 1e-8):
+    #   inner 1e-2  ->  21 total inner FGMRES iters,  rel-err 2.6e-10 vs splu
+    #   inner 1e-4  ->  20 total inner FGMRES iters,  rel-err 2.3e-10 vs splu
+    #   inner 1e-8  ->  19 total inner FGMRES iters,  rel-err 7.7e-10 vs splu
+    # All three converge cleanly; the extra outer iterations from looser inners
+    # are negligible.  1e-4 is chosen as the default: near-minimal outer
+    # iteration count with margin; the A5 GPU ladder may tune this further.
+    #
+    # NOTE: an earlier implementation comment claimed that inner tol 1e-2
+    # "DIVERGES the outer."  That observation was an artifact of a HOST scipy
+    # lgmres probe used during development.  scipy lgmres is NOT robustly
+    # flexible with call-varying operators (it reuses the Krylov basis across
+    # restarts without re-preconditioning), so inexact inners genuinely caused
+    # issues there.  That finding does NOT transfer to the shipped fgmres_dev
+    # backend, which IS robustly flexible.  The 1e-8 value that followed from
+    # that probe was over-tightened and needlessly expensive at 9.24M-DOF scale.
+    _INNER_TOL, _INNER_MAX = 1e-4, 500
 
     def _cg(op, y, diag, tol, mx):
         if not np.any(y):
