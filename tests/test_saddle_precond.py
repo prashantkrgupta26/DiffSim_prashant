@@ -433,7 +433,7 @@ def test_build_pcd_meta_inner_default_is_jacobi():
 @pytest.mark.skipif(
     __import__("importlib").util.find_spec("pyamgx") is None,
     reason="pyamgx not installed (GPU-only); real-AMGX check runs on the box")
-def test_fgmres_pcd_amgx_real_gpu():
+def test_fgmres_pcd_amgx_real():  # needs pyamgx (GPU box); PCD apply itself is host-side
     """Real-AMGX correctness on GPU (skipped on CPU-only CI; T4's box run
     executes this).  With inner='amgx' the F-inner runs the actual AMGX
     BiCGStab+classical-AMG solve on the extracted velocity block; the outer

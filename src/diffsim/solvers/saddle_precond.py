@@ -434,7 +434,10 @@ def make_pcd_apply(A, meta, device, stats=None):
     def _amgx_F(y):
         """AMGX F-inner: BiCGStab + classical-AMG on the EXTRACTED velocity
         block F (sym=False — the convection makes F nonsymmetric).  ``F`` was
-        extracted ONCE at make_pcd_apply construction; AMGX's own
+        extracted ONCE at make_pcd_apply construction (each outer solve
+        builds a fresh closure over its own F; the AMGX singleton state
+        persists globally across closures — same sparsity => values-only
+        refresh, see the key CAVEAT in amgx.py); AMGX's own
         setup-reuse (see amgx.py) skips the AMG-hierarchy rebuild when the
         sparsity is unchanged across applies/steps, so per-apply work is
         solve-only.  Stats fed in the SAME T1 schema: iters from
