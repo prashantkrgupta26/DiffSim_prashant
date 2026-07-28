@@ -60,7 +60,7 @@ from diffsim.sbm.vector import (
 from diffsim.api.ns_bricks import assemble_linear_ns
 from diffsim.physics.poisson import gauss_points
 from diffsim.solvers.timestepping import bdf_coeffs
-from diffsim.solvers.linsolve import solve_linear
+from diffsim.solvers.linsolve import solve_linear, _LAST_ITERS
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +309,7 @@ def run_flow_past_3d(
     mono_solver="splu",
     device="cpu",
     assembly="host",   # assembly backend: "host" (default, bit-for-bit) | "device"
+    solver_stats=None,  # optional list to append per-step iteration counts (A2 ladder)
 ):
     """Run 3-D flow past a finite thin plate with transient BDF2 march.
 
@@ -347,6 +348,12 @@ def run_flow_past_3d(
         "device" (DeviceNSAssembler; symbolic pattern once per mesh epoch,
         numeric fill on device per step, two-sided SBM face system via cached slots).
         "host" default keeps all existing tests bit-for-bit unchanged.
+    solver_stats : list or None
+        Optional list to which per-step iteration counts are appended when the
+        backend provides them (i.e. when mono_solver is an iterative backend such
+        as "fgmres_bdiag" that writes to ``_LAST_ITERS``).  One integer is
+        appended per step.  Default None => no collection, byte-for-byte identical
+        march (no overhead).  Used by the A2 iteration-ladder harness.
 
     Returns a dict with:
       'cd'         : np.ndarray [nsteps] — drag coefficient (x-direction)
@@ -538,8 +545,11 @@ def run_flow_past_3d(
             if mono_solver == "splu":
                 x_cur = splu(Acsr.tocsc()).solve(b)
             else:
+                _LAST_ITERS[0] = None
                 x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
                                      device=device)
+                if solver_stats is not None and _LAST_ITERS[0] is not None:
+                    solver_stats.append(int(_LAST_ITERS[0]))
 
         else:
             # ---- Host assembly path (default; bit-for-bit unchanged) --------
@@ -562,8 +572,11 @@ def run_flow_past_3d(
             if mono_solver == "splu":
                 x_cur = splu(Acsr.tocsc()).solve(b)      # legacy path, bit-for-bit
             else:
+                _LAST_ITERS[0] = None
                 x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
                                      device=device)
+                if solver_stats is not None and _LAST_ITERS[0] is not None:
+                    solver_stats.append(int(_LAST_ITERS[0]))
 
         # Extract velocity for next step
         u_new = x_cur.reshape(nfree, ndof)[:, :dim]

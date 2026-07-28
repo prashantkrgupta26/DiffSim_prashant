@@ -106,7 +106,7 @@ from diffsim.sbm.vector import (
 from diffsim.api.ns_bricks import assemble_linear_ns
 from diffsim.physics.poisson import gauss_points
 from diffsim.solvers.timestepping import bdf_coeffs
-from diffsim.solvers.linsolve import solve_linear
+from diffsim.solvers.linsolve import solve_linear, _LAST_ITERS
 from diffsim.steppers.leray_sbm import LeraySBMShellStepper
 
 
@@ -378,6 +378,7 @@ def run_flow_past(
     on_step=None,      # optional per-step callback: on_step(step, t, u_full, p_full, cd_step)
     reaction_sets=None,  # list of free-node index arrays for reaction-force arbiter (LD-5)
     reaction_terms=False,  # (TD-2) if True, also record per-Nitsche-term reaction history
+    solver_stats=None,  # optional list to append per-step iteration counts (A2 ladder)
 ):
     """Run flow past a finite thin plate with transient BDF2 march.
 
@@ -432,6 +433,12 @@ def run_flow_past(
         for downstream drag (same sign as surrogate-traction Cd).
         Default None => no reaction evaluation, no 'reaction_hist' key, zero overhead
         (bit-for-bit identical to the legacy march).
+    solver_stats : list or None
+        Optional list to which per-step iteration counts are appended when the
+        backend provides them (i.e. when mono_solver is an iterative backend such
+        as "fgmres_bdiag" that writes to ``_LAST_ITERS``).  One integer is
+        appended per step.  Default None => no collection, byte-for-byte identical
+        march (no overhead).  Used by the A2 iteration-ladder harness.
 
     Returns a dict with:
       'cd'       : np.ndarray [nsteps] — drag coefficient history
@@ -791,8 +798,11 @@ def run_flow_past(
             if mono_solver == "splu":
                 x_cur = splu(Acsr.tocsc()).solve(b)
             else:
+                _LAST_ITERS[0] = None
                 x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
                                      device=device)
+                if solver_stats is not None and _LAST_ITERS[0] is not None:
+                    solver_stats.append(int(_LAST_ITERS[0]))
 
         else:
             # ---- Host assembly path (default; bit-for-bit unchanged) --------
@@ -839,8 +849,11 @@ def run_flow_past(
             if mono_solver == "splu":
                 x_cur = splu(Acsr.tocsc()).solve(b)      # legacy path, bit-for-bit
             else:
+                _LAST_ITERS[0] = None
                 x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
                                      device=device)
+                if solver_stats is not None and _LAST_ITERS[0] is not None:
+                    solver_stats.append(int(_LAST_ITERS[0]))
 
         # ---- Reaction-force arbiter (LD-5) per step ---------------------------
         # Computed AFTER the solve so x_cur is the step's solution.
