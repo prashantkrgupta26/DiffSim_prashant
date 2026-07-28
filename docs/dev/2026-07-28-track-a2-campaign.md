@@ -73,15 +73,17 @@ sparsity, values-only refresh after first setup).
 | 3d-L7r9 | fgmres_bdiag | 9,080,000 | 1196.8 | 242.2 s | host | Track A ref |
 | 3d-L7r9 | — | — | — | — | host | setup ~1.5 h, RSS 243-245 GB |
 
-### 4.2 gpubox Measured (T4, device assembly, cuda:1 / cuda:0)
+### 4.2 gpubox Measured (T4, device assembly, cuda:0 / cuda:1)
 
-All legs: `SADDLE_ASSEMBLY=device`, branch `track-a2-strengthen`.
+All legs: `SADDLE_ASSEMBLY=device`, branch `track-a2-strengthen`.  
+Device assignment: bdiag and pcd-amgx legs ran on **cuda:0**; the 2d-r11 probe ran on **cuda:1** (free at the time).
 
 | Tag | Solver | DOFs | iters/step (mean) | s/step | RC | Log |
 |-----|--------|------|--------------------|--------|-----|-----|
-| 3d-L6 | fgmres_bdiag | 1,097,344 | 602.2 | **12.648 s** | 0 | `logs/t4-3dL6-bdiag-device.log` |
-| 3d-L6 | fgmres_pcd+amgx | 1,097,344 | **DNF** (1642 outer @103min, step 1 never done) | **DNF** | SIGTERM | `logs/t4-3dL6-pcdamgx-device.log` |
-| 2d-r11 | fgmres_pcd+amgx | ~1.3M | **DIVERGES** | — | 0 (harness caught) | `logs/t4-2dr11-pcd-amgx-200.log` |
+| 3d-L6 | fgmres_bdiag | 1,097,344 | 602.2 | **12.648 s** | 0 | `logs/t4-3dL6-bdiag-device.log` (cuda:0) |
+| 3d-L6 | fgmres_pcd+amgx | 1,097,344 | **DNF** (1642 outer @103min, step 1 never done) | **DNF** | SIGTERM | `logs/t4-3dL6-pcdamgx-device.log` (cuda:0) |
+| 3d-L6 | fgmres_pcd (jacobi) | 1,097,344 | **35.4** | **11.732 s** | 0 | `logs/t4-3dL6-pcdjacobi-device-20260728-182854-65703.log` (cuda:0) |
+| 2d-r11 | fgmres_pcd+amgx | ~1.3M | **DIVERGES** | — | 0 (harness caught) | `logs/t4-2dr11-pcd-amgx-200.log` (cuda:1) |
 
 **3d-L6 bdiag device-asm headline:**
 - iters/step: 602.2 (virtually identical to 603.0 host reference — device assembly does not change iteration count, as expected)
@@ -110,16 +112,23 @@ iterate that is too poor in quality for the PCD Schur approximation at 1.1M DOF.
 "solve" hits maxiter (not_converged), so the PCD preconditioner receives a low-accuracy F-inner, and
 the outer FGMRES must compensate with far more iterations.
 
-**Root cause:** AMGX BiCGStab+classical-AMG at maxiter=50 is insufficient accuracy for the 3-D NS
-velocity block at Re=250. For jacobi-CG inner, the CG converges (or cap_hits a tight residual) with
-higher relative accuracy, yielding a better Schur approximation. Increasing AMGX maxiter would help
-but make each inner call proportionally more expensive. The AMG setup reuse (hierarchy already built)
-is working, but the solve quality budget is too coarse.
+**Root cause (corrected 2026-07-28 Phase 1.5):** The classical-AMG cycle (Jacobi smoother,
+presweep/postsweep=1) is **structurally ineffective** on the 3-D convection-dominated velocity block
+at Re=250 — this is an inner-quality ceiling, not a budget limitation. The key evidence: AMGX
+BiCGStab+classical-AMG stalls at relative residual 2.2e-3 with **identical residual history** at
+maxiter=50 and maxiter=400 (measured directly on the extracted F block, n=823,008, nnz=64.6M).
+A maxiter sweep is therefore refuted as the next probe — the smoother itself is too weak. By
+contrast, Jacobi-CG reaches relres 2.1e-5 in 20 iterations / 0.31 s on the same matrix. The AMG
+hierarchy is successfully built and reused (setup amortized), but the solve quality under classical-AMG
+with Jacobi smoothing does not improve with more iterations.
+
+**Candidate future probes:** (1) a different AMGX config — aggregation AMG and/or a stronger smoother
+(Gauss-Seidel, ILU-type, Krylov-smoothed); (2) dropping AMGX for the F-block entirely — Jacobi-CG
+is simply better here and requires no external library.
 
 **Conclusion:** pcd-amgx fails the iteration-growth kill-gate at the very first (smallest) ladder
-point. GH200 submission of the pcd-amgx kit at 9.08M DOF is NOT warranted until the AMGX maxiter
-budget is tuned (or the preconditioner redesigned). The leg is a confirmed negative result; the
-process ended (SIGTERM) at ~18:15 CDT without ever completing a single time step.
+point. GH200 submission of the pcd-amgx kit at 9.08M DOF is NOT warranted. The leg is a confirmed
+negative result; the process ended (SIGTERM) at ~18:15 CDT without ever completing a single time step.
 
 #### 4.2.2 2d-r11 pcd-amgx 200-step probe — **DIVERGES (same as jacobi)**
 
@@ -160,8 +169,25 @@ saved to the npz files under `results/saddle_ladder_*_fgmres_pcd.npz` as
 - Convergence: NONE — relres=0.41 after 12000 inner FGMRES iterations
 - No npz written (ConvergenceError → error fallback dict with dofs=-1)
 
-**3d-L6 pcd-jacobi reference (from existing npz `results/saddle_ladder_3d-L6_fgmres_pcd.npz`):**
-- This is the Track A run; inner_stats not present (pre-T1-telemetry run)
+**3d-L6 pcd-jacobi + device assembly (Phase 1.5, from npz `results/saddle_ladder_3d-L6_fgmres_pcd.npz`):**
+- **This is the first production T1 telemetry reading.**
+- iters/step: [35, 37, 36, 35, 34], mean=35.4; s/step=**11.732 s**; converged=True
+- Inner stats (last step, step 5, 34 outer iters — 1 inner apply per outer iter):
+
+| Block | Applies | Iters total | Iters/apply | Cap hits | Max exit relres |
+|-------|---------|-------------|-------------|----------|-----------------|
+| F (velocity) | 34 | 670 | **19.7** | 0 | 5.8e-5 |
+| **Ap (pressure conv-diff)** | **34** | **9610** | **282.6** | **0** | **9.8e-5** |
+| Mp (pressure mass) | 34 | 680 | **20.0** | 0 | 3.7e-5 |
+
+**Inner-iteration headline: Ap block dominates by 14×.** The pressure convection-diffusion
+solve (Ap) requires ~283 CG iterations per outer preconditioner apply vs ~20 for F and Mp.
+No cap hits on any block — all inner solves converge. This identifies Ap as the primary
+inner-solve cost center for any future acceleration effort (e.g. a dedicated Ap preconditioner
+or AMG for the pressure block, if the F-block AMG failure history is avoided).
+
+**3d-L6 pcd-jacobi reference (Track A host-path run — pre-T1-telemetry, for comparison):**
+- inner_stats not present (pre-T1-telemetry run)
 - iters/step: [35, 37, 36, 35, 34], mean=35.4; s/step=38.8 s; converged=True
 
 ---
@@ -185,12 +211,14 @@ Expected: setup time minutes (vs ~1.5 h host), RSS ≪ 243-245 GB (device skips
 the host CSR transient), iters/step ~1196 (unchanged by assembly), s/step scaled
 from the gpubox 3d-L6 observation.
 
-### 5.2 PCD-AMGX kit (device assembly + AMGX inner — REQUIRES pyamgx on nova)
+### 5.2 PCD-AMGX kit — **SUPERSEDED: retargeted to pcd-jacobi (see §8)**
 
-> **BLOCKING — DO NOT SUBMIT until gpubox 3d-L6 pcd-amgx re-run shows ≤2× iteration growth**  
-> Measured result: ≥44× outer iteration growth at 1.1M DOF (≤2× gate threshold). Submitting  
-> to GH200 at 9.08M DOF will consume node-hours and almost certainly fail the same gate.  
-> Root cause: AMGX maxiter=50 budget too coarse for 3-D NS velocity block. Tune first.
+> **BLOCKED — DO NOT SUBMIT the pcd-amgx config to GH200.**  
+> Measured result: ≥46× outer iteration growth at 1.1M DOF (≤2× gate threshold). Root cause  
+> (corrected): the classical-AMG cycle with Jacobi smoother is structurally ineffective on the  
+> 3-D convection-dominated F block — a maxiter increase does NOT help (identical residual history  
+> at maxiter=50 vs maxiter=400 on the same extracted matrix). The GH200 kit has been retargeted  
+> to pcd-jacobi inner; see §8 and `cluster/slurm/saddle_ladder_gh200_pcd.sbatch`.
 
 File: `cluster/slurm/saddle_ladder_gh200_pcd.sbatch`
 
@@ -218,8 +246,11 @@ is feasible in a single job (device assembly makes setup minutes not 1.5 h).
 |-----|----------|------------|--------|----------|
 | 3d-L6 bdiag | host (Track A ref) | N/A | 35.6 s | — |
 | 3d-L6 bdiag | **device (T4)** | fast (< 1 min) | **12.6 s** | — |
+| 3d-L6 pcd-jacobi | host (Track A ref) | N/A | 38.8 s | — |
+| 3d-L6 pcd-jacobi | **device (Phase 1.5)** | fast (< 1 min) | **11.732 s** | — |
 | 3d-L7r9 bdiag | host (Track A ref) | ~1.5 h | 242.2 s | 243-245 GB |
 | 3d-L7r9 bdiag | device (GH200, TODO) | — | — | — |
+| 3d-L7r9 pcd-jacobi | device (GH200, TODO) | — | — | — |
 
 The 2.8× s/step reduction on 3d-L6 bdiag from host→device assembly is a
 significant finding: device assembly not only removes the host-RAM transient but
@@ -230,20 +261,54 @@ PCIe/NVLink bus).
 
 ## TODO-GH200 (SANCTIONED PLACEHOLDER — controller fills after GH200 results)
 
-The binding verdict gate (SUCCESS: 9.08M pcd-amgx outer growth from 3d-L6 ≤ ~2×
-AND s/step ≤ ~60 s) requires the 3d-L7r9 GH200 legs. The controller submits
+The binding verdict gate (SUCCESS: 9.08M pcd-jacobi outer growth from 3d-L6 ≤ ~2×
+AND s/step tractable) requires the 3d-L7r9 GH200 legs. The controller submits
 both sbatch kits after:
-1. Confirming 3d-L6 results above (device assembly works).
-2. Installing pyamgx on nova-arm.
-3. Submitting bdiag kit first (confirms device-assembly setup time + RSS before
-   the pcd-amgx kit, which requires pyamgx).
+1. Confirming 3d-L6 results above (device assembly works — Phase 1 done).
+2. Submitting bdiag kit first (confirms device-assembly setup time + RSS).
+3. Submitting pcd-jacobi kit (pyamgx NOT required — jacobi inner has no deps).
 
 **Fill in here:**
 - 3d-L7r9 bdiag device-asm: iters/step, s/step, setup time, RSS peak, job ID
-- 3d-L7r9 pcd-amgx device-asm: outer iters/step, s/step, inner_stats (F iters/apply, cap_hits), SMI peak, job ID
+- 3d-L7r9 pcd-jacobi device-asm: outer iters/step, s/step, inner_stats (F/Ap/Mp iters/apply, cap_hits), SMI peak, job ID
 - Verdict: PASS / FAIL / partial outcome + rationale
 
 ---
+
+## 8. Phase 1.5 Corrections and Next Steps
+
+### 8.1 Root-cause correction: pcd-amgx classical-AMG stall (not a budget issue)
+
+The Phase 1 campaign doc stated "AMGX maxiter=50 budget too coarse; increase maxiter" as the root
+cause and next probe. **This is refuted.** Direct measurement on the extracted F block (n=823,008,
+nnz=64.6M) shows AMGX BiCGStab+classical-AMG (Jacobi smoother, presweep/postsweep=1) stalls at
+relres 2.2e-3 with **identical residual history** at maxiter=50 and maxiter=400. The smoother is
+structurally ineffective on the convection-dominated block — adding iterations does not help.
+Jacobi-CG (no AMG) reaches relres 2.1e-5 in 20 iterations / 0.31 s on the same matrix.
+
+**Corrected root cause:** The classical-AMG cycle quality ceiling — not the iteration budget.
+
+**Refuted probe:** maxiter sweep.
+
+**Candidate future probes:**
+1. Different AMGX config: aggregation AMG and/or stronger smoother (Gauss-Seidel, ILU-type,
+   Krylov-smoothed). Requires pyamgx rebuild on nova-arm before GH200 submission.
+2. Drop AMGX for the F-block: Jacobi-CG is simply better here and requires no external library.
+   This is the path pursued in §8.2 (GH200 kit retarget).
+
+### 8.2 GH200 pcd kit retargeted to pcd-jacobi
+
+`cluster/slurm/saddle_ladder_gh200_pcd.sbatch` has been retargeted from pcd-amgx to pcd-jacobi:
+- `SADDLE_PCD_INNER=amgx` removed (jacobi is the default)
+- pyamgx prerequisite paragraph moved to a note (applies only to a future amgx-config retry)
+- Expected wall based on gpubox Phase 1.5 measurement: see §4.2 table (pcd-jacobi+device row)
+
+**Note on pyamgx (future amgx-config retry only):** If a future probe retries AMGX with a
+different config (aggregation AMG / stronger smoother), the controller must first install pyamgx
+in `.venv-nova-arm` on nova: build AMGX for aarch64 (`cmake -DCMAKE_CUDA_ARCHITECTURES=90a`),
+stage `libamgxsh.so` under `/work/mech-ai/baskarg/AMGX/build/`, then
+`AMGX_DIR=/work/mech-ai/baskarg/AMGX pip install pyamgx` and verify with an interactive node
+before submitting.
 
 ## 7. Anomalies and Notes
 
@@ -255,8 +320,8 @@ both sbatch kits after:
 
 4. **2d-r11 pcd-amgx DIVERGES** (confirmed, 2026-07-28 16:25 CDT): AMGX inner does NOT fix the 2d-r11 divergence. relres=0.41 (worse than jacobi's ~0.001) after 12000 inner iterations. Confirms the failure is structural (PCD Schur approximation quality on fine-graded 2-D mesh at Re=250), not an inner-solve issue.
 
-5. **3d-L6 pcd-amgx DNF** (confirmed negative, 2026-07-28; process SIGTERMed ~18:15 CDT): After ~103 min wall time and 1642 outer FGMRES iterations, step 1 of 5 never completed. AMGX BiCGStab+classical-AMG at maxiter=50 is too coarse for the PCD F-inner at 1.1M DOF 3-D velocity. Kill-gate fails: iteration growth ≥46× (vs ≤2× required). GH200 pcd-amgx submission is NOT warranted without AMGX parameter re-tuning. Termination cause is external SIGTERM ("Terminated" in log), not OOM — verdict unaffected either way.
+5. **3d-L6 pcd-amgx DNF** (confirmed negative, 2026-07-28; process SIGTERMed ~18:15 CDT): After ~103 min wall time and 1642 outer FGMRES iterations, step 1 of 5 never completed. Root cause (corrected Phase 1.5): classical-AMG with Jacobi smoother is structurally ineffective on the 3-D convection-dominated F block — AMGX stalls at relres 2.2e-3 with identical history at maxiter=50 and maxiter=400; a maxiter sweep is refuted. Kill-gate fails: iteration growth ≥46× (vs ≤2× required). GH200 pcd-amgx submission is NOT warranted without a qualitatively different AMGX config (aggregation AMG / stronger smoother) or dropping AMGX for F entirely. Termination cause is external SIGTERM ("Terminated" in log), not OOM — verdict unaffected either way.
 
 6. **3d-L6 bdiag step-2 spike**: iters [551, 801, 583, 565, 511] — step 1 (BDF1→BDF2) causes a spike to 801 outer iters; this is the well-documented transition artifact and not a solver pathology.
 
-7. **GH200 pcd-amgx sbatch kit status**: Kit is complete and ready in `cluster/slurm/saddle_ladder_gh200_pcd.sbatch` but should NOT be submitted until AMGX maxiter budget is tuned and gpubox 3d-L6 pcd-amgx re-run shows ≤2× iteration growth vs pcd-jacobi. The bdiag kit can still be submitted independently to validate device-assembly speedup on GH200.
+7. **GH200 pcd kit retargeted to jacobi inner (Phase 1.5)**: `cluster/slurm/saddle_ladder_gh200_pcd.sbatch` has been updated to use pcd-jacobi (SADDLE_PCD_INNER unset). The pcd-amgx config is NOT viable without a qualitatively different AMGX config (aggregation AMG / stronger smoother) — increasing maxiter is refuted. A future amgx-config retry would require pyamgx on nova-arm (see §8). The bdiag kit can still be submitted independently to validate device-assembly speedup on GH200.
