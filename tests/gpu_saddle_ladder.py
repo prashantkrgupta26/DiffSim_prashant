@@ -425,7 +425,7 @@ if __name__ == "__main__":
         min_mean = min(v for _, v in valid)
         max_mean = max(v for _, v in valid)
         growth = max_mean / min_mean if min_mean > 0 else float("inf")
-        gate = "PASS" if growth <= 2.5 else "FAIL (>~2x — campaign concludes negative)"
+        gate = "PASS" if growth <= 2.0 else "FAIL (>~2x — campaign concludes negative)"
         print(f"  {sol}: min_iters={min_mean:.1f}  max_iters={max_mean:.1f}  "
               f"growth={growth:.2f}x  -> {gate}", flush=True)
 

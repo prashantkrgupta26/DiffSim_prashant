@@ -219,6 +219,10 @@ point make any extrapolation unreliable.
    - Increase `_INNER_MAX` (currently 500) to allow more inner iterations
    - Switch inner solver from Jacobi-CG to AMGX V-cycle for the Ap block
    - Use AMG-based pressure predictor (the R2b intended path)
+   - PREREQUISITE for any A4/PCD-revival work: add inner-CG iteration telemetry
+     first (`_cg` currently accepts truncated iterates at `_INNER_MAX=500`
+     silently — the mechanistic root of both the 2d-r11 divergence and the 9M
+     wall-cost; without a counter, that work will re-debug this blind).
 
 3. **3D uniform ladder within-dimension scaling**: Run 3D-L7 uniform (if it fits
    on gpubox host RAM) to get a within-3D growth measurement. L7 uniform has
