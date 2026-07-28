@@ -52,7 +52,7 @@ Points run in SEPARATE processes via `SADDLE_POINTS=<tag>`.
 | 2d-r9 | fgmres_bdiag | 90,744 | [4274,3414,3344,2906,2989] | 3385.4 | 11.313 | YES | saddle-2dr9-bdiag-20260727-233643-42933.log |
 | 2d-r9 | fgmres_pcd | 90,744 | [39,50,48,47,47] | **46.2** | 2.956 | YES | saddle-2dr9-pcd-20260727-233800-43285.log |
 | 2d-r11 | fgmres_bdiag | 93,792 | [5853,6623,3542,3913,4277] | 4841.6 | 15.617 | YES | saddle-2dr11-bdiag-20260727-233832-43490.log |
-| 2d-r11 | fgmres_pcd | 93,792 | — | N/A | N/A | **NO** (DIVERGED) | saddle-2dr11-pcd-20260727-234000-43808.log |
+| 2d-r11 | fgmres_pcd | 93,792¹ | — | N/A | N/A | **NO** (DIVERGED) | saddle-2dr11-pcd-20260727-234000-43808.log |
 | 3d-L6 | fgmres_bdiag | 1,097,344 | [551,805,583,565,511] | **603.0** | 35.558 | YES | saddle-3dL6-bdiag-20260727-235440-46681.log |
 | 3d-L6 | fgmres_pcd | 1,097,344 | [35,37,36,35,34] | **35.4** | 38.798 | YES | saddle-3dL6-pcd-20260727-235759-47448.log |
 | 3d-L7r9 | fgmres_bdiag | ~9,240,000 | — | N/A | N/A | **OOM-KILLED** | saddle-3dL7r9-bdiag-20260728-000149-47900.log |
@@ -61,6 +61,9 @@ Points run in SEPARATE processes via `SADDLE_POINTS=<tag>`.
 All logs on gpubox: `/home/bglab/Baskar/DiffSim/logs/`  
 All npz artifacts on gpubox: `/home/bglab/Baskar/DiffSim/results/`
 
+¹ The 2d-r11/fgmres_pcd run DIVERGED (no npz written; summary recorded -1 DOFs).
+The DOF count 93,792 is taken from the bdiag run on the identical r11 mesh.
+
 ---
 
 ## 4. Anomalies and Findings
@@ -68,13 +71,26 @@ All npz artifacts on gpubox: `/home/bglab/Baskar/DiffSim/results/`
 ### 4.1 3D-L7r9 OOM on gpubox (expected)
 
 The 3D-L7r9 adaptive mesh (base-L7 + band-r9, ~9.24M DOF) was killed by the
-Linux OOM-killer during host mesh build on gpubox (62 GB RAM). The log shows
-`Killed` immediately after Warp init, before any solver work. This matches the
-nova GH200 finding (docs §6.2, runbook): the r7b9 mesh build consumed 209.7 GB
-(MaxRSS) exceeding the 200 GB cgroup on nova, consistent with an actual physical
-memory requirement of 60–210 GB+ for the host mesh-build intermediates alone.
+Linux OOM-killer on gpubox (62 GB RAM). The log shows `Killed` immediately after
+Warp init and before any solver output — the OOM occurred inside the first
+`run_flow_past_3d` call, before any solver work.
 
-**Gpubox has only 62 GB RAM — insufficient for 3D-L7r9 mesh build.**  
+**The mesh build is NOT the culprit here.** WP0 (nova GH200 job 11771926)
+measured the r7b9 mesh build itself at **3.71 GB peak / 94 s** — the mesh build
+is exonerated. The 209.7 GB MaxRSS figure recorded earlier was cross-leg
+accumulation in the single-process ladder run (all ladder legs sharing one
+process), not the mesh-build peak in isolation; see
+`docs/dev/2026-07-27-100m-gh200-readiness.md` §2.1 "WP0 RESOLUTION".
+
+**Leading hypothesis for the gpubox OOM** (no per-stage measurement on gpubox;
+labeled as hypothesis): the host CSR-assembly and constraint-projection transients
+at 9.24M-DOF ndof=4 scale exhaust the 62 GB RAM before any solve begins. The
+plausible chain includes the `kron(T, I4)` constraint operator, the two-sided SBM
+face system, the `T_vec.T @ Af_raw @ T_vec` sparse triple product, and the
+step-0 `assemble_linear_ns` + `.tolil()` saddle surgery; the stored saddle CSR
+alone is ~12–16 GB at this scale and the assembly transients multiply it.
+
+**Gpubox has only 62 GB RAM — insufficient for 3D-L7r9 at this DOF scale.**  
 The 9.24M point requires nova GH200 (480 GB Grace socket). A ready-to-submit
 nova sbatch config can be derived from `cluster/slurm/thinshell_gh200_ladder.sbatch`
 with the following env additions:
@@ -84,10 +100,10 @@ SADDLE_POINTS=3d-L7r9
 SADDLE_NSTEPS=5
 SADDLE_DEVICE=cuda:0
 ```
-Note: the nova GH200 also failed on r7b9 mesh build at the 200G cgroup limit
-(runbook §6.2); submit with `--mem=400G` or higher to attempt. The nova A100
-(39 GiB VRAM) cannot run the 9.24M DOF solver, but the GH200 (95 GiB HBM3,
-480 GB Grace) is the target.
+Submit with `--mem=400G` or higher. The GH200 verdict leg will capture the true
+peak via RSS/SMI sampling and is the authoritative measurement for this scale.
+The nova A100 (39 GiB VRAM) cannot run the 9.24M DOF solver; the GH200 (95 GiB
+HBM3, 480 GB Grace) is the target.
 
 ### 4.2 2D-r11 fgmres_pcd DIVERGED
 

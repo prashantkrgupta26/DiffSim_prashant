@@ -314,7 +314,7 @@ This is the R2b block-preconditioner track.
 |--------|------|----------------------|----------------------|
 | gpubox RTX 6000 Ada | 48 GiB | ~1M DOF expected limit (L6 cudss not tested; L5 ~131K DOF confirmed OK; see L6 fused result below) | WSL2 host RAM not cgroup-limited in production use |
 | nova A100-PCIE | 39 GiB | lower than gpubox — use only through L5 for 3-D direct | n/a (slurm job memory) |
-| nova GH200 | 95 GiB HBM3 | **between ~1.1M and ~2.9M saddle DOF** (1.08M confirmed OK at ~51 GiB transient; 2.92M ALLOC_FAILED at 78.3 GiB peak; 8.46M ALLOC_FAILED early) | r7b9 adaptive OOM: MaxRSS 209.7 GB > 200G cgroup; GPU flat 13.5 GiB |
+| nova GH200 | 95 GiB HBM3 | **between ~1.1M and ~2.9M saddle DOF** (1.08M confirmed OK at ~51 GiB transient; 2.92M ALLOC_FAILED at 78.3 GiB peak; 8.46M ALLOC_FAILED early) | r7b9 adaptive OOM: MaxRSS 209.7 GB > 200G cgroup; GPU flat 13.5 GiB [209.7 GB was cross-leg accumulation — mesh build itself 3.71 GB; see §6.2 + WP0 §2.1] |
 
 **cuDSS wall is fill/bandwidth-dependent, not a fixed DOF count.** The same 95-GiB GH200 fits
 1.08M DOF (uniform L6) but fails at 626K DOF adaptive (a5r8, ~23 GiB transient) vs fitting it —
@@ -344,6 +344,9 @@ Is the system 3-D thin-plate (uniform)?
 
 Host mesh-build ceiling (GH200, nova):
   r7b9 (base-L7 + band-L9 adaptive): MaxRSS 209.7 GB > 200G cgroup  →  oom_kill
+    [SUPERSEDED by WP0 (job 11771926): the 209.7 GB was cross-leg accumulation in the
+     single-process ladder; the r7b9 mesh build itself measures 3.71 GB/94 s on Grace
+     (mesh build exonerated) — see docs/dev/2026-07-27-100m-gh200-readiness.md §2.1.]
   Mitigation: raise --mem to approach the 480 GB Grace socket limit, or slim mesh-build intermediates
 ```
 
@@ -638,9 +641,14 @@ cd /Users/baskarg/Dropbox/work/Projects/ClaudeCode/DiffSim && \
 ### Kill-gate verdict
 
 **UNDECIDABLE** — the 9.24M 3D-L7r9 point needed for the 1M→10M decade measurement
-was OOM-killed during HOST mesh build on gpubox (62 GB RAM; mesh build requires ~200+ GB,
-consistent with nova GH200 finding). The kill-gate cannot be decided from the 0.3M→1.1M
-data alone.
+was OOM-killed on gpubox (62 GB RAM) inside the first `run_flow_past_3d` call, before any
+solver output. **The mesh build is not the cause:** WP0 (nova GH200 job 11771926) measured
+the r7b9 mesh build itself at 3.71 GB/94 s (mesh build exonerated; the earlier 209.7 GB
+figure was cross-leg accumulation — see `docs/dev/2026-07-27-100m-gh200-readiness.md` §2.1).
+Leading hypothesis: host-assembly/constraint-projection transients at 9.24M ndof=4 exhaust
+the 62 GB before any solve begins (hypothesis; no per-stage measurement on gpubox). The GH200
+verdict leg (--mem=400G) will capture the true peak. The kill-gate cannot be decided from the
+0.3M→1.1M data alone.
 
 Interim evidence: fgmres_pcd achieves 35–46 iters at both 2D-r9 and 3D-L6 (0.3M→1.1M
 range), indicating DECREASING iteration count with mesh size in this range. However,
