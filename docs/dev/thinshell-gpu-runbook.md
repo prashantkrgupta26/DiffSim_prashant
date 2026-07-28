@@ -530,6 +530,19 @@ reaction path, above); (2) D3b r12 resolution probe (offered; Baskar's call);
 penalty-dominance; (4) canonical-observable adoption — BLOCKED on the escalation
 decision, NOT implemented.
 
+**D3b r12 UPDATE (2026-07-27, log `d3b-r12-retry-20260727-191316-76793.log`):**
+refine_to=12 (256 cells/plate), dt=1.25e-4, 32k steps: **Cd_rxn = 3.1340**
+(penalty 3.009, 96%), Cd_surr = 6.5299, bridge 52.3, St = 0.1562. Increment vs
+r11 = **+0.0857** vs prior +0.2102/+0.2385 ⇒ **SHRINKING — convergent regime**;
+geometric extrapolation Cd_∞ ≈ 3.18 at 6.25% blockage. Verdict: the literature
+deficit is RESOLUTION, not formulation; α-scaling stays the open formulation
+question. **ADOPTION (Baskar):** Cd_rxn (consistent Nitsche reaction) is the
+CANONICAL force observable for thin-shell SBM campaigns — quoted values must
+carry refine level + the still-rising (pre-asymptotic-in-absolute-terms) caveat
+and the blockage note (6.25%-blockage limit ≈3.18 need not equal unconfined
+3.36). Cd_surr is DEMOTED to diagnostic (approximates no partition term). Full
+record: `docs/dev/p2r1a-thin-plate-runbook.md` D3b section.
+
 6. **Projection research track:** fix the structural 2-D divergence at Re=250/L9. Candidate
    suspects listed in §5. Start with `consistent_projection=False` probe on a small mesh (L6,
    no adaptive) to isolate sub-step.

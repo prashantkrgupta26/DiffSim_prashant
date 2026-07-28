@@ -439,3 +439,48 @@ reaction path, above); (2) D3b r12 resolution probe (offered; Baskar's call);
 (3) α-scaling investigation (α~Pe·p² vs fixed 50) — stands, now sharpened by
 penalty-dominance; (4) canonical-observable adoption — BLOCKED on the escalation
 decision, NOT implemented.
+
+### 2026-07-27 D3b r12 probe — increments SHRINKING; reaction ADOPTED as canonical
+
+**Probe:** `tests/gpu_d3b_r12.py` (commit b8521b2 — in-march partition gate
+recalibrated to `1e-11·max(1,|Cd_total|)` after a step-167 trip of the 1e-12 gate
+at 1.06e-12 relative: nnz-scaled rounding, identity held; new gate has 10×
+measured-tail headroom). gpubox RTX 6000 Ada, log
+`d3b-r12-retry-20260727-191316-76793.log`, npz `results/tractdissect_D3b.npz`.
+Config: the D3/r11 leg at refine_to=12 (256 cells/plate), dt=1.25e-4, 32,000
+steps (same physical window as D1–D4). Clean march, `D3B-OK`, 8821.6 s wall.
+
+**Result (same schema as the D1–D4 table):**
+
+```
+ Tag   Cd_rxn  consistency+adjoint              penalty             backflow  Cd_surr   bridge      St        dt
+ D3b   3.1340             0.124869             3.009126             0.000000   6.5299  52.2941  0.1562  1.25e-04
+```
+
+**VERDICT — SHRINKING.** Increment vs r11: **+0.0857**, against prior increments
++0.2102 (r9→r10) and +0.2385 (r10→r11). The sequence 2.5996 → 2.8098 → 3.0483 →
+3.1340 is monotone toward literature 3.36 with the increment cut ~2.8× — the
+ladder has entered the convergent regime, and the spec decision rule's first
+branch now obtains: **the literature deficit is RESOLUTION** (the r9–r11 legs
+were pre-asymptotic), not formulation. Geometric extrapolation (increment ratio
+0.0857/0.2385 ≈ 0.36) puts the mesh limit at Cd_∞ ≈ 3.18 at 6.25% blockage.
+St continued toward literature: 0.2188 (r9/r10) → 0.1875 (r11) → **0.1562**
+(r12; literature ~0.15). Penalty still carries 96% of the reaction
+(3.009/3.134); bridge 52.3 — the α-scaling follow-up stands unchanged.
+
+**Caveats (attached to any quoted Cd):** (i) still pre-asymptotic in absolute
+terms — 3.1340 is 6.7% below 3.36 and the extrapolation rests on a single
+shrinking increment; (ii) the D4 blockage direction (−13% on halving to 3.1%)
+means the 6.25%-blockage limit ≈ 3.18 need not land ON the unconfined 3.36 —
+a confinement-corrected comparison remains open; (iii) the reaction at α=50 is
+numerically penalty virtual work (~96%) — its α-sensitivity is untested at r12.
+
+**ADOPTION (Baskar, 2026-07-27):** the consistent reaction **Cd_rxn is the
+CANONICAL force observable** for thin-shell SBM campaigns, with the
+pre-asymptotic caveat above attached verbatim: every quoted value states its
+refine level and that the r9→r12 ladder is still rising toward the mesh limit.
+The surrogate traction Cd_surr is DEMOTED to a diagnostic: it is a shifted-face
+σ·n functional that approximates no term of the Nitsche partition (bridge 49–77
+on every leg) and overestimates the reaction 2.1–2.3× at α=50. Follow-up (2) is
+closed by this probe; follow-up (4) is closed by this adoption; (1) was resolved
+(window asymmetry, above); (3) α-scaling remains the open formulation question.
