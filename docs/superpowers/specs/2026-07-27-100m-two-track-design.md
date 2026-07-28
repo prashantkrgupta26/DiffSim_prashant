@@ -8,6 +8,18 @@ regardless of outcome.
 
 ---
 
+> **TRACK A VERDICT (2026-07-28): KILL-GATE PASS — Track A VIABLE via
+> `fgmres_bdiag`.** Within-3-D decade 603.0 (1.097M) → 1196.8 (9.08M)
+> iters/step = 1.985× ≤ ~2× (GH200 job 11772638; late-step settled ~1.6×).
+> PCD (`fgmres_pcd`) wins iterations 17-73× where it converges but is
+> wall-time-infeasible at 9M with Jacobi-CG inners (≥86 min/step, DNF twice)
+> and non-robust on the 2-D fine-graded mesh; candidate 2's AMGX velocity-inner
+> (A4) is the identified upgrade, deferred. Host-assembly transients MEASURED
+> 243–245 GB at 9.08M ⇒ device assembly mandatory ≥10M. Full record:
+> `docs/dev/2026-07-27-r2b-saddle-campaign.md` §8. Track B proceeds next as
+> planned — the engine choice between viable-Track-A and rescued-Track-B is
+> made after B's gates report.
+
 ## Track A — R2b saddle-preconditioner campaign (monolithic path)
 
 **Question:** does a scalable iterative solve exist for the VMS-stabilized

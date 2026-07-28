@@ -314,7 +314,7 @@ This is the R2b block-preconditioner track.
 |--------|------|----------------------|----------------------|
 | gpubox RTX 6000 Ada | 48 GiB | ~1M DOF expected limit (L6 cudss not tested; L5 ~131K DOF confirmed OK; see L6 fused result below) | WSL2 host RAM not cgroup-limited in production use |
 | nova A100-PCIE | 39 GiB | lower than gpubox — use only through L5 for 3-D direct | n/a (slurm job memory) |
-| nova GH200 | 95 GiB HBM3 | **between ~1.1M and ~2.9M saddle DOF** (1.08M confirmed OK at ~51 GiB transient; 2.92M ALLOC_FAILED at 78.3 GiB peak; 8.46M ALLOC_FAILED early) | r7b9 adaptive OOM: MaxRSS 209.7 GB > 200G cgroup; GPU flat 13.5 GiB |
+| nova GH200 | 95 GiB HBM3 | **between ~1.1M and ~2.9M saddle DOF** (1.08M confirmed OK at ~51 GiB transient; 2.92M ALLOC_FAILED at 78.3 GiB peak; 8.46M ALLOC_FAILED early) | r7b9 adaptive OOM: MaxRSS 209.7 GB > 200G cgroup; GPU flat 13.5 GiB [209.7 GB was cross-leg accumulation — mesh build itself 3.71 GB; see §6.2 + WP0 §2.1] |
 
 **cuDSS wall is fill/bandwidth-dependent, not a fixed DOF count.** The same 95-GiB GH200 fits
 1.08M DOF (uniform L6) but fails at 626K DOF adaptive (a5r8, ~23 GiB transient) vs fitting it —
@@ -344,6 +344,9 @@ Is the system 3-D thin-plate (uniform)?
 
 Host mesh-build ceiling (GH200, nova):
   r7b9 (base-L7 + band-L9 adaptive): MaxRSS 209.7 GB > 200G cgroup  →  oom_kill
+    [SUPERSEDED by WP0 (job 11771926): the 209.7 GB was cross-leg accumulation in the
+     single-process ladder; the r7b9 mesh build itself measures 3.71 GB/94 s on Grace
+     (mesh build exonerated) — see docs/dev/2026-07-27-100m-gh200-readiness.md §2.1.]
   Mitigation: raise --mem to approach the 480 GB Grace socket limit, or slim mesh-build intermediates
 ```
 
@@ -611,6 +614,43 @@ cd /Users/baskarg/Dropbox/work/Projects/ClaudeCode/DiffSim && \
 | L4 | 0.54 | 19,508 |
 | L5 | 2.89 | 142,180 |
 | L6 | 26.12 | 1,084,100 |
+
+---
+
+---
+
+## 2026-07-27 / 2026-07-28 — R2b Saddle-Preconditioner GPU Campaign (Task A5)
+
+**Hardware:** gpubox RTX 6000 Ada (48 GiB, sm_89, WSL2). Branch: `track-a-r2b`.  
+**Harness:** `tests/gpu_saddle_ladder.py` (SADDLE_POINTS per-process isolation).  
+**Full report:** `docs/dev/2026-07-27-r2b-saddle-campaign.md`
+
+### Campaign results table
+
+| tag | solver | DOFs | iters_mean | s/step | converged |
+|-----|--------|------|-----------|--------|-----------|
+| 2d-r9 | fgmres_bdiag | 90,744 | 3385.4 | 11.3 | YES |
+| 2d-r9 | fgmres_pcd | 90,744 | **46.2** | 3.0 | YES |
+| 2d-r11 | fgmres_bdiag | 93,792 | 4841.6 | 15.6 | YES |
+| 2d-r11 | fgmres_pcd | 93,792 | N/A | N/A | **DIVERGED** |
+| 3d-L6 | fgmres_bdiag | 1,097,344 | 603.0 | 35.6 | YES |
+| 3d-L6 | fgmres_pcd | 1,097,344 | **35.4** | 38.8 | YES |
+| 3d-L7r9 | fgmres_bdiag | ~9,240,000 | N/A | N/A | OOM on gpubox (host-assembly path; see §4.1 note) |
+| 3d-L7r9 | fgmres_bdiag | 9,080,064 | **1196.8** | 242.2 | YES (GH200, job 11772638) |
+| 3d-L7r9 | fgmres_pcd | 9,080,064 | N/A | ≥5,160 | DNF (GH200 2×walltime, jobs 11772733/11772832) |
+
+### Kill-gate verdict (FINAL, 2026-07-28)
+
+**TRACK A VIABLE via fgmres_bdiag.** Within-3-D decade: 603.0 iters/step at 1.097M
+→ 1196.8 at 9.08M = **1.985× growth ≤ ~2× — PASS** (late-step settled values put
+it nearer 1.6×). PCD wins iterations wherever it converges (35 at 3-D L6, 17×
+under bdiag) but is wall-time-infeasible at 9M with Jacobi-CG inners (≥86 min/step
+vs bdiag 4.0 min/step, two GH200 timeouts) and non-robust on the 2-D fine-graded
+mesh — A4 (AMGX velocity-inner) is the identified upgrade to keep PCD outer
+counts at viable apply cost. **Memory (measured):** host-assembly transients
+243–245 GB at 9.08M (mesh build 3.71 GB, WP0) ⇒ device assembly (`ASSEMBLY=device`)
+MANDATORY at ≥10M; GPU peak 36.7 GiB/95. Full record + 100M projection:
+`docs/dev/2026-07-27-r2b-saddle-campaign.md` §8.
 
 ---
 

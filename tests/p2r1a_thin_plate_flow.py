@@ -106,7 +106,7 @@ from diffsim.sbm.vector import (
 from diffsim.api.ns_bricks import assemble_linear_ns
 from diffsim.physics.poisson import gauss_points
 from diffsim.solvers.timestepping import bdf_coeffs
-from diffsim.solvers.linsolve import solve_linear
+from diffsim.solvers.linsolve import solve_linear, _LAST_ITERS
 from diffsim.steppers.leray_sbm import LeraySBMShellStepper
 
 
@@ -378,6 +378,7 @@ def run_flow_past(
     on_step=None,      # optional per-step callback: on_step(step, t, u_full, p_full, cd_step)
     reaction_sets=None,  # list of free-node index arrays for reaction-force arbiter (LD-5)
     reaction_terms=False,  # (TD-2) if True, also record per-Nitsche-term reaction history
+    solver_stats=None,  # optional list to append per-step iteration counts (A2 ladder)
 ):
     """Run flow past a finite thin plate with transient BDF2 march.
 
@@ -432,6 +433,12 @@ def run_flow_past(
         for downstream drag (same sign as surrogate-traction Cd).
         Default None => no reaction evaluation, no 'reaction_hist' key, zero overhead
         (bit-for-bit identical to the legacy march).
+    solver_stats : list or None
+        Optional list to which per-step iteration counts are appended when the
+        backend provides them (i.e. when mono_solver is an iterative backend such
+        as "fgmres_bdiag" that writes to ``_LAST_ITERS``).  One integer is
+        appended per step.  Default None => no collection, byte-for-byte identical
+        march (no overhead).  Used by the A2 iteration-ladder harness.
 
     Returns a dict with:
       'cd'       : np.ndarray [nsteps] — drag coefficient history
@@ -712,6 +719,12 @@ def run_flow_past(
             _rxn_Afc_w.append(np.asarray(Af_c.T @ w_k))
             _rxn_bfc_dot.append(float(bf_c @ w_k))
 
+    # ---- PCD meta cache (fgmres_pcd only) -----------------------------------
+    # build_pcd_meta is called once per BDF order (sigma changes at step 0->1);
+    # the cache dict is passed to solve_linear so make_pcd_apply sees pcd_meta.
+    _pcd_cache = {}           # {("pcd_meta", key): meta, ...}
+    _pcd_last_order = None    # track when to rebuild pcd_meta (sigma change)
+
     # ---- BDF2 march ---------------------------------------------------------
     # Initialize: u=0 everywhere
     x_cur = np.zeros(nfree * ndof)
@@ -733,6 +746,14 @@ def run_flow_past(
         order = 1 if step == 0 else 2
         b0, b1, b2 = bdf_coeffs(order, dt)
         sigma = b0 / dt
+
+        # Rebuild pcd_meta when BDF order (and thus sigma) changes.
+        # This is at most 2 builds per run (BDF1 -> BDF2 at step 1).
+        if mono_solver == "fgmres_pcd" and order != _pcd_last_order:
+            from diffsim.solvers.saddle_precond import build_pcd_meta
+            _pcd_cache[("pcd_meta", "ns2d")] = build_pcd_meta(
+                dm, nu, sigma, p_pin=p_pin)
+            _pcd_last_order = order
         t_new = (step + 1) * dt   # time at the END of this step
 
         # Advecting velocity at Gauss points (linearization around u^n)
@@ -791,8 +812,13 @@ def run_flow_past(
             if mono_solver == "splu":
                 x_cur = splu(Acsr.tocsc()).solve(b)
             else:
+                _LAST_ITERS[0] = None
+                _slv_cache = _pcd_cache if mono_solver == "fgmres_pcd" else None
                 x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
-                                     device=device)
+                                     device=device,
+                                     cache=_slv_cache, cache_key="ns2d")
+                if solver_stats is not None and _LAST_ITERS[0] is not None:
+                    solver_stats.append(int(_LAST_ITERS[0]))
 
         else:
             # ---- Host assembly path (default; bit-for-bit unchanged) --------
@@ -834,13 +860,21 @@ def run_flow_past(
 
             # Solve — routed through solve_linear so MONO_SOLVER/DEVICE select
             # the backend (splu host | cudss GPU-direct | fused GPU-BiCGStab).
-            # Matrix changes every step (Picard convection + kick rows): no cache_key.
+            # Matrix changes every step (Picard convection + kick rows).
+            # For fgmres_pcd the pcd_meta (mesh operators) is constant per BDF
+            # order and lives in _pcd_cache; the fingerprint guard is bypassed
+            # by passing cache_key=None for all other solvers.
             Acsr = A.tocsr()
             if mono_solver == "splu":
                 x_cur = splu(Acsr.tocsc()).solve(b)      # legacy path, bit-for-bit
             else:
+                _LAST_ITERS[0] = None
+                _slv_cache = _pcd_cache if mono_solver == "fgmres_pcd" else None
                 x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
-                                     device=device)
+                                     device=device,
+                                     cache=_slv_cache, cache_key="ns2d")
+                if solver_stats is not None and _LAST_ITERS[0] is not None:
+                    solver_stats.append(int(_LAST_ITERS[0]))
 
         # ---- Reaction-force arbiter (LD-5) per step ---------------------------
         # Computed AFTER the solve so x_cur is the step's solution.

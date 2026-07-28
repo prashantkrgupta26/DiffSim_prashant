@@ -60,7 +60,7 @@ from diffsim.sbm.vector import (
 from diffsim.api.ns_bricks import assemble_linear_ns
 from diffsim.physics.poisson import gauss_points
 from diffsim.solvers.timestepping import bdf_coeffs
-from diffsim.solvers.linsolve import solve_linear
+from diffsim.solvers.linsolve import solve_linear, _LAST_ITERS
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +309,7 @@ def run_flow_past_3d(
     mono_solver="splu",
     device="cpu",
     assembly="host",   # assembly backend: "host" (default, bit-for-bit) | "device"
+    solver_stats=None,  # optional list to append per-step iteration counts (A2 ladder)
 ):
     """Run 3-D flow past a finite thin plate with transient BDF2 march.
 
@@ -347,6 +348,12 @@ def run_flow_past_3d(
         "device" (DeviceNSAssembler; symbolic pattern once per mesh epoch,
         numeric fill on device per step, two-sided SBM face system via cached slots).
         "host" default keeps all existing tests bit-for-bit unchanged.
+    solver_stats : list or None
+        Optional list to which per-step iteration counts are appended when the
+        backend provides them (i.e. when mono_solver is an iterative backend such
+        as "fgmres_bdiag" that writes to ``_LAST_ITERS``).  One integer is
+        appended per step.  Default None => no collection, byte-for-byte identical
+        march (no overhead).  Used by the A2 iteration-ladder harness.
 
     Returns a dict with:
       'cd'         : np.ndarray [nsteps] — drag coefficient (x-direction)
@@ -474,6 +481,17 @@ def run_flow_past_3d(
     plate_area = 4.0 * plate_half_y * plate_half_z
     ref_force = 0.5 * U_inf ** 2 * plate_area
 
+    # ---- PCD meta cache (fgmres_pcd only) -----------------------------------
+    # build_pcd_meta is called once per BDF order (sigma changes at step 0->1).
+    # The cache dict is passed to solve_linear so make_pcd_apply sees pcd_meta.
+    # fgmres_bdiag also reads ndof from ("blocktri_meta", key); wire it here too
+    # so the 3-D bdiag backend gets ndof=4 (not the default 3).
+    _pcd_cache = {"ndof": ndof}   # carry ndof for fgmres_bdiag (blocktri_meta slot)
+    _pcd_last_order = None        # track when to rebuild pcd_meta (sigma change)
+    if mono_solver == "fgmres_bdiag":
+        # fgmres_bdiag reads ndof via ("blocktri_meta", cache_key)
+        _pcd_cache[("blocktri_meta", "ns3d")] = {"ndof": ndof}
+
     # ---- BDF2 march ---------------------------------------------------------
     x_cur = np.zeros(nfree * ndof)
     u_pre2 = np.zeros((nfree, dim))
@@ -487,6 +505,14 @@ def run_flow_past_3d(
         order = 1 if step == 0 else 2
         b0, b1, b2 = bdf_coeffs(order, dt)
         sigma = b0 / dt
+
+        # Rebuild pcd_meta when BDF order (and thus sigma) changes.
+        # This is at most 2 builds per run (BDF1 -> BDF2 at step 1).
+        if mono_solver == "fgmres_pcd" and order != _pcd_last_order:
+            from diffsim.solvers.saddle_precond import build_pcd_meta
+            _pcd_cache[("pcd_meta", "ns3d")] = build_pcd_meta(
+                dm, nu, sigma, p_pin=p_pin)
+            _pcd_last_order = order
 
         # Advecting velocity at Gauss points
         aq, dq = _gp_field_3d(dm, mesh, T, u_pre1, dim)
@@ -538,8 +564,15 @@ def run_flow_past_3d(
             if mono_solver == "splu":
                 x_cur = splu(Acsr.tocsc()).solve(b)
             else:
+                _LAST_ITERS[0] = None
+                _slv_cache = (_pcd_cache
+                              if mono_solver in ("fgmres_pcd", "fgmres_bdiag")
+                              else None)
                 x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
-                                     device=device)
+                                     device=device,
+                                     cache=_slv_cache, cache_key="ns3d")
+                if solver_stats is not None and _LAST_ITERS[0] is not None:
+                    solver_stats.append(int(_LAST_ITERS[0]))
 
         else:
             # ---- Host assembly path (default; bit-for-bit unchanged) --------
@@ -557,13 +590,22 @@ def run_flow_past_3d(
 
             # Solve — routed through solve_linear so MONO_SOLVER/DEVICE select
             # the backend (splu host | cudss GPU-direct | fused GPU-BiCGStab).
-            # Matrix changes every step (Picard convection): no cache_key.
+            # Matrix changes every step (Picard convection).
+            # For fgmres_pcd the pcd_meta is constant per BDF order (mesh ops);
+            # for fgmres_bdiag the blocktri_meta carries ndof=4 for the 3-D case.
             Acsr = A.tocsr()
             if mono_solver == "splu":
                 x_cur = splu(Acsr.tocsc()).solve(b)      # legacy path, bit-for-bit
             else:
+                _LAST_ITERS[0] = None
+                _slv_cache = (_pcd_cache
+                              if mono_solver in ("fgmres_pcd", "fgmres_bdiag")
+                              else None)
                 x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
-                                     device=device)
+                                     device=device,
+                                     cache=_slv_cache, cache_key="ns3d")
+                if solver_stats is not None and _LAST_ITERS[0] is not None:
+                    solver_stats.append(int(_LAST_ITERS[0]))
 
         # Extract velocity for next step
         u_new = x_cur.reshape(nfree, ndof)[:, :dim]
