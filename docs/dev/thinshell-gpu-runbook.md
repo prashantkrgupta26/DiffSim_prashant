@@ -614,6 +614,46 @@ cd /Users/baskarg/Dropbox/work/Projects/ClaudeCode/DiffSim && \
 
 ---
 
+---
+
+## 2026-07-27 / 2026-07-28 — R2b Saddle-Preconditioner GPU Campaign (Task A5)
+
+**Hardware:** gpubox RTX 6000 Ada (48 GiB, sm_89, WSL2). Branch: `track-a-r2b`.  
+**Harness:** `tests/gpu_saddle_ladder.py` (SADDLE_POINTS per-process isolation).  
+**Full report:** `docs/dev/2026-07-27-r2b-saddle-campaign.md`
+
+### Campaign results table
+
+| tag | solver | DOFs | iters_mean | s/step | converged |
+|-----|--------|------|-----------|--------|-----------|
+| 2d-r9 | fgmres_bdiag | 90,744 | 3385.4 | 11.3 | YES |
+| 2d-r9 | fgmres_pcd | 90,744 | **46.2** | 3.0 | YES |
+| 2d-r11 | fgmres_bdiag | 93,792 | 4841.6 | 15.6 | YES |
+| 2d-r11 | fgmres_pcd | 93,792 | N/A | N/A | **DIVERGED** |
+| 3d-L6 | fgmres_bdiag | 1,097,344 | 603.0 | 35.6 | YES |
+| 3d-L6 | fgmres_pcd | 1,097,344 | **35.4** | 38.8 | YES |
+| 3d-L7r9 | fgmres_bdiag | ~9,240,000 | N/A | N/A | OOM (mesh build) |
+| 3d-L7r9 | fgmres_pcd | ~9,240,000 | N/A | N/A | NOT RUN |
+
+### Kill-gate verdict
+
+**UNDECIDABLE** — the 9.24M 3D-L7r9 point needed for the 1M→10M decade measurement
+was OOM-killed during HOST mesh build on gpubox (62 GB RAM; mesh build requires ~200+ GB,
+consistent with nova GH200 finding). The kill-gate cannot be decided from the 0.3M→1.1M
+data alone.
+
+Interim evidence: fgmres_pcd achieves 35–46 iters at both 2D-r9 and 3D-L6 (0.3M→1.1M
+range), indicating DECREASING iteration count with mesh size in this range. However,
+PCD FAILED at 2D-r11 (same DOF count as r9 but finer mesh) — a robustness concern for
+the inner Jacobi-CG quality on finer pressure Laplacians. fgmres_bdiag converges at all
+points but requires 600–5000 iters (not scalable without the 9.24M data).
+
+**Nova GH200 required:** 3D-L7r9 with SADDLE_SOLVERS=fgmres_bdiag,fgmres_pcd,
+SADDLE_POINTS=3d-L7r9, SADDLE_NSTEPS=5, --mem=400G. This is the blocking measurement
+for the kill-gate. The controller handles nova submission.
+
+---
+
 ## Appendix B: GPU Smoke Script Reference
 
 `tests/gpu_smoke_thinshell.py` runs 4 legs (2d-mono, 2d-proj, 3d-mono, 3d-proj)
