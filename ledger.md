@@ -110,3 +110,24 @@ row replacement: 0.53  0.50  0.49
 ```
 
 **Interpretation:** The row-replacement time approximately doubles whenever the boundary-node count doubles. Its scaling exponent is about `0.5` with respect to total DOFs, consistent with a 2-D boundary growing like $\sqrt{n}$. The loop remains inexpensive at these sizes, but its host-side Python cost grows and may matter for much larger meshes.
+
+## Task A3 - Shifted Boundary MMS
+**Date:** July 28, 2026  
+**Run source:** User-provided terminal output.
+
+### Observed Results
+
+| Level | Mesh size `h` | L2 error |
+|---:|---:|---:|
+| 4 | 0.0625 | 3.210e-03 |
+| 5 | 0.0312 | 6.615e-04 |
+| 6 | 0.0156 | 1.508e-04 |
+
+Observed convergence orders:
+
+```text
+level 4 -> 5: 2.28
+level 5 -> 6: 2.13
+```
+
+**Interpretation:** Each refinement halves `h`, and the L2 error decreases by approximately a factor of four. The measured orders are slightly above 2 but move toward the expected second-order rate, which is normal in the pre-asymptotic regime. The A3 shifted-boundary implementation therefore shows the expected approximately `O(h^2)` convergence.
