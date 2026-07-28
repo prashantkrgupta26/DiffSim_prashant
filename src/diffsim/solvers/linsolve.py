@@ -35,6 +35,11 @@ from ..errors import BackendError, ConvergenceError
 
 _CUDSS_OPTS = ...          # lazily built by cudss_options()
 
+# Iteration-count sentinel written by backends that track iteration counts and
+# read by the return_result wrapper (allows cacheless callers to get iters).
+# Single-element list so it is mutable from nested call frames.
+_LAST_ITERS = [None]
+
 
 def cudss_options():
     """DirectSolverOptions with multithreaded host planning
@@ -1057,11 +1062,12 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
     device = default_device() if device is None else device
     if return_result:
         from .result import LinearSolveResult
+        _LAST_ITERS[0] = None          # cleared before every call
         x = solve_linear(A, b, solver=solver, sym=sym, tol=tol,
                          maxiter=maxiter, device=device, cache=cache,
                          cache_key=cache_key)
-        iters = None
-        if cache is not None and cache_key is not None:
+        iters = _LAST_ITERS[0]         # written by backends that track iters
+        if iters is None and cache is not None and cache_key is not None:
             rec = cache.get(("blockch_iters", cache_key))
             if rec is not None:
                 iters = rec[0]
@@ -1476,6 +1482,47 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         if cache is not None and cache_key is not None:
             cache[("blockamgx_iters", cache_key)] = (iters,)
         return x
+
+    if solver == "fgmres_bdiag":
+        # Task A1: block-diagonal (Jacobi-by-block) preconditioned FGMRES for
+        # the monolithic (u, p) saddle system.  The preconditioner applies
+        # independent Jacobi scaling to the velocity block and the
+        # PSPG-stabilized pressure block (with a 1e-12 relative floor on |d_p|
+        # so near-zero pressure pivots do not amplify noise).
+        # CSR construction mirrors the "fused" backend pattern; the outer
+        # Krylov is fgmres_dev (device-resident flexible GMRES, restart=60).
+        from ..assembly.operators import CSROperator
+        from .fgmres_dev import fgmres_dev
+        from .saddle_precond import make_bdiag_apply
+        import warp as wp
+
+        # ndof: caller's contract for the monolithic saddle is ndof = dim+1.
+        # We recover ndof from the blocktri_meta cache slot when available
+        # (same convention used by "blocktri"), otherwise default to 3 (2-D).
+        meta = (cache or {}).get(("blocktri_meta", cache_key), {})
+        ndof = meta.get("ndof", 3)
+
+        op = CSROperator(A, device)
+        apply_dev = make_bdiag_apply(A, ndof, device)
+        N = A.shape[0]
+
+        b_dev = wp.array(np.ascontiguousarray(b, np.float64),
+                         dtype=wp.float64, device=device)
+        x_dev, finfo = fgmres_dev(
+            op.matvec, b_dev, apply_dev, N, device,
+            tol=tol, atol=1e-13, restart=60, maxiter=200)
+
+        if not finfo["converged"]:
+            raise ConvergenceError(
+                f"fgmres_bdiag: not converged after {finfo['inner']} inner "
+                f"iterations ({finfo['outer']} restarts); "
+                f"relres={finfo['relres']:.3e}")
+
+        # Publish iteration count to the module sentinel so the return_result
+        # wrapper (which calls us without return_result=True) can surface it.
+        _LAST_ITERS[0] = finfo["inner"]
+
+        return x_dev.numpy()
 
     from ..errors import ConfigError
     raise ConfigError(f"unknown solver '{solver}'")
