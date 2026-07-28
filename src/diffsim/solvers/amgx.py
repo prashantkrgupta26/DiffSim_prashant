@@ -175,7 +175,12 @@ def amgx_solve(A, b, sym=False, tol=1e-10, maxiter=2000,
     t1 = time.perf_counter()
     slv.solve(B, X)
     t_solve = time.perf_counter() - t1
-    if slv.status not in ("success",):
+    # "not_converged" means maxiter was hit — accept the truncated iterate
+    # (it is used as a smoother in the PCD F-inner; the outer FGMRES carries
+    # the remaining residual, same as the Jacobi-CG cap_hits convention).
+    # Any other non-success status (e.g. "numerical_issues", "crashed") still
+    # raises so genuine AMGX failures surface.
+    if slv.status not in ("success", "not_converged"):
         raise RuntimeError(f"AMGX solve status: {slv.status}")
     X.download(x)
     # telemetry for the scaling harness (best-effort; ignore if unavailable)
