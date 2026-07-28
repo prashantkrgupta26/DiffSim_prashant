@@ -22,7 +22,7 @@ SMI_PID=$!
 # One solver per PROCESS (cross-leg-accumulation lesson: never share a process
 # between ladder legs). Honest rows: a non-zero RC on one leg must not mask the
 # other, so RCs are captured per leg.
-SADDLE_POINTS=3d-L7r9 SADDLE_SOLVERS=fgmres_pcd SADDLE_DEVICE=cuda:0 SADDLE_NSTEPS=5 \
+SADDLE_POINTS=3d-L7r9 SADDLE_SOLVERS=fgmres_pcd SADDLE_DEVICE=cuda:0 SADDLE_NSTEPS=3 VERBOSE=1 \
   PYTHONPATH=src:tests python tests/gpu_saddle_ladder.py
 RC_PCD=$?
 echo "LEG_RC pcd $RC_PCD"
