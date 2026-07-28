@@ -80,7 +80,7 @@ All legs: `SADDLE_ASSEMBLY=device`, branch `track-a2-strengthen`.
 | Tag | Solver | DOFs | iters/step (mean) | s/step | RC | Log |
 |-----|--------|------|--------------------|--------|-----|-----|
 | 3d-L6 | fgmres_bdiag | 1,097,344 | 602.2 | **12.648 s** | 0 | `logs/t4-3dL6-bdiag-device.log` |
-| 3d-L6 | fgmres_pcd+amgx | 1,097,344 | **DNF** (≥1560 outer @100min, step 1 not done) | **DNF** | — (running) | `logs/t4-3dL6-pcdamgx-device.log` |
+| 3d-L6 | fgmres_pcd+amgx | 1,097,344 | **DNF** (1642 outer @103min, step 1 never done) | **DNF** | SIGTERM | `logs/t4-3dL6-pcdamgx-device.log` |
 | 2d-r11 | fgmres_pcd+amgx | ~1.3M | **DIVERGES** | — | 0 (harness caught) | `logs/t4-2dr11-pcd-amgx-200.log` |
 
 **3d-L6 bdiag device-asm headline:**
@@ -92,16 +92,19 @@ All legs: `SADDLE_ASSEMBLY=device`, branch `track-a2-strengthen`.
 
 **Log:** `logs/t4-3dL6-pcdamgx-device.log`  
 **Started:** 16:32 CDT  
-**Status at 18:12 CDT (100 min elapsed):** Process still running (PID 53297); step 1 of 5 NOT YET COMPLETE.
+**Ended:** ~18:15 CDT (~103 min) — process (PID 53297) received SIGTERM ("Terminated" in log);
+step 1 of 5 NEVER COMPLETED. Not an OOM kill: the box's dmesg OOM entry maps to ~00:05 CDT
+(an earlier, unrelated run), and our process RSS was ~4.2 GB on the 62 GB box.
 
-**Measured inner-solve telemetry (from log at 100 min):**
-- 1560 F-inner AMGX calls completed
-- Total AMGX-accumulated time: 9022 s (~150 min GPU compute)
-- Average per inner-solve: 5.78 s
-- All 1560 calls correspond to step 1 only (no step completion marker in log)
+**Final measured inner-solve telemetry (from log):**
+- 1642 F-inner AMGX calls completed at termination
+- Average per inner-solve: ~5.8 s (each hitting maxiter=50 → `not_converged`)
+- All 1642 calls correspond to step 1 only (no step completion marker in log)
+- No npz written (step never completed; the existing `saddle_ladder_3d-L6_fgmres_pcd.npz`
+  dated Jul 28 00:01 is the Track A jacobi run: iters [35,37,36,35,34], 38.8 s/step)
 
-**Verdict:** pcd-amgx on 3d-L6 is NOT viable. The outer FGMRES has accumulated ≥1560 outer iterations
-(vs 35 for pcd-jacobi) without converging step 1. This is ≥44× iteration growth — compared to the
+**Verdict:** pcd-amgx on 3d-L6 is NOT viable. The outer FGMRES accumulated ≥1642 outer iterations
+(vs 35.4 for pcd-jacobi) without converging step 1. This is ≥46× iteration growth — compared to the
 kill-gate threshold of ≤2×. The AMGX F-inner (maxiter=50, BiCGStab+classical-AMG) provides a truncated
 iterate that is too poor in quality for the PCD Schur approximation at 1.1M DOF. Each AMGX inner
 "solve" hits maxiter (not_converged), so the PCD preconditioner receives a low-accuracy F-inner, and
@@ -115,8 +118,8 @@ is working, but the solve quality budget is too coarse.
 
 **Conclusion:** pcd-amgx fails the iteration-growth kill-gate at the very first (smallest) ladder
 point. GH200 submission of the pcd-amgx kit at 9.08M DOF is NOT warranted until the AMGX maxiter
-budget is tuned (or the preconditioner redesigned). The 3d-L6 pcd-amgx process was left running to
-allow natural termination but may be killed without loss — it is a confirmed negative result.
+budget is tuned (or the preconditioner redesigned). The leg is a confirmed negative result; the
+process ended (SIGTERM) at ~18:15 CDT without ever completing a single time step.
 
 #### 4.2.2 2d-r11 pcd-amgx 200-step probe — **DIVERGES (same as jacobi)**
 
@@ -146,12 +149,11 @@ Inner stats (F/Ap/Mp block applies, iters_total, cap_hits, max_exit_relres) are
 saved to the npz files under `results/saddle_ladder_*_fgmres_pcd.npz` as
 `ist_{blk}_{key}` arrays.
 
-**3d-L6 pcd-amgx (partial, from log telemetry at step 1 DNF):**
-- F-inner AMGX calls: ≥1560 (all step 1; each hits maxiter=50 → not_converged)
-- Average per F-inner AMGX call: 5.78 s (50 BiCGStab iters)
-- Total F-inner AMGX accumulated time: ≥9022 s (~150 min GPU compute)
+**3d-L6 pcd-amgx (final, from log telemetry at step-1 DNF / SIGTERM):**
+- F-inner AMGX calls: 1642 (all step 1; each hits maxiter=50 → not_converged)
+- Average per F-inner AMGX call: ~5.8 s (50 BiCGStab iters)
 - Every single call returned `not_converged` (maxiter hit as smoother mode)
-- No npz written (step not completed)
+- No npz written (step never completed)
 
 **2d-r11 pcd-amgx (from log, diverged on step 1):**
 - F-inner AMGX calls: 11784 (harness 200-restart × 60-inner budget; all step 1)
@@ -253,7 +255,7 @@ both sbatch kits after:
 
 4. **2d-r11 pcd-amgx DIVERGES** (confirmed, 2026-07-28 16:25 CDT): AMGX inner does NOT fix the 2d-r11 divergence. relres=0.41 (worse than jacobi's ~0.001) after 12000 inner iterations. Confirms the failure is structural (PCD Schur approximation quality on fine-graded 2-D mesh at Re=250), not an inner-solve issue.
 
-5. **3d-L6 pcd-amgx DNF** (confirmed negative, 2026-07-28 18:12 CDT): After 100 min wall time and ≥1560 outer FGMRES iterations, step 1 of 5 has NOT completed. AMGX BiCGStab+classical-AMG at maxiter=50 is too coarse for the PCD F-inner at 1.1M DOF 3-D velocity. Kill-gate fails: iteration growth ≥44× (vs ≤2× required). GH200 pcd-amgx submission is NOT warranted without AMGX parameter re-tuning.
+5. **3d-L6 pcd-amgx DNF** (confirmed negative, 2026-07-28; process SIGTERMed ~18:15 CDT): After ~103 min wall time and 1642 outer FGMRES iterations, step 1 of 5 never completed. AMGX BiCGStab+classical-AMG at maxiter=50 is too coarse for the PCD F-inner at 1.1M DOF 3-D velocity. Kill-gate fails: iteration growth ≥46× (vs ≤2× required). GH200 pcd-amgx submission is NOT warranted without AMGX parameter re-tuning. Termination cause is external SIGTERM ("Terminated" in log), not OOM — verdict unaffected either way.
 
 6. **3d-L6 bdiag step-2 spike**: iters [551, 801, 583, 565, 511] — step 1 (BDF1→BDF2) causes a spike to 801 outer iters; this is the well-documented transition artifact and not a solver pathology.
 
