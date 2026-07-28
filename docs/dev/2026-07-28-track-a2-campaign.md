@@ -80,35 +80,87 @@ All legs: `SADDLE_ASSEMBLY=device`, branch `track-a2-strengthen`.
 | Tag | Solver | DOFs | iters/step (mean) | s/step | RC | Log |
 |-----|--------|------|--------------------|--------|-----|-----|
 | 3d-L6 | fgmres_bdiag | 1,097,344 | 602.2 | **12.648 s** | 0 | `logs/t4-3dL6-bdiag-device.log` |
-| 3d-L6 | fgmres_pcd+amgx | 1,097,344 | PENDING | PENDING | — | `logs/t4-3dL6-pcdamgx-device.log` |
-| 2d-r11 | fgmres_pcd+amgx | ~1.3M | PENDING | PENDING | — | `logs/t4-2dr11-pcd-amgx-200.log` |
+| 3d-L6 | fgmres_pcd+amgx | 1,097,344 | **DNF** (≥1560 outer @100min, step 1 not done) | **DNF** | — (running) | `logs/t4-3dL6-pcdamgx-device.log` |
+| 2d-r11 | fgmres_pcd+amgx | ~1.3M | **DIVERGES** | — | 0 (harness caught) | `logs/t4-2dr11-pcd-amgx-200.log` |
 
 **3d-L6 bdiag device-asm headline:**
 - iters/step: 602.2 (virtually identical to 603.0 host reference — device assembly does not change iteration count, as expected)
 - **s/step: 12.648 s vs 35.6 s host-path = 2.8× wall-time reduction from device assembly alone**
 - iters by step: [551, 801, 583, 565, 511] — step 2 spike (BDF1→BDF2 transition) normal
 
-#### 4.2.1 3d-L6 pcd-amgx device-asm (PENDING)
+#### 4.2.1 3d-L6 pcd-amgx device-asm — **CATASTROPHIC: FAILED TO CONVERGE IN REASONABLE TIME**
 
-*Run in progress as of report draft. Results to be filled in when the leg completes.*
+**Log:** `logs/t4-3dL6-pcdamgx-device.log`  
+**Started:** 16:32 CDT  
+**Status at 18:12 CDT (100 min elapsed):** Process still running (PID 53297); step 1 of 5 NOT YET COMPLETE.
 
-PLACEHOLDER — to be updated.
+**Measured inner-solve telemetry (from log at 100 min):**
+- 1560 F-inner AMGX calls completed
+- Total AMGX-accumulated time: 9022 s (~150 min GPU compute)
+- Average per inner-solve: 5.78 s
+- All 1560 calls correspond to step 1 only (no step completion marker in log)
 
-#### 4.2.2 2d-r11 pcd-amgx 200-step probe (PENDING)
+**Verdict:** pcd-amgx on 3d-L6 is NOT viable. The outer FGMRES has accumulated ≥1560 outer iterations
+(vs 35 for pcd-jacobi) without converging step 1. This is ≥44× iteration growth — compared to the
+kill-gate threshold of ≤2×. The AMGX F-inner (maxiter=50, BiCGStab+classical-AMG) provides a truncated
+iterate that is too poor in quality for the PCD Schur approximation at 1.1M DOF. Each AMGX inner
+"solve" hits maxiter (not_converged), so the PCD preconditioner receives a low-accuracy F-inner, and
+the outer FGMRES must compensate with far more iterations.
 
-*Run in progress as of report draft. Results to be filled in when the leg completes.*
+**Root cause:** AMGX BiCGStab+classical-AMG at maxiter=50 is insufficient accuracy for the 3-D NS
+velocity block at Re=250. For jacobi-CG inner, the CG converges (or cap_hits a tight residual) with
+higher relative accuracy, yielding a better Schur approximation. Increasing AMGX maxiter would help
+but make each inner call proportionally more expensive. The AMG setup reuse (hierarchy already built)
+is working, but the solve quality budget is too coarse.
 
-The Track A reference had 2d-r11 fgmres_pcd (jacobi inner) DIVERGE (relres 1e-3).
-This leg tests whether the AMGX inner fixes the 2d-r11 divergence.
+**Conclusion:** pcd-amgx fails the iteration-growth kill-gate at the very first (smallest) ladder
+point. GH200 submission of the pcd-amgx kit at 9.08M DOF is NOT warranted until the AMGX maxiter
+budget is tuned (or the preconditioner redesigned). The 3d-L6 pcd-amgx process was left running to
+allow natural termination but may be killed without loss — it is a confirmed negative result.
 
-PLACEHOLDER — to be updated.
+#### 4.2.2 2d-r11 pcd-amgx 200-step probe — **DIVERGES (same as jacobi)**
+
+**Log:** `logs/t4-2dr11-pcd-amgx-200.log`  
+**Duration:** near-instant (step 1 FGMRES blew through 200 restarts × 60 inner = 12000 inner iters)  
+**Result:** `ConvergenceError: fgmres_pcd: not converged after 12000 inner iterations (200 restarts); relres=4.086e-01`
+
+The Track A reference had 2d-r11 fgmres_pcd (jacobi) DIVERGE at relres ~1e-3. This leg confirms the
+AMGX inner does NOT fix the 2d-r11 divergence — the residual is actually worse (0.41 vs ~0.001 for
+jacobi). The divergence is a structural issue with the PCD Schur approximation quality on the
+fine-graded 2-D mesh at Re=250, not an inner-solve accuracy issue.
+
+**Harness output:**
+```
+FAILED 2d-r11/fgmres_pcd: ConvergenceError: fgmres_pcd: not converged after 12000 inner
+  iterations (200 restarts); relres=4.086e-01
+  2d-r11  fgmres_pcd  -1  N/A  N/A  False
+Kill-gate: insufficient valid points for kill-gate check
+SADDLE-LADDER-OK  (harness caught the ConvergenceError as expected; RC=0)
+```
+
+**NPZ:** No npz written for the 2d-r11 pcd-amgx leg (ConvergenceError → error fallback dict with dofs=-1).
 
 ### 4.3 Inner Stats (T1 telemetry — fgmres_pcd legs)
 
 Inner stats (F/Ap/Mp block applies, iters_total, cap_hits, max_exit_relres) are
 saved to the npz files under `results/saddle_ladder_*_fgmres_pcd.npz` as
-`ist_{blk}_{key}` arrays. Specific values from the gpubox legs are listed in
-Section 4.2 once runs complete.
+`ist_{blk}_{key}` arrays.
+
+**3d-L6 pcd-amgx (partial, from log telemetry at step 1 DNF):**
+- F-inner AMGX calls: ≥1560 (all step 1; each hits maxiter=50 → not_converged)
+- Average per F-inner AMGX call: 5.78 s (50 BiCGStab iters)
+- Total F-inner AMGX accumulated time: ≥9022 s (~150 min GPU compute)
+- Every single call returned `not_converged` (maxiter hit as smoother mode)
+- No npz written (step not completed)
+
+**2d-r11 pcd-amgx (from log, diverged on step 1):**
+- F-inner AMGX calls: 11784 (harness 200-restart × 60-inner budget; all step 1)
+- Convergence: NONE — relres=0.41 after 12000 inner FGMRES iterations
+- No npz written (ConvergenceError → error fallback dict with dofs=-1)
+
+**3d-L6 pcd-jacobi reference (from existing npz `results/saddle_ladder_3d-L6_fgmres_pcd.npz`):**
+- This is the Track A run; inner_stats not present (pre-T1-telemetry run)
+- iters/step: [35, 37, 36, 35, 34], mean=35.4; s/step=38.8 s; converged=True
 
 ---
 
@@ -132,6 +184,11 @@ the host CSR transient), iters/step ~1196 (unchanged by assembly), s/step scaled
 from the gpubox 3d-L6 observation.
 
 ### 5.2 PCD-AMGX kit (device assembly + AMGX inner — REQUIRES pyamgx on nova)
+
+> **BLOCKING — DO NOT SUBMIT until gpubox 3d-L6 pcd-amgx re-run shows ≤2× iteration growth**  
+> Measured result: ≥44× outer iteration growth at 1.1M DOF (≤2× gate threshold). Submitting  
+> to GH200 at 9.08M DOF will consume node-hours and almost certainly fail the same gate.  
+> Root cause: AMGX maxiter=50 budget too coarse for 3-D NS velocity block. Tune first.
 
 File: `cluster/slurm/saddle_ladder_gh200_pcd.sbatch`
 
@@ -194,6 +251,10 @@ both sbatch kits after:
 
 3. **amgx.py not_converged fix**: AMGX reports `not_converged` (not `success`) when `maxiter` is hit. For the PCD F-inner this is the correct smoother behavior (same as Jacobi-CG `cap_hits`). The fix accepts `not_converged`; any other non-success status still raises. This was a pre-existing gap caught by the T4 unit test on gpubox.
 
-4. **2d-r11 200-step probe** (pending): the previous 2d-r11 fgmres_pcd (jacobi) diverged. This leg probes whether AMGX inner resolves the divergence. Result pending; report will be updated.
+4. **2d-r11 pcd-amgx DIVERGES** (confirmed, 2026-07-28 16:25 CDT): AMGX inner does NOT fix the 2d-r11 divergence. relres=0.41 (worse than jacobi's ~0.001) after 12000 inner iterations. Confirms the failure is structural (PCD Schur approximation quality on fine-graded 2-D mesh at Re=250), not an inner-solve issue.
 
-5. **3d-L6 bdiag step-2 spike**: iters [551, 801, 583, 565, 511] — step 1 (BDF1→BDF2) causes a spike to 801 outer iters; this is the well-documented transition artifact and not a solver pathology.
+5. **3d-L6 pcd-amgx DNF** (confirmed negative, 2026-07-28 18:12 CDT): After 100 min wall time and ≥1560 outer FGMRES iterations, step 1 of 5 has NOT completed. AMGX BiCGStab+classical-AMG at maxiter=50 is too coarse for the PCD F-inner at 1.1M DOF 3-D velocity. Kill-gate fails: iteration growth ≥44× (vs ≤2× required). GH200 pcd-amgx submission is NOT warranted without AMGX parameter re-tuning.
+
+6. **3d-L6 bdiag step-2 spike**: iters [551, 801, 583, 565, 511] — step 1 (BDF1→BDF2) causes a spike to 801 outer iters; this is the well-documented transition artifact and not a solver pathology.
+
+7. **GH200 pcd-amgx sbatch kit status**: Kit is complete and ready in `cluster/slurm/saddle_ladder_gh200_pcd.sbatch` but should NOT be submitted until AMGX maxiter budget is tuned and gpubox 3d-L6 pcd-amgx re-run shows ≤2× iteration growth vs pcd-jacobi. The bdiag kit can still be submitted independently to validate device-assembly speedup on GH200.
