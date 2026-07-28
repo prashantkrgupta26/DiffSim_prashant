@@ -71,32 +71,17 @@ def profile_case(base, refine):
               f"{el:7.1f}s", flush=True)
         return out
 
-    # Reference: the REAL production builder end-to-end (validates that the
-    # staged re-derivation below has comparable total memory behavior).
+    # Stage 1: the REAL production builder end-to-end (tree refine + 2:1
+    # balance + classify + build_mesh + constraints all inside).
     from p2r1c_thin_plate_flow_3d import build_adaptive_plate_mesh
-    stage("REAL build_adaptive(all)", lambda: build_adaptive_plate_mesh(
+    amr = stage("REAL build_adaptive(all)", lambda: build_adaptive_plate_mesh(
         base, refine, sheet, band_cells=2))
+    mesh, ret = amr["mesh"], amr["ret"]
 
-    tree = stage("build_uniform", lambda: build_uniform(base, dim=3))
-
-    def _refine_loop():
-        t = tree
-        for lvl in range(base, refine):
-            h = t.h()
-            centers = t.centers()
-            # band: cells whose center is within 2*h of the sheet surface
-            d = np.abs(sheet.psi(centers))
-            mark = d < 2.0 * h
-            if not mark.any():
-                break
-            t = refine_elements(t, np.where(mark)[0])
-            t = balance2to1(t)
-        return t
-
-    tree2 = stage("refine+balance loop", _refine_loop)
-    ret, _ic = stage("classify_shell", lambda: classify_shell_intercepted(tree2, sheet))
-    mesh = stage("build_mesh", lambda: build_mesh(ret, p=1))
-    cons = stage("build_constraints", lambda: build_constraints(mesh))
+    # Attribution by re-running the post-tree stages on the builder's outputs
+    # (their peaks attribute those stages; total-minus-these ~ tree ops).
+    mesh2 = stage("re: build_mesh", lambda: build_mesh(ret, p=1))
+    stage("re: build_constraints", lambda: build_constraints(mesh2))
     ftab = face_tables(1, 3)
     stage("extract_two_sided", lambda: extract_two_sided_surrogate(ret, sheet, ftab))
 
