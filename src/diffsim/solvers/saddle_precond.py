@@ -80,6 +80,9 @@ def make_bdiag_apply(A, ndof, device):
     N = A.shape[0]
     diag = np.asarray(A.diagonal()).copy()   # shape (N,), host numpy
 
+    # Guard: N must be divisible by ndof (N = n_nodes * ndof)
+    assert N % ndof == 0, f"N={N} not divisible by ndof={ndof}"
+
     # Identify pressure dofs: node i -> i*ndof + (ndof-1)  (= i*ndof + dim)
     # All dofs not at offset (ndof-1) within a node block are velocity dofs.
     p_mask = np.zeros(N, dtype=bool)

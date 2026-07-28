@@ -1508,9 +1508,11 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
 
         b_dev = wp.array(np.ascontiguousarray(b, np.float64),
                          dtype=wp.float64, device=device)
+        # cycles × restart bounds total inner iterations; cap at 200 to preserve default behavior
+        cycles = min(200, max(1, maxiter // 60))
         x_dev, finfo = fgmres_dev(
             op.matvec, b_dev, apply_dev, N, device,
-            tol=tol, atol=1e-13, restart=60, maxiter=200)
+            tol=tol, atol=1e-13, restart=60, maxiter=cycles)
 
         if not finfo["converged"]:
             raise ConvergenceError(

@@ -48,7 +48,6 @@ def _one_step_system():
         classify_shell_intercepted, extract_two_sided_surrogate)
     from diffsim.sbm.vector import sbm_vector_dirichlet_twosided
     from diffsim.api.ns_bricks import assemble_linear_ns
-    from diffsim.physics.poisson import gauss_points
     from diffsim.solvers.timestepping import bdf_coeffs
 
     # ---- geometry (mirrors run_flow_past defaults) -------------------------
@@ -110,7 +109,6 @@ def _one_step_system():
     bf_c = np.asarray(T_vec.T @ bf_raw)
 
     # Gauss-point field (zero initial velocity -> zero advecting field)
-    xq = gauss_points(mesh, dm.tables_by_p)
     u_pre1 = np.zeros((nfree, dim))
 
     # GP fields from zero velocity
