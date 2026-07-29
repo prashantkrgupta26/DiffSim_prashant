@@ -810,3 +810,147 @@ and comfortable on GB200 NVL4-class parts.
 | AMGX | `/work/mech-ai/baskarg/AMGX/build-arm-sm90/libamgxsh.so` (aarch64, sm_90, 134.9 MB) |
 | pyamgx | installed in `/work/mech-ai/baskarg/DiffSim/.venv-nova-arm` (cp311 linux_aarch64); source clone `/work/mech-ai/baskarg/pyamgx` |
 | Code commits | `09bd9fd` (coo_array int64 fix), `daaa78d` (3d-L7 point), `a39df45` (3d-L8 rung) — nova synced via bundles in `/work/mech-ai/baskarg/bundles/` |
+
+---
+
+## 11. A3 Strengthening Probe Round (2026-07-29) — Solve-Time Levers at 8.58M DOF
+
+**Branch:** `a3-strengthen-probes`  **Commits:** `a84308a` (knobs), `f027b3a` (cluster scripts), `95c81fc` (combo→r120)
+**Hold job:** 11777138 (RUNNING, same GH200 node) — legs via `srun --jobid=11777138 --overlap`; hold left RUNNING at round end
+**Baseline (§10.9 Leg 4):** 3d-L7 uniform, bdiag+device, restart=60, cold start — **1300.2 iters/step, 54.8 s/step** (42 ms/iter; matvec ~4 ms ⇒ ~90% of per-iter time is orthogonalization/vector-ops/launch overhead)
+
+**Round verdict up front: all five legs measured.  New engine row = restart 120 + warm-start
+extrapolation: 676.2 iters/step, 40.76 s/step (−48% iters / −26% wall vs baseline) from two
+env vars, no default changes.**
+
+### 11.1 Code Changes
+
+**A. Restart knob** (`src/diffsim/solvers/linsolve.py`, `fgmres_bdiag` branch)
+
+- `meta["saddle_restart"]` (read from `("blocktri_meta", cache_key)`) → `fgmres_dev(restart=<n>)`.
+  Cycles divisor always equals restart: `cycles = min(200, max(1, maxiter // restart))`.
+  Default 60 preserves today's output byte-for-bit.
+- Env wiring: `SADDLE_RESTART` → `gpu_saddle_ladder.py` → `run_ladder_point(saddle_restart=)` → `run_flow_past_3d/run_flow_past` → `_bdiag_meta["saddle_restart"]`.
+- Gate: 33 passed, 2 skipped (test_saddle_precond + test_saddle_ladder_cpu + test_p2r1a_thin_plate_flow).
+
+**B. Warm-start x0** (`src/diffsim/solvers/linsolve.py`, `fgmres_bdiag` branch)
+
+- Verify-first: `fgmres_dev` signature accepts `x0_dev=None` (line 300 of fgmres_dev.py — CONFIRMED).
+  `run_flow_past_3d` does NOT warm-start (x_cur starts from `np.zeros`, passed to solve_linear as `b`; no prior-step solution fed to fgmres_dev).
+- Implementation: `meta["saddle_x0"] == "extrap"` → `x0 = 2·x^n − x^{n-1}` (linear extrapolation).
+  Prior solutions stored per step in cache under `("bdiag_x_prev", key)` / `("bdiag_x_prev2", key)`.
+  First step: x0=None (cold). Second step: x0=x^n. Third+: x0 = 2x^n − x^{n-1}.
+  Implemented via residual-shift is NOT needed: `fgmres_dev` natively accepts `x0_dev`.
+  Default None = cold start, byte-identical.
+- Env wiring: `SADDLE_X0=extrap` → same pipeline as restart knob.
+- Gate: same 33/2 green.
+
+**C. Fused backend preconditioner hook (INSPECT ONLY)**
+
+The `fused` backend (linsolve.py lines 1120–1136) calls `cg_dev` or `bicgstab_dev` with only
+`diag=` (Jacobi diagonal). There is **no general `apply_dev` hook** in `krylov_dev.cg_dev` /
+`bicgstab_dev` — Jacobi is hardcoded as the only preconditioner.
+
+**Verdict: fused+bdiag needs a wiring ticket.** Not implemented this round.
+See ticket: "fused: add optional apply_dev preconditioner hook to cg_dev/bicgstab_dev".
+
+### 11.2 Measured Results (all five legs run in hold 11777138, 2026-07-29)
+
+All legs: `SADDLE_POINTS=3d-L7 SADDLE_SOLVERS=fgmres_bdiag SADDLE_ASSEMBLY=device SADDLE_NSTEPS=5`
+(P-fused: `SADDLE_SOLVERS=fused`).  P-combo used the measured restart winner r120 (script
+patched after p1/p2 landed — commit `95c81fc`).  Logs `cluster/results/a3-p*-*.log` on nova.
+
+**Runbook: `bash cluster/a3-probes/run-legs.sh <p1..p5>` inside `srun --jobid=11777138 --overlap`.**
+
+| Leg | restart | x0 | solver | iters/step (mean) | s/step | iters vs base | wall vs base |
+|-----|---------|-----|--------|-------------------|--------|---------------|--------------|
+| **Baseline** (§10.9 Leg 4) | 60 | cold | fgmres_bdiag | **1300.2** | **54.842** | — | — |
+| P-restart30 (p1) | 30 | cold | fgmres_bdiag | 1511.6 | 57.644 | **+16.3%** | +5.1% |
+| P-restart120 (p2) | 120 | cold | fgmres_bdiag | 750.6 | 43.153 | **−42.3%** | **−21.3%** |
+| P-warmstart (p3) | 60 | extrap | fgmres_bdiag | 1184.8 | 51.394 | −8.9% | −6.3% |
+| P-fused (p4) | — | cold | fused (raw Jacobi-BiCGStab) | N/A (no solver_stats hook) | 61.538 | — | +12.2% |
+| **P-combo (p5)** | **120** | **extrap** | fgmres_bdiag | **676.2** | **40.761** | **−48.0%** | **−25.7%** |
+
+Per-iteration wall (s/step ÷ iters): baseline 42.2 ms → r30 38.1 ms → r120 57.5 ms →
+combo 60.3 ms.  The wider subspace COSTS more per iteration (longer MGS recurrences), but
+the iteration cut dominates — the exact opposite of the pre-run per-iter-overhead guess.
+
+**NEW ENGINE ROW: r120 + warm-start = 676.2 iters/step, 40.76 s/step — −26% wall vs the
+campaign-baseline engine, from two env vars (`SADDLE_RESTART=120 SADDLE_X0=extrap`), no new
+defaults; both knobs opt-in and parity-gated (33 passed / 2 skipped).**
+
+### 11.3 Per-Lever Verdicts (MEASURED)
+
+**A. Restart — the headline lever: r60 was subspace-stagnating.**
+
+- r120: **−42.3% iters, −21.3% wall.**  The 1300-iteration baseline was substantially
+  restart-cycle information loss, not intrinsic conditioning — doubling the subspace cuts
+  iterations nearly in half even though each iteration gets ~36% dearer (42.2 → 57.5 ms).
+- r30: **anti-win** (+16.3% iters, +5.1% wall) — the cheaper per-iter cost (38.1 ms) cannot
+  pay for the extra restart losses.
+- The pre-run prediction (r30 wins on orthogonalization cost) was WRONG; the measured
+  mechanism is subspace stagnation at r60.  Recorded honestly.
+- Open extension (not this round): r>120 may continue the trend.  Basis memory is
+  **(2m+1)·N·8 B** (right-preconditioned FGMRES allocates BOTH V=(m+1,N) and Z=(m,N)) ≈
+  **16.5 GB at r120/8.58M** — fine at L7, a real constraint at 100M (§11.4 a4).
+
+**B. Warm-start x0=extrap — real but modest at this scale; benefit should GROW.**
+
+- Measured: −8.9% iters / −6.3% wall standalone; stacks with r120 (750.6 → 676.2 =
+  an additional −9.9% on top of r120).  The two levers compose.
+- CAVEAT (mechanism): this is a 5-step FROM-REST march — steps 1–2 fall back to zero/x^n,
+  and the impulsive start makes step-to-step deltas large, so extrapolation quality is at
+  its WORST here.  In a developed transient march (small step-to-step change) the
+  extrapolated x0 should be far closer.  **Follow-up flagged: validate warm-start on a
+  production-length developed march before banking the developed-march win.**
+
+**C. Raw fused — CONVERGED, but slower; a regime-dependence data point.**
+
+- Raw Jacobi-BiCGStab (`fused`) **converged** on the uniform-L7 8.58M saddle at
+  61.5 s/step (+12% vs baseline, +43% vs r120).  The pre-run divergence expectation was
+  wrong for THIS regime; with the earlier L6 3-step convergence, the record now reads:
+  Jacobi-BiCGStab convergence on the SBM saddle is regime-dependent, not categorically
+  impossible.
+- iters N/A: the `fused` backend does not write `_LAST_ITERS` (no solver_stats hook) — a
+  telemetry gap if fused is ever pursued.
+- Still slower than every bdiag row ⇒ **fused is not a lever at this rung.**  The wiring
+  ticket stands: "fused: add optional `apply_dev` preconditioner hook to
+  `cg_dev`/`bicgstab_dev`" (not implemented this round — probes, not projects).
+
+### 11.4 100M Budget Restatement (post-measurement)
+
+Assumptions, labeled:
+- **(a1)** iteration growth α ≈ 0.38 from the measured L6→L7 pair (602 → 1300.2 at 7.8×
+  DOFs); assumed to hold to ~100M (11.7× above L7, factor 11.7^0.38 ≈ 2.55) and to be
+  lever-independent.
+- **(a2)** per-iteration wall scales O(N) (memory-bound SpMV + vecops, single GH200).
+- **(a3)** warm-start's measured stacking (−9…−10%) persists at scale; conservative — the
+  developed-march case should be BETTER (§11.3B) but is unvalidated.
+- **(a4)** r120 behavior holds at 100M.  NOTE: right-preconditioned FGMRES allocates both
+  V=(m+1,N) and Z=(m,N), so basis memory = **(2m+1)·N·8 B**.  At r120/100M: 241×100M×8 B ≈
+  **193 GB — nearly 3× single-GH200 HBM**.  Even the DEFAULT r60 basis at 100M:
+  121×100M×8 B ≈ **96.8 GB — at the HBM ceiling by itself**, making Krylov-basis memory
+  a first-class 100M design driver.  Mitigations: fp32 basis storage, shorter restart at
+  100M (r∈(30,60)), or short-recurrence methods (BiCGStab-precond) — each of which
+  strengthens the fused+bdiag `apply_dev` ticket.  The x/r/w workspace is ~4·N ≈ 3.2 GB
+  at 100M (second-order).  Named constraint, not a blocker at L7/L8.
+
+| Engine | iters/step @8.58M | ms/iter @8.58M | proj. iters @100M (a1) | proj. ms/iter @100M (a2) | proj. s/step @100M |
+|--------|-------------------|----------------|------------------------|--------------------------|---------------------|
+| Baseline r60 cold | 1300.2 | 42.2 | ~3320 | ~494 | ~1640 s ≈ 27 min |
+| **Combo r120+warm** | **676.2** | **60.3** | **~1725** | **~705** | **~1215 s ≈ 20 min** |
+
+Projected combo saving at 100M: **~26% of the step budget** — a 100-step validation march
+drops from ~46 h to ~34 h on one GH200 (subject to a1–a4, and to the L8
+unbounded-intermediate fix (§10.10) which gates any run above ~68M).
+
+### 11.5 Session Artifacts
+
+| Artifact | Path |
+|----------|------|
+| Code commits | `a84308a` (knobs A+B), `f027b3a` (cluster scripts), `95c81fc` (combo→r120) on `a3-strengthen-probes` |
+| Ship script | `cluster/a3-probes/ship-bundle.sh` |
+| Leg runner | `cluster/a3-probes/run-legs.sh <p1..p5>` |
+| Leg logs (nova) | `cluster/results/a3-p1-restart30.log`, `a3-p2-restart120.log`, `a3-p3-warmstart.log`, `a3-p4-fused.log`, `a3-p5-combo.log` (+ `-smi.log` each) |
+| Fused+bdiag ticket | "fused: add `apply_dev` hook to `cg_dev`/`bicgstab_dev`" (open) |
+| Warm-start follow-up | validate `SADDLE_X0=extrap` on a developed production-length march (benefit expected to grow; unvalidated) |

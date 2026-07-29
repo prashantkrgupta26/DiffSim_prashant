@@ -271,6 +271,87 @@ def test_ladder_assembly_none_parity():
 
 
 # ---------------------------------------------------------------------------
+# 3b. A3-parity: saddle_restart=None (default) and saddle_x0=None (default)
+#     are byte-identical to omitting the kwarg entirely.
+# ---------------------------------------------------------------------------
+
+def test_ladder_saddle_restart_none_parity():
+    """saddle_restart=None must produce the same results as omitting it entirely.
+
+    Mirrors test_solver_stats_default_parity and test_ladder_assembly_none_parity:
+    None means "don't pass the kwarg to the driver" — the driver's own default
+    (restart=60) should be used in both cases, giving bit-for-bit identical
+    iteration lists and cd_last.
+
+    Runs tiny cpu ladder point (level=4, 2 steps, fgmres_bdiag) twice.
+    """
+    from gpu_saddle_ladder import run_ladder_point
+
+    kw = dict(
+        solver="fgmres_bdiag",
+        dim=2,
+        nsteps=2,
+        level=4,
+        dt=0.01,
+        nu=0.1,
+        U_inf=1.0,
+        device="cpu",
+    )
+
+    # Reference: no saddle_restart kwarg at all
+    res_ref = run_ladder_point(tag="restart_parity_ref", **kw)
+
+    # Explicit None: must produce identical results
+    res_none = run_ladder_point(tag="restart_parity_none", saddle_restart=None, **kw)
+
+    assert np.allclose(res_ref["cd_last"], res_none["cd_last"], rtol=0, atol=1e-14), (
+        f"saddle_restart=None changed cd_last: "
+        f"{res_ref['cd_last']} vs {res_none['cd_last']}"
+    )
+    assert res_ref["iters_per_step"] == res_none["iters_per_step"], (
+        f"saddle_restart=None changed iters_per_step: "
+        f"{res_ref['iters_per_step']} vs {res_none['iters_per_step']}"
+    )
+
+
+def test_ladder_saddle_x0_none_parity():
+    """saddle_x0=None must produce the same results as omitting it entirely.
+
+    Mirrors test_ladder_saddle_restart_none_parity: None means cold-start
+    (the driver's own default), so both paths must be byte-identical.
+
+    Runs tiny cpu ladder point (level=4, 2 steps, fgmres_bdiag) twice.
+    """
+    from gpu_saddle_ladder import run_ladder_point
+
+    kw = dict(
+        solver="fgmres_bdiag",
+        dim=2,
+        nsteps=2,
+        level=4,
+        dt=0.01,
+        nu=0.1,
+        U_inf=1.0,
+        device="cpu",
+    )
+
+    # Reference: no saddle_x0 kwarg at all
+    res_ref = run_ladder_point(tag="x0_parity_ref", **kw)
+
+    # Explicit None: must produce identical results
+    res_none = run_ladder_point(tag="x0_parity_none", saddle_x0=None, **kw)
+
+    assert np.allclose(res_ref["cd_last"], res_none["cd_last"], rtol=0, atol=1e-14), (
+        f"saddle_x0=None changed cd_last: "
+        f"{res_ref['cd_last']} vs {res_none['cd_last']}"
+    )
+    assert res_ref["iters_per_step"] == res_none["iters_per_step"], (
+        f"saddle_x0=None changed iters_per_step: "
+        f"{res_ref['iters_per_step']} vs {res_none['iters_per_step']}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 4. T3: 3-D assembly pass-through spy-mock verification
 # ---------------------------------------------------------------------------
 

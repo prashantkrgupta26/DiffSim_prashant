@@ -312,6 +312,8 @@ def run_flow_past_3d(
     solver_stats=None,  # optional list to append per-step iteration counts (A2 ladder)
     pcd_inner="jacobi",  # (T4) PCD F-block inner-solve backend: "jacobi" | "amgx"
     pcd_ap_inner="jacobi",  # (T5) PCD Ap-block inner-solve backend: "jacobi" | "amgx"
+    saddle_restart=None,  # A3 knob A: FGMRES restart length; None => default 60
+    saddle_x0=None,       # A3 knob B: warm-start mode; "extrap" | None (cold)
 ):
     """Run 3-D flow past a finite thin plate with transient BDF2 march.
 
@@ -491,8 +493,13 @@ def run_flow_past_3d(
     _pcd_cache = {"ndof": ndof}   # carry ndof for fgmres_bdiag (blocktri_meta slot)
     _pcd_last_order = None        # track when to rebuild pcd_meta (sigma change)
     if mono_solver == "fgmres_bdiag":
-        # fgmres_bdiag reads ndof via ("blocktri_meta", cache_key)
-        _pcd_cache[("blocktri_meta", "ns3d")] = {"ndof": ndof}
+        # fgmres_bdiag reads ndof (and A3 knobs) via ("blocktri_meta", cache_key)
+        _bdiag_meta = {"ndof": ndof}
+        if saddle_restart is not None:
+            _bdiag_meta["saddle_restart"] = int(saddle_restart)
+        if saddle_x0 is not None:
+            _bdiag_meta["saddle_x0"] = saddle_x0
+        _pcd_cache[("blocktri_meta", "ns3d")] = _bdiag_meta
 
     # ---- BDF2 march ---------------------------------------------------------
     x_cur = np.zeros(nfree * ndof)

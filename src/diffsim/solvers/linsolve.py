@@ -1504,7 +1504,19 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         # PSPG-stabilized pressure block (with a 1e-12 relative floor on |d_p|
         # so near-zero pressure pivots do not amplify noise).
         # CSR construction mirrors the "fused" backend pattern; the outer
-        # Krylov is fgmres_dev (device-resident flexible GMRES, restart=60).
+        # Krylov is fgmres_dev (device-resident flexible GMRES, restart configurable via saddle_restart meta (default 60)).
+        #
+        # A3 knob A — restart: opt-in via meta["saddle_restart"] (set by the
+        # driver from SADDLE_RESTART env) or the "saddle_restart" cache entry.
+        # Default 60 is bit-for-bit identical to the prior hardcoded value.
+        # cycles divisor always equals restart so the total-iteration cap is
+        # consistent regardless of restart length.
+        #
+        # A3 knob B — warm-start x0: opt-in via meta["saddle_x0"] = "extrap".
+        # The driver stores the last two solution vectors in the cache under
+        # ("bdiag_x_prev", cache_key) and ("bdiag_x_prev2", cache_key).
+        # x0 = 2*x^n - x^{n-1} (linear extrapolation); first two steps fall
+        # back to x^n or zero.  Default None = cold start, byte-identical.
         from ..assembly.operators import CSROperator
         from .fgmres_dev import fgmres_dev
         from .saddle_precond import make_bdiag_apply
@@ -1516,17 +1528,39 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         meta = (cache or {}).get(("blocktri_meta", cache_key), {})
         ndof = meta.get("ndof", 3)
 
+        # A3 knob A: restart length (opt-in, default 60)
+        _restart = int(meta.get("saddle_restart", 60))
+
         op = CSROperator(A, device)
         apply_dev = make_bdiag_apply(A, ndof, device)
         N = A.shape[0]
 
         b_dev = wp.array(np.ascontiguousarray(b, np.float64),
                          dtype=wp.float64, device=device)
-        # cycles × restart bounds total inner iterations; cap at 200 to preserve default behavior
-        cycles = min(200, max(1, maxiter // 60))
+        # cycles × restart bounds total inner iterations; divisor == restart
+        cycles = min(200, max(1, maxiter // _restart))
+
+        # A3 knob B: warm-start initial guess (opt-in via saddle_x0="extrap")
+        _x0_mode = meta.get("saddle_x0")
+        x0_dev = None
+        if _x0_mode == "extrap" and cache is not None and cache_key is not None:
+            _xn = cache.get(("bdiag_x_prev", cache_key))   # x^n (last step)
+            _xn1 = cache.get(("bdiag_x_prev2", cache_key)) # x^{n-1}
+            if _xn is not None and _xn1 is not None:
+                # linear extrapolation: x0 = 2*x^n - x^{n-1}
+                x0_np = 2.0 * _xn - _xn1
+                x0_dev = wp.array(np.ascontiguousarray(x0_np, np.float64),
+                                  dtype=wp.float64, device=device)
+            elif _xn is not None:
+                # only one prior step: use x^n as initial guess
+                x0_dev = wp.array(np.ascontiguousarray(_xn, np.float64),
+                                  dtype=wp.float64, device=device)
+            # else: first step — cold start (x0_dev stays None)
+
         x_dev, finfo = fgmres_dev(
             op.matvec, b_dev, apply_dev, N, device,
-            tol=tol, atol=1e-13, restart=60, maxiter=cycles)
+            tol=tol, atol=1e-13, restart=_restart, maxiter=cycles,
+            x0_dev=x0_dev)
 
         if not finfo["converged"]:
             raise ConvergenceError(
@@ -1537,6 +1571,15 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         # Publish iteration count to the module sentinel so the return_result
         # wrapper (which calls us without return_result=True) can surface it.
         _LAST_ITERS[0] = finfo["inner"]
+
+        # A3 knob B: store solution for next-step warm start (no-op when
+        # saddle_x0 is not "extrap" — cache keys unused in that case).
+        if _x0_mode == "extrap" and cache is not None and cache_key is not None:
+            _xn_cur = x_dev.numpy()
+            _xn_old = cache.get(("bdiag_x_prev", cache_key))
+            if _xn_old is not None:
+                cache[("bdiag_x_prev2", cache_key)] = _xn_old
+            cache[("bdiag_x_prev", cache_key)] = _xn_cur
 
         return x_dev.numpy()
 
