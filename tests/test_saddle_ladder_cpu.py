@@ -346,3 +346,72 @@ def test_ladder_assembly_passthrough_3d():
     assert received_calls_none == ["<NOT PASSED>"], (
         f"assembly should not be forwarded when omitted, but received: {received_calls_none}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. T5: pcd_ap_inner pass-through spy-mock verification
+# ---------------------------------------------------------------------------
+
+def test_ladder_pcd_ap_inner_passthrough():
+    """run_ladder_point with pcd_ap_inner="amgx" pass-through — mock-only spy
+    verification that the kwarg is forwarded to run_flow_past (2-D driver),
+    and that pcd_ap_inner=None is NOT forwarded.
+
+    Mirrors test_ladder_device_assembly_cpu sub-check (a) exactly, but for
+    the T5 pcd_ap_inner kwarg.
+    """
+    import unittest.mock as mock
+    import p2r1a_thin_plate_flow as _drv
+    from gpu_saddle_ladder import run_ladder_point
+
+    # (a) Verify pcd_ap_inner="amgx" is forwarded to run_flow_past ------------
+    received_ap = []
+
+    def _spy_ap(**kw):
+        received_ap.append(kw.get("pcd_ap_inner", "<NOT PASSED>"))
+        return {"cd": np.array([1.0, 1.0])}
+
+    with mock.patch.object(_drv, "run_flow_past", side_effect=_spy_ap):
+        run_ladder_point(
+            tag="spy_ap",
+            solver="fgmres_pcd",
+            dim=2,
+            nsteps=1,
+            level=3,
+            dt=0.01,
+            nu=0.1,
+            U_inf=1.0,
+            device="cpu",
+            pcd_ap_inner="amgx",
+        )
+
+    assert received_ap == ["amgx"], (
+        f"pcd_ap_inner='amgx' was not forwarded to run_flow_past; "
+        f"received: {received_ap}"
+    )
+
+    # (b) Verify pcd_ap_inner is NOT forwarded when None (default) ------------
+    received_none = []
+
+    def _spy_none(**kw):
+        received_none.append(kw.get("pcd_ap_inner", "<NOT PASSED>"))
+        return {"cd": np.array([1.0, 1.0])}
+
+    with mock.patch.object(_drv, "run_flow_past", side_effect=_spy_none):
+        run_ladder_point(
+            tag="spy_ap_none",
+            solver="fgmres_pcd",
+            dim=2,
+            nsteps=1,
+            level=3,
+            dt=0.01,
+            nu=0.1,
+            U_inf=1.0,
+            device="cpu",
+            # pcd_ap_inner omitted (default behavior)
+        )
+
+    assert received_none == ["<NOT PASSED>"], (
+        f"pcd_ap_inner should not be forwarded when omitted; "
+        f"received: {received_none}"
+    )

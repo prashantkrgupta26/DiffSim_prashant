@@ -144,7 +144,7 @@ ALL_POINTS = [LADDER_2D_R9, LADDER_2D_R11, LADDER_3D_L6, LADDER_3D_L7R9]
 # ---------------------------------------------------------------------------
 
 def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
-                     pcd_inner=None, **cfg):
+                     pcd_inner=None, pcd_ap_inner=None, **cfg):
     """March nsteps of the MONOLITHIC driver and capture per-step iteration counts.
 
     Parameters
@@ -168,6 +168,11 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
         PCD F-block (velocity) inner-solve backend: "jacobi" | "amgx" | None.
         None (default) omits the kwarg, preserving the driver's own default
         ("jacobi"). Set via env SADDLE_PCD_INNER.  Only relevant for
+        solver="fgmres_pcd"; ignored by bdiag/cudss/etc.
+    pcd_ap_inner : str or None
+        PCD Ap-block (pressure Laplacian) inner-solve backend: "jacobi" | "amgx" | None.
+        None (default) omits the kwarg, preserving the driver's own default
+        ("jacobi"). Set via env SADDLE_PCD_AP_INNER.  Only relevant for
         solver="fgmres_pcd"; ignored by bdiag/cudss/etc.
     **cfg :
         Additional kwargs forwarded to the driver (level, refine_to, nu, dt, etc.).
@@ -200,6 +205,8 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
         asm_kw = {} if assembly is None else {"assembly": assembly}
         # pcd_inner pass-through: only forward when explicitly set (T4 AMGX route)
         pcd_kw = {} if pcd_inner is None else {"pcd_inner": pcd_inner}
+        # pcd_ap_inner pass-through: only forward when explicitly set (T5 AMG-on-Ap)
+        pcd_ap_kw = {} if pcd_ap_inner is None else {"pcd_ap_inner": pcd_ap_inner}
 
         t0 = time.time()
         res = run_flow_past(
@@ -208,6 +215,7 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
             solver_stats=stats,
             **asm_kw,
             **pcd_kw,
+            **pcd_ap_kw,
             **kw,
         )
         elapsed = time.time() - t0
@@ -245,6 +253,8 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
         asm_kw = {} if assembly is None else {"assembly": assembly}
         # pcd_inner pass-through: only forward when explicitly set (T4 AMGX route)
         pcd_kw = {} if pcd_inner is None else {"pcd_inner": pcd_inner}
+        # pcd_ap_inner pass-through: only forward when explicitly set (T5 AMG-on-Ap)
+        pcd_ap_kw = {} if pcd_ap_inner is None else {"pcd_ap_inner": pcd_ap_inner}
 
         t0 = time.time()
         res = run_flow_past_3d(
@@ -253,6 +263,7 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
             solver_stats=stats,
             **asm_kw,
             **pcd_kw,
+            **pcd_ap_kw,
             **kw,
         )
         elapsed = time.time() - t0
@@ -401,6 +412,11 @@ if __name__ == "__main__":
     _pcd_inner_env = os.environ.get("SADDLE_PCD_INNER", "").strip()
     PCD_INNER = _pcd_inner_env if _pcd_inner_env else None
 
+    # SADDLE_PCD_AP_INNER: "amgx" | "jacobi" => PCD Ap-block inner-solve backend (T5).
+    # unset (or empty) => None, which preserves the driver's default ("jacobi").
+    _pcd_ap_inner_env = os.environ.get("SADDLE_PCD_AP_INNER", "").strip()
+    PCD_AP_INNER = _pcd_ap_inner_env if _pcd_ap_inner_env else None
+
     # SADDLE_POINTS: comma-separated subset of point tags to run in this process.
     # Used to run each ladder point in a SEPARATE PROCESS (the brief requirement:
     # a single-process multi-leg ladder previously accumulated cross-leg memory
@@ -418,6 +434,7 @@ if __name__ == "__main__":
 
     print(f"[saddle-ladder] device={DEVICE}  solvers={SOLVERS}  "
           f"nsteps={NSTEPS}  assembly={ASSEMBLY}  pcd_inner={PCD_INNER}  "
+          f"pcd_ap_inner={PCD_AP_INNER}  "
           f"points={[p['tag'] for p in ACTIVE_POINTS]}",
           flush=True)
     print("=" * 78, flush=True)
@@ -437,6 +454,7 @@ if __name__ == "__main__":
                     device=DEVICE,
                     assembly=ASSEMBLY,
                     pcd_inner=PCD_INNER,
+                    pcd_ap_inner=PCD_AP_INNER,
                     **{k: v for k, v in point.items()
                        if k not in ("tag", "dim", "nsteps")},
                 )

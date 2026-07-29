@@ -219,11 +219,12 @@ class _ScalarMassBrick(CEquation):
                                               * fe_N(Ntab, fe, b) * detJxW)
 
 
-def build_pcd_meta(dm, nu, sigma, p_pin=None, inner="jacobi"):
+def build_pcd_meta(dm, nu, sigma, p_pin=None, inner="jacobi",
+                   ap_inner="jacobi"):
     """Assemble the pressure-space PCD operators ONCE per mesh from ``dm``.
 
     Returns ``meta = {"ndof", "dim", "Mp", "Ap", "sigma", "nu", "p_pin",
-    "inner"}``
+    "inner", "ap_inner"}``
     where
 
       Mp : scalar pressure MASS   INT q p dV   (constrained T^T M T)
@@ -246,6 +247,19 @@ def build_pcd_meta(dm, nu, sigma, p_pin=None, inner="jacobi"):
     in BOTH modes (they are the SPD pressure-space solves and are unaffected by
     this task by design).  ``inner`` is a cheap flag on the meta dict; the
     per-mesh operator assembly (Mp, Ap) is identical either way.
+
+    ``ap_inner`` (Task T5): the Ap-block (pressure Laplacian) inner-solve
+    backend.  ``"jacobi"`` (default) = today's Jacobi-CG on Ap, BIT-FOR-BIT
+    unchanged.  ``"amgx"`` routes the Ap-inner through AMGX PCG+classical-AMG
+    on the ALREADY-PINNED scalar Ap (sym=True — Ap is SPD after the pin; the
+    constant-pressure nullspace is removed by the same pin the saddle uses).
+    Ap sparsity is CONSTANT across steps (build_pcd_meta builds Ap once per
+    mesh; the AMG hierarchy is built exactly once per run and reused via the
+    setup-reuse path in amgx.py).  The AMGX singleton key (True, 1e-4, 200)
+    is DISTINCT from the F-inner key (False, 1e-4, 50) — no singleton thrash
+    even when both are live simultaneously (per the CAVEAT in amgx.py).
+    Stats feed the T1 schema for the Ap block (iters from last_solve_stats,
+    cap_hits=0 convention matching the F-amgx path).
 
     ``p_pin`` (optional): the monolithic pressure-pin dof index.  CONSTRAINT
     on Ap (MEASURED, root-caused): the pressure STIFFNESS Ap is a pure NEUMANN
@@ -273,9 +287,12 @@ def build_pcd_meta(dm, nu, sigma, p_pin=None, inner="jacobi"):
     if inner not in ("jacobi", "amgx"):
         raise ValueError(
             f"build_pcd_meta: inner must be 'jacobi' or 'amgx', got {inner!r}")
+    if ap_inner not in ("jacobi", "amgx"):
+        raise ValueError(
+            f"build_pcd_meta: ap_inner must be 'jacobi' or 'amgx', got {ap_inner!r}")
     return {"ndof": ndof, "dim": dim, "Mp": Mp, "Ap": Ap,
             "sigma": float(sigma), "nu": float(nu),
-            "p_pin_local": p_pin_local, "inner": inner}
+            "p_pin_local": p_pin_local, "inner": inner, "ap_inner": ap_inner}
 
 
 def _pin_symmetric(M, i):
@@ -356,9 +373,14 @@ def make_pcd_apply(A, meta, device, stats=None):
     # Task T2: F-block (velocity) inner-solve backend.  "jacobi" (default) =
     # Jacobi-CG through the device Krylov stack, bit-for-bit today's behavior.
     # "amgx" = AMGX algebraic multigrid on the EXTRACTED velocity sub-CSR F
-    # (already extracted ONCE above — never the raw saddle).  Ap/Mp are ALWAYS
-    # Jacobi-CG (SPD pressure solves; unchanged by this task, by design).
+    # (already extracted ONCE above — never the raw saddle).
     inner = meta.get("inner", "jacobi")
+    # Task T5: Ap-block (pressure Laplacian) inner-solve backend.  "jacobi"
+    # (default) = Jacobi-CG on the pinned Ap, BIT-FOR-BIT today's behavior.
+    # "amgx" = AMGX PCG+classical-AMG on the ALREADY-PINNED scalar Ap (sym=True
+    # — Ap is SPD after the standard Cahouet-Chabard pin; the singleton key
+    # (True, 1e-4, 200) is distinct from the F-inner key (False, 1e-4, 50)).
+    ap_inner = meta.get("ap_inner", "jacobi")
 
     # device operators + Jacobi diagonals (guard zeros / sign for robustness)
     opF = CSROperator(F, device)
@@ -469,6 +491,47 @@ def make_pcd_apply(A, meta, device, stats=None):
                 rec["max_exit_relres"] = rr
         return x_
 
+    # Task T5: AMGX Ap-inner budget.  200 iterations is generous for a PCG
+    # + classical-AMG on the SCALAR pressure Laplacian (SPD, M-matrix-like
+    # after the Cahouet-Chabard pin) — expected O(10) iterations.
+    # Key (True, 1e-4, 200) is DISTINCT from the F-inner key (False, 1e-4, 50).
+    _AMGX_AP_MAX = 200
+
+    def _amgx_Ap(y):
+        """AMGX Ap-inner: PCG + classical-AMG on the ALREADY-PINNED scalar Ap
+        (sym=True — the pin makes Ap SPD; classical-AMG is the canonical Ap
+        solver).  Ap is CONSTANT across steps (built once per mesh in
+        build_pcd_meta; the AMG hierarchy is built exactly once per run and
+        reused via amgx.py's setup-reuse).  Stats fed in the T1 schema:
+        iters from last_solve_stats() keyed by (True, 1e-4, 200),
+        cap_hits=0 convention (AMGX truncates internally; we accept the
+        iterate as a smoother; the outer FGMRES carries the remaining
+        residual)."""
+        if not np.any(y):
+            return np.zeros_like(y)
+        # module-level shim (monkeypatchable on CPU; imports pyamgx lazily
+        # on the GPU path only) — passed the SCALAR pinned Ap, NEVER the
+        # raw saddle.  Shape: (n_pressure_nodes, n_pressure_nodes).
+        x_ = amgx_solve(Ap, y, sym=True, tol=_INNER_TOL, maxiter=_AMGX_AP_MAX)
+        if stats is not None:
+            rec = stats["Ap"]
+            rec["applies"] += 1
+            it, rr = 0, 0.0
+            try:
+                from .amgx import last_solve_stats
+                key = ("singleton", True, float(_INNER_TOL), int(_AMGX_AP_MAX))
+                s = last_solve_stats().get(key)
+                if s is not None:
+                    it = int(s.get("iterations") or 0)
+                    rr = float(s.get("residual") or 0.0)
+            except Exception:
+                pass
+            rec["iters_total"] += it
+            # cap_hits=0 convention (same as F-amgx path).
+            if rr > rec["max_exit_relres"]:
+                rec["max_exit_relres"] = rr
+        return x_
+
     def _solve_F(y):
         """Dispatch the F-block (velocity) inner solve by the meta ``inner``
         flag: Jacobi-CG (default) or AMGX on the extracted velocity block."""
@@ -476,13 +539,20 @@ def make_pcd_apply(A, meta, device, stats=None):
             return _amgx_F(y)
         return _cg(opF, y, dF, _INNER_TOL, _INNER_MAX, blk="F")
 
+    def _solve_Ap(y):
+        """Dispatch the Ap-block (pressure Laplacian) inner solve by the meta
+        ``ap_inner`` flag: Jacobi-CG (default) or AMGX on the pinned Ap."""
+        if ap_inner == "amgx":
+            return _amgx_Ap(y)
+        return _cg(opAp, y, dAp, _INNER_TOL, _INNER_MAX, blk="Ap")
+
     def _apply_host(r):
         r_u = r[u_ids]
         r_p = r[p_ids]
         # Schur:  z_p = sigma Ap^{-1} r_p + nu Mp^{-1} r_p   (Cahouet-Chabard).
         # Ap in meta is already PINNED (SPD) when p_pin was supplied, so the
-        # Jacobi-CG on Ap is well-posed (a singular Neumann Ap breaks CG).
-        z_p = (sigma * _cg(opAp, r_p, dAp, _INNER_TOL, _INNER_MAX, blk="Ap")
+        # inner solve on Ap is well-posed (a singular Neumann Ap breaks CG).
+        z_p = (sigma * _solve_Ap(r_p)
                + nu * _cg(opMp, r_p, dMp, _INNER_TOL, _INNER_MAX, blk="Mp"))
         if p_pin_local is not None:
             # the saddle pins this pressure dof to an identity row; make the
