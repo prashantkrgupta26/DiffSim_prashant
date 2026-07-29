@@ -541,7 +541,11 @@ def _assemble_csr(asm, aq, dq, fq, nu, sigma):
 def test_ae_batch_parity_identity(coloring, device):
     """Identity-T uniform mesh: multi-batch Ae assembly (forced via a
     tiny _ae_batch) produces a BIT-IDENTICAL CSR (indptr/indices/data)
-    and rhs vs the whole-bin path.  Both colored and uncolored scatter."""
+    and rhs vs the whole-bin path.  Only the UNCOLORED scatter takes the
+    batched path (assemble() batches node_mode + identity-T-uncolored);
+    the coloring=True case asserts _ae_batch is INERT there (the colored
+    scatter reads Ae through non-contiguous whole-bin slot maps and
+    stays whole-bin) and serves as a bit-identical regression check."""
     dm, aq, dq, fq = _setup(3, 3, device)
     nu, sigma = 0.05, 20.0
     ref = DeviceNSAssembler(dm, coloring=coloring)
@@ -549,6 +553,11 @@ def test_ae_batch_parity_identity(coloring, device):
     ne = ref._bins[0][2]
     asm = DeviceNSAssembler(dm, coloring=coloring)
     asm._ae_batch = max(1, ne // 4)          # force >=4 batches
+    # assert which path assemble() takes (mirrors its dispatch condition)
+    batched = asm.node_mode or (asm._identity_T and not asm.coloring)
+    assert batched == (not coloring), (
+        "batched-Ae dispatch must cover identity-T-uncolored only; the "
+        "colored scatter stays whole-bin")
     A_b, b_b = _assemble_csr(asm, aq, dq, fq, nu, sigma)
     assert np.array_equal(A_ref.indptr, A_b.indptr)
     assert np.array_equal(A_ref.indices, A_b.indices)

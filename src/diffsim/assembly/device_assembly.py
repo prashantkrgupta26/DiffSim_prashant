@@ -272,9 +272,12 @@ NODE_PATTERN_AUTO_ENTRIES = 2 * 10 ** 8
 # bound: it caps the transient at the same order as the per-step
 # scatter-batch launch note (~2 GB at full res) while leaving ample
 # headroom under 95 GiB HBM for the persistent CSR/solver state; the
-# derived batch element count is AE_BATCH_BYTES // (npair * 8).  At all
-# existing (toy/mid) scales one batch covers the whole bin, so the
-# launch/scatter sequence is byte-for-byte the pre-W1 path.
+# derived batch element count is AE_BATCH_BYTES // (npair * 8) —
+# 262,144 elements at npair = 1024 (3-D NS hex).  SINGLE-BATCH scales
+# (ne <= that count) keep the launch/scatter sequence byte-for-byte the
+# pre-W1 path; larger meshes (e.g. 3d-L6/L7 node_mode) now run multiple
+# batches — functionally identical (bit-identical CSR, parity-gated),
+# just more launches.
 # ---------------------------------------------------------------------
 AE_BATCH_BYTES = 2 * 2 ** 30            # ~2 GiB per Ae element-block batch
 
