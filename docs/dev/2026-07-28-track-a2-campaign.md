@@ -891,7 +891,8 @@ defaults; both knobs opt-in and parity-gated (33 passed / 2 skipped).**
 - The pre-run prediction (r30 wins on orthogonalization cost) was WRONG; the measured
   mechanism is subspace stagnation at r60.  Recorded honestly.
 - Open extension (not this round): r>120 may continue the trend.  Basis memory is
-  (m+1)·N·8 B ≈ 8.3 GB at r120/8.58M — fine at L7, a real constraint at 100M (§11.4 a4).
+  **(2m+1)·N·8 B** (right-preconditioned FGMRES allocates BOTH V=(m+1,N) and Z=(m,N)) ≈
+  **16.5 GB at r120/8.58M** — fine at L7, a real constraint at 100M (§11.4 a4).
 
 **B. Warm-start x0=extrap — real but modest at this scale; benefit should GROW.**
 
@@ -925,9 +926,14 @@ Assumptions, labeled:
 - **(a2)** per-iteration wall scales O(N) (memory-bound SpMV + vecops, single GH200).
 - **(a3)** warm-start's measured stacking (−9…−10%) persists at scale; conservative — the
   developed-march case should be BETTER (§11.3B) but is unvalidated.
-- **(a4)** r120 behavior holds at 100M.  NOTE: r120 basis memory at 100M ≈ 121×100M×8 B ≈
-  **97 GB — exceeds single-GH200 HBM headroom**; the 100M engine may need r∈(60,120) or
-  basis chunking.  Named constraint, not a blocker at L7/L8.
+- **(a4)** r120 behavior holds at 100M.  NOTE: right-preconditioned FGMRES allocates both
+  V=(m+1,N) and Z=(m,N), so basis memory = **(2m+1)·N·8 B**.  At r120/100M: 241×100M×8 B ≈
+  **193 GB — nearly 3× single-GH200 HBM**.  Even the DEFAULT r60 basis at 100M:
+  121×100M×8 B ≈ **96.8 GB — at the HBM ceiling by itself**, making Krylov-basis memory
+  a first-class 100M design driver.  Mitigations: fp32 basis storage, shorter restart at
+  100M (r∈(30,60)), or short-recurrence methods (BiCGStab-precond) — each of which
+  strengthens the fused+bdiag `apply_dev` ticket.  The x/r/w workspace is ~4·N ≈ 3.2 GB
+  at 100M (second-order).  Named constraint, not a blocker at L7/L8.
 
 | Engine | iters/step @8.58M | ms/iter @8.58M | proj. iters @100M (a1) | proj. ms/iter @100M (a2) | proj. s/step @100M |
 |--------|-------------------|----------------|------------------------|--------------------------|---------------------|

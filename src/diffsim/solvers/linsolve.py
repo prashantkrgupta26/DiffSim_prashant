@@ -1504,7 +1504,7 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         # PSPG-stabilized pressure block (with a 1e-12 relative floor on |d_p|
         # so near-zero pressure pivots do not amplify noise).
         # CSR construction mirrors the "fused" backend pattern; the outer
-        # Krylov is fgmres_dev (device-resident flexible GMRES, restart=60).
+        # Krylov is fgmres_dev (device-resident flexible GMRES, restart configurable via saddle_restart meta (default 60)).
         #
         # A3 knob A — restart: opt-in via meta["saddle_restart"] (set by the
         # driver from SADDLE_RESTART env) or the "saddle_restart" cache entry.
