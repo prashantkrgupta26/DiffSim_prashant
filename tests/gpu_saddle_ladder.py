@@ -123,6 +123,22 @@ LADDER_3D_L6 = dict(
     **_PLATE_3D,
 )
 
+# 3-D L7 uniform (~8.6M DOF: 129^3 nodes x 4 dof/node)
+# GH200 hold session (2026-07-29): uniform mesh => no hanging nodes =>
+# identity_T => the device-assembly ChunkTable path applies (the band-refined
+# 3d-L7r9 point hits the Warp 2^31 slot-array ceiling in the
+# constraint-expansion scatter — see docs/dev/2026-07-28-track-a2-campaign.md
+# §10.2).  This point separates device-assembly-at-scale from that blocker.
+LADDER_3D_L7 = dict(
+    tag="3d-L7",
+    dim=3,
+    level=7,
+    refine_to=None,   # uniform
+    dt=_DT_3D,
+    nsteps=5,
+    **_PLATE_3D,
+)
+
 # 3-D base-L7/band-r9 (~9.24M DOF, WP0 mesh)
 # Source: gpu_gh200_ladder.py Phase 2 rung "r7b9" (base=7, refine_to=9)
 LADDER_3D_L7R9 = dict(
@@ -136,7 +152,8 @@ LADDER_3D_L7R9 = dict(
 )
 
 # Ordered ladder points
-ALL_POINTS = [LADDER_2D_R9, LADDER_2D_R11, LADDER_3D_L6, LADDER_3D_L7R9]
+ALL_POINTS = [LADDER_2D_R9, LADDER_2D_R11, LADDER_3D_L6, LADDER_3D_L7,
+              LADDER_3D_L7R9]
 
 
 # ---------------------------------------------------------------------------

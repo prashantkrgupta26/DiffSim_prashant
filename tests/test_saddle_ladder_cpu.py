@@ -415,3 +415,37 @@ def test_ladder_pcd_ap_inner_passthrough():
         f"pcd_ap_inner should not be forwarded when omitted; "
         f"received: {received_none}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. 3d-L7 uniform ladder point (GH200 hold session: identity_T device-assembly
+#    leg at ~8.6M DOF — separates device-assembly-at-scale from the
+#    constrained-scatter Warp 2^31 blocker that hit 3d-L7r9)
+# ---------------------------------------------------------------------------
+
+def test_ladder_point_3d_l7_uniform():
+    """ALL_POINTS must contain a uniform 3d-L7 point (level=7, refine_to=None).
+
+    The point must sit between 3d-L6 and 3d-L7r9 in ladder order, share the
+    Phase-2 3-D physics constants (nu=0.004, dt=0.005, U_inf=1.0), and be
+    uniform (refine_to=None) so that identity_T holds and the device-assembly
+    ChunkTable path is usable at this scale.
+    """
+    from gpu_saddle_ladder import ALL_POINTS
+
+    tags = [p["tag"] for p in ALL_POINTS]
+    assert "3d-L7" in tags, f"3d-L7 missing from ALL_POINTS tags {tags}"
+
+    p = ALL_POINTS[tags.index("3d-L7")]
+    assert p["dim"] == 3
+    assert p["level"] == 7
+    assert p["refine_to"] is None, "3d-L7 must be UNIFORM (identity_T path)"
+    assert p["nsteps"] == 5
+    assert p["dt"] == 0.005
+    assert p["nu"] == 0.004
+    assert p["U_inf"] == 1.0
+
+    # Ladder ordering: monotone problem-size ordering L6 < L7 < L7r9
+    assert tags.index("3d-L6") < tags.index("3d-L7") < tags.index("3d-L7r9"), (
+        f"3d-L7 must sit between 3d-L6 and 3d-L7r9 in ALL_POINTS order: {tags}"
+    )
