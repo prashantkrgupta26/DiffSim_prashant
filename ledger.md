@@ -131,3 +131,21 @@ level 5 -> 6: 2.13
 ```
 
 **Interpretation:** Each refinement halves `h`, and the L2 error decreases by approximately a factor of four. The measured orders are slightly above 2 but move toward the expected second-order rate, which is normal in the pre-asymptotic regime. The A3 shifted-boundary implementation therefore shows the expected approximately `O(h^2)` convergence.
+
+### A3 Explore (a) — Quadratic Basis (`p=2`)
+**Observed output:**
+
+| Level | Mesh size `h` | L2 error |
+|---:|---:|---:|
+| 4 | 0.0625 | 1.726e-04 |
+| 5 | 0.0312 | 1.423e-05 |
+| 6 | 0.0156 | 1.808e-06 |
+
+Observed convergence orders:
+
+```text
+level 4 -> 5: 3.60
+level 5 -> 6: 2.98
+```
+
+**Interpretation:** The order approaches `3.0`, as expected for quadratic elements in the L2 norm. The first interval is mildly pre-asymptotic (`3.60`), while the finer-mesh interval gives `2.98`, confirming the expected `O(h^3)` behavior. The terminal label should say the order should approach `3.0`, not `2.0`, for this `p=2` run.
