@@ -84,9 +84,9 @@ case "$LEG" in
     run_leg ;;
 
   p5-combo)
-    # best restart from p1/p2 + warm start — determined after p1+p2 land;
-    # default to restart=30 as the smaller subspace (adjust once p1/p2 are measured)
-    export SADDLE_RESTART=30
+    # best restart from p1/p2 + warm start — p2 WON (750.6 iters/43.2 s vs p1 1511.6/57.6):
+    # combo uses the measured winner restart=120
+    export SADDLE_RESTART=120
     export SADDLE_X0=extrap
     run_leg ;;
 
