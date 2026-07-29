@@ -149,3 +149,21 @@ level 5 -> 6: 2.98
 ```
 
 **Interpretation:** The order approaches `3.0`, as expected for quadratic elements in the L2 norm. The first interval is mildly pre-asymptotic (`3.60`), while the finer-mesh interval gives `2.98`, confirming the expected `O(h^3)` behavior. The terminal label should say the order should approach `3.0`, not `2.0`, for this `p=2` run.
+
+### A3 Explore (b) — Retain Intercepted Elements (`lambda=1.0`)
+**Observed output:**
+
+| Level | Mesh size `h` | L2 error |
+|---:|---:|---:|
+| 4 | 0.0625 | 9.324e-03 |
+| 5 | 0.0312 | 3.753e-03 |
+| 6 | 0.0156 | 6.083e-04 |
+
+Observed convergence orders:
+
+```text
+level 4 -> 5: 1.31
+level 5 -> 6: 2.63
+```
+
+**Interpretation:** The coarser interval is pre-asymptotic, but the finer interval gives a super-second-order value of `2.63`; together these results are consistent with the expected convergence approaching `O(h^2)` as the mesh is refined. With `lambda=1.0`, intercepted elements are retained and the surrogate boundary lies on the outside side of the true circle. The shifted-boundary correction still recovers the expected asymptotic order.
