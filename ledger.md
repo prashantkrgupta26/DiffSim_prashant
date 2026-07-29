@@ -167,3 +167,19 @@ level 5 -> 6: 2.63
 ```
 
 **Interpretation:** The coarser interval is pre-asymptotic, but the finer interval gives a super-second-order value of `2.63`; together these results are consistent with the expected convergence approaching `O(h^2)` as the mesh is refined. With `lambda=1.0`, intercepted elements are retained and the surrogate boundary lies on the outside side of the true circle. The shifted-boundary correction still recovers the expected asymptotic order.
+
+### A3 Explore (c) — Sampled `GridSDF` Geometry
+**Experiment:** Temporarily replaced the exact `Sphere` oracle with
+`GridSDF.from_oracle(Sphere((0.5, 0.5), 0.3), n=128)`, while keeping `p=1` and `lambda=1.0`.
+
+**Strict projection result:** The run stopped before solving because Newton closest-point projection failed at 8 of 80 surrogate quadrature points at level 4. The admissibility report gave `newton_ok_frac = 0.9`. This is evidence that the sampled, piecewise-linear GridSDF is less smooth than the analytical circle and does not satisfy the strict projection assumptions at every point.
+
+**Fallback result:** With the optional `max_fail_frac=0.1` projection fallback enabled, the run completed:
+
+| Level | Mesh size `h` | L2 error |
+|---:|---:|---:|
+| 4 | 0.0625 | 9.317e-03 |
+| 5 | 0.0312 | 3.791e-03 |
+| 6 | 0.0156 | 6.401e-04 |
+
+Observed orders were `1.30` and `2.57`. These are very close to the earlier exact-circle `lambda=1.0` results (`1.31`, `2.63`) at these levels, but the sampled geometry introduces projection failures and a small error change. The temporary code changes were restored after testing; this is a diagnostic result, not a permanent change to the A3 tutorial.
