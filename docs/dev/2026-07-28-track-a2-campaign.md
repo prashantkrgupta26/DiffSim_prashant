@@ -276,7 +276,8 @@ both sbatch kits after:
 - 3d-L7r9 bdiag host-asm: **DONE RC 0** — 1196.8 iters (identical to gpubox ref), 247.8 s/step (§10.4)
 - 3d-L7r9 pcd-jacobi host-asm: **DNF** (capped 2h28m, bound >29 min/step) (§10.5)
 - 3d-L7r9 pcd-jacobiF+amgx-Ap: **DNF** (4h cap, bound >48 min/step; Ap-AMG applies work at ~0.22 s — F-block is the wall) (§10.6)
-- 3d-L7 uniform bdiag device-asm: **LANDMARK RC 0** — 54.8 s/step, 14.9 GB RSS (§10.9)
+- 3d-L7 uniform bdiag device-asm: **LANDMARK RC 0** — 54.8 s/step, 14.9 GB RSS; controlled
+  same-mesh A/B vs host asm (237.6 s/step, 190.0 GB) = **4.33× / 12.8× at bit-identical iters** (§10.9)
 - 3d-L8 uniform ~68M capacity probe: failure site captured — unbounded 137.4 GB dof-indices intermediate; persistent state fits HBM (§10.10)
 - device-asm on ADAPTIVE meshes: BLOCKED (Warp 2^31 slot array limit in constraint-expansion path — §10.2)
 - **Verdict: the SUCCESS gate (9.08M pcd-jacobi outer growth ≤ ~2× AND s/step tractable)
@@ -529,7 +530,7 @@ AMGX was cloned and built for aarch64 / sm_90 using CUDA 12.4 at `/usr/local/cud
 | Item | Value |
 |------|-------|
 | Build dir | `/work/mech-ai/baskarg/AMGX/build-arm-sm90/` |
-| libamgxsh.so | 129 MB — BUILT SUCCESSFULLY |
+| libamgxsh.so | 134.9 MB (134,859,296 bytes) — BUILT SUCCESSFULLY |
 | Build time | ~8 min (8 parallel nvcc jobs) |
 | Architecture | sm_90 (GH200) |
 | Build start | 2026-07-29T05:23Z |
@@ -689,12 +690,13 @@ the edge of a single GH200, comfortable on GB200 NVL4-class hardware.
 | Leg1-host | fgmres_bdiag | 9.08M | host | 1196.8 mean [1760,1274,1025,1019,906] | 247.8 | (incl. in 1348 s leg wall) | 231.9 GB | 29,488 MiB | 0 | COMPLETE; iters identical to gpubox ref |
 | Leg2-host | fgmres_pcd | 9.08M | host | DNF (bound >29 min/step) | DNF | (CSR done ~6.5 min in) | 229.6 GB | 36,676 MiB | killed | CAPPED at 2h28m by controller |
 | Leg3-amgxAp | fgmres_pcd+amgxAp | 9.08M | host | DNF (bound >48 min/step) | DNF | (CSR done early) | 200.1 GB | 39,056 MiB | 124 | 4h timeout cap; Ap-AMG apply ~0.22 s works, F-block is the wall |
-| Leg4-L7dev | fgmres_bdiag | 8,582,400 | device | 1300.2 mean [1209,1381,1303,1308,1300] | **54.8** | (incl. in 352 s leg wall) | **14.9 GB** | 35,602 MiB | 0 | LANDMARK: 4.5× s/step, 15.6× RSS vs host at ~equal iters |
+| Leg4-L7dev | fgmres_bdiag | 8,582,400 | device | 1300.2 mean [1209,1381,1303,1308,1300] | **54.8** | (incl. in 352 s leg wall) | **14.9 GB** | 35,602 MiB | 0 | LANDMARK: same-mesh A/B vs Leg 6 — 4.33× s/step, 12.8× RSS at bit-identical iters |
+| Leg6-L7host | fgmres_bdiag | 8,582,400 | host | 1300.2 mean (bit-identical to Leg 4) | 237.6 | (incl. in 1,267 s leg wall) | 190.0 GB | 27,856 MiB | 0 | controlled A/B partner for Leg 4 (§10.9) |
 | Leg5-L8probe | fgmres_bdiag | ~67.9M | device | FAILED (probe objective met) | — | 886 s wall | 66.3 GB | 64,174 MiB persistent | harness-caught | 137.4 GB single alloc refused in chunked dof-indices phase — unbounded intermediate, NOT a capacity wall (§10.10) |
 | 100M probe | — | ~100M | — | — | — | — | — | — | — | host route IMPOSSIBLE (~2.5 TB); device route: persistent ~92 GiB @100M = single-GH200 HBM edge once the intermediate is bounded (§10.10d) |
-| AMGX build | — | — | — | — | — | 8 min | — | — | 0 | libamgxsh.so 129 MB, sm_90; pyamgx cp311 aarch64 installed + import verified |
+| AMGX build | — | — | — | — | — | 8 min | — | — | 0 | libamgxsh.so 134.9 MB, sm_90; pyamgx cp311 aarch64 installed + import verified |
 
-### 10.9 Leg 4 — 3d-L7 UNIFORM + DEVICE Assembly (bdiag) — LANDMARK
+### 10.9 Legs 4+6 — 3d-L7 UNIFORM, DEVICE vs HOST Assembly A/B (bdiag) — LANDMARK
 
 **Status:** COMPLETE — RC 0 (launched 2026-07-29T12:54:47Z, ended 13:00:39Z;
 **total leg wall 352 s**).
@@ -727,22 +729,42 @@ Logs: `cluster/results/hold-leg4-l7dev.log`, `-rss.log`, `-smi.log`.
 | RC | 0 |
 | NPZ | `results/saddle_ladder_3d-L7_fgmres_bdiag.npz` |
 
-**Host-vs-device comparison at ~8.6-9.1M DOF (bdiag, same node, same session):**
+**CONTROLLED same-mesh A/B (Leg 6 vs Leg 4 — 3d-L7 uniform, 8,582,400 DOF, bdiag,
+same node, same session; PRIMARY evidence):**
 
-| | host asm (L7r9, 9.08M) | device asm (L7 uniform, 8.58M) |
-|---|---|---|
-| s/step | 247.8 | **54.8** (4.5×) |
-| iters/step (mean) | 1196.8 | 1300.2 (~equal engine work) |
-| host RSS peak | 231.9 GB | **14.9 GB** (15.6×) |
-| leg wall | 1,348 s | **352 s** (3.8×) |
+Leg 6 (launched 14:25:38Z, ended 14:46:45Z, RC 0) reran the identical point with
+`SADDLE_ASSEMBLY` unset (host path).  Iteration counts are **bit-identical** to the
+device run — [1209, 1381, 1303, 1308, 1300] — so the pair isolates the assembly
+path exactly:
 
-At approximately equal iteration counts, the 247.8 → 54.8 s/step drop shows the
-**per-step host reassembly was the dominant per-step cost** in the host path; the
-device scatter removes it.  The 232 → 15 GB host-RSS drop confirms the host CSR
-transient is entirely bypassed.  HBM headroom datum: ~34.8 GiB at 8.58M DOF →
-~60 GiB free; naive linear scaling puts the uniform L8 rung (~67.9M DOF) at
-~275 GiB — 2.9× over the 95 GiB HBM, making the L8 capacity probe (§10.10) a
-spill/OOM-behavior measurement, not an expected-success run.
+| | Leg 6: HOST asm | Leg 4: DEVICE asm | ratio |
+|---|---|---|---|
+| s/step | 237.571 | **54.842** | **4.33×** |
+| iters/step | 1300.2 (bit-identical) | 1300.2 (bit-identical) | 1.00 |
+| host RSS peak | 190.0 GB | **14.9 GB** | **12.8×** |
+| GPU peak (SMI) | 27,856 MiB | 35,602 MiB | 0.78× (device holds assembly state) |
+| leg wall | 1,267 s | **352 s** | 3.6× |
+| Log | `hold-leg6-l7host.log` | `hold-leg4-l7dev.log` | |
+
+With the mesh, solver, and iteration trajectory held EXACTLY constant, the
+237.6 → 54.8 s/step drop is attributable purely to the assembly path:
+**per-step host reassembly was the dominant per-step cost (4.33×), and the
+190 → 15 GB host-RSS drop confirms the host CSR transient is entirely bypassed
+(12.8×).**  The uniform-mesh host footprint datum (190 GB at 8.58M DOF) also
+confirms the host transient is not an artifact of the adaptive mesh.
+
+**Secondary context — cross-mesh comparison vs the adaptive L7r9 host leg
+(CONFOUNDED: different mesh, different DOF count; superseded by the controlled
+pair above):** host asm on adaptive L7r9 (9.08M DOF, hanging-node constraints)
+measured 247.8 s/step / 231.9 GB RSS / 1,348 s leg (mean 1196.8 iters).  The
+similarity of 247.8 (adaptive) to 237.6 (uniform) s/step on the host path
+indicates the constraint handling adds only ~4% at this scale — the reassembly
+itself dominates on both meshes.
+
+HBM headroom datum: ~34.8 GiB at 8.58M DOF → ~60 GiB free; naive linear scaling
+puts the uniform L8 rung (~67.9M DOF) at ~275 GiB — 2.9× over the 95 GiB HBM,
+making the L8 capacity probe (§10.10) a spill/OOM-behavior measurement, not an
+expected-success run.
 
 ### 10.10 Leg 5 — 3d-L8 UNIFORM Capacity Probe (~68M DOF, device asm) — FAILURE SITE CAPTURED
 
@@ -757,7 +779,7 @@ Launched 2026-07-29T13:51:32Z, ended 14:06:18Z (wall 886 s), commit `a39df45`.
 | Failure site | chunked dof-indices phase (`_dof_indices_kernel_chunked` module had just compiled); preceded by `Warp CUDA error 2: out of memory (wp_alloc_device_async)` |
 | GPU persistent at attempt | 64,174 MiB (~62.7 GiB) — fits in 95 GiB HBM with ~30 GiB spare |
 | Host RSS peak | 66.3 GB (mesh build; no host CSR transient — device path) |
-| Allocation math | 16,777,216 el × (nbf·ndof)²=1024 pairs × 8 B (int64) ≈ 137.4 GB — the "chunked" path allocated the ENTIRE dof-indices intermediate in one piece |
+| Allocation math | ~16.77M active elements (137,367,584,768 / 8192 = 16,768,504 exactly; 2^24 minus plate-excised) × (nbf·ndof)²=1024 pairs × 8 B (int64) ≈ 137.4 GB — the "chunked" path allocated the ENTIRE dof-indices intermediate in one piece |
 | Log | `cluster/results/hold-leg5-l8probe.log` (full traceback) |
 
 **Interpretations (the probe's deliverable):**
@@ -783,7 +805,7 @@ and comfortable on GB200 NVL4-class parts.
 
 | Artifact | Path |
 |----------|------|
-| Leg logs | `/work/mech-ai/baskarg/DiffSim/cluster/results/hold-leg1host-*`, `hold-leg2host-*`, `hold-leg3-*`, `hold-leg4-*`, `hold-leg5-*` |
+| Leg logs | `/work/mech-ai/baskarg/DiffSim/cluster/results/hold-leg1host-*`, `hold-leg2host-*`, `hold-leg3-*`, `hold-leg4-*`, `hold-leg5-*`, `hold-leg6-*` |
 | NPZ (complete legs) | `results/saddle_ladder_3d-L7r9_fgmres_bdiag.npz`, `results/saddle_ladder_3d-L7_fgmres_bdiag.npz` (on nova) |
 | AMGX | `/work/mech-ai/baskarg/AMGX/build-arm-sm90/libamgxsh.so` (aarch64, sm_90, 134.9 MB) |
 | pyamgx | installed in `/work/mech-ai/baskarg/DiffSim/.venv-nova-arm` (cp311 linux_aarch64); source clone `/work/mech-ai/baskarg/pyamgx` |
