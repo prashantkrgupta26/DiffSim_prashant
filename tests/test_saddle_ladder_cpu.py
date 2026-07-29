@@ -449,3 +449,28 @@ def test_ladder_point_3d_l7_uniform():
     assert tags.index("3d-L6") < tags.index("3d-L7") < tags.index("3d-L7r9"), (
         f"3d-L7 must sit between 3d-L6 and 3d-L7r9 in ALL_POINTS order: {tags}"
     )
+
+
+def test_ladder_point_3d_l8_uniform_capacity():
+    """ALL_POINTS must contain a uniform 3d-L8 capacity rung (level=8).
+
+    ~68M-DOF capacity probe point (257^3 nodes x 4 dof/node) for the GH200
+    uniform-mesh device-assembly route.  nsteps=2 (capacity probe semantics,
+    not a 5-step ladder measurement).  Must be last in ladder order.
+    """
+    from gpu_saddle_ladder import ALL_POINTS
+
+    tags = [p["tag"] for p in ALL_POINTS]
+    assert "3d-L8" in tags, f"3d-L8 missing from ALL_POINTS tags {tags}"
+
+    p = ALL_POINTS[tags.index("3d-L8")]
+    assert p["dim"] == 3
+    assert p["level"] == 8
+    assert p["refine_to"] is None, "3d-L8 must be UNIFORM (identity_T path)"
+    assert p["nsteps"] == 2, "capacity rung defaults to 2 steps"
+    assert p["dt"] == 0.005
+    assert p["nu"] == 0.004
+
+    assert tags.index("3d-L8") == len(tags) - 1, (
+        f"3d-L8 must be the last (largest) ladder point: {tags}"
+    )

@@ -151,9 +151,25 @@ LADDER_3D_L7R9 = dict(
     **_PLATE_3D,
 )
 
+# 3-D L8 uniform capacity rung (~67.9M DOF: 257^3 = 16,974,593 nodes x 4 dof)
+# GH200 hold session (2026-07-29): uniform-mesh device-assembly capacity probe.
+# Leg 4 measured ~34.8 GiB HBM at 8.58M DOF; naive scaling puts this rung at
+# ~275 GiB > 95 GiB HBM — the DELIVERABLE is the spill/OOM behavior (Warp
+# mempool on coupled Grace-Hopper memory), not an expected clean pass.
+# nsteps=2 (capacity semantics); run with SADDLE_POINTS=3d-L8 only.
+LADDER_3D_L8 = dict(
+    tag="3d-L8",
+    dim=3,
+    level=8,
+    refine_to=None,   # uniform
+    dt=_DT_3D,
+    nsteps=2,
+    **_PLATE_3D,
+)
+
 # Ordered ladder points
 ALL_POINTS = [LADDER_2D_R9, LADDER_2D_R11, LADDER_3D_L6, LADDER_3D_L7,
-              LADDER_3D_L7R9]
+              LADDER_3D_L7R9, LADDER_3D_L8]
 
 
 # ---------------------------------------------------------------------------
