@@ -281,6 +281,18 @@ NODE_PATTERN_AUTO_ENTRIES = 2 * 10 ** 8
 # ---------------------------------------------------------------------
 AE_BATCH_BYTES = 2 * 2 ** 30            # ~2 GiB per Ae element-block batch
 
+# W2: constraint-expansion scatter chunk cap (ENTRIES per element-aligned
+# chunk of the per-bin slots/src/w arrays).  Each entry costs 8 B (int64
+# slot) + 8 B (f64 weight) + 4 B (int32 src) = 20 B; capping at
+# AE_BATCH_BYTES // 8 keeps the largest single array (slots int64/w f64)
+# <= 2 GiB AND well under 2^31 entries (268M << 2.1B).  Because every
+# element expands to >= (nbf*ndof)^2 entries (>= 1 master per dof), this
+# same cap also bounds the per-chunk Ae (nl^2 entries/element <= expansion
+# entries/element), so ONE cap sizes both the scatter arrays and the Ae
+# element-block transient.  The MEASURED expansion factor per bin
+# (exp_eptr[-1]/ne) sets how many elements land in each chunk.
+EXP_CHUNK_ENTRIES = AE_BATCH_BYTES // 8
+
 
 class DeviceNSAssembler:
     """Per-epoch object: symbolic pattern + slot maps once; numeric fill
@@ -431,6 +443,10 @@ class DeviceNSAssembler:
             e_of = dof_of // nl
             l_of = dof_of % nl
             src_r, src_c, w_rc, rows_e, cols_e = [], [], [], [], []
+            # per-element expansion-entry count -> offsets (W2: chunking
+            # the constraint-expansion scatter slices these arrays by
+            # element, so the boundaries must be element-aligned).
+            exp_cnt = np.empty(ne, np.int64)
             # group by element via sorted order (dof_of already grouped)
             # build per-element index lists
             order = np.argsort(e_of, kind="stable")
@@ -444,15 +460,17 @@ class DeviceNSAssembler:
                 A_, B_ = np.meshgrid(np.arange(len(sl)),
                                      np.arange(len(sl)), indexing="ij")
                 a_, b2 = A_.ravel(), B_.ravel()
+                exp_cnt[e_] = len(a_)
                 src_r.append(e_ * nl * nl + li[a_] * nl + li[b2])
                 rows_e.append(fd[a_])
                 cols_e.append(fd[b2])
                 w_rc.append(ww[a_] * ww[b2])
+            exp_eptr = np.concatenate(([0], np.cumsum(exp_cnt)))
             exp_bins.append((np.concatenate(src_r),
                              np.concatenate(w_rc),
                              np.concatenate(rows_e),
                              np.concatenate(cols_e),
-                             free_dof, m_w, dof_of))
+                             free_dof, m_w, dof_of, exp_eptr))
             rows_all.append(np.concatenate(rows_e))
             cols_all.append(np.concatenate(cols_e))
         self._exp_bins = exp_bins
@@ -464,20 +482,37 @@ class DeviceNSAssembler:
         self.indptr = K.indptr.copy()
         self.indices = K.indices.copy()
         self.nnz = K.nnz
+        # W2: the constraint-expansion scatter overflows warp's 2^31
+        # per-dimension array ceiling in the PER-BIN slots/src/w arrays,
+        # whose length is the EXPANSION-ENTRY count (ne*(nbf*ndof)^2*
+        # masters^2) — a DIFFERENT, larger quantity than the CSR nnz.
+        # At 3d-L7r9 it is 2.37B while nnz is well under 2^31, so the nnz-
+        # gated chunking auto-switch would NOT fire and the flat upload
+        # would crash.  Trigger chunking on max(nnz, max expansion entries)
+        # so the exp-chunk path engages whenever EITHER quantity crosses
+        # the ceiling.  chunking='off' past the ceiling still refuses
+        # loudly inside _resolve_chunking.
+        max_exp = 0
+        if not identity_T:
+            max_exp = max((len(eb[2]) for eb in exp_bins if eb is not None),
+                          default=0)
+        chunk_trigger = max(self.nnz, max_exp)
         # P0-2: resolve the CSR index width from the realized nnz.
-        idx_dt = self._finalize_idx_width(self.nnz)
+        idx_dt = self._finalize_idx_width(self.nnz, chunk_trigger)
         inp = self._idx_np
-        # Task #38: block-row chunk table over the realized pattern.
+        # Task #38 + W2: block-row chunk table over the realized pattern.
         # COO-path chunking supports the identity-T non-colored scatter
-        # (the only COO configuration that can meet these sizes; the
-        # weighted/colored scatters index vals_d through paths kept
-        # narrow-only by scope).
+        # AND (W2) the constraint-expansion weighted scatter (the adaptive
+        # AMR path — hanging nodes make identity_T=False; the expansion
+        # entries reach billions at 9M+ DOF, past warp's 2^31 array
+        # ceiling in BOTH vals_d and the per-bin slot/src/w arrays).  The
+        # colored scatter is still narrow-only by scope.
         if self._chunked:
-            if coloring or not identity_T:
+            if coloring:
                 raise BackendError(
-                    "chunking supports the identity-constraint, "
-                    "non-colored scatter paths only (COO or node-graph "
-                    "pattern)")
+                    "chunking supports the identity-constraint and "
+                    "constraint-expansion (non-colored) scatter paths "
+                    "only (COO or node-graph pattern)")
             self._ctab = ChunkTable(self.indptr, cap=self._chunk_cap,
                                     device=dm.device)
         # slot index per (element-pair entry): position in the CSR
@@ -499,24 +534,40 @@ class DeviceNSAssembler:
                 self._weight_bins.append(None)
                 self._src_bins.append(None)
             else:
-                src, w, rr, cc, fd, mw, dof_of = self._exp_bins[k_bin]
+                src, w, rr, cc, fd, mw, dof_of, _eptr = self._exp_bins[k_bin]
                 slots = np.asarray(K2[rr, cc]).ravel().astype(np.int64)
                 slot_bins.append(slots)
                 self._weight_bins.append(w)
                 self._src_bins.append(src)
         self._slot_bins = slot_bins
-        # device uploads.  Slot arrays index nnz-space -> widen with the
-        # CSR (inp/idx_dt); the source (src_d) and dof (gdof_d) arrays
-        # are element-block-local / dof-space and stay int32.
-        self._slots_d = [wp.array(np.ascontiguousarray(
-            s.astype(inp).ravel()), dtype=idx_dt, device=dm.device)
-            for s in slot_bins]
-        self._w_d = [None if w is None else wp.array(
-            np.ascontiguousarray(w), dtype=wp.float64, device=dm.device)
-            for w in self._weight_bins]
-        self._src_d = [None if s2 is None else wp.array(
-            np.ascontiguousarray(s2.astype(np.int32)), dtype=wp.int32,
-            device=dm.device) for s2 in self._src_bins]
+        # W2: when chunked AND constraint-expanded, the per-bin
+        # slots/src/w arrays themselves pass 2^31 entries (measured 2.37B
+        # at 3d-L7r9) — warp cannot construct the flat 1-D uploads at all.
+        # Chunk them ELEMENT-ALIGNED (a chunk covers elements [e0, e1),
+        # its slice of the element-contiguous expansion arrays) so each
+        # per-chunk array stays under the same byte/element bound as the
+        # Ae batch and the src values rebase cleanly to a batch-local Ae.
+        # Built per bin as _exp_chunks[k_bin] = list of
+        # (e0, e1, slots_d int64, src_d int32 (batch-local), w_d f64).
+        self._exp_chunks = None
+        if self._chunked and not identity_T:
+            self._build_exp_chunks(slot_bins, dm.device)
+            self._slots_d = [None] * len(slot_bins)
+            self._w_d = [None] * len(slot_bins)
+            self._src_d = [None] * len(slot_bins)
+        else:
+            # device uploads.  Slot arrays index nnz-space -> widen with
+            # the CSR (inp/idx_dt); the source (src_d) and dof (gdof_d)
+            # arrays are element-block-local / dof-space and stay int32.
+            self._slots_d = [wp.array(np.ascontiguousarray(
+                s.astype(inp).ravel()), dtype=idx_dt, device=dm.device)
+                for s in slot_bins]
+            self._w_d = [None if w is None else wp.array(
+                np.ascontiguousarray(w), dtype=wp.float64,
+                device=dm.device) for w in self._weight_bins]
+            self._src_d = [None if s2 is None else wp.array(
+                np.ascontiguousarray(s2.astype(np.int32)), dtype=wp.int32,
+                device=dm.device) for s2 in self._src_bins]
         self.vals_d = (ChunkedArray(self._ctab, wp.float64, dm.device)
                        if self._chunked
                        else wp.zeros(self.nnz, dtype=wp.float64,
@@ -535,7 +586,7 @@ class DeviceNSAssembler:
                 self._bw_d.append(None)
                 self._bsrc_d.append(None)
             else:
-                src, w, rr, cc, fd, mw, dof_of = self._exp_bins[k_bin]
+                src, w, rr, cc, fd, mw, dof_of, _eptr = self._exp_bins[k_bin]
                 gdof_bins.append(wp.array(fd.astype(np.int32),
                                           dtype=wp.int32,
                                           device=dm.device))
@@ -568,7 +619,7 @@ class DeviceNSAssembler:
                                          np.arange(color.max() + 2))
                 self._colors.append((order.astype(np.int32), bounds))
 
-    def _finalize_idx_width(self, nnz):
+    def _finalize_idx_width(self, nnz, chunk_estimate=None):
         """Resolve the concrete index dtype from the config knob + the
         realized pattern nnz.  Sets self._idx_dtype (wp) / self._idx_np
         (numpy).  Also asserts dofs (Nfull) fit int32 — always true at
@@ -579,9 +630,18 @@ class DeviceNSAssembler:
         past warp's 2^31-element array ceiling).  Chunked storage
         carries int64 global slots by construction, so chunking forces
         the WIDE index dtype; an explicit index_width='narrow' conflicts
-        and is refused."""
+        and is refused.
+
+        W2: `chunk_estimate` (default = nnz) drives the CHUNKING switch
+        separately from the index width — the constraint-expansion path
+        overflows in its per-bin arrays (expansion-entry count) while nnz
+        itself stays under the ceiling, so chunking must trigger on the
+        larger of the two.  The index dtype still keys off nnz (column
+        indices are dof-space; only chunked storage forces int64)."""
         self._idx_dtype = _resolve_idx_width(self._index_width, nnz)
-        self._chunked = _resolve_chunking(self._chunking, nnz)
+        if chunk_estimate is None:
+            chunk_estimate = nnz
+        self._chunked = _resolve_chunking(self._chunking, chunk_estimate)
         if self._chunked:
             if self._index_width == "narrow":
                 raise ConfigError(
@@ -816,6 +876,60 @@ class DeviceNSAssembler:
                             device=self.dm.device),
             n_spans=len(spans), n_rows=len(rows))
 
+    def _exp_chunk_entries(self):
+        """W2: entries per element-aligned constraint-expansion chunk.
+        Honors the `_ae_batch`-style test hook `_exp_chunk_cap` (tests
+        force a tiny cap to run the multi-chunk path at toy sizes);
+        otherwise the ~2 GiB-derived EXP_CHUNK_ENTRIES bound."""
+        cap = getattr(self, "_exp_chunk_cap", None)
+        if cap is not None:
+            return max(1, int(cap))
+        return EXP_CHUNK_ENTRIES
+
+    def _build_exp_chunks(self, slot_bins, device):
+        """W2: partition each bin's element-contiguous constraint-
+        expansion arrays (slots/src/w) into ELEMENT-ALIGNED chunks whose
+        per-chunk arrays stay < 2^31 entries and <= the ~2 GiB bound.
+
+        A chunk covers elements [e0, e1); its slice of the (already
+        element-contiguous) expansion arrays is uploaded as warp arrays.
+        `src` values are element-local offsets into the WHOLE-bin Ae
+        (e*nl*nl + ...); they are REBASED by e0*nl*nl so the scatter reads
+        the batch-local Ae [e1-e0, nl, nl].  slots stay int64 (nnz-space,
+        chunk-located in-kernel against vals_d's chunk table).  The
+        per-chunk element count is derived from the MEASURED expansion
+        factor: elements are packed greedily until the running entry count
+        would exceed the cap."""
+        cap = self._exp_chunk_entries()
+        ndof = self.ndof
+        self._exp_chunks = []
+        for k_bin, (pv, b, ne, nbf, gdof) in enumerate(self._bins):
+            src, w, rr, cc, fd, mw, dof_of, eptr = self._exp_bins[k_bin]
+            slots = slot_bins[k_bin]
+            nl = nbf * ndof
+            npair = nl * nl
+            chunks = []
+            e0 = 0
+            while e0 < ne:
+                # largest e1 with (eptr[e1]-eptr[e0]) <= cap; >= e0+1 (a
+                # single element's expansion never exceeds cap at any real
+                # scale — nl^2 * masters^2).
+                budget = eptr[e0] + cap
+                e1 = int(np.searchsorted(eptr, budget, side="right") - 1)
+                e1 = min(max(e1, e0 + 1), ne)
+                a, z = int(eptr[e0]), int(eptr[e1])
+                slots_c = np.ascontiguousarray(slots[a:z].astype(np.int64))
+                src_c = np.ascontiguousarray(
+                    (src[a:z] - e0 * npair).astype(np.int32))
+                w_c = np.ascontiguousarray(w[a:z])
+                chunks.append((
+                    e0, e1,
+                    wp.array(slots_c, dtype=wp.int64, device=device),
+                    wp.array(src_c, dtype=wp.int32, device=device),
+                    wp.array(w_c, dtype=wp.float64, device=device)))
+                e0 = e1
+            self._exp_chunks.append(chunks)
+
     def _ae_batch_for(self, npair):
         """Elements per Ae/be batch for a bin whose element matrix has
         `npair` = (nbf*ndof)^2 fp64 entries.  Honors the `_ae_batch`
@@ -908,6 +1022,51 @@ class DeviceNSAssembler:
                                       aq_v, fq_v, wp.float64(nu),
                                       wp.float64(sig2tau), be], device=d)
                     self.scatter_batch(k_bin, e0, Ae, be, nb)
+                continue
+            # W2: chunked constraint-expansion path.  The per-bin
+            # slots/src/w arrays and vals_d all pass 2^31 at adaptive
+            # scale, so the matrix scatter runs per ELEMENT-ALIGNED chunk:
+            # each chunk builds ONLY its elements' Ae ([e1-e0, nl, nl],
+            # bounded ~2 GiB) and scatters through the chunked weighted
+            # kernel (int64 slot chunk-located against vals_d's table).
+            # The rhs stays whole-bin (its expansion arrays are linear in
+            # masters, far under 2^31), so be/its weighted-vec scatter are
+            # unchanged.  Bit-identical to the unchunked weighted scatter:
+            # same per-entry w*Ae contributions, just partitioned.
+            if self._chunked and not self._identity_T:
+                scwc = _scatter_weighted_kernel_chunked()
+                for (e0, e1, slots_c, src_c, w_c) in \
+                        self._exp_chunks[k_bin]:
+                    nb = e1 - e0
+                    Ae = wp.zeros((nb, nl, nl), dtype=wp.float64, device=d)
+                    conn_v = b["conn"][e0:e1]
+                    h_v = b["h"][e0:e1]
+                    aq_v = aq[e0 * nqp:e1 * nqp]
+                    dq_v = dq[e0 * nqp:e1 * nqp]
+                    gaq_v = gaq[e0 * nqp:e1 * nqp]
+                    wp.launch(kA, dim=nb,
+                              inputs=[conn_v, h_v, b["N"], b["dN"],
+                                      b["lapN"], b["w"], aq_v, dq_v, gaq_v,
+                                      wp.float64(nu), wp.float64(sigma),
+                                      wp.float64(sig2tau),
+                                      wp.float64(s_skew), wp.int32(0), Ae],
+                              device=d)
+                    wp.launch(scwc, dim=len(w_c),
+                              inputs=[Ae.reshape((-1,)), src_c, w_c,
+                                      slots_c, self.vals_d.data,
+                                      self._ctab.bases_d,
+                                      wp.int32(self._ctab.nchunks)],
+                              device=d)
+                be = wp.zeros((ne, nl), dtype=wp.float64, device=d)
+                wp.launch(kb, dim=ne,
+                          inputs=[b["conn"], b["h"], b["N"], b["dN"],
+                                  b["w"], aq, fq, wp.float64(nu),
+                                  wp.float64(sig2tau), be], device=d)
+                scat_bw = _scatter_vec_weighted_kernel()
+                wp.launch(scat_bw, dim=len(self._exp_bins[k_bin][4]),
+                          inputs=[be.reshape((-1,)), self._bsrc_d[k_bin],
+                                  self._bw_d[k_bin], self._gdof_d[k_bin],
+                                  self.F_d], device=d)
                 continue
             # constraint-aware / colored paths: whole-bin (unchanged).
             Ae = wp.zeros((ne, nl, nl), dtype=wp.float64, device=d)
@@ -1818,6 +1977,34 @@ def _scatter_weighted_kernel(idx_dtype=wp.int32):
 
     _kernel_cache[key] = scw
     return scw
+
+
+def _scatter_weighted_kernel_chunked():
+    """W2: chunked variant of _scatter_weighted_kernel (the constraint-
+    expansion matrix scatter).  Same arithmetic as the wide (int64) flat
+    kernel — the constraint weight w[i] times the element-block value
+    vals_e[src[i]] — with the int64 global slot chunk-located before the
+    atomic (mirrors _scatter_kernel_chunked).  src[] is BATCH-LOCAL into
+    vals_e (the per-chunk element-block slice), slots[] index nnz-space."""
+    key = ("dev_scatter_w_ch",)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    @wp.kernel(module="unique")
+    def scwc(vals_e: wp.array(dtype=wp.float64),
+             src: wp.array(dtype=wp.int32),
+             w: wp.array(dtype=wp.float64),
+             slots: wp.array(dtype=wp.int64),
+             out: wp.array2d(dtype=wp.float64),
+             bases: wp.array(dtype=wp.int64),
+             nc: wp.int32):
+        i = wp.tid()
+        s = slots[i]
+        c = _chunk_of(bases, nc, s)
+        wp.atomic_add(out, c, wp.int32(s - bases[c]), w[i] * vals_e[src[i]])
+
+    _kernel_cache[key] = scwc
+    return scwc
 
 
 def _dof_indices_kernel(idx_dtype=wp.int32):
