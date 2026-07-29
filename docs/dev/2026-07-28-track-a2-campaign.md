@@ -325,3 +325,108 @@ before submitting.
 6. **3d-L6 bdiag step-2 spike**: iters [551, 801, 583, 565, 511] — step 1 (BDF1→BDF2) causes a spike to 801 outer iters; this is the well-documented transition artifact and not a solver pathology.
 
 7. **GH200 pcd kit retargeted to jacobi inner (Phase 1.5)**: `cluster/slurm/saddle_ladder_gh200_pcd.sbatch` has been updated to use pcd-jacobi (SADDLE_PCD_INNER unset). The pcd-amgx config is NOT viable without a qualitatively different AMGX config (aggregation AMG / stronger smoother) — increasing maxiter is refuted. A future amgx-config retry would require pyamgx on nova-arm (see §8). The bdiag kit can still be submitted independently to validate device-assembly speedup on GH200.
+
+---
+
+## 9. T5: AMG-on-Ap Probe (Baskar-approved interim, 2026-07-28)
+
+### 9.1 Motivation
+
+T4 inner-solve telemetry at 3d-L6 (pcd-jacobi+device, 11.732 s/step, 35.4 outers)
+identified the Ap block as the dominant inner cost: 282.6 iters/apply vs 19.7 for F
+and 20.0 for Mp (14× imbalance, zero cap hits). Ap is the scalar pressure Laplacian
+(SPD, M-matrix-like, pinned at the saddle's pin node) — the canonical target for
+classical AMG. Unlike the F-inner (which failed because classical AMG + Jacobi smoother
+is structurally ineffective on the 3-D convection-dominated nonsymmetric F block),
+Ap is symmetric and well-suited for PCG+classical-AMG.
+
+The question: does collapsing Ap iters/apply from 283 → O(10) translate to a
+measurable s/step reduction at 3d-L6?
+
+### 9.2 Implementation (commit `7a3752b`)
+
+- `build_pcd_meta(..., ap_inner="jacobi")` — new kwarg (`"jacobi"` default, bit-for-bit;
+  `"amgx"` routes Ap-inner through `amgx_solve(Ap, rhs, sym=True, tol=1e-4,
+  maxiter=200)`). Singleton key `(True, 1e-4, 200)` is distinct from F-inner key
+  `(False, 1e-4, 50)` — no singleton thrash. Ap sparsity is constant (built once per
+  mesh); AMG hierarchy built exactly once per run, reused via setup-reuse path.
+- Env plumbing: `SADDLE_PCD_AP_INNER` through ladder + both drivers.
+- Tests: routing monkeypatch (sym=True, scalar Ap shape); default-parity; skipif
+  real-AMGX test. All 31 gate tests passed (2 skipped = real-AMGX on CPU).
+
+### 9.3 Measured Results
+
+**Leg A: 3d-L6 × pcd-jacobiF-amgxAp, 5 steps, device assembly, cuda:0**
+
+Command: `SADDLE_SOLVERS=fgmres_pcd SADDLE_ASSEMBLY=device SADDLE_PCD_AP_INNER=amgx SADDLE_POINTS=3d-L6 SADDLE_NSTEPS=5`
+
+Log: `logs/t5-3dL6-pcdjacobi-amgxAp-20260728-225646-83478.log`
+
+| Metric | T4 reference (pcd-jacobi) | T5 (pcd-jacobiF-amgxAp) | Δ |
+|--------|--------------------------|--------------------------|---|
+| s/step | **11.732 s** | **13.723 s** | +1.99 s (+17% SLOWER) |
+| outers/step (mean) | 35.4 | 36.2 | +0.8 (identical) |
+| iters per step: | [35,37,36,35,34] | [35,38,37,36,35] | ~same |
+| F iters/apply | 19.7 | 19.7 | unchanged |
+| **Ap iters/apply** | **282.6** | **16.9** | **−265.7 (−94%)** |
+| Mp iters/apply | 20.0 | 20.0 | unchanged |
+| Cap hits (any block) | 0 | 0 | — |
+| Ap AMGX setup reused | — | YES (1 build, 35× reused) | — |
+| Ap AMG levels | — | 3 (3d-L6 Ap: 274,336 nodes) | — |
+
+**Verdict: NEGATIVE — AMG-on-Ap is SLOWER at 3d-L6 despite 16.7× Ap iter reduction.**
+
+Root cause: AMGX PCG setup (~0.092 s amortized but actually counted per-apply in the
+`Total Time` printout) is included in the `solve(per iteration)` timing. At 35 Ap
+applies/step, the AMGX call overhead (~0.12 s/call × 35 = 4.2 s/step) exceeds the
+Jacobi-CG time it replaces (~282 iters × cost_per_iter × 35 applies). The iteration
+collapse is real and measured, but the GPU Jacobi-CG is so fast at L6 (small block:
+274K nodes) that AMGX overhead dominates.
+
+**Horizon-pathway projection (assumption labeled):**
+At 9.08M DOF (L7r9), the Ap block is ~8× larger. Jacobi-CG Ap iter count may grow
+(preconditioning quality degrades with problem size) while AMGX setup is a one-time
+cost per run. IF the Ap iter count scales as O(n^{1/3}) with problem size, it would
+be ~2× higher at L7r9 (~566 iters/apply); the AMGX setup overhead would remain
+~0.12 s/apply, but solve time per iteration would increase with problem size. This
+suggests AMGX-Ap could break even or improve at L7r9. The lever is re-evaluated at
+9.08M scale where the Ap block is large enough for AMGX to amortize its setup cost.
+This is **an assumption**: the actual benefit depends on measured L7r9 Ap iter counts
+(not yet measured on this branch).
+
+**Leg B: 2d-r11 × pcd-jacobiF-amgxAp, 200-step early-exit probe**
+
+Command: `SADDLE_SOLVERS=fgmres_pcd SADDLE_ASSEMBLY=device SADDLE_PCD_AP_INNER=amgx SADDLE_POINTS=2d-r11 SADDLE_NSTEPS=200`
+
+Log: `logs/t5-2dr11-pcdjacobi-amgxAp-20260728-230452-84627.log`
+
+Result: **DIVERGES** — `ConvergenceError: fgmres_pcd: not converged after 12000 inner
+iterations (200 restarts); relres=1.397e-03`
+
+This confirms the 2d-r11 divergence is structural (PCD Schur approximation quality on
+the fine-graded 2-D mesh at Re=250), not an Ap inner-solve accuracy issue. The relres
+(1.4e-3) is comparable to the T4 jacobi result (~1e-3) — AMG-on-Ap gives neither
+improvement nor degradation to the structural divergence. 12052 Ap AMGX calls were
+made (1 setup, 12051 reuses) before the harness caught the ConvergenceError. No NPZ
+written (ConvergenceError path → error fallback dict).
+
+### 9.4 Summary Table
+
+| Tag | Config | Ap iters/apply | s/step | Outers | Verdict |
+|-----|--------|---------------|--------|--------|---------|
+| 3d-L6 | pcd-jacobi (T4 ref) | 282.6 | **11.732** | 35.4 | baseline |
+| 3d-L6 | pcd-jacobiF-amgxAp (T5) | **16.9** | 13.723 | 36.2 | SLOWER (+17%) at L6 |
+| 2d-r11 | pcd-jacobiF-amgxAp (T5) | — | DNF | — | DIVERGES (structural) |
+
+### 9.5 Conclusion
+
+AMG-on-Ap is the correct algorithmic direction (Ap iters/apply collapses 17×, zero cap
+hits, setup reused, AMG hierarchy stable) but the per-call AMGX overhead dominates at
+the L6 block size (274K pressure nodes). The lever may become favorable at 9.08M DOF
+(~8× larger Ap block) where Jacobi-CG would need more iterations and AMGX amortizes
+better, but this requires a direct L7r9 measurement to verify. GH200 submission of
+an Ap-amgx kit is NOT warranted at this stage without a credible L7r9 Ap iter count
+estimate showing the crossover point.
+
+The pcd-jacobi (Jacobi-CG on all three inners) remains the best-measured PCD config
+for the current campaign. Future Ap-AMG probes should target L7r9 directly.

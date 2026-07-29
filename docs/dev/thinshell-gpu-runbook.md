@@ -720,3 +720,26 @@ PYTHONPATH=src:tests .venv/bin/python tests/gpu_saddle_ladder.py
 |-----|---------------|-------|
 | `saddle_ladder_gh200.sbatch` | Added `SADDLE_ASSEMBLY=device` | bdiag leg; no pyamgx needed |
 | `saddle_ladder_gh200_pcd.sbatch` | Added `SADDLE_ASSEMBLY=device SADDLE_PCD_INNER=amgx SADDLE_NSTEPS=5` | pcd-amgx leg; REQUIRES pyamgx on nova-arm |
+
+### C.5 T5: AMG-on-Ap Probe (2026-07-28, commit `7a3752b`)
+
+**Full results:** `docs/dev/2026-07-28-track-a2-campaign.md §9`
+
+New env var: `SADDLE_PCD_AP_INNER=amgx` routes the Ap-inner (pressure Laplacian) through
+AMGX PCG+classical-AMG (sym=True, tol=1e-4, maxiter=200). Ap is SPD after the
+Cahouet-Chabard pin; singleton key (True,1e-4,200) is distinct from F-inner key.
+
+```bash
+# AMG-on-Ap probe (pcd-jacobi F, amgx Ap):
+LD_LIBRARY_PATH=/home/bglab/AMGX/build:/usr/lib/wsl/lib \
+SADDLE_POINTS=3d-L6 SADDLE_SOLVERS=fgmres_pcd SADDLE_DEVICE=cuda:0 \
+SADDLE_NSTEPS=5 SADDLE_ASSEMBLY=device SADDLE_PCD_AP_INNER=amgx \
+.venv/bin/python tests/gpu_saddle_ladder.py
+```
+
+**T5 measured verdict (gpubox, 2026-07-28):**
+- 3d-L6: Ap iters/apply 282.6 → 16.9 (−94%), but s/step 11.732 → 13.723 (+17% SLOWER).
+  AMGX PCG call overhead (~0.12 s/apply × 35 applies = 4.2 s/step) exceeds Jacobi-CG
+  savings at L6 block size. Setup reused (1 build, 35× reused per run).
+- 2d-r11: DIVERGES (structural, same as jacobi — AMG-on-Ap does not fix PCD quality).
+- **Lever is re-evaluated at 9.08M DOF where the Ap block is ~8× larger.**
