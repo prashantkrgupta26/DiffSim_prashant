@@ -40,6 +40,12 @@ _CUDSS_OPTS = ...          # lazily built by cudss_options()
 # Single-element list so it is mutable from nested call frames.
 _LAST_ITERS = [None]
 
+# Inner-stats sentinel written by fgmres_pcd after each solve and read by the
+# return_result wrapper.  Schema: {"F": {...}, "Ap": {...}, "Mp": {...}} where
+# each dict has keys applies/iters_total/cap_hits/max_exit_relres.
+# None when the last solve was not fgmres_pcd or stats were not collected.
+_LAST_INNER_STATS = [None]
+
 
 def cudss_options():
     """DirectSolverOptions with multithreaded host planning
@@ -1063,6 +1069,7 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
     if return_result:
         from .result import LinearSolveResult
         _LAST_ITERS[0] = None          # cleared before every call
+        _LAST_INNER_STATS[0] = None    # cleared before every call
         x = solve_linear(A, b, solver=solver, sym=sym, tol=tol,
                          maxiter=maxiter, device=device, cache=cache,
                          cache_key=cache_key)
@@ -1071,8 +1078,10 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
             rec = cache.get(("blockch_iters", cache_key))
             if rec is not None:
                 iters = rec[0]
+        inner_stats = _LAST_INNER_STATS[0]   # written by fgmres_pcd
         return LinearSolveResult(x=x, converged=True, iterations=iters,
-                                 backend=solver, reason="converged")
+                                 backend=solver, reason="converged",
+                                 inner_stats=inner_stats)
     A = A.tocsr()
     if cache is not None and cache_key is not None \
             and solver not in ("blockch", "blockamgx",
@@ -1557,7 +1566,15 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                 "sigma) and pass cache=/cache_key=")
 
         op = CSROperator(A, device)
-        apply_dev = make_pcd_apply(A, meta, device)
+        # T1: per-block inner-solve telemetry — create the accumulator dict
+        # and pass it to make_pcd_apply; after the solve, publish it to the
+        # module sentinel so return_result=True can copy it to inner_stats.
+        _inner_stats: dict = {
+            blk: {"applies": 0, "iters_total": 0,
+                  "cap_hits": 0, "max_exit_relres": 0.0}
+            for blk in ("F", "Ap", "Mp")
+        }
+        apply_dev = make_pcd_apply(A, meta, device, stats=_inner_stats)
         N = A.shape[0]
 
         b_dev = wp.array(np.ascontiguousarray(b, np.float64),
@@ -1574,6 +1591,7 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                 f"relres={finfo['relres']:.3e}")
 
         _LAST_ITERS[0] = finfo["inner"]
+        _LAST_INNER_STATS[0] = _inner_stats   # T1: publish for return_result
         return x_dev.numpy()
 
     from ..errors import ConfigError

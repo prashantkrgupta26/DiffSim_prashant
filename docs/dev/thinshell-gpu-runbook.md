@@ -669,3 +669,77 @@ with minimal steps (2 steps each) to verify the full wiring end-to-end.
 | 3d-proj | `PPE_SOLVER=gpu_cg PRED_SOLVER=cudss DEVICE=cuda:0` |
 
 The script exits with a non-zero code and prints the failed leg if any leg fails.
+
+---
+
+## Appendix C: Track A2 Campaign — SADDLE_PCD_INNER=amgx Route (2026-07-28)
+
+**Branch:** `track-a2-strengthen`  
+**Campaign doc:** `docs/dev/2026-07-28-track-a2-campaign.md`
+
+### C.1 Plumbing (T4 gate commits)
+
+Two commits wired the AMGX inner route into the saddle-ladder harness and drivers:
+
+1. **cc9838b** — `feat(t4): SADDLE_PCD_INNER env + pcd_inner kwarg plumbing`  
+   `SADDLE_PCD_INNER=amgx` → `pcd_inner="amgx"` → `build_pcd_meta(..., inner="amgx")`.
+   Inner stats (F/Ap/Mp) saved to npz as `ist_{blk}_{key}` arrays.
+
+2. **91882fe** — `fix(amgx): accept not_converged as smoother`  
+   AMGX `not_converged` (maxiter hit) is now accepted — the PCD F-inner uses AMGX
+   as a smoother; the outer FGMRES carries the residual.
+
+Gate (both commits): `test_saddle_ladder_cpu` + `test_saddle_precond` — 16 passed
+on gpubox (including `test_fgmres_pcd_amgx_real` — first real-AMGX correctness
+evidence).
+
+### C.2 Invoking AMGX Inner on gpubox
+
+```bash
+# pyamgx requires the AMGX shared lib in LD_LIBRARY_PATH on gpubox:
+export LD_LIBRARY_PATH=/home/bglab/AMGX/build:/usr/lib/wsl/lib
+
+# Example: 3d-L6 pcd-amgx with device assembly (cuda:0)
+cd /home/bglab/Baskar/DiffSim
+LD_LIBRARY_PATH=/home/bglab/AMGX/build:/usr/lib/wsl/lib \
+SADDLE_POINTS=3d-L6 SADDLE_SOLVERS=fgmres_pcd SADDLE_DEVICE=cuda:0 \
+SADDLE_NSTEPS=5 SADDLE_ASSEMBLY=device SADDLE_PCD_INNER=amgx \
+PYTHONPATH=src:tests .venv/bin/python tests/gpu_saddle_ladder.py
+```
+
+### C.3 pyamgx Status per Machine
+
+| Machine | Status | Notes |
+|---------|--------|-------|
+| gpubox | **PRESENT** | `libamgxsh.so` at `/home/bglab/AMGX/build/`; needs LD path above |
+| nova (GH200) | **ABSENT** | No pyamgx package, no libamgxsh.so; controller must build AMGX for aarch64 sm_90a before submitting pcd-amgx kit |
+
+### C.4 GH200 sbatch kits (updated for T4)
+
+| Kit | Key env change | Note |
+|-----|---------------|-------|
+| `saddle_ladder_gh200.sbatch` | Added `SADDLE_ASSEMBLY=device` | bdiag leg; no pyamgx needed |
+| `saddle_ladder_gh200_pcd.sbatch` | Added `SADDLE_ASSEMBLY=device SADDLE_PCD_INNER=amgx SADDLE_NSTEPS=5` | pcd-amgx leg; REQUIRES pyamgx on nova-arm |
+
+### C.5 T5: AMG-on-Ap Probe (2026-07-28, commit `7a3752b`)
+
+**Full results:** `docs/dev/2026-07-28-track-a2-campaign.md §9`
+
+New env var: `SADDLE_PCD_AP_INNER=amgx` routes the Ap-inner (pressure Laplacian) through
+AMGX PCG+classical-AMG (sym=True, tol=1e-4, maxiter=200). Ap is SPD after the
+Cahouet-Chabard pin; singleton key (True,1e-4,200) is distinct from F-inner key.
+
+```bash
+# AMG-on-Ap probe (pcd-jacobi F, amgx Ap):
+LD_LIBRARY_PATH=/home/bglab/AMGX/build:/usr/lib/wsl/lib \
+SADDLE_POINTS=3d-L6 SADDLE_SOLVERS=fgmres_pcd SADDLE_DEVICE=cuda:0 \
+SADDLE_NSTEPS=5 SADDLE_ASSEMBLY=device SADDLE_PCD_AP_INNER=amgx \
+.venv/bin/python tests/gpu_saddle_ladder.py
+```
+
+**T5 measured verdict (gpubox, 2026-07-28):**
+- 3d-L6: Ap iters/apply 282.6 → 16.9 (−94%), but s/step 11.732 → 13.723 (+17% SLOWER).
+  AMGX PCG call overhead (~0.12 s/apply × 35 applies = 4.2 s/step) exceeds Jacobi-CG
+  savings at L6 block size. Setup reused (1 build, 35× reused per run).
+- 2d-r11: DIVERGES (structural, same as jacobi — AMG-on-Ap does not fix PCD quality).
+- **Lever is re-evaluated at 9.08M DOF where the Ap block is ~8× larger.**

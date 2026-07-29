@@ -1,3 +1,19 @@
+> **TRACK A2 VERDICT (2026-07-29, GH200 hold session job 11777138):** The WP4
+> success gate as written (pcd-amgx ≤~2× growth AND ≤~60 s/step at 9.08M)
+> **FAILS** — all three PCD inner variants are wall-clock intractable at 9.08M
+> (jacobi >29 min/step, amgx-Ap >48 min/step despite 0.22 s Ap applies,
+> amgx-F catastrophic; F-inner large-block matvec economics at outer-apply
+> frequency are the wall). **The campaign GOAL is nonetheless achieved via
+> `fgmres_bdiag` + device assembly: 54.8 s/step at 8.58M (uniform, controlled
+> same-mesh A/B: 4.33× s/step and 12.8× RSS over host assembly at bit-identical
+> 1300.2 iterations)** — under the ≤60 s bar. Adaptive 9.08M stands at 247.8
+> s/step (host asm) pending the constrained-scatter ChunkTable extension; the
+> chunked dof-indices intermediate needs a size bound for uniform ≥~30M
+> (measured 137.4 GB single alloc at 68M; persistent 62.7 GiB fits HBM).
+> Warp is device-strict on GH200 (no Grace spill). Warm setup ~2 min. AMGX
+> aarch64+pyamgx delivered on nova. WP1 telemetry + WP3 wiring shipped; WP2
+> refuted-with-mechanism. Full record: `docs/dev/2026-07-28-track-a2-campaign.md`.
+
 # Track A2 — Strengthen the Monolithic Engine (A4 + telemetry + device assembly)
 
 **Date:** 2026-07-28. **Approved:** Baskar ("Looks right - write the spec and plan").

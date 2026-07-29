@@ -310,6 +310,8 @@ def run_flow_past_3d(
     device="cpu",
     assembly="host",   # assembly backend: "host" (default, bit-for-bit) | "device"
     solver_stats=None,  # optional list to append per-step iteration counts (A2 ladder)
+    pcd_inner="jacobi",  # (T4) PCD F-block inner-solve backend: "jacobi" | "amgx"
+    pcd_ap_inner="jacobi",  # (T5) PCD Ap-block inner-solve backend: "jacobi" | "amgx"
 ):
     """Run 3-D flow past a finite thin plate with transient BDF2 march.
 
@@ -511,7 +513,8 @@ def run_flow_past_3d(
         if mono_solver == "fgmres_pcd" and order != _pcd_last_order:
             from diffsim.solvers.saddle_precond import build_pcd_meta
             _pcd_cache[("pcd_meta", "ns3d")] = build_pcd_meta(
-                dm, nu, sigma, p_pin=p_pin)
+                dm, nu, sigma, p_pin=p_pin, inner=pcd_inner,
+                ap_inner=pcd_ap_inner)
             _pcd_last_order = order
 
         # Advecting velocity at Gauss points
