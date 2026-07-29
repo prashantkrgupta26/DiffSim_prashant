@@ -177,7 +177,8 @@ ALL_POINTS = [LADDER_2D_R9, LADDER_2D_R11, LADDER_3D_L6, LADDER_3D_L7,
 # ---------------------------------------------------------------------------
 
 def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
-                     pcd_inner=None, pcd_ap_inner=None, **cfg):
+                     pcd_inner=None, pcd_ap_inner=None,
+                     saddle_restart=None, saddle_x0=None, **cfg):
     """March nsteps of the MONOLITHIC driver and capture per-step iteration counts.
 
     Parameters
@@ -207,6 +208,14 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
         None (default) omits the kwarg, preserving the driver's own default
         ("jacobi"). Set via env SADDLE_PCD_AP_INNER.  Only relevant for
         solver="fgmres_pcd"; ignored by bdiag/cudss/etc.
+    saddle_restart : int or None
+        A3 knob A: FGMRES restart length for fgmres_bdiag.  None (default)
+        preserves the driver default of 60 (bit-for-bit identical).  Set via
+        env SADDLE_RESTART.
+    saddle_x0 : str or None
+        A3 knob B: warm-start mode for fgmres_bdiag: "extrap" => linear
+        extrapolation from prior two steps; None (default) = cold start.
+        Set via env SADDLE_X0.
     **cfg :
         Additional kwargs forwarded to the driver (level, refine_to, nu, dt, etc.).
 
@@ -240,6 +249,12 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
         pcd_kw = {} if pcd_inner is None else {"pcd_inner": pcd_inner}
         # pcd_ap_inner pass-through: only forward when explicitly set (T5 AMG-on-Ap)
         pcd_ap_kw = {} if pcd_ap_inner is None else {"pcd_ap_inner": pcd_ap_inner}
+        # A3 knobs: saddle_restart / saddle_x0 (opt-in; None => driver default)
+        saddle_kw = {}
+        if saddle_restart is not None:
+            saddle_kw["saddle_restart"] = int(saddle_restart)
+        if saddle_x0 is not None:
+            saddle_kw["saddle_x0"] = saddle_x0
 
         t0 = time.time()
         res = run_flow_past(
@@ -249,6 +264,7 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
             **asm_kw,
             **pcd_kw,
             **pcd_ap_kw,
+            **saddle_kw,
             **kw,
         )
         elapsed = time.time() - t0
@@ -288,6 +304,12 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
         pcd_kw = {} if pcd_inner is None else {"pcd_inner": pcd_inner}
         # pcd_ap_inner pass-through: only forward when explicitly set (T5 AMG-on-Ap)
         pcd_ap_kw = {} if pcd_ap_inner is None else {"pcd_ap_inner": pcd_ap_inner}
+        # A3 knobs: saddle_restart / saddle_x0 (opt-in; None => driver default)
+        saddle_kw = {}
+        if saddle_restart is not None:
+            saddle_kw["saddle_restart"] = int(saddle_restart)
+        if saddle_x0 is not None:
+            saddle_kw["saddle_x0"] = saddle_x0
 
         t0 = time.time()
         res = run_flow_past_3d(
@@ -297,6 +319,7 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
             **asm_kw,
             **pcd_kw,
             **pcd_ap_kw,
+            **saddle_kw,
             **kw,
         )
         elapsed = time.time() - t0
@@ -450,6 +473,16 @@ if __name__ == "__main__":
     _pcd_ap_inner_env = os.environ.get("SADDLE_PCD_AP_INNER", "").strip()
     PCD_AP_INNER = _pcd_ap_inner_env if _pcd_ap_inner_env else None
 
+    # A3 knob A — SADDLE_RESTART: integer restart length for fgmres_bdiag/pcd.
+    # unset (or empty) => None, which preserves the driver default (60).
+    _restart_env = os.environ.get("SADDLE_RESTART", "").strip()
+    SADDLE_RESTART = int(_restart_env) if _restart_env else None
+
+    # A3 knob B — SADDLE_X0: warm-start mode for fgmres_bdiag.
+    # "extrap" => linear extrapolation from prior two steps; unset => None (cold start).
+    _x0_env = os.environ.get("SADDLE_X0", "").strip()
+    SADDLE_X0 = _x0_env if _x0_env else None
+
     # SADDLE_POINTS: comma-separated subset of point tags to run in this process.
     # Used to run each ladder point in a SEPARATE PROCESS (the brief requirement:
     # a single-process multi-leg ladder previously accumulated cross-leg memory
@@ -468,6 +501,7 @@ if __name__ == "__main__":
     print(f"[saddle-ladder] device={DEVICE}  solvers={SOLVERS}  "
           f"nsteps={NSTEPS}  assembly={ASSEMBLY}  pcd_inner={PCD_INNER}  "
           f"pcd_ap_inner={PCD_AP_INNER}  "
+          f"saddle_restart={SADDLE_RESTART}  saddle_x0={SADDLE_X0}  "
           f"points={[p['tag'] for p in ACTIVE_POINTS]}",
           flush=True)
     print("=" * 78, flush=True)
@@ -488,6 +522,8 @@ if __name__ == "__main__":
                     assembly=ASSEMBLY,
                     pcd_inner=PCD_INNER,
                     pcd_ap_inner=PCD_AP_INNER,
+                    saddle_restart=SADDLE_RESTART,
+                    saddle_x0=SADDLE_X0,
                     **{k: v for k, v in point.items()
                        if k not in ("tag", "dim", "nsteps")},
                 )

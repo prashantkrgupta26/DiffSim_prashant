@@ -381,6 +381,8 @@ def run_flow_past(
     solver_stats=None,  # optional list to append per-step iteration counts (A2 ladder)
     pcd_inner="jacobi",  # (T4) PCD F-block inner-solve backend: "jacobi" | "amgx"
     pcd_ap_inner="jacobi",  # (T5) PCD Ap-block inner-solve backend: "jacobi" | "amgx"
+    saddle_restart=None,  # A3 knob A: FGMRES restart length; None => default 60
+    saddle_x0=None,       # A3 knob B: warm-start mode; "extrap" | None (cold)
 ):
     """Run flow past a finite thin plate with transient BDF2 march.
 
@@ -721,11 +723,19 @@ def run_flow_past(
             _rxn_Afc_w.append(np.asarray(Af_c.T @ w_k))
             _rxn_bfc_dot.append(float(bf_c @ w_k))
 
-    # ---- PCD meta cache (fgmres_pcd only) -----------------------------------
+    # ---- PCD / bdiag meta cache ---------------------------------------------
     # build_pcd_meta is called once per BDF order (sigma changes at step 0->1);
     # the cache dict is passed to solve_linear so make_pcd_apply sees pcd_meta.
+    # fgmres_bdiag reads ndof and A3 knobs via ("blocktri_meta", cache_key).
     _pcd_cache = {}           # {("pcd_meta", key): meta, ...}
     _pcd_last_order = None    # track when to rebuild pcd_meta (sigma change)
+    if mono_solver == "fgmres_bdiag":
+        _bdiag_meta = {"ndof": ndof}
+        if saddle_restart is not None:
+            _bdiag_meta["saddle_restart"] = int(saddle_restart)
+        if saddle_x0 is not None:
+            _bdiag_meta["saddle_x0"] = saddle_x0
+        _pcd_cache[("blocktri_meta", "ns2d")] = _bdiag_meta
 
     # ---- BDF2 march ---------------------------------------------------------
     # Initialize: u=0 everywhere
@@ -816,7 +826,9 @@ def run_flow_past(
                 x_cur = splu(Acsr.tocsc()).solve(b)
             else:
                 _LAST_ITERS[0] = None
-                _slv_cache = _pcd_cache if mono_solver == "fgmres_pcd" else None
+                _slv_cache = (_pcd_cache
+                              if mono_solver in ("fgmres_pcd", "fgmres_bdiag")
+                              else None)
                 x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
                                      device=device,
                                      cache=_slv_cache, cache_key="ns2d")
@@ -872,7 +884,9 @@ def run_flow_past(
                 x_cur = splu(Acsr.tocsc()).solve(b)      # legacy path, bit-for-bit
             else:
                 _LAST_ITERS[0] = None
-                _slv_cache = _pcd_cache if mono_solver == "fgmres_pcd" else None
+                _slv_cache = (_pcd_cache
+                              if mono_solver in ("fgmres_pcd", "fgmres_bdiag")
+                              else None)
                 x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
                                      device=device,
                                      cache=_slv_cache, cache_key="ns2d")
