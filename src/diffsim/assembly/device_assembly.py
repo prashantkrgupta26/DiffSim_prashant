@@ -254,6 +254,31 @@ class ChunkedArray:
 NODE_PATTERN_AUTO_ENTRIES = 2 * 10 ** 8
 
 
+# ---------------------------------------------------------------------
+# W1: per-step element-block (Ae/be) intermediate bound.  assemble()
+# used to allocate the WHOLE bin's element matrices in one array,
+# Ae = wp.zeros((ne, nl, nl)) with nl = nbf*ndof — sized to the ENTIRE
+# element set.  Measured wall: a single 137,367,584,768-byte (137.4 GB)
+# device allocation at 3d-L8 (ne = 16,768,504 active elements, nl = 32
+# -> ne * 1024 * 8 B) hard-OOM'd on a 95 GiB GH200 whose PERSISTENT
+# state was only 62.7 GiB (campaign doc 2026-07-28 §10.10).  It was an
+# unbounded intermediate, not a capacity wall.
+#
+# Fix: compute Ae/be in element BATCHES whose byte footprint stays
+# <= AE_BATCH_BYTES and scatter each batch (reusing the scatter_batch /
+# batched-scatter machinery already in this module).  The element-block
+# math is per-element and independent, so the assembled CSR is
+# BIT-IDENTICAL to the whole-bin path (parity-gated).  2 GiB is the
+# bound: it caps the transient at the same order as the per-step
+# scatter-batch launch note (~2 GB at full res) while leaving ample
+# headroom under 95 GiB HBM for the persistent CSR/solver state; the
+# derived batch element count is AE_BATCH_BYTES // (npair * 8).  At all
+# existing (toy/mid) scales one batch covers the whole bin, so the
+# launch/scatter sequence is byte-for-byte the pre-W1 path.
+# ---------------------------------------------------------------------
+AE_BATCH_BYTES = 2 * 2 ** 30            # ~2 GiB per Ae element-block batch
+
+
 class DeviceNSAssembler:
     """Per-epoch object: symbolic pattern + slot maps once; numeric fill
     per step on device."""
@@ -290,6 +315,12 @@ class DeviceNSAssembler:
         self._chunk_cap = chunk_cap
         self._chunked = False               # provisional; finalized below
         self._ctab = None
+        # W1: per-step Ae/be element-block batch size (elements).  None
+        # -> derived per bin from AE_BATCH_BYTES (assemble() bounds the
+        # element-matrix transient).  Tests set a small value to force
+        # the multi-batch path at toy sizes; a whole-bin value (>= ne)
+        # reproduces the pre-W1 single-launch path byte-for-byte.
+        self._ae_batch = None
         # Task #36 mixed-precision: fp32 round-on-store snapshot config.
         # vals_d ALWAYS stays fp64 (accumulation contract); _vals_fp32 is
         # allocated only when val_dtype='fp32' and refreshed from vals_d
@@ -782,6 +813,16 @@ class DeviceNSAssembler:
                             device=self.dm.device),
             n_spans=len(spans), n_rows=len(rows))
 
+    def _ae_batch_for(self, npair):
+        """Elements per Ae/be batch for a bin whose element matrix has
+        `npair` = (nbf*ndof)^2 fp64 entries.  Honors the `_ae_batch`
+        override (tests force small batches); otherwise derives the
+        largest count whose Ae footprint (nb*npair*8 B) stays within
+        AE_BATCH_BYTES (>= 1 always)."""
+        if self._ae_batch is not None:
+            return max(1, int(self._ae_batch))
+        return max(1, AE_BATCH_BYTES // (npair * 8))
+
     # ------------------------------------------------------------------
     def assemble(self, aq_by_bin, div_aq_by_bin, fq_by_bin, nu, sigma,
                  sig2tau=None, s_skew=0.5, strong_b_vals=None,
@@ -824,11 +865,50 @@ class DeviceNSAssembler:
                                dtype=wp.float64, device=d)
                 self._gaq_d[pv] = gaq
             fq = _dev(fq_by_bin[pv])
-            Ae = wp.zeros((ne, nbf * ndof, nbf * ndof), dtype=wp.float64,
-                          device=d)
-            be = wp.zeros((ne, nbf * ndof), dtype=wp.float64, device=d)
             kA = make_linear_ns_Ae(nbf, nqp, dm.dim)
             kb = make_linear_ns_be(nbf, nqp, dm.dim)
+            npair = (nbf * ndof) ** 2
+            nl = nbf * ndof
+            # W1: the identity-T non-colored and node-graph scatters read
+            # Ae/be as element-CONTIGUOUS block ranges (scatter_batch
+            # slices its slot maps / computes slots in-kernel by element
+            # offset), so the whole-bin Ae — the 137 GB OOM at 3d-L8 — is
+            # replaced by element BATCHES bounded to AE_BATCH_BYTES.  The
+            # element-block math is per-element independent, so batching
+            # is bit-identical to the whole-bin launch.  The weighted
+            # (constraint-aware) and colored scatters index Ae through
+            # non-contiguous whole-bin slot maps and are scoped to
+            # small/mid meshes (never near the OOM scale), so they keep
+            # the single whole-bin allocation unchanged.
+            if self.node_mode or (self._identity_T and not self.coloring):
+                step = self._ae_batch_for(npair)
+                for e0 in range(0, ne, step):
+                    nb = min(step, ne - e0)
+                    Ae = wp.zeros((nb, nl, nl), dtype=wp.float64, device=d)
+                    be = wp.zeros((nb, nl), dtype=wp.float64, device=d)
+                    conn_v = b["conn"][e0:e0 + nb]
+                    h_v = b["h"][e0:e0 + nb]
+                    aq_v = aq[e0 * nqp:(e0 + nb) * nqp]
+                    dq_v = dq[e0 * nqp:(e0 + nb) * nqp]
+                    gaq_v = gaq[e0 * nqp:(e0 + nb) * nqp]
+                    fq_v = fq[e0 * nqp:(e0 + nb) * nqp]
+                    wp.launch(kA, dim=nb,
+                              inputs=[conn_v, h_v, b["N"], b["dN"],
+                                      b["lapN"], b["w"],
+                                      aq_v, dq_v, gaq_v, wp.float64(nu),
+                                      wp.float64(sigma),
+                                      wp.float64(sig2tau),
+                                      wp.float64(s_skew), wp.int32(0), Ae],
+                              device=d)
+                    wp.launch(kb, dim=nb,
+                              inputs=[conn_v, h_v, b["N"], b["dN"], b["w"],
+                                      aq_v, fq_v, wp.float64(nu),
+                                      wp.float64(sig2tau), be], device=d)
+                    self.scatter_batch(k_bin, e0, Ae, be, nb)
+                continue
+            # constraint-aware / colored paths: whole-bin (unchanged).
+            Ae = wp.zeros((ne, nl, nl), dtype=wp.float64, device=d)
+            be = wp.zeros((ne, nl), dtype=wp.float64, device=d)
             wp.launch(kA, dim=ne,
                       inputs=[b["conn"], b["h"], b["N"], b["dN"],
                               b["lapN"],   # G4: complete SUPG/PSPG resu
@@ -841,19 +921,12 @@ class DeviceNSAssembler:
                       inputs=[b["conn"], b["h"], b["N"], b["dN"], b["w"],
                               aq, fq, wp.float64(nu), wp.float64(sig2tau),
                               be], device=d)
-            npair = (nbf * ndof) ** 2
-            if self.node_mode:
-                self.scatter_bin(k_bin, Ae, be)   # A and b together
-                continue
             if not self._identity_T:
                 scw = _scatter_weighted_kernel(self._idx_dtype)
                 wp.launch(scw, dim=len(self._slot_bins[k_bin]),
                           inputs=[Ae.reshape((-1,)), self._src_d[k_bin],
                                   self._w_d[k_bin], self._slots_d[k_bin],
                                   self.vals_d], device=d)
-            elif not self.coloring:
-                self._scatter_A(Ae.reshape((-1,)), self._slots_d[k_bin],
-                                ne * npair)
             else:
                 order, bounds = self._colors[k_bin]
                 order_d = wp.array(order, dtype=wp.int32, device=d)

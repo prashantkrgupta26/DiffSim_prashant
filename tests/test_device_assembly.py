@@ -518,3 +518,82 @@ def test_constraint_aware_csr_int64_indptr(device):
         f"DeviceNSAssembler.indptr must be int64 on constrained mesh "
         f"(got {asm.indptr.dtype}); coo_matrix overflow regression"
     )
+
+
+# ---------------------------------------------------------------------
+# W1: bound the per-step element-block (Ae/be) intermediate.  The
+# whole-bin `Ae = wp.zeros((ne, nl, nl))` in assemble() sized to the
+# ENTIRE element set — measured OOM: a single 137.4 GB allocation at
+# ~68M DOF (3d-L8, ne=16.77M, nl=32 -> ne*1024*8 B), NOT a capacity
+# wall (persistent state was 62.7 GiB).  The fix computes Ae/be in
+# element BATCHES bounded by AE_BATCH_BYTES and scatters each batch;
+# the assembled CSR must be BIT-IDENTICAL to the whole-bin path.  The
+# `_ae_batch` hook forces the multi-batch path at toy sizes here.
+# ---------------------------------------------------------------------
+def _assemble_csr(asm, aq, dq, fq, nu, sigma):
+    A, b = asm.assemble(aq, dq, fq, nu, sigma)
+    A = A.tocsr()
+    A.sort_indices()
+    return A, b
+
+
+@pytest.mark.parametrize("coloring", [False, True])
+def test_ae_batch_parity_identity(coloring, device):
+    """Identity-T uniform mesh: multi-batch Ae assembly (forced via a
+    tiny _ae_batch) produces a BIT-IDENTICAL CSR (indptr/indices/data)
+    and rhs vs the whole-bin path.  Both colored and uncolored scatter."""
+    dm, aq, dq, fq = _setup(3, 3, device)
+    nu, sigma = 0.05, 20.0
+    ref = DeviceNSAssembler(dm, coloring=coloring)
+    A_ref, b_ref = _assemble_csr(ref, aq, dq, fq, nu, sigma)
+    ne = ref._bins[0][2]
+    asm = DeviceNSAssembler(dm, coloring=coloring)
+    asm._ae_batch = max(1, ne // 4)          # force >=4 batches
+    A_b, b_b = _assemble_csr(asm, aq, dq, fq, nu, sigma)
+    assert np.array_equal(A_ref.indptr, A_b.indptr)
+    assert np.array_equal(A_ref.indices, A_b.indices)
+    assert np.array_equal(A_ref.data, A_b.data), (
+        "Ae-batched CSR data must be BIT-IDENTICAL to whole-bin",
+        np.abs(A_ref.data - A_b.data).max())
+    assert np.array_equal(b_ref, b_b)
+
+
+def test_ae_batch_parity_node_pattern(device):
+    """Node-graph pattern (forced): multi-batch Ae assembly through the
+    in-kernel-slot scatter is BIT-IDENTICAL to the whole-bin path."""
+    dm = _strip3d(device, 8, 8, 8, 4)
+    rng = np.random.default_rng(7)
+    pv = list(dm.bins)[0]
+    from diffsim.physics.poisson import gauss_points
+    xq = gauss_points(dm.mesh, dm.tables_by_p)
+    ngp = len(xq[pv])
+    aq = {pv: rng.standard_normal((ngp, 3)) * 0.5}
+    dq = {pv: rng.standard_normal(ngp) * 0.1}
+    fq = {pv: rng.standard_normal((ngp, 3))}
+    nu, sigma = 0.05, 20.0
+    ref = DeviceNSAssembler(dm, ndof=4, node_pattern=True)
+    A_ref, b_ref = _assemble_csr(ref, aq, dq, fq, nu, sigma)
+    ne = ref._bins[0][2]
+    asm = DeviceNSAssembler(dm, ndof=4, node_pattern=True)
+    asm._ae_batch = max(1, ne // 3)
+    A_b, b_b = _assemble_csr(asm, aq, dq, fq, nu, sigma)
+    assert np.array_equal(A_ref.indptr, A_b.indptr)
+    assert np.array_equal(A_ref.indices, A_b.indices)
+    assert np.array_equal(A_ref.data, A_b.data), (
+        np.abs(A_ref.data - A_b.data).max())
+    assert np.array_equal(b_ref, b_b)
+
+
+def test_ae_batch_default_bound(device):
+    """The derived default Ae batch keeps the per-batch element-block
+    intermediate <= AE_BATCH_BYTES (the ~2 GB bound) and, at these toy
+    sizes where ne fits in one batch, stays single-batch (bit-for-bit
+    the pre-W1 path)."""
+    from diffsim.assembly.device_assembly import AE_BATCH_BYTES
+    dm, aq, dq, fq = _setup(3, 3, device)
+    asm = DeviceNSAssembler(dm)
+    pv, b, ne, nbf, gdof = asm._bins[0]
+    npair = (nbf * asm.ndof) ** 2
+    nb = asm._ae_batch_for(npair)
+    assert nb * npair * 8 <= AE_BATCH_BYTES
+    assert nb >= ne          # toy mesh: single batch, unchanged path
