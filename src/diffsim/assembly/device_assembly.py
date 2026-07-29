@@ -424,8 +424,8 @@ class DeviceNSAssembler:
         self._exp_bins = exp_bins
         r = np.concatenate(rows_all)
         c = np.concatenate(cols_all)
-        K = sp.coo_matrix((np.ones(len(r)), (r, c)),
-                          shape=(self.Nfull, self.Nfull)).tocsr()
+        K = sp.coo_array((np.ones(len(r)), (r, c)),
+                         shape=(self.Nfull, self.Nfull)).tocsr()
         K.sort_indices()
         self.indptr = K.indptr.copy()
         self.indices = K.indices.copy()
@@ -602,8 +602,8 @@ class DeviceNSAssembler:
         c = np.concatenate(cols_all) if len(cols_all) > 1 else cols_all[0]
         # duplicate count per node pair <= elements sharing the pair
         # (<= 2^dim on conforming hexes) — int8 cannot overflow
-        G = sp.coo_matrix((np.ones(len(r), np.int8), (r, c)),
-                          shape=(n, n)).tocsr()
+        G = sp.coo_array((np.ones(len(r), np.int8), (r, c)),
+                         shape=(n, n)).tocsr()
         G.sort_indices()
         del r, c
         Gptr = G.indptr.astype(np.int64)

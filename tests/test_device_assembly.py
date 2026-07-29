@@ -484,3 +484,37 @@ def test_film_node_pattern_march_parity(device):
     print(f"film node-pattern march parity: {len(rec_o)} steps, "
           f"max rel {max(errs):.2e}")
     assert max(errs) < 1e-9, errs
+
+
+def test_constraint_aware_csr_int64_indptr(device):
+    """Regression: constrained-path COO uses sp.coo_array (int64 indptr).
+
+    sp.coo_matrix.tocsr() produces int32 indptr/indices (overflows at ~2^31
+    NNZ for large adaptive meshes, e.g. 3d-L7r9 with hanging nodes).
+    sp.coo_array.tocsr() produces int64 indptr.  This test asserts that
+    DeviceNSAssembler's constraint-aware scatter path (identity_T=False,
+    non-uniform AMR mesh) stores int64 indptr so the overflow cannot occur
+    at large scale.
+    """
+    from diffsim.octree.build import refine_elements
+    from diffsim.octree.balance import balance2to1
+    from diffsim.octree.build import build_uniform as bu
+    from diffsim.physics.poisson import gauss_points
+
+    # AMR mesh with hanging nodes (non-identity T) — triggers the
+    # constraint-expansion path in DeviceNSAssembler.__init__.
+    tree = bu(3, dim=2)
+    mask = np.zeros(len(tree), bool)
+    mask[0] = True
+    tree = balance2to1(refine_elements(tree, mask))
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), device)
+    asm = DeviceNSAssembler(dm)
+    # The constraint-expansion path sets self.indptr from K.indptr.
+    # With coo_array (the fix), K.indptr is int64; with the old coo_matrix
+    # it would be int32 (would silently overflow at ~2^31 NNZ).
+    assert asm.indptr.dtype == np.int64, (
+        f"DeviceNSAssembler.indptr must be int64 on constrained mesh "
+        f"(got {asm.indptr.dtype}); coo_matrix overflow regression"
+    )
