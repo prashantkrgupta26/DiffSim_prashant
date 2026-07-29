@@ -376,12 +376,16 @@ Log: `logs/t5-3dL6-pcdjacobi-amgxAp-20260728-225646-83478.log`
 
 **Verdict: NEGATIVE — AMG-on-Ap is SLOWER at 3d-L6 despite 16.7× Ap iter reduction.**
 
-Root cause: AMGX PCG setup (~0.092 s amortized but actually counted per-apply in the
-`Total Time` printout) is included in the `solve(per iteration)` timing. At 35 Ap
-applies/step, the AMGX call overhead (~0.12 s/call × 35 = 4.2 s/step) exceeds the
-Jacobi-CG time it replaces (~282 iters × cost_per_iter × 35 applies). The iteration
-collapse is real and measured, but the GPU Jacobi-CG is so fast at L6 (small block:
-274K nodes) that AMGX overhead dominates.
+Root cause — corrected accounting (T5 review): the GROSS AMGX Ap cost measured
+from the log is ~4.4 s/step (179 `Total Time` entries summing 21.8 s over 5
+steps; ~0.122 s/call × ~35 applies). The Jacobi-CG Ap work it REPLACES was
+~2.4 s/step (inferred by subtraction: 4.4 gross − 2.0 net = 2.4), giving the
+measured NET delta of +2.0 s/step (13.723 − 11.732). Both numbers are needed
+for any crossover model: gross-AMGX ≈ constant-ish per apply (setup reused;
+per-call launch/transfer overhead dominates on the small 274K-node block),
+while Jacobi-Ap cost grows with block size and conditioning. The iteration
+collapse (282.6 → 16.9/apply) is real; at L6 the GPU Jacobi-CG is simply so
+fast on the small block that AMGX's per-call overhead exceeds the saving.
 
 **Horizon-pathway projection (assumption labeled):**
 At 9.08M DOF (L7r9), the Ap block is ~8× larger. Jacobi-CG Ap iter count may grow
