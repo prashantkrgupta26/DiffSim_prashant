@@ -809,4 +809,135 @@ and comfortable on GB200 NVL4-class parts.
 | NPZ (complete legs) | `results/saddle_ladder_3d-L7r9_fgmres_bdiag.npz`, `results/saddle_ladder_3d-L7_fgmres_bdiag.npz` (on nova) |
 | AMGX | `/work/mech-ai/baskarg/AMGX/build-arm-sm90/libamgxsh.so` (aarch64, sm_90, 134.9 MB) |
 | pyamgx | installed in `/work/mech-ai/baskarg/DiffSim/.venv-nova-arm` (cp311 linux_aarch64); source clone `/work/mech-ai/baskarg/pyamgx` |
+
+---
+
+## 11. A3 Strengthening Probe Round (2026-07-29) — Solve-Time Levers at 8.58M DOF
+
+**Branch:** `a3-strengthen-probes`  **Commits:** `a84308a` (knobs), `f027b3a` (cluster scripts)
+**Hold job:** 11777138 (RUNNING, same GH200 node) — legs via `srun --jobid=11777138 --overlap`
+**Baseline (§10.9 Leg 4):** 3d-L7 uniform, bdiag+device, restart=60, cold start — **1300.2 iters/step, 54.8 s/step** (42 ms/iter; ~90% of per-iter time is orthogonalization/vector-ops/launch overhead)
+
+### 11.1 Code Changes
+
+**A. Restart knob** (`src/diffsim/solvers/linsolve.py`, `fgmres_bdiag` branch)
+
+- `meta["saddle_restart"]` (read from `("blocktri_meta", cache_key)`) → `fgmres_dev(restart=<n>)`.
+  Cycles divisor always equals restart: `cycles = min(200, max(1, maxiter // restart))`.
+  Default 60 preserves today's output byte-for-bit.
+- Env wiring: `SADDLE_RESTART` → `gpu_saddle_ladder.py` → `run_ladder_point(saddle_restart=)` → `run_flow_past_3d/run_flow_past` → `_bdiag_meta["saddle_restart"]`.
+- Gate: 33 passed, 2 skipped (test_saddle_precond + test_saddle_ladder_cpu + test_p2r1a_thin_plate_flow).
+
+**B. Warm-start x0** (`src/diffsim/solvers/linsolve.py`, `fgmres_bdiag` branch)
+
+- Verify-first: `fgmres_dev` signature accepts `x0_dev=None` (line 300 of fgmres_dev.py — CONFIRMED).
+  `run_flow_past_3d` does NOT warm-start (x_cur starts from `np.zeros`, passed to solve_linear as `b`; no prior-step solution fed to fgmres_dev).
+- Implementation: `meta["saddle_x0"] == "extrap"` → `x0 = 2·x^n − x^{n-1}` (linear extrapolation).
+  Prior solutions stored per step in cache under `("bdiag_x_prev", key)` / `("bdiag_x_prev2", key)`.
+  First step: x0=None (cold). Second step: x0=x^n. Third+: x0 = 2x^n − x^{n-1}.
+  Implemented via residual-shift is NOT needed: `fgmres_dev` natively accepts `x0_dev`.
+  Default None = cold start, byte-identical.
+- Env wiring: `SADDLE_X0=extrap` → same pipeline as restart knob.
+- Gate: same 33/2 green.
+
+**C. Fused backend preconditioner hook (INSPECT ONLY)**
+
+The `fused` backend (linsolve.py lines 1120–1136) calls `cg_dev` or `bicgstab_dev` with only
+`diag=` (Jacobi diagonal). There is **no general `apply_dev` hook** in `krylov_dev.cg_dev` /
+`bicgstab_dev` — Jacobi is hardcoded as the only preconditioner.
+
+**Verdict: fused+bdiag needs a wiring ticket.** Not implemented this round.
+See ticket: "fused: add optional apply_dev preconditioner hook to cg_dev/bicgstab_dev".
+
+### 11.2 Measurement Matrix
+
+All legs: `SADDLE_POINTS=3d-L7 SADDLE_SOLVERS=fgmres_bdiag SADDLE_ASSEMBLY=device SADDLE_NSTEPS=5` (except P-fused).
+Runbook: `bash cluster/a3-probes/run-legs.sh <leg>` inside `srun --jobid=11777138 --overlap`.
+Logs: `cluster/results/a3-<leg>.log`.
+
+| Leg | SADDLE_RESTART | SADDLE_X0 | SADDLE_SOLVERS | Expected iters/step | Expected s/step | Status |
+|-----|---------------|-----------|----------------|--------------------|-----------------|----|
+| **Baseline** | 60 (hardcoded) | cold | fgmres_bdiag | 1300.2 | **54.8** | MEASURED §10.9 |
+| P-restart30 (p1) | 30 | cold | fgmres_bdiag | TBD | TBD | PENDING |
+| P-restart120 (p2) | 120 | cold | fgmres_bdiag | TBD | TBD | PENDING |
+| P-warmstart (p3) | 60 | extrap | fgmres_bdiag | TBD | TBD | PENDING |
+| P-fused (p4) | — | cold | fused (raw) | diverge possible | TBD | PENDING |
+| P-combo (p5) | best(30,120) | extrap | fgmres_bdiag | TBD | TBD | PENDING |
+
+*(Fill measured values after legs run; update verdict column.)*
+
+### 11.3 Per-Lever Verdicts (Pre-Run Analysis)
+
+**A. Restart (30 vs 60 vs 120):**
+
+Shorter restart (30) reduces orthogonalization cost per cycle: the MGS loop is O(j) per step
+and the combine kernel is O(m×N) — at restart=60 with ~22 restarts (1300 iters / 60), the
+dominant cost is the 60-vector basis. Restart=30 halves basis storage and orthogonalization
+work per cycle at the expense of more restarts (~43). Whether net iters increase depends on
+problem conditioning. At 42 ms/iter × 1300 iters = 54.6 s, if restart=30 holds same iters
+the per-restart overhead drops. If iters increase by <30%, restart=30 is still faster.
+Restart=120 widens the subspace: potentially fewer restarts but more work per restart cycle.
+
+*Verdict (pre-run):* most likely winner is restart=30 (subspace already large enough; the
+per-iter orthogonalization cost dominates, not subspace stagnation). Restart=120 is the
+control experiment.
+
+**B. Warm-start x0=extrap:**
+
+The BDF2 NS solution changes slowly in a transient march. The extrapolated x0 = 2x^n − x^{n-1}
+should reduce the initial residual by O(dt²) vs the zero start. With dt=0.01 and U_inf=1 the
+velocity field changes at ~1% per step; the extrapolated residual should be O(0.01²) = O(1e-4)
+times smaller than the zero-start residual. If the convergence curve is near-linear this
+halves log(1/r_0), cutting iterations by up to ~50%.
+
+*Verdict (pre-run):* warm-start is the most likely large win. If iters drop by 30–50%,
+the implied 100M budget reduction is proportional (see §11.4).
+
+**C. Raw fused (no preconditioner):**
+
+fused backend uses only Jacobi preconditioning. The saddle system at 8.58M DOF with bdiag
+reached 1300 iters — Jacobi-only will almost certainly diverge or exceed iteration cap.
+Recording the divergence row is the honest scientific result.
+
+*Verdict (pre-run):* expect DIVERGE or iters > cap. No budget implication if diverges.
+
+### 11.4 100M Budget Projection
+
+Assumptions (labeled):
+- Scaling law: iters/step scales as O(h^α) with α estimated from §10 ladder;
+  at 100M vs 8.58M DOF, approximately 100M/8.58M ≈ 11.7× DOFs.
+- From §10 data: 3d-L6 (1.1M) → 3d-L7 (8.58M) iters: 602 → 1300 = 2.16× at 7.8× DOFs.
+  Empirical α ≈ log(2.16)/log(7.8) ≈ 0.38.
+- Extrapolated 100M iters/step: 1300 × (100M/8.58M)^0.38 ≈ 1300 × 11.7^0.38 ≈ 1300 × 2.7 ≈ **3500 iters/step** (assumption: uniform mesh, same preconditioner).
+- Extrapolated s/step: 54.8 × (100M/8.58M)^(1+α) at fixed device cost — the per-iter time
+  includes O(N) work; total = iters × ms/iter. If ms/iter scales as O(N) at 100M:
+  ms/iter_100M ≈ 42 × (100M/8.58M) ≈ 490 ms/iter; s/step_100M ≈ 3500 × 0.49 ≈ **1715 s/step ≈ 29 min/step**.
+  This is the **no-lever baseline** at 100M.
+
+**Lever impact on 100M budget (assumptions labeled):**
+
+| Lever | If iters/step at 8.58M | % reduction | Projected 100M iters/step | Projected 100M s/step |
+|-------|------------------------|-------------|---------------------------|-----------------------|
+| Baseline (current) | 1300 | — | ~3500 | ~29 min |
+| restart=30 (if no iter increase) | 1300 | 0% iters, ~10% s (orthog) | ~3500 | ~26 min |
+| restart=30 (if +20% iters) | 1560 | −20% iters | ~4200 | ~31 min (worse) |
+| warm-start (if −30% iters) | 910 | 30% | ~2450 | ~20 min |
+| warm-start (if −50% iters) | 650 | 50% | ~1750 | ~14 min |
+| combo best+extrap | depends on p1/p2/p3 | — | — | — |
+
+*(All projections assume ~linear extrapolation from 8.58M → 100M; actual scaling may differ.)*
+
+**Key implication:** if warm-start reduces iters by ≥30%, the 100M time budget drops from
+~29 min/step to ~20 min/step — making a 100-step validation run feasible in <33 h on a
+single GH200 once the L8 unbounded-intermediate is fixed.
+
+### 11.5 Session Artifacts
+
+| Artifact | Path |
+|----------|------|
+| Code commits | `a84308a` (knobs A+B), `f027b3a` (cluster scripts) on `a3-strengthen-probes` |
+| Ship script | `cluster/a3-probes/ship-bundle.sh` |
+| Leg runner | `cluster/a3-probes/run-legs.sh <p1..p5>` |
+| Leg logs | `cluster/results/a3-p1-restart30.log`, `a3-p2-restart120.log`, `a3-p3-warmstart.log`, `a3-p4-fused.log`, `a3-p5-combo.log` (on nova after legs run) |
+| Fused+bdiag ticket | "fused: add apply_dev hook to cg_dev/bicgstab_dev" (not implemented this round) |
 | Code commits | `09bd9fd` (coo_array int64 fix), `daaa78d` (3d-L7 point), `a39df45` (3d-L8 rung) — nova synced via bundles in `/work/mech-ai/baskarg/bundles/` |
