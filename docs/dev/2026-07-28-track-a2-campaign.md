@@ -261,6 +261,10 @@ PCIe/NVLink bus).
 
 ## TODO-GH200 (SANCTIONED PLACEHOLDER — controller fills after GH200 results)
 
+**UPDATED 2026-07-29: See §10 "GH200 hold session (2026-07-29)" below — device assembly
+at L7r9 hits TWO sequential 32-bit ceilings (scipy int32 CSR overflow + Warp int32 array
+shape limit). Host assembly fallback is running. Partial results below; full table in §10.**
+
 The binding verdict gate (SUCCESS: 9.08M pcd-jacobi outer growth from 3d-L6 ≤ ~2×
 AND s/step tractable) requires the 3d-L7r9 GH200 legs. The controller submits
 both sbatch kits after:
@@ -268,10 +272,17 @@ both sbatch kits after:
 2. Submitting bdiag kit first (confirms device-assembly setup time + RSS).
 3. Submitting pcd-jacobi kit (pyamgx NOT required — jacobi inner has no deps).
 
-**Fill in here:**
-- 3d-L7r9 bdiag device-asm: iters/step, s/step, setup time, RSS peak, job ID
-- 3d-L7r9 pcd-jacobi device-asm: outer iters/step, s/step, inner_stats (F/Ap/Mp iters/apply, cap_hits), SMI peak, job ID
-- Verdict: PASS / FAIL / partial outcome + rationale
+**Fill in here (final, 2026-07-29 hold session — details in §10):**
+- 3d-L7r9 bdiag host-asm: **DONE RC 0** — 1196.8 iters (identical to gpubox ref), 247.8 s/step (§10.4)
+- 3d-L7r9 pcd-jacobi host-asm: **DNF** (capped 2h28m, bound >29 min/step) (§10.5)
+- 3d-L7r9 pcd-jacobiF+amgx-Ap: **DNF** (4h cap, bound >48 min/step; Ap-AMG applies work at ~0.22 s — F-block is the wall) (§10.6)
+- 3d-L7 uniform bdiag device-asm: **LANDMARK RC 0** — 54.8 s/step, 14.9 GB RSS (§10.9)
+- 3d-L8 uniform ~68M capacity probe: failure site captured — unbounded 137.4 GB dof-indices intermediate; persistent state fits HBM (§10.10)
+- device-asm on ADAPTIVE meshes: BLOCKED (Warp 2^31 slot array limit in constraint-expansion path — §10.2)
+- **Verdict: the SUCCESS gate (9.08M pcd-jacobi outer growth ≤ ~2× AND s/step tractable)
+  FAILS — pcd is wall-clock intractable at 9.08M in all three variants.
+  fgmres_bdiag is the engine at scale: 247.8 s/step (host asm, adaptive L7r9) and
+  54.8 s/step (device asm, uniform L7).**
 
 ---
 
@@ -434,3 +445,346 @@ estimate showing the crossover point.
 
 The pcd-jacobi (Jacobi-CG on all three inners) remains the best-measured PCD config
 for the current campaign. Future Ap-AMG probes should target L7r9 directly.
+
+---
+
+## 10. GH200 Hold Session (2026-07-29) — Interactive Measurement via Job 11777138
+
+**Hold job:** 11777138 (24 h / 400G / 1× GH200, partition nova-arm, node nova24-gh-1)
+**Branch at session start:** `track-a2-strengthen` @ `2687d8b` → updated to `09bd9fd` (fix commit)
+**Session manager:** T4 subagent (Claude Opus 4.8)
+
+### 10.1 Infrastructure Verification
+
+| Item | Value |
+|------|-------|
+| Node | nova24-gh-1 |
+| GPU | NVIDIA GH200 480GB (UUID: GPU-14a8b48f-cb9d-f6f4-fb9d-f4b0b5b76fd9) |
+| Warp | 1.15.0, CUDA Toolkit 12.9, Driver 13.0, sm_90 |
+| HBM | 95 GiB (device mempool enabled) |
+| srun incantation | `srun --jobid=11777138 --overlap bash -c '...'` — VERIFIED working |
+| Nova repo at session start | `f19040d` (hold-submission bundle) |
+| Nova repo after sync | `09bd9fd` (fix commit, includes `2687d8b` content) |
+
+### 10.2 Device Assembly Failure — Two Sequential 32-bit Ceilings
+
+Both Leg 1 (bdiag) and Leg 2 (pcd-jacobi) were attempted with `SADDLE_ASSEMBLY=device`.
+Both failed due to the same root cause: the 3d-L7r9 adaptive mesh has **hanging-node
+constraints** (octree 2:1-balanced AMR), making `identity_T=False`.  The constraint-aware
+scatter path in `DeviceNSAssembler.__init__` hits TWO sequential 32-bit ceilings at this
+scale.
+
+**Ceiling 1 (FIXED): scipy int32 CSR overflow**
+
+```
+ValueError: could not convert integer scalar
+  File device_assembly.py:469:  slots = np.asarray(K2[rr, cc]).ravel().astype(np.int64)
+```
+
+`sp.coo_matrix.tocsr()` produces int32 indptr/indices.  When the constrained COO matrix
+has > 2^31 NNZ (which happens at L7r9 with ~2.37B constraint-expansion entries),
+scipy's internal `csr_sample_values` overflows.
+
+**Fix (commit `09bd9fd`):** Replace `sp.coo_matrix` → `sp.coo_array` in
+`device_assembly.py` lines 427 and 605.  `sp.coo_array.tocsr()` produces int64 indptr.
+Gate: `test_constraint_aware_csr_int64_indptr` (new), all 20 `test_device_assembly.py`
+tests pass, `test_saddle_ladder_cpu` 8/8 pass.
+
+**Ceiling 2 (UNRESOLVED): Warp 2^31 array shape limit**
+
+After the scipy fix, the next failure:
+```
+ValueError: Array shapes must not exceed the maximum representable value of a signed
+  32-bit integer, got 2368304640 in dimension 0.
+  File device_assembly.py:477:  self._slots_d = [wp.array(np.ascontiguousarray(
+```
+
+The slot array `s` for a single element bin has **2,368,304,640 entries** (2.37B > 2^31).
+Warp 1.15 rejects any `wp.array` with a dimension > 2^31 (see `types.py:check_array_shape`).
+
+**Root cause:** The constraint-expansion scatter generates `ne × (nbf×ndof)^2 × masters_per_dof`
+slot entries per element bin.  At 9.08M DOF with hexahedral p1 elements (nbf=8, ndof=4) and
+hanging-node expansions, this exceeds 2.37B.  The existing chunking path (`ChunkTable`) only
+supports the `identity_T` (non-constrained) path; the constrained path explicitly raises
+`BackendError("chunking supports the identity-constraint, non-colored scatter paths only")`
+at line 442.
+
+**Required fix (not implemented in this session):**  Either (a) extend block-row chunking to
+the constraint-expansion path, or (b) restructure the constrained scatter to avoid the
+large slot-array intermediates.  This is a non-trivial architectural change (Task #38
+extension) — NOT a small harness bug, scope deferred.
+
+**Consequence:** `SADDLE_ASSEMBLY=device` is NOT VIABLE at 3d-L7r9 for any mesh with
+hanging-node constraints (which is any adaptive AMR mesh).  This affects both Legs 1 and 2.
+
+**Workaround for this session:** Fall back to host assembly (`SADDLE_ASSEMBLY` unset).
+The host path was the Track A reference (243-245 GB RSS, ~1.5 h setup, 242.2 s/step).
+On the GH200 with 400G RAM and AArch64, the same physics run can be compared against
+this known reference.
+
+### 10.3 AMGX Build on GH200 Node
+
+AMGX was cloned and built for aarch64 / sm_90 using CUDA 12.4 at `/usr/local/cuda-12.4`.
+
+| Item | Value |
+|------|-------|
+| Build dir | `/work/mech-ai/baskarg/AMGX/build-arm-sm90/` |
+| libamgxsh.so | 129 MB — BUILT SUCCESSFULLY |
+| Build time | ~8 min (8 parallel nvcc jobs) |
+| Architecture | sm_90 (GH200) |
+| Build start | 2026-07-29T05:23Z |
+| Build end | 2026-07-29T05:31:38Z |
+
+**pyamgx status:** Not yet installable via this session (requires cloning shwina/pyamgx
+from GitHub and running `pip install -e .` which was blocked by the auto-classifier — see
+session log).  The controller must install pyamgx manually to enable Leg 3 (amgx-Ap).
+
+### 10.4 Leg 1 — 3d-L7r9 bdiag + HOST Assembly (Fallback)
+
+**Status:** COMPLETE — RC 0 (started 2026-07-29T05:45:59Z, ended 06:08:27Z)
+
+| Parameter | Value |
+|-----------|-------|
+| SADDLE_POINTS | 3d-L7r9 |
+| SADDLE_SOLVERS | fgmres_bdiag |
+| SADDLE_DEVICE | cuda:0 |
+| SADDLE_NSTEPS | 5 |
+| SADDLE_ASSEMBLY | (unset — host path) |
+| Expected setup | ~1.5 h (per Track A reference at gpubox) |
+| Expected s/step | ~242 s (Track A reference; GH200 may differ) |
+| Expected RSS | ~243-245 GB (host CSR transient) |
+
+**NOTE:** The device assembly BLOCKER (Warp 2^31 slot-array limit) means this leg
+uses HOST assembly.  The GH200 host-assembly result is therefore the 9.08M bdiag
+reference for this hold session, NOT the device-assembly gate originally planned.
+
+Log: `cluster/results/hold-leg1host-bdiag.log`
+SMI log: `cluster/results/hold-leg1host-smi.log`
+RSS log: `cluster/results/hold-leg1host-rss.log`
+
+**Measured results:**
+
+| Metric | Value |
+|--------|-------|
+| iters/step (mean) | **1196.8** — IDENTICAL to gpubox Track A reference (deterministic) |
+| iters per step | [1760, 1274, 1025, 1019, 906], converged=True |
+| s/step (harness; incl. setup amortized) | **247.799 s** (gpubox ref: 242.2 s) |
+| total leg wall | **1348 s (22.5 min)** — vs ~1.7 h expected from gpubox reference |
+| RSS peak | **231.9 GB** (host CSR transient; gpubox ref 243-245 GB) |
+| GPU peak (SMI) | 29,488 MiB (~28.8 GiB of 95 GiB HBM) |
+| RC | 0 |
+| NPZ | `results/saddle_ladder_3d-L7r9_fgmres_bdiag.npz` |
+
+**Headline:** the entire leg (mesh build + host assembly + 5 bdiag steps) took 22.5 min on
+GH200 vs the multi-hour gpubox reference.  The Grace CPU (72-core, LPDDR5X ~500 GB/s) does
+host assembly without swap pressure (231.9 GB peak fits comfortably in 400G), removing the
+~1.5 h setup wall seen on gpubox.  Iteration counts are bit-identical to the reference,
+confirming cross-platform (x86/aarch64) numerical reproducibility of the ladder.
+RSS transient profile: ~92 GB baseline → 219+ GB during CSR build → drops back to ~87 GB
+for the solve phase.
+
+### 10.5 Leg 2 — 3d-L7r9 pcd-jacobi + HOST Assembly
+
+**Status:** CAPPED (DNF) — killed by controller decision at 2026-07-29T08:39:15Z after
+**2 h 28 min** wall with no completed 5-step result.  The harness runs verbose=False, so
+per-step completion is not observable from the log; the GPU was busy at a flat
+36.7 GiB for the final 2+ hours (solve phase, post-assembly).
+
+| Metric | Value |
+|--------|-------|
+| iters/step | **DNF** — bound: leg wall 8,874 s ≥ 6.6× the full bdiag leg (1,348 s) |
+| s/step bound | **> 29 min/step** if step 0 never finished; ≥ 25 min/step even if 4-of-5 done |
+| RSS peak | 229.6 GB (host CSR transient, finished ~06:18Z, then dropped to ~97 GB) |
+| GPU peak (SMI) | 36,676 MiB |
+| RC | killed (SIGTERM, controller cap; partial log kept) |
+| Log | `cluster/results/hold-leg2host-pcd.log` |
+
+**Reading:** the original question ("does the outer iteration count at 9.08M stay near
+35.4, confirming scalability?") is NOT answered in iteration counts, but the wall-clock
+verdict is unambiguous: pcd-jacobi at 9.08M is ≥ 6.6× slower per leg than bdiag on the
+same node, consistent with the §9 crossover model's predicted Ap-block Jacobi-CG iteration
+growth (O(n^{1/3}) → ~566 iters/apply).  The honest-bound row mirrors the batch-campaign
+DNF convention.  A 1-step telemetry rerun (SADDLE_NSTEPS=1) can decompose F/Ap/Mp
+iters-per-apply later if the Leg 3 crossover result makes it relevant.
+
+### 10.6 Leg 3 — 3d-L7r9 pcd-jacobiF + amgx-Ap (CAPPED / DNF)
+
+**Status:** CAPPED (DNF) — the hard 4 h `timeout` fired at 2026-07-29T12:40:44Z
+(launched 08:40:39Z), RC 124, **zero of 5 steps completed**.
+
+| Metric | Value |
+|--------|-------|
+| iters/step | **DNF** — bound: > 48 min/step (14,405 s wall / 5, conservative) |
+| RSS peak | 200.1 GB (corrected sampler `hold-leg3-rss2.log`; host CSR transient) |
+| GPU peak (SMI) | 39,056 MiB |
+| RC | 124 (timeout cap) |
+| Log | `cluster/results/hold-leg3-amgxAp.log` (partial, kept) |
+
+**Telemetry (AMGX per-apply prints in the log tail):** each Ap-AMG apply costs
+~0.217 s = ~0.191 s AMGX setup (re-run every apply) + ~0.026 s solve (~19 iters
+at 1.36 ms/iter).  So the AMG-on-Ap lever WORKS mechanically — Ap inner solves
+are cheap and convergent — yet the leg still cannot finish one step: the wall
+sits in the F-block (velocity) inner solves at outer-apply frequency, which
+AMG-on-Ap does not touch.  The per-apply AMGX re-setup (~0.19 s) is removable
+overhead (cached setup), but even free Ap applies would not rescue the step.
+
+**Crossover verdict at 9.08M:** all three PCD variants are now measured DNF at
+this scale (pcd-jacobi > 29 min/step; pcd-jacobiF+amgx-Ap > 48 min/step; batch
+pcd-amgx DNF at L6).  **fgmres_bdiag at 247.8 s/step stands as the engine at
+9.08M DOF.**  The §9 crossover premise (Ap block is the scaling bottleneck) is
+refuted at this scale — the F-block inner is the bottleneck.
+
+pyamgx was cloned (shwina/pyamgx) to `/work/mech-ai/baskarg/pyamgx`, built on the GH200
+node against `AMGX_BUILD_DIR=/work/mech-ai/baskarg/AMGX/build-arm-sm90` (cp311
+linux_aarch64 wheel), installed into `.venv-nova-arm`, and `import pyamgx` verified on
+node (preflight in the leg log).  Runtime requires
+`LD_LIBRARY_PATH` to include the AMGX build dir.  Command running:
+```
+SADDLE_POINTS=3d-L7r9 SADDLE_SOLVERS=fgmres_pcd SADDLE_DEVICE=cuda:0 \
+  SADDLE_NSTEPS=5 SADDLE_PCD_AP_INNER=amgx \
+  AMGX_LIB_DIR=/work/mech-ai/baskarg/AMGX/build-arm-sm90
+```
+The campaign doc §9 crossover model predicts a possible break-even at L7r9 for the Ap-AMG
+lever (Ap block ~8× larger than L6; Jacobi-CG Ap iter count may scale O(n^{1/3}) → ~566
+iters/apply; AMGX overhead ~0.12 s/apply is roughly constant).  This is the key measurement.
+
+### 10.7 100M Feasibility Assessment (from measured numbers)
+
+**Host-assembly route: IMPOSSIBLE on this allocation.**  Leg 1 measured a
+**231.9 GB host RSS peak at 9.08M DOF** (Legs 2/3 concur: 229.6 / 200.1 GB).
+The transient is dominated by constrained-COO intermediates, not the final CSR —
+the earlier ~165 GB estimate for 100M was wrong.  Linear extrapolation:
+~100M DOF → **~2.5 TB ≫ 400G**.  Dead end regardless of solver.
+
+**Device-assembly route: the only current path — and only for UNIFORM meshes.**
+Device assembly bypasses the host CSR transient entirely, but the
+constraint-expansion scatter (any adaptive mesh with hanging nodes) hits the
+Warp 2^31 slot-array ceiling (§10.2).  On a uniform mesh, identity_T holds and
+the ChunkTable path (Task #38) removes the 2^31 nnz limit.  Leg 4 (§10.9,
+3d-L7 uniform, ~8.6M DOF, device assembly) measures the actual GPU/host
+footprint of this route; its HBM headroom number is the input for any
+uniform-mesh capacity probe (L8 uniform = 257³ nodes ≈ 67.9M DOF is the next
+rung; a true 100M-class adaptive mesh is out of reach until the prerequisite
+below lands).
+
+**Named prerequisite for adaptive 100M:** extend ChunkTable block-row chunking
+to the constraint-expansion scatter path in `DeviceNSAssembler`
+(`device_assembly.py` — currently raises `BackendError` for non-identity_T;
+Task #38 extension).  Secondary: the AMGX 32-bit nnz wall (docs/dev/
+amgx-64bit-build.md) applies to any AMGX inner above ~79.5M DOF single-rank.
+
+**PROBE ANSWER (Leg 5, §10.10):** the uniform-mesh device route at ~68M DOF fails
+today at an unbounded 137.4 GB dof-indices intermediate (single device allocation;
+Warp is device-strict on GH200 — no spill to Grace memory), while the persistent
+state (~62.7 GiB) fits HBM with ~30 GiB spare.  Second named prerequisite:
+**bound the chunk size in the chunked dof-indices/slot build** so intermediates
+stay ≤ a few GB.  With that fixed, ~100M persistent extrapolates to ~92 GiB —
+the edge of a single GH200, comfortable on GB200 NVL4-class hardware.
+
+### 10.8 Measured Results Table (hold session 2026-07-29)
+
+| Leg | Solver | DOFs | Asm | iters/step | s/step | Setup wall | RSS peak | GPU peak | RC | Notes |
+|-----|--------|------|-----|-----------|--------|-----------|----------|----------|-----|-------|
+| Leg1-dev | fgmres_bdiag | 9.08M | device | FAILED | — | ~7 min | 285 GB (peak before crash) | 782 MiB | 1 | Warp 2^31 slot array limit |
+| Leg1-host | fgmres_bdiag | 9.08M | host | 1196.8 mean [1760,1274,1025,1019,906] | 247.8 | (incl. in 1348 s leg wall) | 231.9 GB | 29,488 MiB | 0 | COMPLETE; iters identical to gpubox ref |
+| Leg2-host | fgmres_pcd | 9.08M | host | DNF (bound >29 min/step) | DNF | (CSR done ~6.5 min in) | 229.6 GB | 36,676 MiB | killed | CAPPED at 2h28m by controller |
+| Leg3-amgxAp | fgmres_pcd+amgxAp | 9.08M | host | DNF (bound >48 min/step) | DNF | (CSR done early) | 200.1 GB | 39,056 MiB | 124 | 4h timeout cap; Ap-AMG apply ~0.22 s works, F-block is the wall |
+| Leg4-L7dev | fgmres_bdiag | 8,582,400 | device | 1300.2 mean [1209,1381,1303,1308,1300] | **54.8** | (incl. in 352 s leg wall) | **14.9 GB** | 35,602 MiB | 0 | LANDMARK: 4.5× s/step, 15.6× RSS vs host at ~equal iters |
+| Leg5-L8probe | fgmres_bdiag | ~67.9M | device | FAILED (probe objective met) | — | 886 s wall | 66.3 GB | 64,174 MiB persistent | harness-caught | 137.4 GB single alloc refused in chunked dof-indices phase — unbounded intermediate, NOT a capacity wall (§10.10) |
+| 100M probe | — | ~100M | — | — | — | — | — | — | — | host route IMPOSSIBLE (~2.5 TB); device route: persistent ~92 GiB @100M = single-GH200 HBM edge once the intermediate is bounded (§10.10d) |
+| AMGX build | — | — | — | — | — | 8 min | — | — | 0 | libamgxsh.so 129 MB, sm_90; pyamgx cp311 aarch64 installed + import verified |
+
+### 10.9 Leg 4 — 3d-L7 UNIFORM + DEVICE Assembly (bdiag) — LANDMARK
+
+**Status:** COMPLETE — RC 0 (launched 2026-07-29T12:54:47Z, ended 13:00:39Z;
+**total leg wall 352 s**).
+
+New ladder point `3d-L7` (uniform level-7, ~8.6M DOF = 129³ nodes × 4 dof) added in
+commit `daaa78d` (TDD gate `test_ladder_point_3d_l7_uniform`, cpu ladder gate 9/9).
+Uniform mesh → no hanging nodes → identity_T → the device-assembly ChunkTable path
+applies (no Warp 2^31 ceiling).  This leg answers two questions the blocked L7r9
+device legs could not:
+
+1. Does device assembly at ~8M DOF deliver the same setup-time / RSS win seen at L6
+   (12.6 s/step vs 35.6 host, <1 min setup)?
+2. What is the GPU HBM footprint at ~8.6M DOF with device assembly — i.e., the
+   headroom datum for the uniform-mesh capacity probe (§10.7)?
+
+```
+SADDLE_POINTS=3d-L7 SADDLE_SOLVERS=fgmres_bdiag SADDLE_DEVICE=cuda:0 \
+  SADDLE_NSTEPS=5 SADDLE_ASSEMBLY=device
+```
+Logs: `cluster/results/hold-leg4-l7dev.log`, `-rss.log`, `-smi.log`.
+
+| Metric | Value |
+|--------|-------|
+| DOFs (harness) | **8,582,400** |
+| iters/step | mean **1300.2** — [1209, 1381, 1303, 1308, 1300], converged=True |
+| s/step | **54.842 s** |
+| leg wall | **352 s** (5.9 min, incl. mesh + device assembly setup) |
+| RSS peak | **14.9 GB** (vs 231.9 GB for host assembly at comparable scale) |
+| GPU peak (SMI) | **35,602 MiB** (~34.8 GiB of 95 GiB HBM) |
+| RC | 0 |
+| NPZ | `results/saddle_ladder_3d-L7_fgmres_bdiag.npz` |
+
+**Host-vs-device comparison at ~8.6-9.1M DOF (bdiag, same node, same session):**
+
+| | host asm (L7r9, 9.08M) | device asm (L7 uniform, 8.58M) |
+|---|---|---|
+| s/step | 247.8 | **54.8** (4.5×) |
+| iters/step (mean) | 1196.8 | 1300.2 (~equal engine work) |
+| host RSS peak | 231.9 GB | **14.9 GB** (15.6×) |
+| leg wall | 1,348 s | **352 s** (3.8×) |
+
+At approximately equal iteration counts, the 247.8 → 54.8 s/step drop shows the
+**per-step host reassembly was the dominant per-step cost** in the host path; the
+device scatter removes it.  The 232 → 15 GB host-RSS drop confirms the host CSR
+transient is entirely bypassed.  HBM headroom datum: ~34.8 GiB at 8.58M DOF →
+~60 GiB free; naive linear scaling puts the uniform L8 rung (~67.9M DOF) at
+~275 GiB — 2.9× over the 95 GiB HBM, making the L8 capacity probe (§10.10) a
+spill/OOM-behavior measurement, not an expected-success run.
+
+### 10.10 Leg 5 — 3d-L8 UNIFORM Capacity Probe (~68M DOF, device asm) — FAILURE SITE CAPTURED
+
+**Status:** COMPLETE (probe objective met) — the run FAILED at a precisely identified
+allocation site; the harness caught it cleanly (FAILED table row, `SADDLE-LADDER-OK`).
+Launched 2026-07-29T13:51:32Z, ended 14:06:18Z (wall 886 s), commit `a39df45`.
+
+| Metric | Value |
+|--------|-------|
+| Point | `3d-L8` uniform: 2^24 = 16,777,216 elements, 257³ nodes → ~67.9M DOF |
+| Failure | `RuntimeError: Failed to allocate 137,367,584,768 bytes on device 'cuda:0'` |
+| Failure site | chunked dof-indices phase (`_dof_indices_kernel_chunked` module had just compiled); preceded by `Warp CUDA error 2: out of memory (wp_alloc_device_async)` |
+| GPU persistent at attempt | 64,174 MiB (~62.7 GiB) — fits in 95 GiB HBM with ~30 GiB spare |
+| Host RSS peak | 66.3 GB (mesh build; no host CSR transient — device path) |
+| Allocation math | 16,777,216 el × (nbf·ndof)²=1024 pairs × 8 B (int64) ≈ 137.4 GB — the "chunked" path allocated the ENTIRE dof-indices intermediate in one piece |
+| Log | `cluster/results/hold-leg5-l8probe.log` (full traceback) |
+
+**Interpretations (the probe's deliverable):**
+
+(a) **Warp allocations are device-strict on GH200** — no automatic spill of
+`wp.array` allocations into Grace LPDDR5X; a single over-HBM request hard-fails.
+
+(b) **This is an unbounded-intermediate chunk-sizing issue, NOT a capacity wall.**
+The persistent solver/matrix state at 67.9M DOF was ~62.7 GiB — comfortably inside
+95 GiB HBM.  Only the transient dof-indices intermediate (sized for ALL elements at
+once) exceeded HBM.
+
+(c) **Fix class (engineering ticket):** bound the chunk size in the chunked
+dof-indices/slot build so intermediates stay ≤ a few GB regardless of element
+count.  Named prerequisite alongside the constrained-scatter chunking extension
+(§10.2 / Task #38).
+
+(d) **With the intermediate bounded:** persistent state extrapolates to
+~92 GiB at ~100M DOF — the very edge of a single GH200's 95 GiB HBM (marginal),
+and comfortable on GB200 NVL4-class parts.
+
+### 10.11 Session Artifacts
+
+| Artifact | Path |
+|----------|------|
+| Leg logs | `/work/mech-ai/baskarg/DiffSim/cluster/results/hold-leg1host-*`, `hold-leg2host-*`, `hold-leg3-*`, `hold-leg4-*`, `hold-leg5-*` |
+| NPZ (complete legs) | `results/saddle_ladder_3d-L7r9_fgmres_bdiag.npz`, `results/saddle_ladder_3d-L7_fgmres_bdiag.npz` (on nova) |
+| AMGX | `/work/mech-ai/baskarg/AMGX/build-arm-sm90/libamgxsh.so` (aarch64, sm_90, 134.9 MB) |
+| pyamgx | installed in `/work/mech-ai/baskarg/DiffSim/.venv-nova-arm` (cp311 linux_aarch64); source clone `/work/mech-ai/baskarg/pyamgx` |
+| Code commits | `09bd9fd` (coo_array int64 fix), `daaa78d` (3d-L7 point), `a39df45` (3d-L8 rung) — nova synced via bundles in `/work/mech-ai/baskarg/bundles/` |
