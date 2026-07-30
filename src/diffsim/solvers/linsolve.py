@@ -1148,7 +1148,9 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         ndof = meta.get("ndof", 3)
 
         op = CSROperator(A, device)
-        apply_bdiag = make_bdiag_apply(A, ndof, device)
+        # W5d knob (same convention as fgmres_bdiag): opt-in node-block Jacobi.
+        apply_bdiag = make_bdiag_apply(A, ndof, device,
+                                       block=meta.get("bdiag_block", "scalar"))
 
         x, info = bicgstab_dev(op, b, tol=tol, atol=1e-13, maxiter=maxiter,
                                check_every=100, apply_dev=apply_bdiag)
@@ -1556,7 +1558,10 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         _restart = int(meta.get("saddle_restart", 60))
 
         op = CSROperator(A, device)
-        apply_dev = make_bdiag_apply(A, ndof, device)
+        # W5d knob: bdiag_block="node" upgrades scalar Jacobi to per-node
+        # ndof x ndof block Jacobi (opt-in via blocktri_meta; default scalar).
+        apply_dev = make_bdiag_apply(A, ndof, device,
+                                     block=meta.get("bdiag_block", "scalar"))
         N = A.shape[0]
 
         b_dev = wp.array(np.ascontiguousarray(b, np.float64),
