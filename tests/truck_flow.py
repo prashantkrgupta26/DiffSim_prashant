@@ -343,7 +343,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               viz_checkpoint_interval=None, viz_Q_thresh=0.5, viz_roi=None,
               mesh_only=False, linsolve_tol=1e-10, linsolve_tol_schedule=None,
               saddle_restart=None,
-              saddle_equilibrate=False, soft_start=None):
+              saddle_equilibrate=False, soft_start=None, dt_schedule=None):
     """Run the truck case: transient BDF2 monolithic march.
 
     Returns a history dict with keys:
@@ -399,6 +399,16 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
           ramping the inlet from 0 to full over the first ``soft_start`` steps.
           Mitigates the impulsive-start startup pressure spike (the +201/-87
           cd_react transient).  None (default) or <=0 = off, byte-identical.
+      dt_schedule : callable or None
+          step index -> dt_unit for that step (the C++ dt_V startup ladder).
+          A smaller startup dt raises sigma = b0/dt, restoring the
+          mass-dominance that keeps plain block-Jacobi convergent through the
+          developing-flow transient (T4b forensics).  The dt change is handled
+          with the variable-step BDF2 table (bdf_coeffs dt_prev branch), no
+          BDF1 restart; unit time accumulates (t_new = sum of per-step dt), so
+          all t-based schedules (nu, tol, soft_start) stay physical-time
+          consistent.  None (default) = fixed dt, byte-identical (t_new keeps
+          the (step+1)*dt closed form).
     """
     dim = 3
     ndof = dim + 1
@@ -598,11 +608,19 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             _bd["saddle_equilibrate"] = True     # T4b diagonal equilibration
         _pcd_cache[("blocktri_meta", "truck")] = _bd
 
+    t_cur = 0.0
+    dt_prev_step = None
     for step in range(nsteps):
+        dt_step = (float(dt_schedule(step)) if dt_schedule is not None
+                   else dt)
         order = 1 if step == 0 else 2
-        b0, b1, b2 = bdf_coeffs(order, dt)
-        sigma = b0 / dt
-        t_new = (step + 1) * dt
+        b0, b1, b2 = bdf_coeffs(order, dt_step,
+                                dt_prev=(dt_prev_step if order == 2 else None))
+        sigma = b0 / dt_step
+        # closed form when no schedule (byte-identical to prior behaviour);
+        # accumulated sum under a schedule (physical time stays consistent)
+        t_new = ((step + 1) * dt if dt_schedule is None
+                 else t_cur + dt_step)
         nu_step = float(nu_schedule(t_new)) if nu_schedule is not None else nu
 
         aq, dq = _gp_field(dm, mesh, T, u_pre1, dim)
@@ -612,9 +630,10 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                 tb = dm.tables_by_p[pv]
                 vals = np.asarray(T @ u_pre1)[mesh.conn_of[pv]]
                 fq_raw[pv] = (np.einsum("qa,ead->eqd", tb.N, vals).reshape(-1, dim)
-                              / dt)
+                              / dt_step)
         else:
-            fq_raw = _gp_history_fq(dm, mesh, T, u_pre1, u_pre2, b1, b2, dt, dim)
+            fq_raw = _gp_history_fq(dm, mesh, T, u_pre1, u_pre2, b1, b2,
+                                    dt_step, dim)
 
         # If nu changes, the SBM face system must be reassembled (it scales nu).
         if nu_schedule is not None:
@@ -737,6 +756,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
 
         u_pre2 = u_pre1.copy()
         u_pre1 = u_new.copy()
+        t_cur = t_new
+        dt_prev_step = dt_step
 
         if verbose:
             print(f"[truck] step {step:3d}  Cd_react={cd[step]:+.4f}  "

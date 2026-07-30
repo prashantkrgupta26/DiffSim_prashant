@@ -145,6 +145,23 @@ def tol_sched(t_unit):
 print(f"[T5] soft_start={SOFT_START} dt-units  tol_loose={TOL_LOOSE} -> "
       f"tol_tight={TOL_TIGHT} at step>{TOL_TIGHTEN_STEP}", flush=True)
 
+# DT-SEGMENTED STARTUP (the C++ dt_V startup ladder, r120b escalation): the
+# clean r120b leg proved the developing-flow solve exceeds scalar-Jacobi at
+# full dt (24000 inner iters, relres 7.6e-4 at step 12).  T4b forensics: what
+# makes Jacobi work is sigma-dominance (sigma = b0/dt).  DT_START_FACTOR>0
+# runs the first DT_START_STEPS steps at dt/DT_START_FACTOR (sigma x FACTOR),
+# then returns to full dt via the variable-step BDF2 table.  All t-based
+# schedules (nu ramp, tol, soft_start) stay physical-time consistent because
+# run_truck accumulates t_new under a dt_schedule.
+DT_START_FACTOR = float(os.environ.get("DT_START_FACTOR", "0") or 0)
+DT_START_STEPS = int(os.environ.get("DT_START_STEPS", "0") or 0)
+dt_sched = None
+if DT_START_FACTOR > 0 and DT_START_STEPS > 0:
+    def dt_sched(step, _dt=dt, _f=DT_START_FACTOR, _n=DT_START_STEPS):
+        return _dt / _f if step < _n else _dt
+    print(f"[T5] DT ladder: dt/{DT_START_FACTOR} for first {DT_START_STEPS} "
+          f"steps (sigma x{DT_START_FACTOR}), then dt={dt}", flush=True)
+
 from diffsim.solvers import linsolve
 _step_times = []
 _last_step_t = [time.time()]
@@ -197,6 +214,7 @@ res = run_truck(
     viz_checkpoint_interval=CKPT_INT,
     viz_Q_thresh=0.5,
     soft_start=(SOFT_START if SOFT_START > 0 else None),
+    dt_schedule=dt_sched,
 )
 t_total = time.time() - t_run
 
