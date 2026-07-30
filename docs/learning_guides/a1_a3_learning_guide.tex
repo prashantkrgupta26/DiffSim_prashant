@@ -1,0 +1,313 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,booktabs,enumitem,xcolor,hyperref,listings}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+\lstset{basicstyle=\ttfamily\small,columns=fullflexible,frame=single}
+\title{DiffSim Learning Guide\\A1--A3: Verification, Boundary Conditions, and Shifted Geometry}
+\author{Study notes from the DiffSim tutorials}
+\date{July 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{How to read the DiffSim code}
+
+The tutorials combine mathematics, finite elements, sparse linear algebra,
+and GPU kernels. The basic computational flow is always
+\[
+ \text{exact solution} \to \text{mesh} \to \text{assemble } A,b
+ \to \text{apply boundary conditions} \to \text{solve} \to \text{measure error}.
+\]
+
+The code uses a hybrid CPU/GPU design. Normal Python, NumPy, SciPy, sparse
+matrix conversion, and \texttt{splu} run on the CPU (the \emph{host}). Warp
+kernels launched with \texttt{device=DEVICE} run on the GPU (the \emph{device}).
+The GPU does not automatically accelerate a SciPy call.
+
+\section{Finite-element building blocks}
+
+\subsection{From cells to a finite-element mesh}
+
+\texttt{build\_uniform(level, dim=2)} creates square cells. These cells are
+not yet a finite-element algebraic system. \texttt{build\_mesh(tree,p)}
+creates global node coordinates, element connectivity, boundary-node flags,
+and polynomial-order information. For $p=1$, a square has corner nodes. For
+$p=2$, it also has edge and interior interpolation points.
+
+If an element has local nodes $a$ and basis functions $N_a$, then
+\[
+ u_h(x)=\sum_a N_a(x)u_a.
+\]
+Assembly combines element matrices into a global sparse matrix.
+
+\subsection{Why constraints are needed}
+
+Adaptive meshes can have a fine element next to a coarse element. A node on
+the fine side may not exist on the coarse side; this is a \emph{hanging node}.
+Continuity requires its value to be interpolated from independent nodes. The
+constraint object stores
+\[
+ u_{\rm all}=T u_{\rm free}.
+\]
+The solver works with the independent values and reconstructs all values by
+\texttt{u\_all = T @ u\_free}. On a uniform mesh there are no hanging nodes,
+so $T$ is the identity.
+
+For quadratic elements the interpolation is not generally a $0.5/0.5$ rule.
+The code evaluates the appropriate Lagrange basis functions. For nodes
+$\xi=-1,0,1$, evaluation at $\xi=-0.5$ gives weights
+\[
+ (0.375,\;0.75,\;-0.125).
+\]
+
+\section{A1: manufactured solutions and convergence}
+
+\subsection{The PDE and MMS idea}
+
+The model problem is Poisson's equation:
+\[
+ -\Delta u=f \quad \text{in }\Omega,
+ \qquad u=g \quad \text{on }\partial\Omega.
+\]
+The method of manufactured solutions chooses a known answer $u^*$, then
+defines the data so that $u^*$ solves the PDE:
+\[
+ f=-\Delta u^*, \qquad g=u^*|_{\partial\Omega}.
+\]
+For a smooth solution and linear elements, the expected $L^2$ error is
+\[
+ \|u-u_h\|_{L^2}=O(h^2).
+\]
+For quadratic elements it is typically $O(h^3)$.
+
+The measured order between two levels is
+\[
+ r=\log_2\left(\frac{E_h}{E_{h/2}}\right).
+\]
+An order of 2 means that halving $h$ reduces the error by about four.
+
+\subsection{A1 results}
+
+The $p=1$ run produced errors approximately
+\[
+ 1.302\times10^{-3},\quad 3.255\times10^{-4},\quad
+ 8.138\times10^{-5},
+\]
+with orders $2.00,2.00$. This verifies the expected second-order behavior.
+
+The quadratic patch test used $u^*=x^2+y^2$. A quadratic finite-element
+space represents this function exactly, so the error was near machine
+precision ($10^{-15}$). This is not ordinary asymptotic convergence; it is a
+discrete-space exactness test.
+
+\section{Boundary conditions}
+
+\subsection{Dirichlet row replacement}
+
+The discrete system has the form
+\[
+ A u=b.
+\]
+If a boundary degree of freedom must equal $g_i$, one simple method replaces
+its row by an identity row:
+\[
+ A_{i,:}\leftarrow e_i^T, \qquad b_i\leftarrow g_i.
+\]
+The resulting equation is exactly $u_i=g_i$.
+
+This is easy to understand and useful in tutorials. Production codes often
+eliminate known boundary degrees of freedom. Splitting unknowns into interior
+and boundary parts gives
+\[
+ A_{II}u_I=b_I-A_{IB}g.
+\]
+This reduced system is smaller and can preserve symmetry when rows and
+columns are treated consistently.
+
+\subsection{Natural Neumann conditions and pinning}
+
+After integration by parts,
+\[
+ \int_\Omega \nabla w\cdot\nabla u\,d\Omega
+ -\int_{\partial\Omega}w\,\nabla u\cdot n\,d\Gamma
+ =\int_\Omega wf\,d\Omega.
+\]
+If no boundary term is added on a face, the weak form naturally imposes
+\[
+ \nabla u\cdot n=0.
+\]
+With pure Neumann conditions, adding a constant to a solution gives another
+solution. The matrix is singular. Pinning one node, for example $u(0,0)=1$,
+removes this arbitrary constant (the gauge). It does not represent a new
+physical wall condition.
+
+For the cosine manufactured solution, the normal flux is zero on every face,
+so the pure-Neumann problem is compatible. The sine solution has nonzero flux
+on the $y$-faces, so using zero natural flux there produces an inconsistent
+problem and a large nonconvergent error.
+
+\section{A2 results and lesson}
+
+With $u^*=\sin(\pi x)\sin(\pi y)$, all-face Dirichlet conditions gave
+second-order convergence. The x-only case gave errors near $0.47$ and order
+near zero. The reason is that the omitted $y$-faces silently impose zero
+flux, while
+\[
+ \frac{\partial u^*}{\partial y}
+ =\pi\sin(\pi x)\cos(\pi y)
+\]
+is generally nonzero there. Refinement cannot fix a wrong boundary condition.
+
+The A2 performance experiment timed the CPU Python row-replacement loop.
+Boundary nodes doubled from 128 to 1024, while loop time grew from
+$2.23\times10^{-4}$ to $1.792\times10^{-3}$ seconds. The measured exponent
+was about $0.5$ with respect to total 2-D degrees of freedom, consistent with
+boundary size growing like $\sqrt n$.
+
+\section{A3: shifted boundary method}
+
+\subsection{Exact circle and Cartesian background mesh}
+
+A3 solves Poisson's equation inside a disk of radius $0.3$ centered at
+$(0.5,0.5)$, but the mesh is a Cartesian square mesh. The mesh is not fitted
+to the circle. Elements are classified as inside or outside, and exposed
+faces of retained elements create a staircase \emph{surrogate boundary}.
+
+\subsection{The lambda criterion}
+
+For an intercepted element, let $\theta_{\rm out}$ be its estimated outside
+volume fraction. The production rule keeps it when
+\[
+ \theta_{\rm out}\le \lambda.
+\]
+Thus $\lambda=0$ keeps only fully interior elements, while $\lambda=1$
+keeps every element touched by the circle. Fully interior elements are always
+kept and fully exterior elements are dropped.
+
+\subsection{Projection data}
+
+For every Gauss quadrature point $x_q$ on a surrogate face, the geometry
+oracle finds a closest true-boundary point $y$. The displacement is
+\[
+ d=y-x_q.
+\]
+The true normal is the normalized level-set gradient at $y$:
+\[
+ n=\frac{\nabla\psi(y)}{\|\nabla\psi(y)\|},
+\]
+oriented outward from the physical domain. It is conceptually separate from
+$d$, although an exact closest-point projection on a smooth surface makes the
+two directions parallel.
+
+The displacement tells the method \emph{where} the true boundary is. The
+normal tells it \emph{which direction is perpendicular to the boundary} and
+is needed for the flux $\nabla u\cdot n$ and Nitsche terms.
+
+\subsection{Taylor shift and the Hessian}
+
+The surrogate point is not the true boundary point. The method approximates
+the value at $y=x+d$ by Taylor expansion:
+\[
+ Su(x)=u(x)+\nabla u(x)\cdot d
+ +\frac12d^T H(u)(x)d+\cdots.
+\]
+The Hessian is the matrix of second derivatives:
+\[
+ H(u)=
+ \begin{bmatrix}u_{xx}&u_{xy}\\u_{yx}&u_{yy}\end{bmatrix}.
+\]
+For $p=1$, the first-order shift is used. For $p=2$, the Hessian term is
+needed to obtain the matching third-order $L^2$ behavior. The sign of $d$
+matters: when the surrogate changes from inside to outside, $d$ reverses,
+and the signed Taylor term reverses too.
+
+\subsection{Nitsche terms}
+
+The shifted SBM Dirichlet form contains, schematically,
+\[
+ -\int_{\widetilde\Gamma} w(\nabla u\cdot\widetilde n)\,dS
+ -\int_{\widetilde\Gamma}(\nabla w\cdot\widetilde n)Su\,dS
+ +\int_{\widetilde\Gamma}\frac{\alpha}{h}(Sw)(Su)\,dS.
+\]
+The first term is consistency, the second is adjoint consistency, and the
+third is penalty/stability. The test function is also shifted:
+\[
+ Sw=w+\nabla w\cdot d+\frac12d^TH(w)d.
+\]
+This does not physically move the function; it approximates its value at the
+true boundary while integration remains on the staircase.
+
+\subsection{A3 measured results}
+
+For $p=1$, the exact-circle experiment gave errors
+\[
+3.210\times10^{-3},\;6.615\times10^{-4},\;1.508\times10^{-4}
+\]
+and orders $2.28,2.13$, consistent with $O(h^2)$. For $p=2$, the errors were
+\[
+1.726\times10^{-4},\;1.423\times10^{-5},\;1.808\times10^{-6}
+\]
+and orders $3.60,2.98$, confirming the expected $O(h^3)$ rate on the finer
+interval.
+
+With $\lambda=1$, the p1 errors were
+\[
+9.324\times10^{-3},\;3.753\times10^{-3},\;6.083\times10^{-4},
+\]
+with orders $1.31,2.63$. The coarse interval is pre-asymptotic; the finer
+interval is approaching the expected second-order behavior. The method works
+whether the surrogate is inside or outside because $d$ is signed.
+
+\subsection{Sampled GridSDF geometry}
+
+\texttt{GridSDF} stores signed-distance values at a $129\times129$ grid of
+corner points and uses multilinear interpolation. Negative values mean
+inside, positive values mean outside, and the interpolated zero set
+approximates the circle. This models geometry obtained from voxel data or a
+sampled level set rather than an analytic formula.
+
+The strict closest-point test failed at 8 of 80 points because the sampled
+field is only piecewise smooth. Allowing a 10\% fallback produced errors
+\[
+9.317\times10^{-3},\;3.791\times10^{-3},\;6.401\times10^{-4}
+\]
+and orders $1.30,2.57$, close to the exact-circle $\lambda=1$ result. The
+physical lesson is that geometry representation can eventually create an
+error floor: once the FEM mesh is finer than the geometry data, refining the
+FEM mesh alone cannot recover the exact shape.
+
+\section{Performance and the research lesson}
+
+For a 2-D uniform refinement, the number of degrees of freedom grows by about
+four when $h$ is halved. If $t\propto n^\alpha$, then
+\[
+ \alpha=\frac{\log(t_2/t_1)}{\log(n_2/n_1)}.
+\]
+The A1 performance study found approximately linear assembly and a
+superlinear sparse solve. At level 8, representative GPU-visible timings
+were assembly $0.1501$ seconds and solve $0.2433$ seconds. The Warp assembly
+kernels ran on the RTX GPU, but SciPy's \texttt{splu} solve remained on the
+CPU. Thus the solve was the bottleneck.
+
+The broader lesson is to measure both accuracy and cost. A method can have
+the correct convergence order but still become unusable if its solve or
+geometry stage scales poorly. Conversely, a fast calculation is not useful if
+its boundary conditions or geometry are wrong.
+
+\section{Final checklist}
+
+\begin{enumerate}[leftmargin=*]
+\item Derive $f$ and $g$ from a known manufactured solution.
+\item Check errors and convergence orders, not just one solution plot.
+\item Distinguish physical boundary conditions from mesh-continuity constraints.
+\item Remember that omitted weak boundary terms impose natural zero flux.
+\item Use signed displacement $d$ for shifted geometry and the true normal for flux.
+\item Match Taylor-shift order to polynomial order: p1 uses first order, p2 uses Hessian correction.
+\item Expect pre-asymptotic fluctuations on coarse meshes.
+\item Measure scaling and identify the eventual bottleneck.
+\item Treat sampled geometry as an additional numerical approximation with its own error floor.
+\end{enumerate}
+
+\end{document}
