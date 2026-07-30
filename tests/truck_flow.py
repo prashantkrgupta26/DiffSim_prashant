@@ -257,6 +257,26 @@ def _pressure_pin(coords, ndof, dim):
     return corner * ndof + dim
 
 
+def soft_start_amp(t_unit, soft_start, dt):
+    """Inlet amplitude ramp multiplier for the impulsive-start transient.
+
+    Physical motivation (TU5R): the campaign's impulsive step-function inlet
+    (full amplitude at t=0) drives a spurious startup pressure spike — the
+    incompressible pressure is elliptic, so switching the inlet on instantly
+    excites the whole field at once (the +201/-87 cd_react class transient seen
+    post-onset in the T5 gate leg).  A short linear amplitude ramp
+
+        amp(t) = min(1, t / (soft_start * dt))
+
+    turns the inlet on over ``soft_start`` time-units (in dt) and lets the
+    startup pressure response develop smoothly.  ``soft_start=None`` (default)
+    or <= 0 returns 1.0 (off; byte-identical to prior behaviour).
+    """
+    if soft_start is None or soft_start <= 0:
+        return 1.0
+    return float(min(1.0, t_unit / (float(soft_start) * dt)))
+
+
 # ---------------------------------------------------------------------------
 # Truck-enclosing reaction indicator
 # ---------------------------------------------------------------------------
@@ -322,7 +342,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               viz_interval=None, viz_dir=None,
               viz_checkpoint_interval=None, viz_Q_thresh=0.5, viz_roi=None,
               mesh_only=False, linsolve_tol=1e-10, linsolve_tol_schedule=None,
-              saddle_equilibrate=False):
+              saddle_equilibrate=False, soft_start=None):
     """Run the truck case: transient BDF2 monolithic march.
 
     Returns a history dict with keys:
@@ -371,6 +391,13 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
           fgmres_bdiag / fused_bdiag backend (breaks the scalar-Jacobi relres
           floor caused by the ~10-order diagonal span of the Cb_f Nitsche
           penalties on fine surrogate faces).  Default False = byte-identical.
+      soft_start : float or None
+          TU5R: inlet amplitude ramp length in dt-units.  When set, the inflow
+          x-velocity strong-BC value is scaled per step by
+          soft_start_amp(t_new, soft_start, dt) = min(1, t_new/(soft_start*dt)),
+          ramping the inlet from 0 to full over the first ``soft_start`` steps.
+          Mitigates the impulsive-start startup pressure spike (the +201/-87
+          cd_react transient).  None (default) or <=0 = off, byte-identical.
     """
     dim = 3
     ndof = dim + 1
@@ -421,6 +448,20 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
     bc_rows, bc_vals, masks, coords = truck_strong_bc(
         mesh, cons, ndof, dim, scale, cfg.slope_near_ground, cfg.domain_max)
     p_pin = _pressure_pin(coords, ndof, dim)
+
+    # ---- soft-start inlet ramp bookkeeping (TU5R; opt-in) -------------------
+    # Which entries of (bc_rows, bc_vals) are inflow x-velocity DOFs with a
+    # nonzero target (u_x = ramp)?  Those are the only rows scaled by the
+    # per-step amplitude; every other strong row (no-slip 0, slip 0, u_y/u_z=0
+    # at the inlet) stays fixed.  Precomputed ONCE; None/off => empty mask.
+    _inflow_x_rows = None
+    if soft_start is not None and soft_start > 0:
+        _inflow_nodes = np.nonzero(masks["inflow"])[0]
+        _inflow_x_dofs = set(int(n) * ndof + 0 for n in _inflow_nodes)
+        _bc_rows_arr = np.asarray(bc_rows, np.int64)
+        _mask = np.array([int(r) in _inflow_x_dofs and abs(v) > 0.0
+                          for r, v in zip(_bc_rows_arr, bc_vals)], bool)
+        _inflow_x_rows = np.nonzero(_mask)[0]   # indices INTO bc_rows/bc_vals
 
     # ---- SBM face terms (geometry fixed; pre-assembled) ---------------------
     noslip = lambda y: np.zeros((len(y), dim))
@@ -597,6 +638,15 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         _tol = (float(linsolve_tol_schedule(t_new))
                 if linsolve_tol_schedule is not None else linsolve_tol)
 
+        # Soft-start: scale the inflow x-velocity strong-BC values this step.
+        # bc_vals_step == bc_vals when soft_start is off (byte-identical).
+        if _inflow_x_rows is not None:
+            _amp = soft_start_amp(t_new, soft_start, dt)
+            bc_vals_step = np.asarray(bc_vals, np.float64).copy()
+            bc_vals_step[_inflow_x_rows] *= _amp
+        else:
+            bc_vals_step = bc_vals
+
         if assembly == "device":
             # ---- Device-resident CSR handoff path (P1) ----------------------
             # A_vol on device + atomic-add Af_c at fixed slots + static strong
@@ -604,7 +654,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             # (assemble_handoff); the fgmres_bdiag / fused_bdiag saddle paths
             # in solve_linear consume vals_d directly.  Read the env live so
             # parity harnesses can toggle it (default byte-identical to host).
-            _val_of = {int(r): float(v) for r, v in zip(bc_rows, bc_vals)}
+            _val_of = {int(r): float(v) for r, v in zip(bc_rows, bc_vals_step)}
             _val_of[int(p_pin)] = 0.0
             _sb = np.array([_val_of[int(r)] for r in _strong_rows])
             _dev_csr = os.environ.get(
@@ -649,7 +699,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             _b_vol = b.copy()
             A = (A + Af_c).tolil()
             b = b + bf_c
-            for r, v in zip(bc_rows, bc_vals):
+            for r, v in zip(bc_rows, bc_vals_step):
                 A.rows[r] = [int(r)]; A.data[r] = [1.0]; b[r] = v
             A.rows[p_pin] = [p_pin]; A.data[p_pin] = [1.0]; b[p_pin] = 0.0
 

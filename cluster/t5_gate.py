@@ -106,8 +106,26 @@ print(f"[T5] nu_unit(0)={nu_sched(0.0):.3e} effRe={scale/nu_sched(0.0):.0f}",
 # post-ramp stays tight (1e-6).
 TOL_RAMP = float(os.environ.get("TOL_RAMP", "5e-4"))
 
+# TU5R SOFT-START LEG: the corrected physics is that the startup spike is the
+# incompressible (elliptic) pressure response to an IMPULSIVE inlet, NOT a
+# front-arrival event.  A short inlet amplitude ramp lets that pressure
+# response develop smoothly.  SOFT_START = ramp length in dt-units (default 30;
+# set 0 to disable).  Combined with a STEP-BASED tol schedule: loose through
+# the startup transient, tight after step TOL_TIGHTEN_STEP (~200).
+SOFT_START = float(os.environ.get("SOFT_START", "30"))
+TOL_LOOSE = float(os.environ.get("TOL_LOOSE", "5e-4"))
+TOL_TIGHT = float(os.environ.get("TOL_TIGHT", "1e-6"))
+TOL_TIGHTEN_STEP = int(os.environ.get("TOL_TIGHTEN_STEP", "200"))
+# tighten-step -> unit time boundary (t_new = (step+1)*dt is passed in)
+_tol_tighten_t = (TOL_TIGHTEN_STEP + 1) * dt
+
 def tol_sched(t_unit):
-    return TOL_RAMP if t_unit < ramp_end_unit else 1e-6
+    # loose through startup (step < TOL_TIGHTEN_STEP), tight after.  The Re ramp
+    # is far longer than the leg, so this is the operative schedule.
+    return TOL_LOOSE if t_unit < _tol_tighten_t else TOL_TIGHT
+
+print(f"[T5] soft_start={SOFT_START} dt-units  tol_loose={TOL_LOOSE} -> "
+      f"tol_tight={TOL_TIGHT} at step>{TOL_TIGHTEN_STEP}", flush=True)
 
 from diffsim.solvers import linsolve
 _step_times = []
@@ -159,6 +177,7 @@ res = run_truck(
     viz_dir=VIZ_DIR,
     viz_checkpoint_interval=CKPT_INT,
     viz_Q_thresh=0.5,
+    soft_start=(SOFT_START if SOFT_START > 0 else None),
 )
 t_total = time.time() - t_run
 

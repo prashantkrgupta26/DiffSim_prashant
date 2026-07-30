@@ -296,3 +296,68 @@ def test_bc_masks_nonempty_and_structure():
             r = int(i) * ndof + c
             assert r in rowset, f"ground node {i} comp {c} not constrained"
             assert val_of[r] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Group 4: soft-start inlet amplitude ramp (TU5R)
+# ---------------------------------------------------------------------------
+
+def test_soft_start_amp_math():
+    """soft_start_amp is a clamped linear ramp: 0->1 over soft_start*dt, then 1;
+    off (None or <=0) is exactly 1.0."""
+    from truck_flow import soft_start_amp
+    dt = 0.02
+    N = 30.0
+    # off
+    assert soft_start_amp(0.0, None, dt) == 1.0
+    assert soft_start_amp(5.0, 0, dt) == 1.0
+    assert soft_start_amp(5.0, -1, dt) == 1.0
+    # ramp: at t = k*dt the amplitude is k/N (for k<N)
+    assert abs(soft_start_amp(1 * dt, N, dt) - 1.0 / N) < 1e-12
+    assert abs(soft_start_amp(15 * dt, N, dt) - 15.0 / N) < 1e-12
+    # exactly at the ramp end -> 1.0; beyond -> clamped 1.0
+    assert abs(soft_start_amp(N * dt, N, dt) - 1.0) < 1e-12
+    assert soft_start_amp(100 * dt, N, dt) == 1.0
+    # monotone non-decreasing
+    ts = [i * dt for i in range(0, 60)]
+    amps = [soft_start_amp(t, N, dt) for t in ts]
+    assert all(b >= a - 1e-15 for a, b in zip(amps, amps[1:]))
+
+
+def test_soft_start_off_is_byte_identical():
+    """soft_start=None reproduces the default march EXACTLY (the knob is a pure
+    opt-in; default path must be untouched)."""
+    from truck_flow import run_truck
+    cfg = load_truck_config(_CFG_PATH)
+    merged = _tiny_tire_mesh(cfg)
+    common = dict(nsteps=3, base_level=5, truck_band_to=6, band_cells=2,
+                  merged=merged, region_refine=False, nu=1.0 / 50.0, dt=0.02,
+                  device="cpu", assembly="host", mono_solver="splu",
+                  verbose=False)
+    res_default = run_truck(cfg, **common)
+    res_off = run_truck(cfg, soft_start=None, **common)
+    for k in ("cd", "cd_surr"):
+        np.testing.assert_array_equal(res_default[k], res_off[k])
+
+
+def test_soft_start_reduces_startup_response():
+    """A soft-start ramp shrinks the impulsive step-0 inlet drive: the early
+    reaction-drag magnitude is strictly smaller than the impulsive (full-
+    amplitude) start, because the inlet is only a fraction of U at step 0."""
+    from truck_flow import run_truck
+    cfg = load_truck_config(_CFG_PATH)
+    merged = _tiny_tire_mesh(cfg)
+    common = dict(nsteps=3, base_level=5, truck_band_to=6, band_cells=2,
+                  merged=merged, region_refine=False, nu=1.0 / 50.0, dt=0.02,
+                  device="cpu", assembly="host", mono_solver="splu",
+                  verbose=False)
+    res_impulse = run_truck(cfg, **common)                 # full amplitude
+    res_soft = run_truck(cfg, soft_start=30.0, **common)   # ramp over 30 dt
+    # at step 0, t=dt -> amp = 1/30, so the inlet-driven cd_surr magnitude is
+    # much smaller under soft-start than the impulsive start.
+    assert abs(res_soft["cd_surr"][0]) < abs(res_impulse["cd_surr"][0]), (
+        f"soft {res_soft['cd_surr'][0]} vs impulse "
+        f"{res_impulse['cd_surr'][0]}")
+    # results still finite everywhere
+    assert np.all(np.isfinite(res_soft["cd"]))
+    assert np.all(np.isfinite(res_soft["cd_surr"]))
