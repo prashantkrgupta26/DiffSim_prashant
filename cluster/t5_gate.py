@@ -162,6 +162,30 @@ if DT_START_FACTOR > 0 and DT_START_STEPS > 0:
     print(f"[T5] DT ladder: dt/{DT_START_FACTOR} for first {DT_START_STEPS} "
           f"steps (sigma x{DT_START_FACTOR}), then dt={dt}", flush=True)
 
+# PCD PER-STEP FALLBACK (five-leg Jacobi-class verdict): bdiag stays the fast
+# primary; any step that exhausts its budget is re-solved with the Track-A
+# fgmres_pcd (Cahouet-Chabard Schur, AMGX inners per A4/A2).  SADDLE_FALLBACK=
+# pcd enables; PCD_F_INNER / PCD_AP_INNER pick the inner backends.
+SADDLE_FALLBACK = os.environ.get("SADDLE_FALLBACK", "") or None
+PCD_F_INNER = os.environ.get("PCD_F_INNER", "amgx")
+PCD_AP_INNER = os.environ.get("PCD_AP_INNER", "amgx")
+if SADDLE_FALLBACK:
+    print(f"[T5] saddle_fallback={SADDLE_FALLBACK} "
+          f"(F={PCD_F_INNER}, Ap={PCD_AP_INNER})", flush=True)
+
+# TAU_DT (Baskar directive): decouple tau_m's transient term from the marching
+# dt so a dt-ladder startup doesn't collapse the pressure stabilization.
+#   unset/"" -> None (tau follows marching dt, as today)
+#   "base"   -> freeze tau at the BASE dt (exact once ladder reaches full dt)
+#   "0"      -> drop the transient term (steady tau)
+#   <float>  -> freeze tau at that dt_unit
+_tau_env = os.environ.get("TAU_DT", "").strip()
+TAU_DT = (None if _tau_env == "" else
+          dt if _tau_env == "base" else float(_tau_env))
+if TAU_DT is not None:
+    print(f"[T5] TAU_DT={TAU_DT} (tau_m transient frozen; marching dt free)",
+          flush=True)
+
 from diffsim.solvers import linsolve
 _step_times = []
 _last_step_t = [time.time()]
@@ -215,6 +239,10 @@ res = run_truck(
     viz_Q_thresh=0.5,
     soft_start=(SOFT_START if SOFT_START > 0 else None),
     dt_schedule=dt_sched,
+    saddle_fallback=SADDLE_FALLBACK,
+    pcd_f_inner=PCD_F_INNER,
+    pcd_ap_inner=PCD_AP_INNER,
+    tau_dt=TAU_DT,
 )
 t_total = time.time() - t_run
 

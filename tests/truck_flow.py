@@ -343,7 +343,9 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               viz_checkpoint_interval=None, viz_Q_thresh=0.5, viz_roi=None,
               mesh_only=False, linsolve_tol=1e-10, linsolve_tol_schedule=None,
               saddle_restart=None,
-              saddle_equilibrate=False, soft_start=None, dt_schedule=None):
+              saddle_equilibrate=False, soft_start=None, dt_schedule=None,
+              saddle_fallback=None, pcd_f_inner="amgx", pcd_ap_inner="amgx",
+              tau_dt=None):
     """Run the truck case: transient BDF2 monolithic march.
 
     Returns a history dict with keys:
@@ -409,6 +411,34 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
           all t-based schedules (nu, tol, soft_start) stay physical-time
           consistent.  None (default) = fixed dt, byte-identical (t_new keeps
           the (step+1)*dt closed form).
+      saddle_fallback : str or None
+          "pcd": per-step solver fallback (five-leg Jacobi-class verdict).
+          When the primary bdiag-family solve raises ConvergenceError, the
+          SAME step is re-solved with fgmres_pcd (Track-A Cahouet-Chabard
+          Schur preconditioner, build_pcd_meta assembled once per mesh, sigma/
+          nu refreshed per use).  Easy steps keep the fast bdiag path; only
+          budget-exhausted steps pay the PCD cost (plus the device->host CSR
+          pull under SADDLE_DEVICE_CSR).  None (default) = byte-identical
+          (failure raises as before).
+      pcd_f_inner, pcd_ap_inner : str
+          Inner-solve backends for the PCD fallback F/Ap blocks ("amgx"
+          default — the A4/A2-validated AMGX inners; "jacobi" = dependency-
+          free CG).  Only read when saddle_fallback="pcd".
+      tau_dt : float or None
+          Baskar directive (dt-ladder rescue): decouple tau_m's transient
+          term from the marching dt.  The dt-ladder leg showed that at small
+          dt the 4/dt^2 term collapses tau_m — and tau is the ONLY p-p
+          coupling in the stabilized form, so the pressure block goes
+          near-singular for diagonal preconditioners.  Other groups drop the
+          transient term at small dt; this knob generalizes:
+            None (default) : sig2tau = (2 sigma)^2 as today, byte-identical.
+            > 0            : sig2tau = (2 b0/tau_dt)^2 — tau frozen at the
+                             given dt (e.g. base dt during a dt-ladder
+                             startup: exact once the march reaches full dt).
+            0              : sig2tau = 0 — steady tau, transient term
+                             dropped entirely.
+          Approximates tau only; the discrete time derivative (sigma, BDF
+          history) always uses the TRUE marching dt.
     """
     dim = 3
     ndof = dim + 1
@@ -608,6 +638,47 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             _bd["saddle_equilibrate"] = True     # T4b diagonal equilibration
         _pcd_cache[("blocktri_meta", "truck")] = _bd
 
+    # ---- per-step PCD fallback (five-leg Jacobi-class verdict) --------------
+    _fb_meta = None
+    if saddle_fallback == "pcd" and mono_solver in ("fgmres_bdiag",
+                                                    "fused_bdiag"):
+        from diffsim.solvers.saddle_precond import build_pcd_meta
+        _t_fb = time.time()
+        # sigma/nu here are placeholders — refreshed from the failing step's
+        # actual values before every fallback solve (Mp/Ap are geometry-only).
+        _fb_meta = build_pcd_meta(dm, nu if nu is not None else 1.0, 1.0 / dt,
+                                  p_pin=int(p_pin), inner=pcd_f_inner,
+                                  ap_inner=pcd_ap_inner)
+        _pcd_cache[("pcd_meta", "truck")] = _fb_meta
+        print(f"[truck] PCD fallback armed (F={pcd_f_inner}, "
+              f"Ap={pcd_ap_inner}, meta {time.time()-_t_fb:.1f}s)", flush=True)
+
+    def _iter_solve(Acsr, b, _tol, sigma, nu_step, step):
+        """Primary iterative solve with optional one-shot PCD re-solve."""
+        _slv_cache = (_pcd_cache if mono_solver in
+                      ("fgmres_pcd", "fgmres_bdiag", "fused_bdiag")
+                      else None)
+        try:
+            return solve_linear(Acsr, b, solver=mono_solver, sym=False,
+                                tol=_tol, device=device,
+                                cache=_slv_cache, cache_key="truck")
+        except Exception as e:
+            if _fb_meta is None or type(e).__name__ != "ConvergenceError":
+                raise
+            print(f"[truck] step {step}: {mono_solver} exhausted ({e}) -> "
+                  f"fgmres_pcd fallback", flush=True)
+            _fb_meta["sigma"] = float(sigma)
+            _fb_meta["nu"] = float(nu_step)
+            _t0 = time.time()
+            A_host = Acsr if sp.issparse(Acsr) else Acsr.tocsr()
+            x = solve_linear(A_host, b, solver="fgmres_pcd", sym=False,
+                             tol=_tol, device=device,
+                             cache=_pcd_cache, cache_key="truck")
+            print(f"[truck] step {step}: PCD fallback CONVERGED "
+                  f"(iters={_LAST_ITERS[0]}, {time.time()-_t0:.1f}s)",
+                  flush=True)
+            return x
+
     t_cur = 0.0
     dt_prev_step = None
     for step in range(nsteps):
@@ -617,6 +688,11 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         b0, b1, b2 = bdf_coeffs(order, dt_step,
                                 dt_prev=(dt_prev_step if order == 2 else None))
         sigma = b0 / dt_step
+        # tau_dt: decouple tau_m's transient term from the marching dt
+        # (None -> assemblers default to (2 sigma)^2, byte-identical)
+        _sig2tau = None
+        if tau_dt is not None:
+            _sig2tau = 0.0 if tau_dt <= 0 else (2.0 * b0 / tau_dt) ** 2
         # closed form when no schedule (byte-identical to prior behaviour);
         # accumulated sum under a schedule (physical time stays consistent)
         t_new = ((step + 1) * dt if dt_schedule is None
@@ -685,6 +761,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                          else _dev_asm.assemble)
             Acsr, b = _asm_call(
                 aq, dq, fq_raw, nu_step, sigma,
+                sig2tau=_sig2tau,
                 strong_b_vals=_sb,
                 extra_matrix=(_af_slots_d, _af_vals_d),
                 extra_rhs=(_bf_dofs_d, _bf_vals_d))
@@ -692,12 +769,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                 x_cur = splu(Acsr.tocsc()).solve(b)
             else:
                 _LAST_ITERS[0] = None
-                _slv_cache = (_pcd_cache if mono_solver in
-                              ("fgmres_pcd", "fgmres_bdiag", "fused_bdiag")
-                              else None)
-                x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
-                                     tol=_tol, device=device,
-                                     cache=_slv_cache, cache_key="truck")
+                x_cur = _iter_solve(Acsr, b, _tol, sigma, nu_step, step)
 
             # Reaction arbiter (device): F_raw = w^T(A_full x) - w^T(Af x)
             #                                    - w^T b + w^T bf
@@ -716,7 +788,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             F_raw = _wAx - _wAfx - _wb + _wbf
         else:
             # ---- Host assembly path (default; bit-for-bit unchanged) --------
-            A, b = assemble_linear_ns(dm, aq, dq, fq_raw, nu_step, sigma=sigma)
+            A, b = assemble_linear_ns(dm, aq, dq, fq_raw, nu_step, sigma=sigma,
+                                      sig2tau=_sig2tau)
             _A_vol = A.tocsr()      # pre-SBM, pre-surgery (reaction arbiter)
             _b_vol = b.copy()
             A = (A + Af_c).tolil()
@@ -730,12 +803,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                 x_cur = splu(Acsr.tocsc()).solve(b)
             else:
                 _LAST_ITERS[0] = None
-                _slv_cache = (_pcd_cache if mono_solver in
-                              ("fgmres_pcd", "fgmres_bdiag", "fused_bdiag")
-                              else None)
-                x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
-                                     tol=_tol, device=device,
-                                     cache=_slv_cache, cache_key="truck")
+                x_cur = _iter_solve(Acsr, b, _tol, sigma, nu_step, step)
             # consistent reaction (x-drag): F_raw = w^T (A_vol x - b_vol)
             F_raw = (float(np.asarray(_A_vol.T @ w_rxn) @ x_cur)
                      - float(w_rxn @ _b_vol))
