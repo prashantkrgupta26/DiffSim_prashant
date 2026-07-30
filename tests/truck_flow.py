@@ -321,7 +321,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               L_ref=None, bodies=None, merged=None, reaction_band=None,
               viz_interval=None, viz_dir=None,
               viz_checkpoint_interval=None, viz_Q_thresh=0.5, viz_roi=None,
-              mesh_only=False, linsolve_tol=1e-10):
+              mesh_only=False, linsolve_tol=1e-10, linsolve_tol_schedule=None,
+              saddle_equilibrate=False):
     """Run the truck case: transient BDF2 monolithic march.
 
     Returns a history dict with keys:
@@ -359,6 +360,17 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
           For production transient NS at large DOF counts, 1e-5 or 1e-6 is
           sufficient and dramatically reduces iteration counts; set via the
           T4 smoke gate.
+      linsolve_tol_schedule : callable or None
+          t_unit -> tol callable (Baskar directive, T4b).  When given it
+          OVERRIDES linsolve_tol per step: loose (e.g. 5e-4) during the Re ramp,
+          tight (e.g. 1e-6) post-ramp — trivial analogue of nu_schedule.  Called
+          with t_new (unit time of the step just being solved).  None (default)
+          = fixed linsolve_tol, byte-identical.
+      saddle_equilibrate : bool
+          T4b: opt-in symmetric diagonal equilibration of the saddle inside the
+          fgmres_bdiag / fused_bdiag backend (breaks the scalar-Jacobi relres
+          floor caused by the ~10-order diagonal span of the Cb_f Nitsche
+          penalties on fine surrogate faces).  Default False = byte-identical.
     """
     dim = 3
     ndof = dim + 1
@@ -477,6 +489,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         _bd = {"ndof": ndof}
         if saddle_x0 is not None:
             _bd["saddle_x0"] = saddle_x0
+        if saddle_equilibrate:
+            _bd["saddle_equilibrate"] = True     # T4b diagonal equilibration
         _pcd_cache[("blocktri_meta", "truck")] = _bd
 
     for step in range(nsteps):
@@ -520,8 +534,11 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             _LAST_ITERS[0] = None
             _slv_cache = (_pcd_cache if mono_solver in
                           ("fgmres_pcd", "fgmres_bdiag", "fused_bdiag") else None)
+            # T4b: per-step tolerance schedule (loose in ramp, tight after).
+            _tol = (float(linsolve_tol_schedule(t_new))
+                    if linsolve_tol_schedule is not None else linsolve_tol)
             x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
-                                 tol=linsolve_tol,
+                                 tol=_tol,
                                  device=device, cache=_slv_cache,
                                  cache_key="truck")
 
@@ -548,7 +565,14 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             print(f"[truck] step {step:3d}  Cd_react={cd[step]:+.4f}  "
                   f"Cd_surr={cd_surr[step]:+.4f}", flush=True)
         if on_step is not None:
+            # T4b: expose the RAW (un-normalized) forces + the shared ref_force
+            # so the harness can arithmetically diagnose the cd_surr magnitude
+            # (Fs[0] is the raw surrogate x-traction; F_raw is the raw reaction;
+            # both are divided by the SAME ref_force to form cd).
             on_step(step, dict(cd=cd[step], cd_surr=cd_surr[step],
+                               F_surr_raw=float(Fs[0]),
+                               F_react_raw=float(-F_raw),
+                               ref_force=float(ref_force),
                                x=x_cur))
         if _viz_hook is not None:
             _viz_hook(step, dict(x=x_cur))
@@ -567,18 +591,39 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                 nsteps=nsteps, viz_hook=_viz_hook)
 
 
-def make_nu_schedule(cfg, U_inf=1.0, L_ref=1.0):
+def make_nu_schedule(cfg, U_inf=1.0, L_ref=1.0, scale=None):
     """Time-based Re ramp -> nu(t) callable, from Re_V / Re_ramping.
 
     Piecewise-linear Re(t) through (Re_ramping[i], Re_V[i]); nu = U*L/Re.
+
+    UNIT-SYSTEM MAPPING (T4b — the recurring #1 bug class; see the campaign
+    doc's unit table).  The C++ prior art computes on the PHYSICAL channel
+    frame domain=[16,2,2] with Coe_diff = 1/Re, dt=0.01, ramp times in that
+    same frame (Re_ramping = physical seconds).  Our octree remaps coordinates
+    to the unit cube via an ISOTROPIC scale s = domain_scale = 1/16
+    (x_unit = s * x_phys).  Under this pure spatial rescaling with U held at 1:
+
+        nu_unit = s * nu_phys = s / Re      (Re preserved: Re = U*L/nu, and the
+                                             feature length s*L keeps Re fixed)
+        t_unit  = s * t_phys                (convection term consistency)
+
+    So when ``scale`` is given, this returns nu in UNIT-CUBE units as a function
+    of UNIT time: it maps t_unit -> t_phys = t_unit/s to interpolate Re, then
+    returns nu_unit = s * L_ref / Re.  The driver must correspondingly pass
+    dt in unit time (dt_unit = s * dt_phys).  ``scale=None`` (legacy) keeps the
+    old physical-frame mapping (nu = U*L/Re, t interpreted directly) — kept only
+    for back-compat; the truck smoke passes scale=cfg.domain_scale.
     """
     ts = np.asarray(cfg.re_ramping, np.float64)
     res = np.asarray(cfg.re_v, np.float64)
+    s = 1.0 if scale is None else float(scale)
 
     def nu_of_t(t):
-        Re = float(np.interp(t, ts, res))
+        # t is UNIT time when scale given; map back to physical for the ramp.
+        t_phys = t / s
+        Re = float(np.interp(t_phys, ts, res))
         Re = max(Re, 1e-12)
-        return U_inf * L_ref / Re
+        return s * U_inf * L_ref / Re
 
     return nu_of_t
 
