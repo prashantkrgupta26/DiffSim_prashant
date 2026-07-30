@@ -954,3 +954,87 @@ unbounded-intermediate fix (§10.10) which gates any run above ~68M).
 | Leg logs (nova) | `cluster/results/a3-p1-restart30.log`, `a3-p2-restart120.log`, `a3-p3-warmstart.log`, `a3-p4-fused.log`, `a3-p5-combo.log` (+ `-smi.log` each) |
 | Fused+bdiag ticket | "fused: add `apply_dev` hook to `cg_dev`/`bicgstab_dev`" (open) |
 | Warm-start follow-up | validate `SADDLE_X0=extrap` on a developed production-length march (benefit expected to grow; unvalidated) |
+
+---
+
+## 12. W2b Profile — Assembly-Side Cost Attribution at 3d-L7r9 (2026-07-29)
+
+**Question:** 3d-L7r9 (adaptive 9.08M DOF, device assembly, chunked constrained scatter) clocks
+167.7 s/step with ~55 s solve — leaving ~110 s/step of apparent assembly-side cost whose
+theoretical floor is ~10–40 ms. Where do the ~110 s actually go?
+
+### 12.1 Instrumentation
+
+Commit `3ae54d6` adds opt-in per-phase wall-time breakdowns behind `DIFFSIM_ASM_PROFILE=1`
+(default inert, zero overhead). Phases timed with `wp.synchronize()` boundaries:
+- **upload** — GP-field host→device uploads per bin
+- **Ae** — Ae/be compute kernels (kA/kb launches, all chunks)
+- **scatter** — weighted-chunked scatter into vals_d/F_d
+- **extra** — add_matrix_values (SBM face system)
+- **strong** — apply_strong_rows BC surgery
+- **pull** — `vals_d.numpy()` + `F_d.numpy()` device→host transfer
+- **host-pre** — `_gp_field_3d` + `_gp_history_fq_3d` (driver-side host numpy ops)
+- **solve** — `solve_linear` wall time
+- **post** — `T_vec @ x_cur`, traction, force recovery
+
+### 12.2 Measured Per-Step Breakdown (3d-L7r9, fgmres_bdiag, CUDA GH200 480GB)
+
+All times in ms. Step 0 includes first-call Warp kernel compilation (~18 extra modules).
+
+```
+step  host-pre  asm-total  upload    Ae    scatter  extra  strong    pull    chunks  solve    post    step-tot
+   0    3082.7    4422.7     35.2    520.9   32.8     3.6    5.9    3797.8      9   48196.7   973.6   56739.4
+   1    3115.7    3452.9     52.5    512.3   30.4    11.8    0.3    2843.0      9   39312.6  1063.7   47015.1
+   2    3335.2  108867.4     51.6    514.4   30.4    11.9    0.3  108255.9      9   30804.5  1007.6  144089.5
+```
+
+### 12.3 Attribution
+
+**Step 1 (clean BDF1, no compilation, 47.0 s total):**
+- host-pre: 3.1 s — host-side GP field interpolation (sparse T@u_pre1, einsum)
+- asm-total: 3.5 s, dominated by **pull: 2.8 s** (vals_d.numpy()) + Ae: 0.5 s
+- solve: 39.3 s (fgmres_bdiag iteration; historical baseline was ~55 s)
+
+**Step 2 (BDF2, severe memory pressure, 144.1 s total):**
+- pull: **108.3 s** — `ChunkedArray.numpy()` device→host pull
+- Everything else (Ae, scatter, host-pre, solve) unchanged at ~34 s
+
+### 12.4 Verdict
+
+**The entire ~110 s non-solve excess is `vals_d.numpy()` — the chunked device→host pull.**
+
+Mechanistically: `ChunkedArray.numpy()` issues 9 separate `self.data[c].numpy()[:cnt[c]]` calls
+in a Python loop, staging each chunk through a CPU buffer and concatenating. At 9.08M DOF /
+9 chunks the vals_d array is ~2.37B float64 entries = ~19 GB. Even at HBM bandwidth (3.35 TB/s
+GH200 bandwidth) this should take ~5.7 ms; the measured 108 s at step 2 indicates
+**memory pressure-driven migration**: after the FGMRES solve occupies 75+ GiB of HBM (measured
+via nvidia-smi), the vals_d chunks must be re-paged from host-mirrored or CPU-resident memory,
+incurring NVLink/PCIe latency per chunk instead of HBM bandwidth.
+
+Step 1 (2.8 s) is better because the solve is shorter (BDF1 warmup, fewer iters) and leaves
+more HBM resident.
+
+**The variability** (2.8 s vs 108.3 s) is therefore not an algorithmic problem but a
+**memory-residency hazard**: the 19 GB vals_d buffer is evicted from HBM during the solve's
+working-set build, and re-paging it via the chunked-Python loop pays per-chunk staging overhead.
+
+### 12.5 Implied Fix
+
+Eliminate `vals_d.numpy()` entirely — use `assemble_device()` (which returns a device-resident
+torch CSR via dlpack zero-copy) rather than `assemble()` (which pulls back to host CSR). This
+removes the 19 GB device→host transfer AND the subsequent host→device upload for the iterative
+solver. The `fgmres_bdiag` solver's `solve_linear` path already supports device CSR input;
+wiring `assemble_device()` through `run_flow_past_3d` when `mono_solver` is an iterative
+device solver is the fix target for W3.
+
+Secondary fix: reduce the chunk count (currently 9) to reduce per-chunk Python overhead; or
+replace the Python loop with a single pinned-memory DMA gather kernel.
+
+### 12.6 Session Artifacts
+
+| Artifact | Path / SHA |
+|----------|------------|
+| Profiling instrumentation commit | `3ae54d6` (`probe(w2b)`) on `w-engine-hardening` |
+| GPU profiling log | `cluster/results/w2b-profile.log` |
+| Driver instrumented | `tests/p2r1c_thin_plate_flow_3d.py` (lines 65–67, 522–535, 592–614, 671–700) |
+| Assembler instrumented | `src/diffsim/assembly/device_assembly.py` (lines 18–43, 1000–1228) |
