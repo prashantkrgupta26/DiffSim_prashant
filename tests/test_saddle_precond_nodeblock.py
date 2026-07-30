@@ -74,7 +74,7 @@ def _solve_with_bdiag(A, b, ndof, block, device="cpu", tol=1e-10,
                      dtype=wp.float64, device=device)
 
     # cycles × restart caps total inner iterations (mirrors fgmres_bdiag)
-    cycles = min(maxiter, max(1, (restart * maxiter) // restart))
+    cycles = maxiter
 
     x_dev, finfo = fgmres_dev(
         op.matvec, b_dev, apply_dev, N, device,
@@ -206,3 +206,73 @@ def test_nodeblock_beats_scalar_iters():
         f"node-block did NOT beat scalar: node={it_node} scalar={it_scalar} "
         f"— W5d motivation not satisfied at level-4 2-D Re=250 saddle "
         f"(both numbers printed above for the record)")
+
+
+# ---------------------------------------------------------------------------
+# Test 4: asymmetric-block regression test (Fortran vs C order)
+# ---------------------------------------------------------------------------
+
+def test_nodeblock_asymmetric_block_exact():
+    """test_nodeblock_asymmetric_block_exact — hand-craft a small block-diagonal
+    matrix (2 nodes, ndof=3) with known asymmetric blocks per node. Build the
+    node-block apply via make_bdiag_apply(A, ndof=3, device="cpu", block="node"),
+    apply to a random vector, and assert z == inv(B_i) @ v_i per node (np.allclose
+    1e-12). This pins B⁻¹ vs Bᵀ⁻¹ (a Fortran-order ravel regression would fail it).
+    """
+    import scipy.sparse as sp
+    from diffsim.solvers.saddle_precond import make_bdiag_apply
+
+    ndof = 3
+    n_nodes = 2
+    device = "cpu"
+
+    # Hand-crafted asymmetric blocks (different per node to catch transpose bugs)
+    # Node 0: [[4, 1, 0], [2, 5, 1], [0, 3, 6]]
+    B0 = np.array([[4.0, 1.0, 0.0],
+                   [2.0, 5.0, 1.0],
+                   [0.0, 3.0, 6.0]], dtype=np.float64)
+
+    # Node 1: [[3, 2, 1], [1, 4, 2], [2, 1, 5]]
+    B1 = np.array([[3.0, 2.0, 1.0],
+                   [1.0, 4.0, 2.0],
+                   [2.0, 1.0, 5.0]], dtype=np.float64)
+
+    # Construct block-diagonal CSR matrix
+    A_dense = np.zeros((n_nodes * ndof, n_nodes * ndof), dtype=np.float64)
+    A_dense[0:3, 0:3] = B0
+    A_dense[3:6, 3:6] = B1
+    A_csr = sp.csr_matrix(A_dense)
+
+    # Precompute inverses (ground truth)
+    B0_inv = np.linalg.inv(B0)
+    B1_inv = np.linalg.inv(B1)
+
+    # Build the node-block apply
+    apply_node = make_bdiag_apply(A_csr, ndof, device, block="node")
+
+    # Random test vector
+    rng = np.random.default_rng(123)
+    v_np = rng.standard_normal(n_nodes * ndof)
+    v_dev = wp.array(np.ascontiguousarray(v_np, np.float64),
+                     dtype=wp.float64, device=device)
+
+    # Apply preconditioner
+    z_dev = wp.zeros(n_nodes * ndof, dtype=wp.float64, device=device)
+    apply_node(v_dev, z_dev)
+    z_np = z_dev.numpy()
+
+    # Extract blocks and verify inv(B_i) @ v_i per node
+    for i in range(n_nodes):
+        r0 = i * ndof
+        r1 = r0 + ndof
+        v_block = v_np[r0:r1]
+        z_block = z_np[r0:r1]
+
+        if i == 0:
+            z_expected = B0_inv @ v_block
+        else:
+            z_expected = B1_inv @ v_block
+
+        assert np.allclose(z_block, z_expected, rtol=1e-12, atol=1e-14), (
+            f"node {i} block inversion mismatch: "
+            f"max |z - B_inv @ v| = {np.abs(z_block - z_expected).max():.3e}")

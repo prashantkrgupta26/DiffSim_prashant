@@ -225,15 +225,14 @@ def make_bdiag_apply(A, ndof, device, block="scalar"):
         blk = np.asarray(A[r0:r1, r0:r1].todense(), dtype=np.float64)
         try:
             blk_inv = np.linalg.inv(blk)
+            # Guard: if the condition number is too large treat as singular
+            # (np.linalg.inv does not raise on near-singular; check via rcond)
+            rcond = 1.0 / (np.linalg.cond(blk) + 1e-300)
+            if rcond < 1e-14:
+                blk_inv = np.eye(ndof, dtype=np.float64)
+                _singular_count += 1
         except np.linalg.LinAlgError:
             # Singular block: fall back to identity (safer than blowing up)
-            blk_inv = np.eye(ndof, dtype=np.float64)
-            _singular_count += 1
-
-        # Guard: if the condition number is too large treat as singular
-        # (np.linalg.inv does not raise on near-singular; check via rcond)
-        rcond = 1.0 / (np.linalg.cond(blk) + 1e-300)
-        if rcond < 1e-14:
             blk_inv = np.eye(ndof, dtype=np.float64)
             _singular_count += 1
 
