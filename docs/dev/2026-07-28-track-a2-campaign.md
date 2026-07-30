@@ -1038,3 +1038,46 @@ replace the Python loop with a single pinned-memory DMA gather kernel.
 | GPU profiling log | `cluster/results/w2b-profile.log` |
 | Driver instrumented | `tests/p2r1c_thin_plate_flow_3d.py` (lines 65–67, 522–535, 592–614, 671–700) |
 | Assembler instrumented | `src/diffsim/assembly/device_assembly.py` (lines 18–43, 1000–1228) |
+
+## 13. W2c — Device-Resident CSR Handoff (kill the 19 GB pull) (2026-07-29)
+
+**Fix landed.** Commit `98ea879` on `w-engine-hardening`. Opt-in `SADDLE_DEVICE_CSR=1`
+(default byte-identical). On the device-assembly path the driver calls
+`DeviceNSAssembler.assemble_handoff()` (new) instead of `assemble()`: the assembled
+values stay device-resident (`DeviceSaddleCSR` wrapper over `vals_d`; static sparsity
+uploaded once/epoch). `solve_linear`'s `fgmres_bdiag`/`fused_bdiag` scalar path builds
+the SpMV from `device_operator()` (no re-upload) and the preconditioner from
+`make_bdiag_apply_from_diag(diagonal_device())` — a 73 MB diagonal gather+download
+instead of the 19 GB values pull. Node-block Jacobi and other solvers fall back to
+`.tocsr()` transparently. Files: `device_assembly.py`, `solvers/linsolve.py`,
+`solvers/saddle_precond.py`, both thin-plate drivers.
+
+### 13.1 Measured (3d-L7r9, fgmres_bdiag, GH200, SADDLE_DEVICE_CSR=1, nsteps=3)
+
+```
+step  host-pre  asm-total  upload    Ae   scatter  extra  strong   pull  chunks   solve     post   step-tot
+   0   3125.2      612.6    21.3   523.8   32.9    2.9    5.5    0.0     9    87050.7  990.6   91845.9
+   1   3483.7      599.6    32.6   520.3   30.4   11.8    0.3    0.0     9    66424.3  979.8   71568.6
+   2   3293.0      656.4    88.1   514.8   30.5   12.2    0.4    0.0     9    48219.0  980.9   53233.8
+```
+`dofs=9,080,064  iters_mean=1353.0  iters=[1760,1274,1025]  converged=True`. SADDLE-LADDER-OK.
+
+**pull = 0.0 ms on every step** (W2b: 3797.8 / 2843.0 / **108255.9**); `asm-total`
+612.6 / 599.6 / 656.4 ms (W2b: 4422.7 / 3452.9 / **108867.4**). Step 2 (the BDF2
+HBM-eviction case that cost 108 s in W2b) is now 53.2 s total. Iteration counts are
+byte-identical to the W2b/W2 reference — the handoff relocates values, not arithmetic.
+CPU parity gates (2-D + 3-D device-assembly fgmres_bdiag, SADDLE_DEVICE_CSR 0 vs 1):
+identical iterations and cd trajectory to 1e-14. Step-0 solve is inflated by one-time
+JIT of the handoff SpMV/gather kernels + profiling-mode `wp.synchronize()`.
+
+Note W2b §12.5's "implied fix" pointed at `assemble_device()` (torch/dlpack CSR for
+the cuDSS direct path); W2c instead keeps the Warp-native `vals_d` resident and feeds
+the **iterative** fgmres_bdiag stack (the actual 3d-L7r9 solver) via
+`device_operator()`+`diagonal_device()` — same principle (no host round-trip), correct
+target for the iterative path.
+
+| Artifact | Path / SHA |
+|----------|------------|
+| Fix commit | `98ea879` (`feat(solvers): device-resident CSR handoff … (W2c)`) |
+| GPU leg log | `cluster/results/w2c-devcsr.log`, `results/saddle_ladder_3d-L7r9_fgmres_bdiag.npz` (nova) |
+| Parity tests | `test_saddle_ladder_cpu.py::test_device_csr_handoff_parity`, `test_p2r1c_thin_plate_flow_3d.py::test_device_csr_handoff_parity_3d` |
