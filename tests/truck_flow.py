@@ -318,7 +318,9 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               saddle_x0=None, nu_schedule=None, on_step=None, verbose=False,
               base_level=6, dt=0.01, nu=None, U_inf=1.0, alpha=None,
               truck_band_to=None, band_cells=3, region_refine=True,
-              L_ref=None, bodies=None, merged=None, reaction_band=None):
+              L_ref=None, bodies=None, merged=None, reaction_band=None,
+              viz_interval=None, viz_dir=None,
+              viz_checkpoint_interval=None, viz_Q_thresh=0.5, viz_roi=None):
     """Run the truck case: transient BDF2 monolithic march.
 
     Returns a history dict with keys:
@@ -330,6 +332,21 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
       'n_slab_cut'  int       intercepted slab cells (must be 0)
       'n_cells'     int
       'nsteps'      int
+
+    Optional viz kwargs (all default to None = no-op, byte-identical march):
+      viz_interval : int or None
+          Write per-frame extracts every this many steps (Q-isosurface .vtp,
+          centerline slice .vtp, surface-Cp .vtp).  None disables all viz.
+      viz_dir : str or pathlib.Path or None
+          Output directory for viz artifacts.  Required when viz_interval
+          is not None.
+      viz_checkpoint_interval : int or None
+          Write full .vtu every this many steps.  Defaults to
+          max(1, nsteps // 5) when viz_interval is set.
+      viz_Q_thresh : float
+          Q-criterion isosurface threshold (default 0.5).
+      viz_roi : tuple or None
+          [x0,x1,y0,y1,z0,z1] ROI clip box in unit-cube coords.
     """
     dim = 3
     ndof = dim + 1
@@ -395,6 +412,24 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             continue                # keep w orthogonal to surgery rows
         w_rxn[dof_ux] = 1.0
         n_rxn_nodes += 1
+
+    # ---- viz hook setup (opt-in; None = no-op, byte-identical march) --------
+    _viz_hook = None
+    if viz_interval is not None and viz_dir is not None:
+        import pathlib as _pathlib
+        from diffsim.viz.truck_viz import TruckVizHook as _TruckVizHook
+        _ckpt_interval = (viz_checkpoint_interval
+                          if viz_checkpoint_interval is not None
+                          else max(1, nsteps // 5))
+        _viz_hook = _TruckVizHook(
+            mesh, cons, merged, fx["sf"],
+            _pathlib.Path(viz_dir),
+            viz_interval=int(viz_interval),
+            checkpoint_interval=_ckpt_interval,
+            Q_thresh=viz_Q_thresh,
+            roi=viz_roi,
+            U_inf=U_inf,
+        )
 
     # ---- march --------------------------------------------------------------
     x_cur = np.zeros(nfree * ndof)
@@ -482,6 +517,11 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         if on_step is not None:
             on_step(step, dict(cd=cd[step], cd_surr=cd_surr[step],
                                x=x_cur))
+        if _viz_hook is not None:
+            _viz_hook(step, dict(x=x_cur))
+
+    if _viz_hook is not None:
+        _viz_hook.write_time_average()
 
     if verbose:
         print(f"[truck] done in {time.time()-t0:.1f}s", flush=True)
@@ -491,7 +531,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                 n_excluded=fx["n_excluded"], n_slab_cut=fx["n_slab_cut"],
                 n_cells=fx["n_cells"], n_rxn_nodes=n_rxn_nodes,
                 sf_faces=int(fx["sf"].elem.size), L_ref=float(L_ref),
-                nsteps=nsteps)
+                nsteps=nsteps, viz_hook=_viz_hook)
 
 
 def make_nu_schedule(cfg, U_inf=1.0, L_ref=1.0):
