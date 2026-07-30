@@ -1080,4 +1080,141 @@ target for the iterative path.
 |----------|------------|
 | Fix commit | `98ea879` (`feat(solvers): device-resident CSR handoff … (W2c)`) |
 | GPU leg log | `cluster/results/w2c-devcsr.log`, `results/saddle_ladder_3d-L7r9_fgmres_bdiag.npz` (nova) |
+
+---
+
+## 14. W-Round Summary and Verdicts (2026-07-29/30)
+
+**Branch:** `w-engine-hardening`  **Dates:** 2026-07-29–30  **Hold:** job 11777138 (24 h GH200)
+
+W-round ran in six tasks plus a wiring catch and an A3 probe carry-in, all on the
+same branch off master (post Track A2 merge `af275ee`).
+
+---
+
+### 14.1 Round Table
+
+Every row is source-traceable to the section or scratchpad report listed in
+the "Source" column.
+
+| Task | Verdict | Headline number | Source |
+|------|---------|-----------------|--------|
+| **W1** | PASS — Ae-batch bound verified; 68M assembly end-to-end clear | GPU peak 86.8 GiB; host RSS 160.8 GiB; L7 recheck bit-identical iters, 54.36 s/step (no regression) | scratchpad/task-W1-report.md |
+| **W1b** | BACKLOG — CSR flat upload refuses 7.27B-nnz arrays (Warp int32/dim cap, `linsolve.py:1534`) | W1b precisely located at `CSROperator` flat 1-D upload; fix class = 2-D shaping/row-blocking; gates 68M–100M single-GPU SOLVE (assembly already clear) | scratchpad/task-W1-report.md §"New ceiling W1b" |
+| **W2** | PASS — constrained-scatter chunking correct; bit-identical CSR at 9.08M adaptive | Adaptive device: 167.7 s/step cold (1.48× vs host-asm reference 247.8 s); combo r120+extrap: 213.6 s/step (SLOWER — see §14.3b correction) | scratchpad/task-W2-report.md |
+| **W2b** | ATTRIBUTION — 19 GB `vals_d.numpy()` device→host pull identified as the entire non-solve excess (~110 s/step); atomic scatter hypothesis refuted (scatter = 0.03 s) | Step 2 pull: 108 s; Ae: 0.5 s; scatter: 0.03 s — sink is the ChunkedArray.numpy() pull under HBM eviction | §12 (campaign); scratchpad/task-W2b-report.md |
+| **W2c** | PASS — device-resident CSR handoff eliminates the 19 GB pull; pull = 0.0 ms every step | Worst step 144 s (W2b) → 53 s (W2c); asm-total 0.6 s; iterations byte-identical; parity 1e-14 both dims | §13 (campaign); scratchpad/task-W2c-report.md |
+| **W4** | PASS — developed march at 8.58M uniform (200 steps, r120+warmstart engine) | 164.8 iters/step mean, 10.46 s/step; settled-tail (last 50 steps): mean 146.5, min 53, max 227 iters | scratchpad/task-W1-report.md §"W4 measurement-march record" |
+| **W5a** | PASS (memory-insurance) — `fused_bdiag` (BiCGStab + bdiag, O(N) workspace) validated at 8.58M uniform | 1140 iters, 69.1 s/step CONVERGED; 1.26× wall premium vs `fgmres` r60 baseline (54.8 s); O(N) memory = 100M basis-free insurance outer | ledger line 154; scratchpad/task-W5a-report.md |
+| **W5d** | NEGATIVE (honest) — node-block Jacobi shelved | 1314.8 iters / 138.3 s/step; zero iteration benefit at 3-D uniform; ~60 ms/iter apply overhead as implemented; revisit only if a config shows iteration wins | ledger line 154; scratchpad/task-W5d-report.md |
+| **W3** | DEFERRED — nova single-GPU; pattern-dev on gpubox 2×Ada later, full test on Horizon | — | ledger line 145 |
+| **A3 probes (carry-in)** | PASS — restart sweep + warm-start; r30 anti-win confirmed | restart=120 + warm-start = 676.2 iters/step, 40.76 s/step (−48% iters / −26% wall vs r60 baseline); r30 anti-win: +16.3% iters; fused CONVERGED but slower | §11 (campaign); scratchpad/task-A3probes-report.md |
+| **Wiring catch** | FIXED — `fused_bdiag` driver meta gate was `fgmres_bdiag`-only; fused_bdiag silently received ndof=3 on 3-D (wrong masks); first W5 leg discarded | Commit `5541d05`; gate widened + `SADDLE_BDIAG_BLOCK` plumbed through both drivers + harness; 47 tests green; W5 GPU legs relaunched on corrected code | ledger line 153 |
+
+---
+
+### 14.2 Corrections (Supersessions)
+
+Three claims from earlier sections are superseded by W-round measurements.  Each
+cites the original claim and the evidence that overturns it.
+
+**(a) §10.10 OOM attribution superseded by W1.**
+
+§10.10 attributed the 68M OOM to the `_dof_indices_kernel_chunked` path ("the
+chunked dof-indices phase had just compiled; preceded by `wp_alloc_device_async`
+out-of-memory").  W1's analysis of the actual traceback frame in
+`hold-leg5-l8probe.log` confirmed the failing allocation is the per-step whole-bin
+element-block buffer in `DeviceNSAssembler.assemble()`:
+
+```
+device_assembly.py:868 (pre-fix): Ae = wp.zeros((ne, nbf*ndof, nbf*ndof), dtype=wp.float64, device=d)
+```
+
+Arithmetic: 16,768,504 elements × 32² pairs × 8 B = 137,367,584,768 B — byte-for-byte
+the traceback value.  The dof-indices / slot build had **succeeded** (the kernel had
+merely just compiled, which is what produced the log line immediately before the
+failure).  §10.10 text is superseded; the OOM was the unbounded whole-bin Ae
+allocation in `assemble()`, fixed by the element-batch bound in W1
+(scratchpad/task-W1-report.md §"Root cause").
+
+**(b) §10 / W2 GPU-row: combo-slower interpretation superseded by W2 review.**
+
+The W2 GPU rows showed the r120+extrap combo (213.6 s/step) as slower than plain
+bdiag (167.7 s/step) on the 9.08M adaptive mesh, despite fewer mean iterations
+(1097.4 vs 1196.8).  The initial read was "r120 orthogonalization overhead on the
+adaptive system."  The W2 review overturned this: the evidence favours HBM-pressure
+basis thrash — at r120+extrap the HBM footprint is 84.1 GiB / 95 GiB (11 GiB
+headroom), while the uniform-mesh A3 win used 58 GiB headroom.  The two-lever combo
+won on the uniform run precisely because headroom was ample; on the adaptive system
+the basis competes with the expanded constraint chunks (~47 GB resident).  Plain
+`fgmres_bdiag` (167.7 s/step) is therefore the adaptive-mesh default; r120+extrap
+is reserved for uniform meshes with confirmed HBM headroom.  See scratchpad/task-W2-report.md §5 concerns.
+
+**(c) "Uncoalesced atomics" hypothesis for adaptive assembly cost refuted by W2b.**
+
+Prior to W2b the dominant hypothesis for the ~110 s/step non-solve excess at 9.08M
+adaptive was uncoalesced atomic scatter (the constraint-weighted scatter touches
+irregular global slots).  W2b's phase breakdown (§12.2) refuted this directly:
+scatter = 0.03 s (Ae 0.5 s, scatter 0.03 s, extra 0.01 s).  The entire non-solve
+excess was the 19 GB `vals_d.numpy()` ChunkedArray device→host pull, removed by
+W2c.  The atomic-contention hypothesis is closed; see scratchpad/task-W2b-report.md
+§"Attribution Verdict."
+
+---
+
+### 14.3 Updated 100M / Truck Projections
+
+All numbers carry labeled assumptions; none are new claims beyond what the
+referenced sections establish.
+
+**Adaptive-mesh 9.08M engine (post-W2c, cold/settled):**
+
+- Cold (step 0–2, BDF2 with HBM-eviction pull): **~53 s/step** (§13.1, step 2
+  = 53.2 s; iters_mean 1353.0; pull = 0.0 ms; asm-total ~0.6 s; profiling-mode
+  wp.synchronize() adds <1 s; un-profiled steady step is solve + <1 s assembly).
+- Settled (developed march, W4: 8.58M uniform r120+warmstart 200-step march):
+  **~12 s/step** — W4 settled-tail mean 10.46 s/step (last-50 mean 146.5 iters);
+  the adaptive-mesh cold figure (~53 s) converges toward this as the solver warms
+  up and iteration counts fall (iters per step: 1760 → 1274 → 1025 → ... → sub-200
+  in developed flow); the ~12 s settled is the floor estimate for the warm
+  adaptive engine at scale (assumption: iteration count profile mirrors uniform
+  in developed march; not separately measured on adaptive post-W2c — follow-up item).
+
+**Truck (10–12M DOF adaptive, pre-T-B4 / mesh-sequencing):**
+
+- Conservative projection: **~15 s/step settled** (linear DOF-scale from adaptive
+  9.08M settled figure; mesh-sequencing T-A1 and incremental assembly T-B4 not yet
+  applied).  This is a pre-T-B4 baseline; T-B4 is expected to reduce per-step cost
+  further, not measured here.
+
+**Horizon pathway (per-iteration constants, post-W2c):**
+
+- The Horizon pathway doc's per-iteration solve constants stand.  W2c removes the
+  per-step assembly term from the 9.08M adaptive budget (was: ~110 s assembly-side;
+  now: ~0.6 s).  Remaining first-class 100M single-GPU memory items:
+  - **W1b** — CSR flat upload nnz-shape fix (gates 68M–100M solve; `linsolve.py:1534`).
+  - **fp32 basis / short restart** — r120 basis at 100M = 193 GB (2m+1 = 241 vectors
+    × 100M × 8 B); r60 = 96.8 GB (at HBM ceiling alone); mitigations: fp32 basis
+    storage, restart ∈ (30,60) tuning at scale, or `fused_bdiag` short-recurrence
+    (validated as memory-insurance outer at 1.26× wall premium, W5a).
+  - **gaq lazy-alloc** — `self._gaq_d` at 3d-L8 is ~9 GiB of dead persistent HBM
+    (frozen-a buffer, kernels never read it in the newton=0 path); lazy-allocate
+    only when newton=1.  Candidate for 9 GiB HBM recovery at 68M–100M scale
+    (W1 report §"Ledger note").
+
+---
+
+### 14.4 Follow-Up Items
+
+| Item | Description | Constraint / gate |
+|------|-------------|-------------------|
+| **W1b** | CSR flat upload nnz-shape fix in `linsolve.py:1534`; 2-D shaping or row-blocking in `CSROperator` | Gates 68M–100M single-GPU SOLVE; not a truck blocker (~1.3B nnz < 2^31) |
+| **W2b residual: host-pre** | `_gp_field_3d` + `_gp_history_fq_3d` cost ~3.3 s/step; sparse T@u + einsum on host; device-side GP-field interpolation or caching is the fix direction | Secondary after W2c; profiling overhead makes exact figure uncertain (~30% inflation in W2b mode) |
+| **W2b residual: diagonal pull** | 73 MB/step diagonal gather download for scalar bdiag preconditioner remains; fully device-resident preconditioner eliminates it | Negligible at 9.08M; notable only near 100M (diagonal = 73 MB × 100M/9.08M ≈ 800 MB/step) |
+| **RHS-scatter dedup** | `device_assembly.py:1060` duplicates the RHS scatter path; refactor candidate | Cosmetic / latent correctness risk; flagged in W2 review |
+| **Silent-fallback debug line** | W2c's `DeviceSaddleCSR.tocsr()` fallback path fires silently for non-fast-path callers; a `logging.debug` line should flag unexpected fallbacks | W2c review minor |
+| **SADDLE_VERBOSE hook** | No built-in env to enable per-step solve-time stdout on the production drivers without code changes; SADDLE_VERBOSE=1 would reduce one-off profiling overhead | Quality-of-life; assists future W-round-style profiling |
+| **gaq lazy-alloc** | `self._gaq_d` ~9 GiB dead persistent at 3d-L8; lazy-allocate only when newton=1 | 9 GiB HBM recovery at 68M–100M scale; low risk (the buffer is zeroed and unused) |
+| **W3 (Horizon)** | Full multi-GPU pattern dev (gpubox 2×Ada) then Horizon B200; deferred this round (nova = single GH200) | Blocked on availability; gpubox pattern-dev is the prerequisite |
+| **Warm-start adaptive settled-march** | Validate `SADDLE_RESTART=120 SADDLE_X0=extrap` on a developed adaptive march (r60 vs r120) under W2c device-resident CSR; the A3 win was on uniform-8.58M; the adaptive cold figure was taken at r60 | W2 combo was SLOWER on adaptive cold; unsettled; benefit may differ in developed march |
 | Parity tests | `test_saddle_ladder_cpu.py::test_device_csr_handoff_parity`, `test_p2r1c_thin_plate_flow_3d.py::test_device_csr_handoff_parity_3d` |
