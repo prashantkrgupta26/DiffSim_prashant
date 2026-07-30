@@ -38,6 +38,12 @@ NSTEPS     = int(os.environ.get("NSTEPS",     "800"))
 VIZ_INT    = int(os.environ.get("VIZ_INTERVAL", "20"))
 CKPT_INT   = int(os.environ.get("VIZ_CKPT_INTERVAL", "200"))
 EQUIL      = os.environ.get("SADDLE_EQUILIBRATE", "0") == "1"
+# assembly path: "device" (P1 device-CSR handoff, needs a warp install with
+# native/ headers so the NS element kernel can cold-compile) or "host" (scipy
+# assembly; no new kernel compile).  Default device; set TRUCK_ASSEMBLY=host to
+# fall back on the ARM venv where warp lacks native/ headers (JIT of a
+# module="unique" kernel raises "cannot open source file builtin.h").
+ASSEMBLY   = os.environ.get("TRUCK_ASSEMBLY", "device")
 VIZ_DIR    = os.environ.get(
     "VIZ_DIR", "/work/mech-ai/baskarg/DiffSim/results/truck-t5-frames")
 
@@ -67,7 +73,8 @@ threading.Thread(target=_smi_sampler, daemon=True).start()
 
 print("=" * 72, flush=True)
 print(f"[T5] GATE LEG  base={BASE_LEVEL} band={BAND_TO} nsteps={NSTEPS} "
-      f"viz_interval={VIZ_INT} ckpt={CKPT_INT} equilibrate={EQUIL}", flush=True)
+      f"viz_interval={VIZ_INT} ckpt={CKPT_INT} equilibrate={EQUIL} "
+      f"assembly={ASSEMBLY}", flush=True)
 
 import torch, warp as wp
 wp.init()
@@ -127,7 +134,7 @@ t_run = time.time()
 res = run_truck(
     cfg, NSTEPS,
     device="cuda",
-    assembly="device",
+    assembly=ASSEMBLY,
     mono_solver="fgmres_bdiag",
     saddle_x0="extrap",
     saddle_equilibrate=EQUIL,
