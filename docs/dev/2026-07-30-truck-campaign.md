@@ -372,3 +372,115 @@ DOF) — the T5 path — NOT cuDSS-blocktri.
 3. Address the host-CSR RSS (198 GB) before a long run — route the driver through the device
    CSR handoff end-to-end (avoid .tolil/.tocsr surgery on host).
 4. cd_surr: real start-up surrogate-functional pathology; use cd_react.
+
+---
+
+# T5 — Device CSR handoff + warm-start + incremental-assembly verdict + GATE LEG
+
+**Date:** 2026-07-30  **Branch:** `truck-bringup`  **Hold job:** 11783474 (nova24-gh-1, GH200)
+
+## Pre-items (P1/P2/P3)
+
+**P1 — device-resident CSR handoff routed end-to-end (commit bdb2928).**
+`run_truck(assembly="device")` mirrors `run_flow_past_3d`'s device path: a
+`DeviceNSAssembler(dm)` builds the symbolic pattern once, the geometry-cached
+SBM face system `Af_c` uploads to fixed CSR slots once, and the STATIC strong
+rows (BC rows + pressure pin — fixed for the mesh) are precomputed via
+`set_strong_rows()` ONCE (the W2c pattern the brief called for — no per-step
+`.tolil/.tocsr` surgery). Per step: `assemble_handoff(...)` builds `A_vol` on
+device, atomic-adds `Af_c` at its slots, applies the strong-row plan on device,
+and returns a `DeviceSaddleCSR` whose values stay resident (`SADDLE_DEVICE_CSR=1`).
+This deletes the host-CSR + LIL surgery that produced T4b's 198 GB RSS.
+
+*Reaction arbiter on the device path.* The host reaction is `w^T(A_vol x - b_vol)`
+on the pre-SBM, pre-surgery matrix. The device fill gives `A_full = A_vol + Af +
+surgery`, but `w_rxn` is orthogonal to surgery rows, so on its rows
+`A_full = A_vol + Af` and `b = b_vol + bf`, giving
+
+    F_raw = w^T(A_full x) - w^T(Af x) - w^T b + w^T bf
+
+`A_full x` is one device SpMV; the `Af x`/`bf` corrections use the small host
+face system + a cheap sparse `w` dot. Parity gate `test_truck_device_assembly_parity`
+(host vs device, `SADDLE_DEVICE_CSR` off AND on, forces match < 1e-8) passes.
+
+**P2 — warm-start (commit bdb2928).** `saddle_x0="extrap"` threads through the
+`blocktri_meta` cache into `solve_linear`'s extrapolation `x0 = 2x^n − x^{n-1}`.
+Verified to flow on the device path and to strictly reduce summed inner
+iterations vs a cold start (`test_truck_warm_start_reduces_iters`).
+
+**P3 — viz hook fires during a march (commit b71b09b).** A 4-step device march
+with `viz_interval=2` writes ≥2 frame batches (Q-iso / centerline / surface-Cp
+`.vtp`) + a meshio `.vtu` checkpoint on disk; `test_truck_viz_hook_fires_in_march`
+gates it. (T4 left the viz leg "not reached".)
+
+## T5 proper — incremental assembly: static/dynamic split (ESCAPE TAKEN)
+
+Honest derivation per the T-B4 escape clause. Assembling the linearized rbVMS NS
+operator at two DIFFERENT advecting fields with `sigma`/`nu`/`dt`/mesh FIXED and
+diffing the CSR values (`test_incremental_assembly_static_set_is_empty`, and the
+probe `cluster/static_split.py` at the corrected-unit `sigma=1600, nu=6.25e-5`
+regime) gives:
+
+| Set | nnz | fraction |
+|-----|-----|----------|
+| PURELY static (velocity-independent) | 0 | **0.000%** |
+| DYNAMIC (velocity-dependent) | all | **100.000%** |
+
+Every one of the 16 dof-blocks (u-u, u-p, p-u, p-p) is dynamic. The reason:
+`tau_m(|a|)` weights the SUPG/PSPG/grad-div stabilization, which contributes to
+EVERY block, and those tau-weighted terms share CSR slots (atomic-add
+accumulation) with the Galerkin mass/viscous/pressure/continuity terms — so the
+slot VALUE is velocity-dependent even where a Galerkin sub-term is static. The
+static set is not merely too small to pay; it is **empty**. `fill_static() +
+fill_dynamic()` would degenerate to a full fill plus bookkeeping — all loss.
+
+**Verdict: the T-B4 incremental-assembly sub-item is honorably STOPPED.** The full
+fill is retained. The finding is captured as a permanent test that will fail
+(prompting a revisit) if the operator ever grows a static block. ~200-line budget
+NOT spent on the split; the effort redirects to the gate leg (and, if a future
+rung wants incrementality, the honest lever is caching `tau_m` when `|a|` is
+frozen, not a static/dynamic CSR partition).
+
+## Gate leg — the ramp march to truck-arrival
+
+*(runner `cluster/t5_gate.py`; NSTEPS=800, viz_interval=20, ckpt=200,
+device CSR + warm-start + plain fgmres_bdiag, tol loose 5e-4 in ramp.)*
+
+**Unit-table step counts** (dt_unit = 0.01/16 = 6.25e-4):
+- truck arrival: front x=0.3125 / U=1 → t_unit=0.3125 → **step ~500**
+- Re ramp mid (t_phys=50): t_unit=3.125 → step 5000 (NOT reached at 800)
+- Re ramp end (t_phys=51): t_unit=3.1875 → step 5100 (NOT reached at 800)
+
+So Re stays ~1000 for the whole 800-step leg and the tol schedule stays loose
+throughout (arrival is deep inside the ramp).
+
+### Environment blocker (root-caused + worked around)
+The GH200 ARM venv's warp 1.15.0 is MISSING its `native/` header tree, so any
+cold JIT of the NS element kernel fails (`cannot open source file "builtin.h"`).
+T5 is the first run to exercise the truck device path, so it surfaced this.
+1.15.0 isn't on PyPI (it came from an NVIDIA index, headerless aarch64 wheel);
+PyPI aarch64 warp tops at 1.12.1 (which DOES bundle native/). Downgrading to
+1.12.1 fails (`@wp.kernel` rejects `module_options=`, API drift). **Workaround
+(cluster/t5_hdr.sh): stage 1.12.1's `native/` C++ headers into the 1.15.0
+warp/native dir** — the 1.15.0 Python API is untouched, and the headers are
+ABI-compatible with the 1.15.0 codegen. Verified: full kernel stack compiles to
+sm90 ptx, device path runs. (Separately: a `git stash -u` during a bundle sync
+swept the un-gitignored venv into the stash and broke it; recovered from the
+stash's untracked tree and gitignored the venvs — commit 1376e98.)
+
+### Gate-leg trace (base=7 band=12, 7.96M DOF, device path)
+
+| step | s/step | iters | cd_react | cd_surr | RSS | GPU SMI |
+|------|--------|-------|----------|---------|-----|---------|
+| 0 | 517.8 (mesh+JIT) | 4 | -0.00000 | -124.9 | 283.9G | 65.4G |
+| 1 | 6.4 | 2 | -0.00000 | -184.1 | 283.9G | 65.4G |
+| 2 | 15.3 | 2 | -0.00000 | -322.3 | 283.9G | 67.4G |
+| 3 | 6.7 | 2 | -0.00000 | -539.4 | 283.9G | 67.5G |
+| 4 | 7.0 | 2 | -0.00000 | -885.2 | 283.9G | 67.5G |
+
+**s/step ~6-15s (vs T4b 170s); iters 2-4 (vs T4b 720+, the warm-start win);
+RSS peak 283.9 GB < 400G (P1 removed the .tolil/.tocsr surgery).** cd_react
+correctly 0 pre-arrival. At ~10s/step, arrival (step 500) ~85 min, full 800
+~135 min. <FIRST-CONTACT + VIZ ARTIFACTS APPENDED ON COMPLETION>
+
+
