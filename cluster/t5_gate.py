@@ -100,8 +100,14 @@ nu_sched = make_nu_schedule(cfg, U_inf=1.0, L_ref=1.0, scale=scale)
 print(f"[T5] nu_unit(0)={nu_sched(0.0):.3e} effRe={scale/nu_sched(0.0):.0f}",
       flush=True)
 
+# T5 leg-2 knob: the leg-1 march died at step 25 (post-arrival transient) with
+# relres=8.87e-4 vs the 5e-4 ramp tol — only 1.8x above.  TOL_RAMP loosens the
+# in-ramp tol (e.g. 1e-3) so the march survives the impulsive-arrival transient;
+# post-ramp stays tight (1e-6).
+TOL_RAMP = float(os.environ.get("TOL_RAMP", "5e-4"))
+
 def tol_sched(t_unit):
-    return 5e-4 if t_unit < ramp_end_unit else 1e-6
+    return TOL_RAMP if t_unit < ramp_end_unit else 1e-6
 
 from diffsim.solvers import linsolve
 _step_times = []
