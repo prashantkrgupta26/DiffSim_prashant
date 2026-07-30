@@ -383,6 +383,7 @@ def run_flow_past(
     pcd_ap_inner="jacobi",  # (T5) PCD Ap-block inner-solve backend: "jacobi" | "amgx"
     saddle_restart=None,  # A3 knob A: FGMRES restart length; None => default 60
     saddle_x0=None,       # A3 knob B: warm-start mode; "extrap" | None (cold)
+    bdiag_block=None,     # W5d knob: "node" => per-node block Jacobi; None => scalar
 ):
     """Run flow past a finite thin plate with transient BDF2 march.
 
@@ -729,12 +730,14 @@ def run_flow_past(
     # fgmres_bdiag reads ndof and A3 knobs via ("blocktri_meta", cache_key).
     _pcd_cache = {}           # {("pcd_meta", key): meta, ...}
     _pcd_last_order = None    # track when to rebuild pcd_meta (sigma change)
-    if mono_solver == "fgmres_bdiag":
+    if mono_solver in ("fgmres_bdiag", "fused_bdiag"):
         _bdiag_meta = {"ndof": ndof}
         if saddle_restart is not None:
             _bdiag_meta["saddle_restart"] = int(saddle_restart)
         if saddle_x0 is not None:
             _bdiag_meta["saddle_x0"] = saddle_x0
+        if bdiag_block is not None:
+            _bdiag_meta["bdiag_block"] = bdiag_block
         _pcd_cache[("blocktri_meta", "ns2d")] = _bdiag_meta
 
     # ---- BDF2 march ---------------------------------------------------------
@@ -815,7 +818,14 @@ def run_flow_past(
             # assemble: volume fill + extra_matrix(Af) + extra_rhs(bf)
             # + strong rows — order mirrors host: A_vol + Af_c, b + bf_c,
             # then LIL surgery.  Oracle: aq/dq/fq as flat pv-keyed dicts.
-            Acsr, b = _dev_asm.assemble(
+            # W2c: SADDLE_DEVICE_CSR=1 keeps values device-resident
+            # (assemble_handoff); default byte-identical (assemble).
+            # Read live (env, not import-time) so parity harnesses can toggle.
+            _dev_csr = os.environ.get(
+                "SADDLE_DEVICE_CSR", "0").strip() not in ("", "0")
+            _asm_call = (_dev_asm.assemble_handoff if _dev_csr
+                         else _dev_asm.assemble)
+            Acsr, b = _asm_call(
                 aq, dq, fq_raw, nu, sigma,
                 strong_b_vals=_sb,
                 extra_matrix=(_af_slots_d, _af_vals_d),

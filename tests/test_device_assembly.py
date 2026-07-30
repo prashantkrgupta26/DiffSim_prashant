@@ -518,3 +518,211 @@ def test_constraint_aware_csr_int64_indptr(device):
         f"DeviceNSAssembler.indptr must be int64 on constrained mesh "
         f"(got {asm.indptr.dtype}); coo_matrix overflow regression"
     )
+
+
+# ---------------------------------------------------------------------
+# W2: constraint-aware scatter chunking.  At adaptive scale (hanging-node
+# constraints -> identity_T=False) the per-bin constraint-expansion
+# slots/src/w arrays AND vals_d pass warp's 2^31-element array ceiling
+# (measured 2.37B expansion entries at 3d-L7r9).  The fix chunks the
+# weighted matrix scatter ELEMENT-ALIGNED so every per-chunk array stays
+# under the bound; the assembled CSR must be BIT-IDENTICAL to the
+# unchunked constrained path.  The `_exp_chunk_cap` hook + chunking="force"
+# force the multi-chunk path at toy sizes.
+# ---------------------------------------------------------------------
+def _adaptive_constrained_dm(device, level=4):
+    """Small 2-D AMR mesh with hanging nodes (non-identity T)."""
+    from diffsim.octree.build import refine_elements
+    from diffsim.octree.balance import balance2to1
+    from diffsim.octree.build import build_uniform as bu
+    tree = bu(level, dim=2)
+    mask = np.zeros(len(tree), bool)
+    mask[0] = True
+    mask[len(tree) // 2] = True
+    tree = balance2to1(refine_elements(tree, mask))
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2), device)
+    from diffsim.physics.poisson import gauss_points
+    xq = gauss_points(mesh, dm.tables_by_p)
+    rng = np.random.default_rng(11)
+    aq, dq, fq = {}, {}, {}
+    for pv in dm.bins:
+        ngp = len(xq[pv])
+        aq[pv] = rng.standard_normal((ngp, 2)) * 0.5
+        dq[pv] = rng.standard_normal(ngp) * 0.1
+        fq[pv] = rng.standard_normal((ngp, 2))
+    return dm, aq, dq, fq
+
+
+def test_constraint_scatter_chunk_parity(device):
+    """W2 gate: constraint-expansion weighted scatter with chunking
+    FORCED (multi-chunk via a tiny _exp_chunk_cap) produces a
+    BIT-IDENTICAL CSR (indptr/indices/data) and rhs vs the unchunked
+    constrained path — the parity that lets adaptive meshes take the
+    device assembler at scale."""
+    dm, aq, dq, fq = _adaptive_constrained_dm(device)
+    nu, sigma = 0.05, 20.0
+    ref = DeviceNSAssembler(dm)                       # unchunked (default)
+    assert not ref._identity_T, "mesh must have hanging constraints"
+    A_ref, b_ref = ref.assemble(aq, dq, fq, nu, sigma)
+    A_ref = A_ref.tocsr(); A_ref.sort_indices()
+
+    asm = DeviceNSAssembler(dm, chunking="force", chunk_cap=64)
+    # measured expansion factor -> force many chunks (a handful of
+    # elements each) so the element-aligned partition is exercised.
+    n_exp = len(asm._slot_bins[0])
+    ne = asm._bins[0][2]
+    asm._exp_chunk_cap = max(1, n_exp // (4 * ne)) or 1  # >=4 chunks
+    asm._build_exp_chunks(asm._slot_bins, dm.device)
+    nchunks = sum(len(c) for c in asm._exp_chunks)
+    assert nchunks >= 4, f"expected multi-chunk, got {nchunks}"
+    assert asm._chunked
+    A_b, b_b = asm.assemble(aq, dq, fq, nu, sigma)
+    A_b = A_b.tocsr(); A_b.sort_indices()
+
+    assert np.array_equal(A_ref.indptr, A_b.indptr)
+    assert np.array_equal(A_ref.indices, A_b.indices)
+    assert np.array_equal(A_ref.data, A_b.data), (
+        "chunked constrained CSR data must be BIT-IDENTICAL to unchunked",
+        float(np.abs(A_ref.data - A_b.data).max()))
+    assert np.array_equal(b_ref, b_b)
+
+
+def test_constraint_scatter_chunk_auto_trigger(device, monkeypatch):
+    """W2 regression: chunking must AUTO-trigger from the constraint-
+    EXPANSION entry count, not the CSR nnz.  At 3d-L7r9 the expansion
+    arrays hit 2.37B while nnz stays under 2^31 — the nnz-gated switch
+    would leave the flat wp.array upload to crash.  Lower the chunk
+    threshold below this small mesh's expansion count (but keep it above
+    nnz) and assert the assembler chunks and stays bit-identical."""
+    import diffsim.assembly.device_assembly as da
+    dm, aq, dq, fq = _adaptive_constrained_dm(device)
+    nu, sigma = 0.05, 20.0
+    ref = DeviceNSAssembler(dm)                       # default: unchunked
+    assert not ref._chunked
+    A_ref, b_ref = ref.assemble(aq, dq, fq, nu, sigma)
+    A_ref = A_ref.tocsr(); A_ref.sort_indices()
+    n_exp = len(ref._slot_bins[0])
+    nnz = ref.nnz
+    assert n_exp > nnz, "expansion entries must exceed nnz for this test"
+    # threshold between nnz and the expansion count: nnz alone must NOT
+    # trip it, expansion MUST.
+    thr = (nnz + n_exp) // 2
+    monkeypatch.setattr(da, "CHUNK_NNZ_THRESHOLD", thr)
+    monkeypatch.setattr(da, "EXP_CHUNK_ENTRIES", max(1, n_exp // 5))
+    asm = DeviceNSAssembler(dm)                       # auto
+    assert asm._chunked, "chunking must auto-trigger on expansion count"
+    assert asm._exp_chunks is not None
+    A_a, b_a = asm.assemble(aq, dq, fq, nu, sigma)
+    A_a = A_a.tocsr(); A_a.sort_indices()
+    assert np.array_equal(A_ref.indptr, A_a.indptr)
+    assert np.array_equal(A_ref.indices, A_a.indices)
+    assert np.array_equal(A_ref.data, A_a.data)
+    assert np.array_equal(b_ref, b_a)
+
+
+def test_constraint_scatter_chunk_matches_host(device):
+    """W2: the chunked constrained device assembly also matches the HOST
+    T^T K T reference at 1e-12 (the end-to-end correctness the unchunked
+    path is gated on, now through the chunked scatter)."""
+    dm, aq, dq, fq = _adaptive_constrained_dm(device)
+    nu, sigma = 0.05, 20.0
+    A_h, b_h = assemble_linear_ns(dm, aq, dq, fq, nu, sigma=sigma)
+    asm = DeviceNSAssembler(dm, chunking="force", chunk_cap=64)
+    asm._exp_chunk_cap = 32
+    asm._build_exp_chunks(asm._slot_bins, dm.device)
+    assert sum(len(c) for c in asm._exp_chunks) >= 2
+    A_d, b_d = asm.assemble(aq, dq, fq, nu, sigma)
+    diff = (A_h - A_d)
+    scale = np.abs(A_h.data).max()
+    assert (np.abs(diff.data).max() / scale if diff.nnz else 0) < 1e-12
+    assert np.abs(b_h - b_d).max() / max(np.abs(b_h).max(), 1e-30) < 1e-12
+
+
+# ---------------------------------------------------------------------
+# W1: bound the per-step element-block (Ae/be) intermediate.  The
+# whole-bin `Ae = wp.zeros((ne, nl, nl))` in assemble() sized to the
+# ENTIRE element set — measured OOM: a single 137.4 GB allocation at
+# ~68M DOF (3d-L8, ne=16.77M, nl=32 -> ne*1024*8 B), NOT a capacity
+# wall (persistent state was 62.7 GiB).  The fix computes Ae/be in
+# element BATCHES bounded by AE_BATCH_BYTES and scatters each batch;
+# the assembled CSR must be BIT-IDENTICAL to the whole-bin path.  The
+# `_ae_batch` hook forces the multi-batch path at toy sizes here.
+# ---------------------------------------------------------------------
+def _assemble_csr(asm, aq, dq, fq, nu, sigma):
+    A, b = asm.assemble(aq, dq, fq, nu, sigma)
+    A = A.tocsr()
+    A.sort_indices()
+    return A, b
+
+
+@pytest.mark.parametrize("coloring", [False, True])
+def test_ae_batch_parity_identity(coloring, device):
+    """Identity-T uniform mesh: multi-batch Ae assembly (forced via a
+    tiny _ae_batch) produces a BIT-IDENTICAL CSR (indptr/indices/data)
+    and rhs vs the whole-bin path.  Only the UNCOLORED scatter takes the
+    batched path (assemble() batches node_mode + identity-T-uncolored);
+    the coloring=True case asserts _ae_batch is INERT there (the colored
+    scatter reads Ae through non-contiguous whole-bin slot maps and
+    stays whole-bin) and serves as a bit-identical regression check."""
+    dm, aq, dq, fq = _setup(3, 3, device)
+    nu, sigma = 0.05, 20.0
+    ref = DeviceNSAssembler(dm, coloring=coloring)
+    A_ref, b_ref = _assemble_csr(ref, aq, dq, fq, nu, sigma)
+    ne = ref._bins[0][2]
+    asm = DeviceNSAssembler(dm, coloring=coloring)
+    asm._ae_batch = max(1, ne // 4)          # force >=4 batches
+    # assert which path assemble() takes (mirrors its dispatch condition)
+    batched = asm.node_mode or (asm._identity_T and not asm.coloring)
+    assert batched == (not coloring), (
+        "batched-Ae dispatch must cover identity-T-uncolored only; the "
+        "colored scatter stays whole-bin")
+    A_b, b_b = _assemble_csr(asm, aq, dq, fq, nu, sigma)
+    assert np.array_equal(A_ref.indptr, A_b.indptr)
+    assert np.array_equal(A_ref.indices, A_b.indices)
+    assert np.array_equal(A_ref.data, A_b.data), (
+        "Ae-batched CSR data must be BIT-IDENTICAL to whole-bin",
+        np.abs(A_ref.data - A_b.data).max())
+    assert np.array_equal(b_ref, b_b)
+
+
+def test_ae_batch_parity_node_pattern(device):
+    """Node-graph pattern (forced): multi-batch Ae assembly through the
+    in-kernel-slot scatter is BIT-IDENTICAL to the whole-bin path."""
+    dm = _strip3d(device, 8, 8, 8, 4)
+    rng = np.random.default_rng(7)
+    pv = list(dm.bins)[0]
+    from diffsim.physics.poisson import gauss_points
+    xq = gauss_points(dm.mesh, dm.tables_by_p)
+    ngp = len(xq[pv])
+    aq = {pv: rng.standard_normal((ngp, 3)) * 0.5}
+    dq = {pv: rng.standard_normal(ngp) * 0.1}
+    fq = {pv: rng.standard_normal((ngp, 3))}
+    nu, sigma = 0.05, 20.0
+    ref = DeviceNSAssembler(dm, ndof=4, node_pattern=True)
+    A_ref, b_ref = _assemble_csr(ref, aq, dq, fq, nu, sigma)
+    ne = ref._bins[0][2]
+    asm = DeviceNSAssembler(dm, ndof=4, node_pattern=True)
+    asm._ae_batch = max(1, ne // 3)
+    A_b, b_b = _assemble_csr(asm, aq, dq, fq, nu, sigma)
+    assert np.array_equal(A_ref.indptr, A_b.indptr)
+    assert np.array_equal(A_ref.indices, A_b.indices)
+    assert np.array_equal(A_ref.data, A_b.data), (
+        np.abs(A_ref.data - A_b.data).max())
+    assert np.array_equal(b_ref, b_b)
+
+
+def test_ae_batch_default_bound(device):
+    """The derived default Ae batch keeps the per-batch element-block
+    intermediate <= AE_BATCH_BYTES (the ~2 GB bound) and, at these toy
+    sizes where ne fits in one batch, stays single-batch (bit-for-bit
+    the pre-W1 path)."""
+    from diffsim.assembly.device_assembly import AE_BATCH_BYTES
+    dm, aq, dq, fq = _setup(3, 3, device)
+    asm = DeviceNSAssembler(dm)
+    pv, b, ne, nbf, gdof = asm._bins[0]
+    npair = (nbf * asm.ndof) ** 2
+    nb = asm._ae_batch_for(npair)
+    assert nb * npair * 8 <= AE_BATCH_BYTES
+    assert nb >= ne          # toy mesh: single batch, unchanged path

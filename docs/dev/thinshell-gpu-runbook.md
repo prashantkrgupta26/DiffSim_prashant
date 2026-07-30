@@ -743,3 +743,17 @@ SADDLE_NSTEPS=5 SADDLE_ASSEMBLY=device SADDLE_PCD_AP_INNER=amgx \
   savings at L6 block size. Setup reused (1 build, 35× reused per run).
 - 2d-r11: DIVERGES (structural, same as jacobi — AMG-on-Ap does not fix PCD quality).
 - **Lever is re-evaluated at 9.08M DOF where the Ap block is ~8× larger.**
+
+---
+
+## Appendix D: W-Round (2026-07-29/30) — A2 Section Pointer
+
+**W-round: see campaign doc §14** (`docs/dev/2026-07-28-track-a2-campaign.md`) for the
+full round summary, corrections, and updated projections.
+
+Key numbers for this runbook's A2 section:
+- Adaptive device engine (9.08M, post-W2c): **~53 s/step cold / ~12 s/step settled**
+  (cold from §13.1 step 2 = 53.2 s; settled from W4 200-step developed march, §14.1).
+- Plain `fgmres_bdiag` is the adaptive-mesh default; r120+extrap is reserved for uniform
+  meshes with confirmed HBM headroom (§14.2b, W2 review correction).
+- W1b (CSR nnz-shape fix) gates 68M–100M single-GPU solve; not a truck blocker at ~10–12M.

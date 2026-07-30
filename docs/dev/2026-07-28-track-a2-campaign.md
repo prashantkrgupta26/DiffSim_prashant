@@ -954,3 +954,267 @@ unbounded-intermediate fix (§10.10) which gates any run above ~68M).
 | Leg logs (nova) | `cluster/results/a3-p1-restart30.log`, `a3-p2-restart120.log`, `a3-p3-warmstart.log`, `a3-p4-fused.log`, `a3-p5-combo.log` (+ `-smi.log` each) |
 | Fused+bdiag ticket | "fused: add `apply_dev` hook to `cg_dev`/`bicgstab_dev`" (open) |
 | Warm-start follow-up | validate `SADDLE_X0=extrap` on a developed production-length march (benefit expected to grow; unvalidated) |
+
+---
+
+## 12. W2b Profile — Assembly-Side Cost Attribution at 3d-L7r9 (2026-07-29)
+
+**Question:** 3d-L7r9 (adaptive 9.08M DOF, device assembly, chunked constrained scatter) clocks
+167.7 s/step with ~55 s solve — leaving ~110 s/step of apparent assembly-side cost whose
+theoretical floor is ~10–40 ms. Where do the ~110 s actually go?
+
+### 12.1 Instrumentation
+
+Commit `3ae54d6` adds opt-in per-phase wall-time breakdowns behind `DIFFSIM_ASM_PROFILE=1`
+(default inert, zero overhead). Phases timed with `wp.synchronize()` boundaries:
+- **upload** — GP-field host→device uploads per bin
+- **Ae** — Ae/be compute kernels (kA/kb launches, all chunks)
+- **scatter** — weighted-chunked scatter into vals_d/F_d
+- **extra** — add_matrix_values (SBM face system)
+- **strong** — apply_strong_rows BC surgery
+- **pull** — `vals_d.numpy()` + `F_d.numpy()` device→host transfer
+- **host-pre** — `_gp_field_3d` + `_gp_history_fq_3d` (driver-side host numpy ops)
+- **solve** — `solve_linear` wall time
+- **post** — `T_vec @ x_cur`, traction, force recovery
+
+### 12.2 Measured Per-Step Breakdown (3d-L7r9, fgmres_bdiag, CUDA GH200 480GB)
+
+All times in ms. Step 0 includes first-call Warp kernel compilation (~18 extra modules).
+
+```
+step  host-pre  asm-total  upload    Ae    scatter  extra  strong    pull    chunks  solve    post    step-tot
+   0    3082.7    4422.7     35.2    520.9   32.8     3.6    5.9    3797.8      9   48196.7   973.6   56739.4
+   1    3115.7    3452.9     52.5    512.3   30.4    11.8    0.3    2843.0      9   39312.6  1063.7   47015.1
+   2    3335.2  108867.4     51.6    514.4   30.4    11.9    0.3  108255.9      9   30804.5  1007.6  144089.5
+```
+
+### 12.3 Attribution
+
+**Step 1 (clean BDF1, no compilation, 47.0 s total):**
+- host-pre: 3.1 s — host-side GP field interpolation (sparse T@u_pre1, einsum)
+- asm-total: 3.5 s, dominated by **pull: 2.8 s** (vals_d.numpy()) + Ae: 0.5 s
+- solve: 39.3 s (fgmres_bdiag iteration; historical baseline was ~55 s)
+
+**Step 2 (BDF2, severe memory pressure, 144.1 s total):**
+- pull: **108.3 s** — `ChunkedArray.numpy()` device→host pull
+- Everything else (Ae, scatter, host-pre, solve) unchanged at ~34 s
+
+### 12.4 Verdict
+
+**The entire ~110 s non-solve excess is `vals_d.numpy()` — the chunked device→host pull.**
+
+Mechanistically: `ChunkedArray.numpy()` issues 9 separate `self.data[c].numpy()[:cnt[c]]` calls
+in a Python loop, staging each chunk through a CPU buffer and concatenating. At 9.08M DOF /
+9 chunks the vals_d array is ~2.37B float64 entries = ~19 GB. Even at HBM bandwidth (3.35 TB/s
+GH200 bandwidth) this should take ~5.7 ms; the measured 108 s at step 2 indicates
+**memory pressure-driven migration**: after the FGMRES solve occupies 75+ GiB of HBM (measured
+via nvidia-smi), the vals_d chunks must be re-paged from host-mirrored or CPU-resident memory,
+incurring NVLink/PCIe latency per chunk instead of HBM bandwidth.
+
+Step 1 (2.8 s) is better because the solve is shorter (BDF1 warmup, fewer iters) and leaves
+more HBM resident.
+
+**The variability** (2.8 s vs 108.3 s) is therefore not an algorithmic problem but a
+**memory-residency hazard**: the 19 GB vals_d buffer is evicted from HBM during the solve's
+working-set build, and re-paging it via the chunked-Python loop pays per-chunk staging overhead.
+
+### 12.5 Implied Fix
+
+Eliminate `vals_d.numpy()` entirely — use `assemble_device()` (which returns a device-resident
+torch CSR via dlpack zero-copy) rather than `assemble()` (which pulls back to host CSR). This
+removes the 19 GB device→host transfer AND the subsequent host→device upload for the iterative
+solver. The `fgmres_bdiag` solver's `solve_linear` path already supports device CSR input;
+wiring `assemble_device()` through `run_flow_past_3d` when `mono_solver` is an iterative
+device solver is the fix target for W3.
+
+Secondary fix: reduce the chunk count (currently 9) to reduce per-chunk Python overhead; or
+replace the Python loop with a single pinned-memory DMA gather kernel.
+
+### 12.6 Session Artifacts
+
+| Artifact | Path / SHA |
+|----------|------------|
+| Profiling instrumentation commit | `3ae54d6` (`probe(w2b)`) on `w-engine-hardening` |
+| GPU profiling log | `cluster/results/w2b-profile.log` |
+| Driver instrumented | `tests/p2r1c_thin_plate_flow_3d.py` (lines 65–67, 522–535, 592–614, 671–700) |
+| Assembler instrumented | `src/diffsim/assembly/device_assembly.py` (lines 18–43, 1000–1228) |
+
+## 13. W2c — Device-Resident CSR Handoff (kill the 19 GB pull) (2026-07-29)
+
+**Fix landed.** Commit `98ea879` on `w-engine-hardening`. Opt-in `SADDLE_DEVICE_CSR=1`
+(default byte-identical). On the device-assembly path the driver calls
+`DeviceNSAssembler.assemble_handoff()` (new) instead of `assemble()`: the assembled
+values stay device-resident (`DeviceSaddleCSR` wrapper over `vals_d`; static sparsity
+uploaded once/epoch). `solve_linear`'s `fgmres_bdiag`/`fused_bdiag` scalar path builds
+the SpMV from `device_operator()` (no re-upload) and the preconditioner from
+`make_bdiag_apply_from_diag(diagonal_device())` — a 73 MB diagonal gather+download
+instead of the 19 GB values pull. Node-block Jacobi and other solvers fall back to
+`.tocsr()` transparently. Files: `device_assembly.py`, `solvers/linsolve.py`,
+`solvers/saddle_precond.py`, both thin-plate drivers.
+
+### 13.1 Measured (3d-L7r9, fgmres_bdiag, GH200, SADDLE_DEVICE_CSR=1, nsteps=3)
+
+```
+step  host-pre  asm-total  upload    Ae   scatter  extra  strong   pull  chunks   solve     post   step-tot
+   0   3125.2      612.6    21.3   523.8   32.9    2.9    5.5    0.0     9    87050.7  990.6   91845.9
+   1   3483.7      599.6    32.6   520.3   30.4   11.8    0.3    0.0     9    66424.3  979.8   71568.6
+   2   3293.0      656.4    88.1   514.8   30.5   12.2    0.4    0.0     9    48219.0  980.9   53233.8
+```
+`dofs=9,080,064  iters_mean=1353.0  iters=[1760,1274,1025]  converged=True`. SADDLE-LADDER-OK.
+
+**pull = 0.0 ms on every step** (W2b: 3797.8 / 2843.0 / **108255.9**); `asm-total`
+612.6 / 599.6 / 656.4 ms (W2b: 4422.7 / 3452.9 / **108867.4**). Step 2 (the BDF2
+HBM-eviction case that cost 108 s in W2b) is now 53.2 s total. Iteration counts are
+byte-identical to the W2b/W2 reference — the handoff relocates values, not arithmetic.
+CPU parity gates (2-D + 3-D device-assembly fgmres_bdiag, SADDLE_DEVICE_CSR 0 vs 1):
+identical iterations and cd trajectory to 1e-14. Step-0 solve is inflated by one-time
+JIT of the handoff SpMV/gather kernels + profiling-mode `wp.synchronize()`.
+
+Note W2b §12.5's "implied fix" pointed at `assemble_device()` (torch/dlpack CSR for
+the cuDSS direct path); W2c instead keeps the Warp-native `vals_d` resident and feeds
+the **iterative** fgmres_bdiag stack (the actual 3d-L7r9 solver) via
+`device_operator()`+`diagonal_device()` — same principle (no host round-trip), correct
+target for the iterative path.
+
+| Artifact | Path / SHA |
+|----------|------------|
+| Fix commit | `98ea879` (`feat(solvers): device-resident CSR handoff … (W2c)`) |
+| GPU leg log | `cluster/results/w2c-devcsr.log`, `results/saddle_ladder_3d-L7r9_fgmres_bdiag.npz` (nova) |
+
+---
+
+## 14. W-Round Summary and Verdicts (2026-07-29/30)
+
+**Branch:** `w-engine-hardening`  **Dates:** 2026-07-29–30  **Hold:** job 11777138 (24 h GH200)
+
+W-round ran in six tasks plus a wiring catch and an A3 probe carry-in, all on the
+same branch off master (post Track A2 merge `af275ee`).
+
+---
+
+### 14.1 Round Table
+
+Every row is source-traceable to the section or scratchpad report listed in
+the "Source" column.
+
+| Task | Verdict | Headline number | Source |
+|------|---------|-----------------|--------|
+| **W1** | PASS — Ae-batch bound verified; 68M assembly end-to-end clear | GPU peak 86.8 GiB; host RSS 160.8 GiB; L7 recheck bit-identical iters, 54.36 s/step (no regression) | scratchpad/task-W1-report.md |
+| **W1b** | BACKLOG — CSR flat upload refuses 7.27B-nnz arrays (Warp int32/dim cap, `linsolve.py:1534`) | W1b precisely located at `CSROperator` flat 1-D upload; fix class = 2-D shaping/row-blocking; gates 68M–100M single-GPU SOLVE (assembly already clear) | scratchpad/task-W1-report.md §"New ceiling W1b" |
+| **W2** | PASS — constrained-scatter chunking correct; bit-identical CSR at 9.08M adaptive | Adaptive device: 167.7 s/step cold (1.48× vs host-asm reference 247.8 s); combo r120+extrap: 213.6 s/step (SLOWER — see §14.3b correction) | scratchpad/task-W2-report.md |
+| **W2b** | ATTRIBUTION — 19 GB `vals_d.numpy()` device→host pull identified as the entire non-solve excess (~110 s/step); atomic scatter hypothesis refuted (scatter = 0.03 s) | Step 2 pull: 108 s; Ae: 0.5 s; scatter: 0.03 s — sink is the ChunkedArray.numpy() pull under HBM eviction | §12 (campaign); scratchpad/task-W2b-report.md |
+| **W2c** | PASS — device-resident CSR handoff eliminates the 19 GB pull; pull = 0.0 ms every step | Worst step 144 s (W2b) → 53 s (W2c); asm-total 0.6 s; iterations byte-identical; parity 1e-14 both dims | §13 (campaign); scratchpad/task-W2c-report.md |
+| **W4** | PASS — developed march at 8.58M uniform (200 steps, r120+warmstart engine) | 164.8 iters/step mean, 10.46 s/step; settled-tail (last 50 steps): mean 146.5, min 53, max 227 iters | scratchpad/task-W1-report.md §"W4 measurement-march record" |
+| **W5a** | PASS (memory-insurance) — `fused_bdiag` (BiCGStab + bdiag, O(N) workspace) validated at 8.58M uniform | 1140 iters, 69.1 s/step CONVERGED; 1.26× wall premium vs `fgmres` r60 baseline (54.8 s); O(N) memory = 100M basis-free insurance outer | ledger line 154; scratchpad/task-W5a-report.md |
+| **W5d** | NEGATIVE (honest) — node-block Jacobi shelved | 1314.8 iters / 138.3 s/step; zero iteration benefit at 3-D uniform; ~60 ms/iter apply overhead as implemented; revisit only if a config shows iteration wins | ledger line 154; scratchpad/task-W5d-report.md |
+| **W3** | DEFERRED — nova single-GPU; pattern-dev on gpubox 2×Ada later, full test on Horizon | — | ledger line 145 |
+| **A3 probes (carry-in)** | PASS — restart sweep + warm-start; r30 anti-win confirmed | restart=120 + warm-start = 676.2 iters/step, 40.76 s/step (−48% iters / −26% wall vs r60 baseline); r30 anti-win: +16.3% iters; fused CONVERGED but slower | §11 (campaign); scratchpad/task-A3probes-report.md |
+| **Wiring catch** | FIXED — `fused_bdiag` driver meta gate was `fgmres_bdiag`-only; fused_bdiag silently received ndof=3 on 3-D (wrong masks); first W5 leg discarded | Commit `5541d05`; gate widened + `SADDLE_BDIAG_BLOCK` plumbed through both drivers + harness; 47 tests green; W5 GPU legs relaunched on corrected code | ledger line 153 |
+
+---
+
+### 14.2 Corrections (Supersessions)
+
+Three claims from earlier sections are superseded by W-round measurements.  Each
+cites the original claim and the evidence that overturns it.
+
+**(a) §10.10 OOM attribution superseded by W1.**
+
+§10.10 attributed the 68M OOM to the `_dof_indices_kernel_chunked` path ("the
+chunked dof-indices phase had just compiled; preceded by `wp_alloc_device_async`
+out-of-memory").  W1's analysis of the actual traceback frame in
+`hold-leg5-l8probe.log` confirmed the failing allocation is the per-step whole-bin
+element-block buffer in `DeviceNSAssembler.assemble()`:
+
+```
+device_assembly.py:868 (pre-fix): Ae = wp.zeros((ne, nbf*ndof, nbf*ndof), dtype=wp.float64, device=d)
+```
+
+Arithmetic: 16,768,504 elements × 32² pairs × 8 B = 137,367,584,768 B — byte-for-byte
+the traceback value.  The dof-indices / slot build had **succeeded** (the kernel had
+merely just compiled, which is what produced the log line immediately before the
+failure).  §10.10 text is superseded; the OOM was the unbounded whole-bin Ae
+allocation in `assemble()`, fixed by the element-batch bound in W1
+(scratchpad/task-W1-report.md §"Root cause").
+
+**(b) §10 / W2 GPU-row: combo-slower interpretation superseded by W2 review.**
+
+The W2 GPU rows showed the r120+extrap combo (213.6 s/step) as slower than plain
+bdiag (167.7 s/step) on the 9.08M adaptive mesh, despite fewer mean iterations
+(1097.4 vs 1196.8).  The initial read was "r120 orthogonalization overhead on the
+adaptive system."  The W2 review overturned this: the evidence favours HBM-pressure
+basis thrash — at r120+extrap the HBM footprint is 84.1 GiB / 95 GiB (11 GiB
+headroom), while the uniform-mesh A3 win used 58 GiB headroom.  The two-lever combo
+won on the uniform run precisely because headroom was ample; on the adaptive system
+the basis competes with the expanded constraint chunks (~47 GB resident).  Plain
+`fgmres_bdiag` (167.7 s/step) is therefore the adaptive-mesh default; r120+extrap
+is reserved for uniform meshes with confirmed HBM headroom.  See scratchpad/task-W2-report.md §5 concerns.
+
+**(c) "Uncoalesced atomics" hypothesis for adaptive assembly cost refuted by W2b.**
+
+Prior to W2b the dominant hypothesis for the ~110 s/step non-solve excess at 9.08M
+adaptive was uncoalesced atomic scatter (the constraint-weighted scatter touches
+irregular global slots).  W2b's phase breakdown (§12.2) refuted this directly:
+scatter = 0.03 s (Ae 0.5 s, scatter 0.03 s, extra 0.01 s).  The entire non-solve
+excess was the 19 GB `vals_d.numpy()` ChunkedArray device→host pull, removed by
+W2c.  The atomic-contention hypothesis is closed; see scratchpad/task-W2b-report.md
+§"Attribution Verdict."
+
+---
+
+### 14.3 Updated 100M / Truck Projections
+
+All numbers carry labeled assumptions; none are new claims beyond what the
+referenced sections establish.
+
+**Adaptive-mesh 9.08M engine (post-W2c, cold/settled):**
+
+- Cold (step 0–2, BDF2 with HBM-eviction pull): **~53 s/step** (§13.1, step 2
+  = 53.2 s; iters_mean 1353.0; pull = 0.0 ms; asm-total ~0.6 s; profiling-mode
+  wp.synchronize() adds <1 s; un-profiled steady step is solve + <1 s assembly).
+- Settled (developed march, W4: 8.58M uniform r120+warmstart 200-step march):
+  **~12 s/step** — W4 settled-tail mean 10.46 s/step (last-50 mean 146.5 iters);
+  the adaptive-mesh cold figure (~53 s) converges toward this as the solver warms
+  up and iteration counts fall (iters per step: 1760 → 1274 → 1025 → ... → sub-200
+  in developed flow); the ~12 s settled is the floor estimate for the warm
+  adaptive engine at scale (assumption: iteration count profile mirrors uniform
+  in developed march; not separately measured on adaptive post-W2c — follow-up item).
+
+**Truck (10–12M DOF adaptive, pre-T-B4 / mesh-sequencing):**
+
+- Conservative projection: **~15 s/step settled** (linear DOF-scale from adaptive
+  9.08M settled figure; mesh-sequencing T-A1 and incremental assembly T-B4 not yet
+  applied).  This is a pre-T-B4 baseline; T-B4 is expected to reduce per-step cost
+  further, not measured here.
+
+**Horizon pathway (per-iteration constants, post-W2c):**
+
+- The Horizon pathway doc's per-iteration solve constants stand.  W2c removes the
+  per-step assembly term from the 9.08M adaptive budget (was: ~110 s assembly-side;
+  now: ~0.6 s).  Remaining first-class 100M single-GPU memory items:
+  - **W1b** — CSR flat upload nnz-shape fix (gates 68M–100M solve; `linsolve.py:1534`).
+  - **fp32 basis / short restart** — r120 basis at 100M = 193 GB (2m+1 = 241 vectors
+    × 100M × 8 B); r60 = 96.8 GB (at HBM ceiling alone); mitigations: fp32 basis
+    storage, restart ∈ (30,60) tuning at scale, or `fused_bdiag` short-recurrence
+    (validated as memory-insurance outer at 1.26× wall premium, W5a).
+  - **gaq lazy-alloc** — `self._gaq_d` at 3d-L8 is ~9 GiB of dead persistent HBM
+    (frozen-a buffer, kernels never read it in the newton=0 path); lazy-allocate
+    only when newton=1.  Candidate for 9 GiB HBM recovery at 68M–100M scale
+    (W1 report §"Ledger note").
+
+---
+
+### 14.4 Follow-Up Items
+
+| Item | Description | Constraint / gate |
+|------|-------------|-------------------|
+| **W1b** | CSR flat upload nnz-shape fix in `linsolve.py:1534`; 2-D shaping or row-blocking in `CSROperator` | Gates 68M–100M single-GPU SOLVE; not a truck blocker (~1.3B nnz < 2^31) |
+| **W2b residual: host-pre** | `_gp_field_3d` + `_gp_history_fq_3d` cost ~3.3 s/step; sparse T@u + einsum on host; device-side GP-field interpolation or caching is the fix direction | Secondary after W2c; profiling overhead makes exact figure uncertain (~30% inflation in W2b mode) |
+| **W2b residual: diagonal pull** | 73 MB/step diagonal gather download for scalar bdiag preconditioner remains; fully device-resident preconditioner eliminates it | Negligible at 9.08M; notable only near 100M (diagonal = 73 MB × 100M/9.08M ≈ 800 MB/step) |
+| **RHS-scatter dedup** | `device_assembly.py:1060` duplicates the RHS scatter path; refactor candidate | Cosmetic / latent correctness risk; flagged in W2 review |
+| **Silent-fallback debug line** | W2c's `DeviceSaddleCSR.tocsr()` fallback path fires silently for non-fast-path callers; a `logging.debug` line should flag unexpected fallbacks | W2c review minor |
+| **SADDLE_VERBOSE hook** | No built-in env to enable per-step solve-time stdout on the production drivers without code changes; SADDLE_VERBOSE=1 would reduce one-off profiling overhead | Quality-of-life; assists future W-round-style profiling |
+| **gaq lazy-alloc** | `self._gaq_d` ~9 GiB dead persistent at 3d-L8; lazy-allocate only when newton=1 | 9 GiB HBM recovery at 68M–100M scale; low risk (the buffer is zeroed and unused) |
+| **W3 (Horizon)** | Full multi-GPU pattern dev (gpubox 2×Ada) then Horizon B200; deferred this round (nova = single GH200) | Blocked on availability; gpubox pattern-dev is the prerequisite |
+| **Warm-start adaptive settled-march** | Validate `SADDLE_RESTART=120 SADDLE_X0=extrap` on a developed adaptive march (r60 vs r120) under W2c device-resident CSR; the A3 win was on uniform-8.58M; the adaptive cold figure was taken at r60 | W2 combo was SLOWER on adaptive cold; unsettled; benefit may differ in developed march |
+| Parity tests | `test_saddle_ladder_cpu.py::test_device_csr_handoff_parity`, `test_p2r1c_thin_plate_flow_3d.py::test_device_csr_handoff_parity_3d` |

@@ -499,6 +499,56 @@ def test_ladder_pcd_ap_inner_passthrough():
 
 
 # ---------------------------------------------------------------------------
+# 5b. W2c: SADDLE_DEVICE_CSR device-resident handoff parity
+# ---------------------------------------------------------------------------
+
+def test_device_csr_handoff_parity():
+    """W2c: SADDLE_DEVICE_CSR=1 (device-resident CSR handoff) must be
+    bit-for-bit identical to the default (host-CSR pull) on the device-assembly
+    fgmres_bdiag path — same per-step iterations and same cd trajectory to
+    1e-14.  The opt-in only changes WHERE the assembled values live (device vs
+    host); the arithmetic (SpMV, scalar block-Jacobi diagonal) is identical.
+
+    Runs the tiny 2-D level=4 / 2-step device-assembly point on the "cpu" Warp
+    device twice, toggling only the SADDLE_DEVICE_CSR env var.
+    """
+    from p2r1a_thin_plate_flow import run_flow_past
+
+    kw = dict(
+        level=4, nsteps=2, dt=0.01, nu=0.1, U_inf=1.0, verbose=False,
+        mono_solver="fgmres_bdiag", device="cpu", assembly="device",
+    )
+
+    _prev = os.environ.get("SADDLE_DEVICE_CSR")
+    try:
+        # Default: host-CSR pull path
+        os.environ["SADDLE_DEVICE_CSR"] = "0"
+        stats_ref = []
+        res_ref = run_flow_past(solver_stats=stats_ref, **kw)
+
+        # Opt-in: device-resident handoff
+        os.environ["SADDLE_DEVICE_CSR"] = "1"
+        stats_dev = []
+        res_dev = run_flow_past(solver_stats=stats_dev, **kw)
+    finally:
+        if _prev is None:
+            os.environ.pop("SADDLE_DEVICE_CSR", None)
+        else:
+            os.environ["SADDLE_DEVICE_CSR"] = _prev
+
+    # Identical iteration counts (the preconditioner + operator are the same).
+    assert stats_ref == stats_dev, (
+        f"SADDLE_DEVICE_CSR changed per-step iterations: "
+        f"{stats_ref} (host) vs {stats_dev} (device)"
+    )
+    # Identical drag trajectory to 1e-14.
+    assert np.allclose(res_ref["cd"], res_dev["cd"], rtol=0, atol=1e-14), (
+        f"SADDLE_DEVICE_CSR changed cd trajectory: "
+        f"{res_ref['cd']} (host) vs {res_dev['cd']} (device)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 6. 3d-L7 uniform ladder point (GH200 hold session: identity_T device-assembly
 #    leg at ~8.6M DOF — separates device-assembly-at-scale from the
 #    constrained-scatter Warp 2^31 blocker that hit 3d-L7r9)
