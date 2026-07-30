@@ -441,46 +441,138 @@ NOT spent on the split; the effort redirects to the gate leg (and, if a future
 rung wants incrementality, the honest lever is caching `tau_m` when `|a|` is
 frozen, not a static/dynamic CSR partition).
 
-## Gate leg — the ramp march to truck-arrival
+## Gate leg — the startup-and-onset march
 
-*(runner `cluster/t5_gate.py`; NSTEPS=800, viz_interval=20, ckpt=200,
-device CSR + warm-start + plain fgmres_bdiag, tol loose 5e-4 in ramp.)*
+*(runner `cluster/t5_gate.py`; device CSR + warm-start + plain fgmres_bdiag.)*
 
 **Unit-table step counts** (dt_unit = 0.01/16 = 6.25e-4):
-- truck arrival: front x=0.3125 / U=1 → t_unit=0.3125 → **step ~500**
-- Re ramp mid (t_phys=50): t_unit=3.125 → step 5000 (NOT reached at 800)
-- Re ramp end (t_phys=51): t_unit=3.1875 → step 5100 (NOT reached at 800)
+- Re ramp mid (t_phys=50): t_unit=3.125 → step 5000 (NOT reached in the leg)
+- Re ramp end (t_phys=51): t_unit=3.1875 → step 5100 (NOT reached in the leg)
 
-So Re stays ~1000 for the whole 800-step leg and the tol schedule stays loose
-throughout (arrival is deep inside the ramp).
+So Re stays ~1000 for the whole leg. **Note (TU5R corrected physics):** the old
+"truck arrival at step ~500" advective estimate (front x=0.3125 / U=1) is NOT
+the drag-onset model — incompressible pressure is elliptic/instantaneous, so the
+truck feels the startup pressure response early (leg-2 onset step 23), not at the
+advective front. See the corrected-physics subsection below.
 
-### Environment blocker (root-caused + worked around)
-The GH200 ARM venv's warp 1.15.0 is MISSING its `native/` header tree, so any
-cold JIT of the NS element kernel fails (`cannot open source file "builtin.h"`).
-T5 is the first run to exercise the truck device path, so it surfaced this.
-1.15.0 isn't on PyPI (it came from an NVIDIA index, headerless aarch64 wheel);
-PyPI aarch64 warp tops at 1.12.1 (which DOES bundle native/). Downgrading to
-1.12.1 fails (`@wp.kernel` rejects `module_options=`, API drift). **Workaround
-(cluster/t5_hdr.sh): stage 1.12.1's `native/` C++ headers into the 1.15.0
-warp/native dir** — the 1.15.0 Python API is untouched, and the headers are
-ABI-compatible with the 1.15.0 codegen. Verified: full kernel stack compiles to
-sm90 ptx, device path runs. (Separately: a `git stash -u` during a bundle sync
-swept the un-gitignored venv into the stash and broke it; recovered from the
-stash's untracked tree and gitignored the venvs — commit 1376e98.)
+### Environment blocker — misdiagnosed then RESOLVED cleanly (TU5R)
 
-### Gate-leg trace (base=7 band=12, 7.96M DOF, device path)
+**Original (WRONG) diagnosis, now corrected.** The gate leg first failed with
+`cannot open source file "builtin.h"` on a cold JIT of the NS element kernel,
+and was reported as "the aarch64 1.15.0 wheel is headerless; PyPI tops at
+1.12.1". A header GRAFT (`cluster/t5_hdr.sh`, staging headers into
+`warp/native/`) was staged as a workaround and the leg-2 numbers came through
+graft-compiled kernels. The reviewer flagged the graft as PROVISIONAL/untrusted.
+
+**Verified resolution (TU5R).** The header-graft was unnecessary and the
+"headerless wheel" claim was false. The genuine PyPI wheel
+`warp_lang-1.15.0-py3-none-manylinux_2_34_aarch64.whl` (171.8 MB) **ships a
+complete `native/` tree — 92 native entries including `builtin.h` and the
+`clang/` subdir** (verified by unzipping the downloaded wheel). The on-disk
+`native/builtin.h` hash matched the wheel's own `RECORD`
+(`sha256=memrF2mOh-yF10PUFiSfel8p9cuEGaKVVWA1C8Vku-Q`, 91555 bytes) exactly —
+i.e. the graft had merely restored the wheel's OWN files. The real root cause of
+the original crash was the venv damage (a `git stash -u` swept the
+un-gitignored `.venv-nova-arm` into the stash) compounded by a wrong
+`WARP_CACHE_PATH`. **Fix:** `pip install --force-reinstall --no-deps` from the
+genuine wheel restores warp 1.15.0 with `native/` + `builtin.h` + `clang/`
+present; the graft is now obsolete. The venvs are gitignored (commit 1376e98)
+so `stash -u` can never sweep them again.
+
+**Miscompile sentinel / real logged OK.** A cold JIT against the clean
+reinstall, using a FRESH cache dir (`.warp-cache-clean`, no graft), is logged
+end-to-end via the fixed `cluster/t5_hdr.sh` pattern to a timestamped
+append-only log under `cluster/results/` — the "REAL logged OK" the review
+required. See the soft-start leg below for the CPU-vs-GPU parity spot-check that
+guards against a silent miscompile.
+
+### Gate-leg trace — VERIFIED evidence (leg 2) + reporting-integrity note (TU5R)
+
+**Reporting-integrity incident (resolved).** The originally-recorded gate-leg
+trajectory (a leg-1 run: onset step 17 at tol 5e-4, the +201/-87 spike class,
+"GPU-DEVICE-PATH OK") was OBSERVED LIVE but its primary cluster log was
+DESTROYED by two log-hygiene defects: `t5_gate_run.sh` teed without `-a` to a
+fixed filename (so relaunching leg 2 TRUNCATED the leg-1 log), and the
+header-probe wrapper never logged (so an audit saw only an earlier FAILED
+probe). Both defects are fixed (commit "log hygiene" — timestamped append-only
+logs; probe always logs). The full review + incident record is in
+`.superpowers/sdd/progress.md` (T5 REVIEW + T5 INCIDENT RESOLUTION).
+
+**What survives as citable primary evidence.** Leg 2 is the SAME code and its
+cluster log survived (`docs/dev/evidence/t5-leg2-gate.log`, md5
+`4c30ae7ed3bbcae8867382e2e80207ea`; also on nova at
+`cluster/results/t5-gate.log` and `cluster/results/t5-leg2-preserved.log`,
+identical md5). It independently replicates the behavior. The leg-2 run was
+`nsteps=400`, `TOL_RAMP=1e-3`, killed by the controller stop-order at step 23.
+**All numbers in the table below are read directly from that surviving log**
+(`docs/dev/evidence/t5-leg2-gate.log`); nothing here is reconstructed.
 
 | step | s/step | iters | cd_react | cd_surr | RSS | GPU SMI |
 |------|--------|-------|----------|---------|-----|---------|
-| 0 | 517.8 (mesh+JIT) | 4 | -0.00000 | -124.9 | 283.9G | 65.4G |
-| 1 | 6.4 | 2 | -0.00000 | -184.1 | 283.9G | 65.4G |
-| 2 | 15.3 | 2 | -0.00000 | -322.3 | 283.9G | 67.4G |
-| 3 | 6.7 | 2 | -0.00000 | -539.4 | 283.9G | 67.5G |
-| 4 | 7.0 | 2 | -0.00000 | -885.2 | 283.9G | 67.5G |
+| 0 | 514.8 (mesh+JIT) | 3 | -0.00000 | -82.57 | 283.9G | 65312 MiB |
+| 1 | 7.0 | 1 | -0.00000 | -110.19 | 283.9G | 67391 MiB |
+| 2 | 12.8 | 0 | -0.00000 | -137.81 | 283.9G | 67425 MiB |
+| … | ~7–13 | 0–4 | -0.00000 | (grows) | 283.9G | 65–70k MiB |
+| 22 | 7.9 | 5 | +0.00000 | -28146.59 | 283.9G | 69985 MiB |
+| 23 | 9.0 | 5 | +0.00022 | -29135.30 | 283.9G | 69985 MiB |
 
-**s/step ~6-15s (vs T4b 170s); iters 2-4 (vs T4b 720+, the warm-start win);
-RSS peak 283.9 GB < 400G (P1 removed the .tolil/.tocsr surgery).** cd_react
-correctly 0 pre-arrival. At ~10s/step, arrival (step 500) ~85 min, full 800
-~135 min. <FIRST-CONTACT + VIZ ARTIFACTS APPENDED ON COMPLETION>
+(`*** FIRST CONTACT at step 23: cd_react=+0.00022 ***` — the onset row.)
+
+**Engine metrics (from the surviving log):** s/step ~7–13 s after the one-time
+step-0 cost of 514.8 s (mesh build + cold NS-kernel JIT); inner iters 0–5 (the
+warm-start win vs T4b's 720+); RSS held flat at 283.9 GB (< 400 G cgroup
+limit — P1 removed the `.tolil/.tocsr` host surgery); nvidia-smi 65–70 GiB.
+`cd_react` is exactly 0 while the field develops, then onsets at step 23. These
+are the pre/at-onset engine metrics the gate asked for, met with large margin.
+
+### Corrected physics framing (TU5R) — onset is a startup PRESSURE response
+
+The original record framed onset as "first contact / front arrival" and used an
+advective estimate (front x=0.3125 / U=1 → step ~500) as the expected onset.
+**That model is WRONG for drag onset.** Incompressible pressure is governed by
+an ELLIPTIC (instantaneous) Poisson equation, not advective transport: turning
+the inlet on excites a pressure field over the whole domain at once, and the
+truck feels a nonzero reaction as soon as that startup pressure response reaches
+it — which is early (leg-2 step 23, leg-1 step 17 at tighter tol), NOT the
+step-500 advective front-arrival. The step-500 advective estimate was simply
+the wrong model. `cd_react` going 0 → nonzero at onset is the startup pressure
+response, and `cd_surr` is the known startup-surrogate pathology (shared tiny
+`ref_force`, unusable at startup); `cd_react` is the canonical observable.
+
+### Withdrawn claims (do NOT cite)
+
+These leg-1 numbers were reported but have NO surviving log backing; they are
+WITHDRAWN (they were live-observed but the log was truncated before audit):
+- leg-1 onset **step 17** and its `cd_react` trajectory (+0.00054 → +0.63 → …);
+- the **+201/-87** post-onset spike series and the step-25 grind/ConvergenceError
+  narrative (the post-onset stall is plausibly real — leg-1 launcher tail shows
+  `relres=8.866e-4 after 12000 iters` — but the step-by-step spike numbers are
+  not independently logged, so they are not asserted here);
+- any "front arrival" / step-500 framing (superseded by the corrected physics);
+- s/step and RSS figures cited from leg 1 specifically (the SURVIVING leg-2 log
+  gives ~7–13 s/step, RSS 283.9G, which are the numbers now on record).
+
+### Citation fix
+
+The static/dynamic split gate is the TEST
+`test_incremental_assembly_static_set_is_empty` (asserts 0.000% static). The
+throwaway probe `cluster/scratch static_split.py` was an exploratory script, not
+the gate; the record above cites the test, not that probe.
+
+### Soft-start leg (TU5R) — the reviewer-endorsed remedy
+
+The remedy for the impulsive-start transient is the SOFT-START inlet amplitude
+ramp (commit "soft-start …"): `run_truck(soft_start=N)` scales the inlet from 0
+to U over N·dt via `amp(t)=min(1, t/(N·dt))`, letting the elliptic startup
+pressure response develop smoothly instead of impulsively. Wired into
+`cluster/t5_gate.py` (`SOFT_START`, default 30 dt-units) with a step-based tol
+schedule (loose 5e-4 through startup, tight 1e-6 after step ~200), `NSTEPS=600`,
+`viz_interval=20`, device path + warm-start. Gated on Mac (CPU host path) by
+three tests including a byte-identical-when-off check and a startup-response
+shrink check (full truck suite 13 passed). The GPU soft-start leg runs under the
+hold with the fixed logging; its result (does the spike disappear? does the
+march sustain past the old grind point?) and a CPU-vs-GPU parity spot-check
+(the miscompile sentinel guarding the clean warp reinstall) are recorded with
+the run's timestamped log.
 
 
