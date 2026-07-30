@@ -62,6 +62,10 @@ from diffsim.physics.poisson import gauss_points
 from diffsim.solvers.timestepping import bdf_coeffs
 from diffsim.solvers.linsolve import solve_linear, _LAST_ITERS
 
+# W2b: opt-in per-step timing breakdown (DIFFSIM_ASM_PROFILE=1).
+import os as _os
+_STEP_PROFILE = _os.environ.get("DIFFSIM_ASM_PROFILE", "0").strip() not in ("", "0")
+
 
 # ---------------------------------------------------------------------------
 # Geometry helpers
@@ -515,7 +519,21 @@ def run_flow_past_3d(
     cl_y_hist = np.zeros(nsteps)
     cl_z_hist = np.zeros(nsteps)
 
+    # W2b: header for per-step breakdown table (only when DIFFSIM_ASM_PROFILE=1)
+    if _STEP_PROFILE and assembly == "device":
+        print(
+            f"\n[W2b-profile] step breakdown (assembly=device)"
+            f"\n{'step':>4}  {'host-pre':>9}  {'asm-total':>9}"
+            f"  {'upload':>7}  {'Ae':>7}  {'scatter':>8}"
+            f"  {'extra':>7}  {'strong':>7}  {'pull':>8}"
+            f"  {'chunks':>6}  {'solve':>9}  {'post':>7}  {'step-tot':>9}",
+            flush=True)
+
     for step in range(nsteps):
+        if _STEP_PROFILE and assembly == "device":
+            import time as _time
+            _t_step0 = _time.perf_counter()
+
         order = 1 if step == 0 else 2
         b0, b1, b2 = bdf_coeffs(order, dt)
         sigma = b0 / dt
@@ -530,6 +548,8 @@ def run_flow_past_3d(
             _pcd_last_order = order
 
         # Advecting velocity at Gauss points
+        if _STEP_PROFILE and assembly == "device":
+            _t_host0 = _time.perf_counter()
         aq, dq = _gp_field_3d(dm, mesh, T, u_pre1, dim)
 
         # History forcing
@@ -543,6 +563,8 @@ def run_flow_past_3d(
         else:
             fq_raw = _gp_history_fq_3d(dm, mesh, T, u_pre1, u_pre2,
                                         b1, b2, dt, dim)
+        if _STEP_PROFILE and assembly == "device":
+            _t_host_ms = (_time.perf_counter() - _t_host0) * 1e3
 
         if assembly == "device":
             # ---- Device assembly path ---------------------------------------
@@ -569,13 +591,20 @@ def run_flow_past_3d(
             # assemble: volume fill + extra_matrix(Af) + extra_rhs(bf)
             # + strong rows — order mirrors host: A_vol + Af_c, b + bf_c,
             # then LIL surgery.  Oracle: aq/dq/fq as flat pv-keyed dicts.
+            if _STEP_PROFILE:
+                _t_asm0 = _time.perf_counter()
             Acsr, b = _dev_asm.assemble(
                 aq, dq, fq_raw, nu, sigma,
                 strong_b_vals=_sb,
                 extra_matrix=(_af_slots_d, _af_vals_d),
                 extra_rhs=(_bf_dofs_d, _bf_vals_d))
+            if _STEP_PROFILE:
+                _t_asm_ms = (_time.perf_counter() - _t_asm0) * 1e3
+                _prof = getattr(_dev_asm, "_last_profile", {})
 
             # Solve (same routing as host path)
+            if _STEP_PROFILE:
+                _t_slv0 = _time.perf_counter()
             if mono_solver == "splu":
                 x_cur = splu(Acsr.tocsc()).solve(b)
             else:
@@ -588,6 +617,8 @@ def run_flow_past_3d(
                                      cache=_slv_cache, cache_key="ns3d")
                 if solver_stats is not None and _LAST_ITERS[0] is not None:
                     solver_stats.append(int(_LAST_ITERS[0]))
+            if _STEP_PROFILE:
+                _t_slv_ms = (_time.perf_counter() - _t_slv0) * 1e3
 
         else:
             # ---- Host assembly path (default; bit-for-bit unchanged) --------
@@ -623,6 +654,8 @@ def run_flow_past_3d(
                     solver_stats.append(int(_LAST_ITERS[0]))
 
         # Extract velocity for next step
+        if _STEP_PROFILE and assembly == "device":
+            _t_post0 = _time.perf_counter()
         u_new = x_cur.reshape(nfree, ndof)[:, :dim]
 
         # Full node-major vector for traction
@@ -644,6 +677,22 @@ def run_flow_past_3d(
         # Rotate history
         u_pre2 = u_pre1.copy()
         u_pre1 = u_new.copy()
+
+        if _STEP_PROFILE and assembly == "device":
+            _t_post_ms = (_time.perf_counter() - _t_post0) * 1e3
+            _t_step_ms = (_time.perf_counter() - _t_step0) * 1e3
+            _p = _prof if _prof else {}
+            print(
+                f"[W2b] {step:4d}  {_t_host_ms:9.1f}  {_t_asm_ms:9.1f}"
+                f"  {_p.get('upload_ms', 0.0):7.1f}"
+                f"  {_p.get('ae_ms', 0.0):7.1f}"
+                f"  {_p.get('scatter_ms', 0.0):8.1f}"
+                f"  {_p.get('extra_ms', 0.0):7.1f}"
+                f"  {_p.get('strong_ms', 0.0):7.1f}"
+                f"  {_p.get('pull_ms', 0.0):8.1f}"
+                f"  {_p.get('chunks', 0):6d}"
+                f"  {_t_slv_ms:9.1f}  {_t_post_ms:7.1f}  {_t_step_ms:9.1f}",
+                flush=True)
 
         if verbose:
             print(f"[p2r1c-3d] step {step:3d}  Cd={cd_hist[step]:+.4f}  "

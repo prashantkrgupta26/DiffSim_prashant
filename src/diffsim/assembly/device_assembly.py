@@ -15,6 +15,10 @@ Scope: meshes WITHOUT hanging constraints (T == identity — uniform-tree
 carves; both gate meshes qualify). Constraint-aware scatter (cuFEM-style
 master-DOF elimination) is D1 item 3.
 """
+import os
+import sys
+import time
+
 import numpy as np
 import scipy.sparse as sp
 import warp as wp
@@ -22,6 +26,21 @@ import warp as wp
 from ..errors import BackendError, ConfigError
 
 from .operators import _kernel_cache, _chunk_of
+
+# ---------------------------------------------------------------------------
+# W2b: opt-in per-phase profiling.  Activated by DIFFSIM_ASM_PROFILE=1.
+# Completely inert when the env var is absent or "0" — no timing objects
+# are created, no wp.synchronize() calls are injected.
+# ---------------------------------------------------------------------------
+_ASM_PROFILE = os.environ.get("DIFFSIM_ASM_PROFILE", "0").strip() not in ("", "0")
+
+
+def _asm_prof_sync(label, t0_ref):
+    """Synchronize device then return (elapsed_ms, new_t0).  ONLY called
+    when _ASM_PROFILE is True — never in the default hot path."""
+    wp.synchronize()
+    now = time.perf_counter()
+    return (now - t0_ref) * 1e3, now
 
 
 # ---------------------------------------------------------------------
@@ -966,12 +985,28 @@ class DeviceNSAssembler:
         ndof = self.ndof
         if sig2tau is None:
             sig2tau = (2.0 * sigma) ** 2
+
+        # W2b: per-phase profiling accumulators (only allocated when
+        # DIFFSIM_ASM_PROFILE=1; otherwise these lines are never reached
+        # and _ASM_PROFILE stays False — zero overhead in the default path).
+        if _ASM_PROFILE:
+            _t_upload = 0.0    # input GP-field host->device uploads (ms)
+            _t_ae = 0.0        # Ae/be compute kernels (ms)
+            _t_scat = 0.0      # scatter kernels into vals_d/F_d (ms)
+            _t_extra = 0.0     # add_matrix_values / add_rhs_values (ms)
+            _t_strong = 0.0    # apply_strong_rows (ms)
+            _t_pull = 0.0      # vals_d.numpy() + F_d.numpy() host pull (ms)
+            _nchunks_total = 0 # total constraint-expansion chunks fired
+            _t0 = time.perf_counter()
+
         self.vals_d.zero_()
         self.F_d.zero_()
         if not hasattr(self, "_gaq_d"):
             self._gaq_d = {}
         for k_bin, (pv, b, ne, nbf, gdof) in enumerate(self._bins):
             nqp = b["nqp"]
+            if _ASM_PROFILE:
+                _t_up0 = time.perf_counter()
             aq = _dev(aq_by_bin[pv])
             dq = _dev(div_aq_by_bin[pv])
             # frozen-a linearization: gaq only read at newton=1 (never
@@ -982,6 +1017,9 @@ class DeviceNSAssembler:
                                dtype=wp.float64, device=d)
                 self._gaq_d[pv] = gaq
             fq = _dev(fq_by_bin[pv])
+            if _ASM_PROFILE:
+                wp.synchronize()
+                _t_upload += (time.perf_counter() - _t_up0) * 1e3
             kA = make_linear_ns_Ae(nbf, nqp, dm.dim)
             kb = make_linear_ns_be(nbf, nqp, dm.dim)
             npair = (nbf * ndof) ** 2
@@ -1009,6 +1047,8 @@ class DeviceNSAssembler:
                     dq_v = dq[e0 * nqp:(e0 + nb) * nqp]
                     gaq_v = gaq[e0 * nqp:(e0 + nb) * nqp]
                     fq_v = fq[e0 * nqp:(e0 + nb) * nqp]
+                    if _ASM_PROFILE:
+                        _t_ae0 = time.perf_counter()
                     wp.launch(kA, dim=nb,
                               inputs=[conn_v, h_v, b["N"], b["dN"],
                                       b["lapN"], b["w"],
@@ -1021,7 +1061,14 @@ class DeviceNSAssembler:
                               inputs=[conn_v, h_v, b["N"], b["dN"], b["w"],
                                       aq_v, fq_v, wp.float64(nu),
                                       wp.float64(sig2tau), be], device=d)
+                    if _ASM_PROFILE:
+                        wp.synchronize()
+                        _t_ae += (time.perf_counter() - _t_ae0) * 1e3
+                        _t_sc0 = time.perf_counter()
                     self.scatter_batch(k_bin, e0, Ae, be, nb)
+                    if _ASM_PROFILE:
+                        wp.synchronize()
+                        _t_scat += (time.perf_counter() - _t_sc0) * 1e3
                 continue
             # W2: chunked constraint-expansion path.  The per-bin
             # slots/src/w arrays and vals_d all pass 2^31 at adaptive
@@ -1038,6 +1085,9 @@ class DeviceNSAssembler:
                 for (e0, e1, slots_c, src_c, w_c) in \
                         self._exp_chunks[k_bin]:
                     nb = e1 - e0
+                    if _ASM_PROFILE:
+                        _nchunks_total += 1
+                        _t_ae0 = time.perf_counter()
                     Ae = wp.zeros((nb, nl, nl), dtype=wp.float64, device=d)
                     conn_v = b["conn"][e0:e1]
                     h_v = b["h"][e0:e1]
@@ -1051,12 +1101,19 @@ class DeviceNSAssembler:
                                       wp.float64(sig2tau),
                                       wp.float64(s_skew), wp.int32(0), Ae],
                               device=d)
+                    if _ASM_PROFILE:
+                        wp.synchronize()
+                        _t_ae += (time.perf_counter() - _t_ae0) * 1e3
+                        _t_sc0 = time.perf_counter()
                     wp.launch(scwc, dim=len(w_c),
                               inputs=[Ae.reshape((-1,)), src_c, w_c,
                                       slots_c, self.vals_d.data,
                                       self._ctab.bases_d,
                                       wp.int32(self._ctab.nchunks)],
                               device=d)
+                    if _ASM_PROFILE:
+                        wp.synchronize()
+                        _t_scat += (time.perf_counter() - _t_sc0) * 1e3
                 be = wp.zeros((ne, nl), dtype=wp.float64, device=d)
                 wp.launch(kb, dim=ne,
                           inputs=[b["conn"], b["h"], b["N"], b["dN"],
@@ -1069,6 +1126,8 @@ class DeviceNSAssembler:
                                   self.F_d], device=d)
                 continue
             # constraint-aware / colored paths: whole-bin (unchanged).
+            if _ASM_PROFILE:
+                _t_ae0 = time.perf_counter()
             Ae = wp.zeros((ne, nl, nl), dtype=wp.float64, device=d)
             be = wp.zeros((ne, nl), dtype=wp.float64, device=d)
             wp.launch(kA, dim=ne,
@@ -1083,6 +1142,10 @@ class DeviceNSAssembler:
                       inputs=[b["conn"], b["h"], b["N"], b["dN"], b["w"],
                               aq, fq, wp.float64(nu), wp.float64(sig2tau),
                               be], device=d)
+            if _ASM_PROFILE:
+                wp.synchronize()
+                _t_ae += (time.perf_counter() - _t_ae0) * 1e3
+                _t_sc0 = time.perf_counter()
             if not self._identity_T:
                 scw = _scatter_weighted_kernel(self._idx_dtype)
                 wp.launch(scw, dim=len(self._slot_bins[k_bin]),
@@ -1112,18 +1175,54 @@ class DeviceNSAssembler:
                           inputs=[be.reshape((-1,)), self._bsrc_d[k_bin],
                                   self._bw_d[k_bin], self._gdof_d[k_bin],
                                   self.F_d], device=d)
+            if _ASM_PROFILE:
+                wp.synchronize()
+                _t_scat += (time.perf_counter() - _t_sc0) * 1e3
+        if _ASM_PROFILE:
+            _t_ex0 = time.perf_counter()
         if extra_matrix is not None:
             self.add_matrix_values(*extra_matrix)
         if extra_rhs is not None:
             self.add_rhs_values(*extra_rhs)
+        if _ASM_PROFILE:
+            wp.synchronize()
+            _t_extra = (time.perf_counter() - _t_ex0) * 1e3
+            _t_str0 = time.perf_counter()
         if getattr(self, "_strong", None) is not None:
             self.apply_strong_rows(strong_b_vals)
+        if _ASM_PROFILE:
+            wp.synchronize()
+            _t_strong = (time.perf_counter() - _t_str0) * 1e3
         if getattr(self, "_return_device", False) == "raw":
+            if _ASM_PROFILE:
+                _t_total = (time.perf_counter() - _t0) * 1e3
+                self._last_profile = dict(
+                    upload_ms=_t_upload, ae_ms=_t_ae, scatter_ms=_t_scat,
+                    extra_ms=_t_extra, strong_ms=_t_strong, pull_ms=0.0,
+                    chunks=_nchunks_total, total_ms=_t_total)
             return None                    # fill-only (assemble_fill)
         if getattr(self, "_return_device", False):
+            if _ASM_PROFILE:
+                _t_total = (time.perf_counter() - _t0) * 1e3
+                self._last_profile = dict(
+                    upload_ms=_t_upload, ae_ms=_t_ae, scatter_ms=_t_scat,
+                    extra_ms=_t_extra, strong_ms=_t_strong, pull_ms=0.0,
+                    chunks=_nchunks_total, total_ms=_t_total)
             return self.device_csr()
+        if _ASM_PROFILE:
+            _t_pull0 = time.perf_counter()
         A = sp.csr_matrix((self.vals_d.numpy(), self.indices,
                            self.indptr), shape=(self.Nfull, self.Nfull))
+        F_host = self.F_d.numpy()
+        if _ASM_PROFILE:
+            wp.synchronize()
+            _t_pull = (time.perf_counter() - _t_pull0) * 1e3
+            _t_total = (time.perf_counter() - _t0) * 1e3
+            self._last_profile = dict(
+                upload_ms=_t_upload, ae_ms=_t_ae, scatter_ms=_t_scat,
+                extra_ms=_t_extra, strong_ms=_t_strong, pull_ms=_t_pull,
+                chunks=_nchunks_total, total_ms=_t_total)
+            return A, F_host
         return A, self.F_d.numpy()
 
     def assemble_fill(self, *a, **k):
