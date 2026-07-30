@@ -685,8 +685,12 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         # Pass Acsr as-is: the fgmres_pcd branch reuses a DeviceSaddleCSR's
         # resident SpMV for the outer matvec (no 19 GB duplicate upload) and
         # pulls host values only for the preconditioner block extraction.
+        # Bounded rescue: cap the fallback budget so a non-converging rescue
+        # fails in ~1 h, not an unbounded grind (leg-3 lesson: jacobi-inner
+        # PCD at the transient crest ran >5 h toward a 12000-iter default).
+        _fb_maxiter = int(os.environ.get("PCD_FALLBACK_MAXITER", "3000"))
         x = solve_linear(Acsr, b, solver="fgmres_pcd", sym=False,
-                         tol=_tol, device=device,
+                         tol=_tol, device=device, maxiter=_fb_maxiter,
                          cache=_pcd_cache, cache_key="truck")
         print(f"[truck] step {step}: PCD fallback CONVERGED "
               f"(iters={_LAST_ITERS[0]}, {time.time()-_t0:.1f}s)",
