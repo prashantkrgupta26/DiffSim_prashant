@@ -265,6 +265,7 @@ def write_q_isosurface(
     dim = mesh.dim
 
     all_cells = []
+    cell_types = []
     for pv_key in sorted(mesh.bins.keys()):
         conn = mesh.conn_of[pv_key]   # [Ne, nbf]
         perm = _lattice_to_vtk(dim, int(pv_key))
@@ -272,19 +273,21 @@ def write_q_isosurface(
         # pyvista hex connectivity
         nbf = conn_vtk.shape[1]
         if nbf == 8:
-            cell_type = pv.CellType.HEXAHEDRON
+            vtktype = pv.CellType.HEXAHEDRON
         elif nbf == 27:
-            cell_type = pv.CellType.TRIQUADRATIC_HEXAHEDRON
+            vtktype = pv.CellType.TRIQUADRATIC_HEXAHEDRON
         else:
             continue
         for row in conn_vtk:
             all_cells.append([nbf] + list(row))
+            cell_types.append(int(vtktype))
 
     if not all_cells:
         return None
 
     flat_cells = np.array([v for row in all_cells for v in row], dtype=np.int64)
-    grid = pv.UnstructuredGrid(flat_cells, np.array([12] * len(all_cells)), coords)
+    cell_types_arr = np.array(cell_types, dtype=np.uint8)
+    grid = pv.UnstructuredGrid(flat_cells, cell_types_arr, coords)
     grid.point_data["Q"] = Q_node.astype(np.float32)
     grid.point_data["velocity_magnitude"] = umag_node.astype(np.float32)
 
@@ -375,6 +378,11 @@ def write_centerline_slice(
     if u_arr.shape[1] == 3:
         grid.point_data["velocity"] = u_arr
     grid.point_data["Q"] = Q_node.astype(np.float32)
+
+    # ROI clip
+    if roi is not None:
+        x0, x1, y0, y1, z0, z1 = roi
+        grid = grid.clip_box([x0, x1, y0, y1, z0, z1], invert=False)
 
     # Determine slice position (center of domain)
     axis_map = {"x": 0, "y": 1, "z": 2}
@@ -549,8 +557,6 @@ class TruckVizHook:
         T = self.T
         dim = self.mesh.dim
         ndof = dim + 1
-        x_all = np.asarray(T @ x_free.reshape(-1, ndof)[:, :dim])
-        # Actually we need T applied per-component
         # x_free is [nfree * ndof]; reshape to [nfree, ndof]
         x_f = x_free.reshape(-1, ndof)
         u_free = x_f[:, :dim]   # [nfree, dim]

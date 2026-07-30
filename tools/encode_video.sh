@@ -33,10 +33,10 @@ fi
 VIZ_DIR="${1:?Usage: $0 VIZ_DIR [FPS] [SHOTS...]}"
 FPS="${2:-24}"
 shift 2 2>/dev/null || shift 1 2>/dev/null || true
-SHOTS=("${@:-q_iso centerline surface_cp}")
-if [[ ${#SHOTS[@]} -eq 1 ]]; then
-    # May have been passed as a single space-separated string
-    read -ra SHOTS <<< "${SHOTS[0]}"
+if [[ $# -eq 0 ]]; then
+    SHOTS=(q_iso centerline surface_cp)
+else
+    SHOTS=("$@")
 fi
 
 RENDERS_DIR="${VIZ_DIR}/renders"

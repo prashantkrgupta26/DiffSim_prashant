@@ -133,8 +133,8 @@ class TestQCriterionUnit:
                       [omega,   0.0,  0.0],
                       [0.0,     0.0,  0.0]])
         Q = self._q_from_linear_field(mesh, G)
-        # Omega part: antisym[[shear,-omega],[omega,0]] -> Omega_12 = -(omega+shear)/2
-        # Omega_21 = (omega+shear)/2; shear sym part S_11=shear, S_12=S_21=shear/2
+        # Omega part: antisym[[shear,-omega],[omega,0]] -> Omega_12 = -omega, S_12=shear/2
+        # Omega_21 = omega; sym part S_11=shear, S_12=S_21=shear/2
         # At dominant omega > shear, Q should be positive on average
         assert Q.mean() > 0.0, f"rotation-dominated flow must give positive mean Q"
 
