@@ -34,6 +34,67 @@ from .operators import _kernel_cache, _chunk_of
 # ---------------------------------------------------------------------------
 _ASM_PROFILE = os.environ.get("DIFFSIM_ASM_PROFILE", "0").strip() not in ("", "0")
 
+# ---------------------------------------------------------------------------
+# W2c: opt-in device-resident CSR handoff.  Activated by SADDLE_DEVICE_CSR=1.
+# When set, the NS driver's device-assembly path swaps assemble() for
+# assemble_handoff(), which keeps the 19 GB assembled values DEVICE-RESIDENT
+# (no ChunkedArray.numpy() pull) and hands the solver a DeviceSaddleCSR that
+# exposes a Warp SpMV operator + a device-gathered diagonal (73 MB pull only).
+# Defaults byte-identical: absent/"0" => the classic host-CSR pull path.
+# ---------------------------------------------------------------------------
+_DEVICE_CSR_HANDOFF = os.environ.get(
+    "SADDLE_DEVICE_CSR", "0").strip() not in ("", "0")
+
+
+class DeviceSaddleCSR:
+    """Lightweight device-resident handoff for the monolithic saddle solve.
+
+    Carries the assembler whose ``vals_d`` holds the just-filled CSR values
+    (still on device) plus the STATIC sparsity (indptr/indices, uploaded once
+    per mesh epoch).  Exposes just enough scipy-CSR surface (``.shape``,
+    ``.nnz``, ``.dtype``, ``.tocsr()``, ``.tocsc()``) that the existing driver
+    and the splu fallback keep working, but the fgmres_bdiag / fused_bdiag
+    branches of ``solve_linear`` recognize it and consume the device buffers
+    directly — no 19 GB device->host pull, no CSROperator re-upload.
+
+    ``.tocsr()`` / ``.tocsc()`` deliberately fall back to the full host pull
+    (the classic path) so any code that genuinely needs host values still
+    works; the device-fast path in solve_linear never calls them.
+    """
+
+    __slots__ = ("asm", "shape", "nnz", "dtype")
+
+    def __init__(self, asm):
+        self.asm = asm
+        self.shape = (asm.Nfull, asm.Nfull)
+        self.nnz = asm.nnz
+        self.dtype = np.float64
+
+    # Device-resident consumption surface (used by solve_linear fast paths).
+    def device_operator(self):
+        """Warp SpMV operator over the resident CSR values (no host copy)."""
+        return self.asm.device_operator()
+
+    def diagonal_device(self):
+        """The current matrix diagonal as a device wp.array (device gather;
+        no host copy).  Slots are precomputed once per epoch (see
+        DeviceNSAssembler.diagonal_device)."""
+        return self.asm.diagonal_device()
+
+    # scipy-CSR compatibility surface (host fallbacks).
+    def tocsr(self):
+        """Full host CSR — the classic 19 GB pull.  Only reached by callers
+        that did not take the device fast path (e.g. splu)."""
+        return sp.csr_matrix((self.asm.vals_d.numpy(), self.asm.indices,
+                              self.asm.indptr), shape=self.shape)
+
+    def tocsc(self):
+        return self.tocsr().tocsc()
+
+    def diagonal(self):
+        """Host diagonal via the device gather + small (73 MB at L7r9) pull."""
+        return self.asm.diag_host()
+
 
 def _asm_prof_sync(label, t0_ref):
     """Synchronize device then return (elapsed_ms, new_t0).  ONLY called
@@ -1201,6 +1262,18 @@ class DeviceNSAssembler:
                     extra_ms=_t_extra, strong_ms=_t_strong, pull_ms=0.0,
                     chunks=_nchunks_total, total_ms=_t_total)
             return None                    # fill-only (assemble_fill)
+        if getattr(self, "_return_device", False) == "handoff":
+            # W2c: keep values device-resident.  Pull only the small rhs
+            # (Nfull*8 B) to host — the driver's post-processing (traction,
+            # reshape) consumes a host x; the 19 GB values array stays on
+            # device for the SpMV / preconditioner.
+            if _ASM_PROFILE:
+                _t_total = (time.perf_counter() - _t0) * 1e3
+                self._last_profile = dict(
+                    upload_ms=_t_upload, ae_ms=_t_ae, scatter_ms=_t_scat,
+                    extra_ms=_t_extra, strong_ms=_t_strong, pull_ms=0.0,
+                    chunks=_nchunks_total, total_ms=_t_total)
+            return DeviceSaddleCSR(self), self.F_d.numpy()
         if getattr(self, "_return_device", False):
             if _ASM_PROFILE:
                 _t_total = (time.perf_counter() - _t0) * 1e3
@@ -1232,6 +1305,21 @@ class DeviceNSAssembler:
         self._return_device = "raw"
         try:
             self.assemble(*a, **k)
+        finally:
+            self._return_device = False
+
+    def assemble_handoff(self, *a, **k):
+        """W2c: like assemble() but returns ``(DeviceSaddleCSR, F_host)``.
+
+        The assembled values stay DEVICE-RESIDENT (no ChunkedArray.numpy()
+        pull) — the killer 19 GB device->host round-trip W2b profiled.  Only
+        the small rhs vector is pulled.  The fgmres_bdiag / fused_bdiag paths
+        in solve_linear recognize DeviceSaddleCSR and consume vals_d via a
+        Warp SpMV + a device-gathered diagonal.  splu (or any host caller)
+        transparently falls back to the full pull via .tocsr()."""
+        self._return_device = "handoff"
+        try:
+            return self.assemble(*a, **k)
         finally:
             self._return_device = False
 
@@ -1528,10 +1616,14 @@ class DeviceNSAssembler:
 
         return _Op()
 
-    def diag_host(self):
-        """Current matrix diagonal (host, for the Krylov Jacobi
-        preconditioner): slot ids once per epoch, then a device gather +
-        one small download per step."""
+    def diagonal_device(self):
+        """Current matrix diagonal as a DEVICE wp.array (no host pull).
+
+        Slot ids (nnz-space positions of the diagonal entries) are static per
+        mesh epoch — computed once host-side from the CSR pattern — then each
+        call is a pure device gather into a reused ``_diag_d`` buffer.  This is
+        the W2c device-resident preconditioner-diagonal source; ``diag_host``
+        is the same gather followed by one small (Nfull*8 B) download."""
         if not hasattr(self, "_diag_slots_d"):
             probe = sp.csr_matrix(
                 (np.arange(self.nnz, dtype=np.float64), self.indices,
@@ -1552,7 +1644,13 @@ class DeviceNSAssembler:
             wp.launch(_gather_kernel(self._idx_dtype), dim=self.Nfull,
                       inputs=[self.vals_d, self._diag_slots_d,
                               self._diag_d], device=self.dm.device)
-        return self._diag_d.numpy()
+        return self._diag_d
+
+    def diag_host(self):
+        """Current matrix diagonal (host, for the Krylov Jacobi
+        preconditioner): slot ids once per epoch, then a device gather +
+        one small download per step."""
+        return self.diagonal_device().numpy()
 
     def device_csr(self):
         """Zero-copy torch CSR over vals_d + device rhs (dlpack).

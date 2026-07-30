@@ -1082,7 +1082,17 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         return LinearSolveResult(x=x, converged=True, iterations=iters,
                                  backend=solver, reason="converged",
                                  inner_stats=inner_stats)
-    A = A.tocsr()
+    # W2c: device-resident CSR handoff.  A DeviceSaddleCSR keeps the assembled
+    # values on device; the saddle iterative backends (fgmres_bdiag /
+    # fused_bdiag) consume them via a Warp SpMV + device-gathered diagonal, so
+    # we must NOT call A.tocsr() (the 19 GB pull we are eliminating).  Any other
+    # solver still gets the host CSR through .tocsr() (transparent fallback).
+    from ..assembly.device_assembly import DeviceSaddleCSR
+    _dev_handoff = A if isinstance(A, DeviceSaddleCSR) else None
+    if _dev_handoff is None:
+        A = A.tocsr()
+    elif solver not in ("fgmres_bdiag", "fused_bdiag"):
+        A = A.tocsr()          # unsupported solver: fall back to host pull
     if cache is not None and cache_key is not None \
             and solver not in ("blockch", "blockamgx",
                                "fgmres_bdiag", "fgmres_pcd", "fused_bdiag"):
@@ -1147,10 +1157,19 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         meta = (cache or {}).get(("blocktri_meta", cache_key), {})
         ndof = meta.get("ndof", 3)
 
-        op = CSROperator(A, device)
-        # W5d knob (same convention as fgmres_bdiag): opt-in node-block Jacobi.
-        apply_bdiag = make_bdiag_apply(A, ndof, device,
-                                       block=meta.get("bdiag_block", "scalar"))
+        _bdiag_block = meta.get("bdiag_block", "scalar")
+        if _dev_handoff is not None and _bdiag_block == "scalar":
+            # W2c device-resident fast path (see fgmres_bdiag for rationale).
+            from .saddle_precond import make_bdiag_apply_from_diag
+            op = _dev_handoff.device_operator()
+            apply_bdiag = make_bdiag_apply_from_diag(
+                _dev_handoff.diagonal_device(), ndof, device)
+        else:
+            if _dev_handoff is not None:
+                A = _dev_handoff.tocsr()   # node-block: needs host CSR blocks
+            op = CSROperator(A, device)
+            # W5d knob (same convention as fgmres_bdiag): opt-in node-block Jacobi.
+            apply_bdiag = make_bdiag_apply(A, ndof, device, block=_bdiag_block)
 
         x, info = bicgstab_dev(op, b, tol=tol, atol=1e-13, maxiter=maxiter,
                                check_every=100, apply_dev=apply_bdiag)
@@ -1557,12 +1576,26 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         # A3 knob A: restart length (opt-in, default 60)
         _restart = int(meta.get("saddle_restart", 60))
 
-        op = CSROperator(A, device)
-        # W5d knob: bdiag_block="node" upgrades scalar Jacobi to per-node
-        # ndof x ndof block Jacobi (opt-in via blocktri_meta; default scalar).
-        apply_dev = make_bdiag_apply(A, ndof, device,
-                                     block=meta.get("bdiag_block", "scalar"))
-        N = A.shape[0]
+        _bdiag_block = meta.get("bdiag_block", "scalar")
+        if _dev_handoff is not None and _bdiag_block == "scalar":
+            # W2c device-resident fast path: SpMV over the resident CSR values
+            # (no re-upload) + preconditioner diagonal from a device gather
+            # (73 MB download vs the 19 GB values pull).  Only the scalar
+            # bdiag needs the diagonal alone; node-block Jacobi needs full CSR
+            # sub-blocks and takes the host fallback below.
+            from .saddle_precond import make_bdiag_apply_from_diag
+            op = _dev_handoff.device_operator()
+            apply_dev = make_bdiag_apply_from_diag(
+                _dev_handoff.diagonal_device(), ndof, device)
+            N = _dev_handoff.shape[0]
+        else:
+            if _dev_handoff is not None:
+                A = _dev_handoff.tocsr()   # node-block: needs host CSR blocks
+            op = CSROperator(A, device)
+            # W5d knob: bdiag_block="node" upgrades scalar Jacobi to per-node
+            # ndof x ndof block Jacobi (opt-in via blocktri_meta; default scalar).
+            apply_dev = make_bdiag_apply(A, ndof, device, block=_bdiag_block)
+            N = A.shape[0]
 
         b_dev = wp.array(np.ascontiguousarray(b, np.float64),
                          dtype=wp.float64, device=device)

@@ -65,6 +65,8 @@ from diffsim.solvers.linsolve import solve_linear, _LAST_ITERS
 # W2b: opt-in per-step timing breakdown (DIFFSIM_ASM_PROFILE=1).
 import os as _os
 _STEP_PROFILE = _os.environ.get("DIFFSIM_ASM_PROFILE", "0").strip() not in ("", "0")
+# W2c: opt-in device-resident CSR handoff — SADDLE_DEVICE_CSR=1 keeps values on
+# device (assemble_handoff) instead of pulling 19 GB/step; read live per step.
 
 
 # ---------------------------------------------------------------------------
@@ -593,7 +595,16 @@ def run_flow_past_3d(
             # then LIL surgery.  Oracle: aq/dq/fq as flat pv-keyed dicts.
             if _STEP_PROFILE:
                 _t_asm0 = _time.perf_counter()
-            Acsr, b = _dev_asm.assemble(
+            # W2c: SADDLE_DEVICE_CSR=1 keeps the assembled values
+            # device-resident (assemble_handoff) instead of pulling the
+            # full CSR to host (assemble); solve_linear's saddle paths
+            # consume the device buffers directly.  Default byte-identical.
+            # Read live (env, not import-time) so parity harnesses can toggle.
+            _dev_csr = _os.environ.get(
+                "SADDLE_DEVICE_CSR", "0").strip() not in ("", "0")
+            _asm_call = (_dev_asm.assemble_handoff if _dev_csr
+                         else _dev_asm.assemble)
+            Acsr, b = _asm_call(
                 aq, dq, fq_raw, nu, sigma,
                 strong_b_vals=_sb,
                 extra_matrix=(_af_slots_d, _af_vals_d),

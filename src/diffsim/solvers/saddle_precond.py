@@ -119,6 +119,65 @@ def _node_block_kernel(ndof):
     return nodeblock_apply
 
 
+def _scalar_bdiag_apply_from_diag(diag, ndof, device):
+    """Build the scalar (element-wise) Jacobi apply from an already-extracted
+    host diagonal array.  This is the ONE arithmetic definition of the scalar
+    saddle preconditioner: both ``make_bdiag_apply(block="scalar")`` (which
+    pulls A.diagonal()) and the W2c device path (which gathers the diagonal on
+    device, then downloads it — 73 MB) route through here, so they are
+    bit-for-bit identical."""
+    diag = np.ascontiguousarray(np.asarray(diag, dtype=np.float64))
+    N = diag.shape[0]
+    assert N % ndof == 0, f"N={N} not divisible by ndof={ndof}"
+    n_nodes = N // ndof
+
+    # Identify pressure dofs: node i -> i*ndof + (ndof-1)  (= i*ndof + dim)
+    # All dofs not at offset (ndof-1) within a node block are velocity dofs.
+    p_mask = np.zeros(N, dtype=bool)
+    p_mask[np.arange(n_nodes) * ndof + (ndof - 1)] = True
+
+    # Velocity block: plain Jacobi.  Guard zeros (can arise on Dirichlet
+    # rows where the row is replaced by [0,…,1,…,0]; those diagonal entries
+    # are 1.0 after surgery, so the guard is defensive only).
+    dinv = np.empty(N, dtype=np.float64)
+    d_u = diag[~p_mask].copy()
+    d_u[d_u == 0.0] = 1.0
+    dinv[~p_mask] = 1.0 / d_u
+
+    # Pressure block: abs-value floor at eps_p * max|d| (whole system).
+    # The PSPG stabilization makes the p-p diagonal nonzero; the floor
+    # catches pathological near-zero entries without destroying real entries.
+    max_d = float(np.abs(diag).max()) if N > 0 else 1.0
+    eps_p = 1e-12
+    d_p = diag[p_mask].copy()
+    d_p_safe = np.maximum(np.abs(d_p), eps_p * max_d)
+    dinv[p_mask] = 1.0 / d_p_safe
+
+    # Upload the inverse diagonal to the device (once).
+    dinv_d = wp.array(np.ascontiguousarray(dinv), dtype=wp.float64,
+                      device=device)
+
+    kernel = _bdiag_kernel()
+
+    def apply_dev(v_in, z_out):
+        """z_out = M^{-1} v_in  (element-wise diagonal scaling)."""
+        wp.launch(kernel, dim=N, inputs=[dinv_d, v_in, z_out],
+                  device=device)
+
+    return apply_dev
+
+
+def make_bdiag_apply_from_diag(diag_d, ndof, device):
+    """W2c: scalar block-diagonal apply built from a DEVICE diagonal array
+    (wp.array or anything with a ``.numpy()``).  The diagonal is gathered on
+    device by the assembler (DeviceNSAssembler.diagonal_device) and downloaded
+    here (Nfull*8 B — 73 MB at 3d-L7r9 — vs the 19 GB full-values pull the W2c
+    handoff eliminates).  Bit-for-bit identical to ``make_bdiag_apply(block=
+    'scalar')`` because both call ``_scalar_bdiag_apply_from_diag``."""
+    diag = diag_d.numpy() if hasattr(diag_d, "numpy") else np.asarray(diag_d)
+    return _scalar_bdiag_apply_from_diag(diag, ndof, device)
+
+
 def make_bdiag_apply(A, ndof, device, block="scalar"):
     """Block-diagonal (Jacobi-by-block) preconditioner for the (u, p) saddle.
 
@@ -172,41 +231,7 @@ def make_bdiag_apply(A, ndof, device, block="scalar"):
     # ------------------------------------------------------------------
     if block == "scalar":
         diag = np.asarray(A.diagonal()).copy()   # shape (N,), host numpy
-
-        # Identify pressure dofs: node i -> i*ndof + (ndof-1)  (= i*ndof + dim)
-        # All dofs not at offset (ndof-1) within a node block are velocity dofs.
-        p_mask = np.zeros(N, dtype=bool)
-        p_mask[np.arange(n_nodes) * ndof + (ndof - 1)] = True
-
-        # Velocity block: plain Jacobi.  Guard zeros (can arise on Dirichlet
-        # rows where the row is replaced by [0,…,1,…,0]; those diagonal entries
-        # are 1.0 after surgery, so the guard is defensive only).
-        dinv = np.empty(N, dtype=np.float64)
-        d_u = diag[~p_mask].copy()
-        d_u[d_u == 0.0] = 1.0
-        dinv[~p_mask] = 1.0 / d_u
-
-        # Pressure block: abs-value floor at eps_p * max|d| (whole system).
-        # The PSPG stabilization makes the p-p diagonal nonzero; the floor
-        # catches pathological near-zero entries without destroying real entries.
-        max_d = float(np.abs(diag).max()) if N > 0 else 1.0
-        eps_p = 1e-12
-        d_p = diag[p_mask].copy()
-        d_p_safe = np.maximum(np.abs(d_p), eps_p * max_d)
-        dinv[p_mask] = 1.0 / d_p_safe
-
-        # Upload the inverse diagonal to the device (once).
-        dinv_d = wp.array(np.ascontiguousarray(dinv), dtype=wp.float64,
-                          device=device)
-
-        kernel = _bdiag_kernel()
-
-        def apply_dev(v_in, z_out):
-            """z_out = M^{-1} v_in  (element-wise diagonal scaling)."""
-            wp.launch(kernel, dim=N, inputs=[dinv_d, v_in, z_out],
-                      device=device)
-
-        return apply_dev
+        return _scalar_bdiag_apply_from_diag(diag, ndof, device)
 
     # ------------------------------------------------------------------
     # block="node" — per-node ndof×ndof block Jacobi

@@ -818,7 +818,14 @@ def run_flow_past(
             # assemble: volume fill + extra_matrix(Af) + extra_rhs(bf)
             # + strong rows — order mirrors host: A_vol + Af_c, b + bf_c,
             # then LIL surgery.  Oracle: aq/dq/fq as flat pv-keyed dicts.
-            Acsr, b = _dev_asm.assemble(
+            # W2c: SADDLE_DEVICE_CSR=1 keeps values device-resident
+            # (assemble_handoff); default byte-identical (assemble).
+            # Read live (env, not import-time) so parity harnesses can toggle.
+            _dev_csr = os.environ.get(
+                "SADDLE_DEVICE_CSR", "0").strip() not in ("", "0")
+            _asm_call = (_dev_asm.assemble_handoff if _dev_csr
+                         else _dev_asm.assemble)
+            Acsr, b = _asm_call(
                 aq, dq, fq_raw, nu, sigma,
                 strong_b_vals=_sb,
                 extra_matrix=(_af_slots_d, _af_vals_d),
