@@ -627,7 +627,9 @@ def test_fused_bdiag_vs_fgmres_bdiag_iterations():
     """Report fused_bdiag vs fgmres_bdiag iteration counts on the level-4
     saddle.  Both must solve correctly; we print counts for the W5a campaign
     record (fused_bdiag=BiCGStab+bdiag, fgmres_bdiag=FGMRES+bdiag).
-    No iteration-count ordering enforced: the point is the measurement."""
+    No iteration-count ordering enforced: the point is the measurement.
+    BiCGStab's per-step cost is 2 matvecs; fused_bdiag's justification is MEMORY
+    (no Krylov basis storage at 100M DOFs), not matvec count."""
     from diffsim.solvers.linsolve import solve_linear
 
     Acsr, b, x_splu = _get_system()
@@ -639,9 +641,11 @@ def test_fused_bdiag_vs_fgmres_bdiag_iterations():
 
     it_fused = r_fused.iterations
     it_fgmres = r_fgmres.iterations
+    bicgstab_matvec_equiv = 2 * it_fused
     print(f"\n[W5a] fused_bdiag (BiCGStab) vs fgmres_bdiag (FGMRES) "
           f"iterations on level-4 saddle: "
-          f"fused_bdiag={it_fused}  fgmres_bdiag={it_fgmres}")
+          f"fused_bdiag={it_fused}  fgmres_bdiag={it_fgmres} "
+          f"(each BiCGStab step = 2 matvecs: {it_fused} steps = {bicgstab_matvec_equiv} matvec-equiv vs FGMRES {it_fgmres})")
 
     assert np.allclose(r_fused.x, x_splu, rtol=1e-8, atol=1e-9), (
         f"fused_bdiag: max |x - x_splu| = "
