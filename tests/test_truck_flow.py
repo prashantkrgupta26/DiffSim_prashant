@@ -26,6 +26,19 @@ _CFG_PATH = os.path.join(
     "truck_4case_fresh_inputs", "NewRun-no-shell-slope0p25", "config.txt")
 
 
+def _tiny_tire_mesh(cfg, half=0.05, center=(0.35, 0.0625, 0.0625)):
+    """ONE tire STL, recentered + enlarged into a resolvable box in the channel
+    slab (the tiny-gate body).  Native tire is sub-cell at CI levels, so it is
+    normalized to [-1,1] and scaled to ``half`` about ``center`` (all in
+    unit-cube coords)."""
+    from diffsim.geometry.merged_trimesh import MergedTriMesh, _read_stl
+    v, t = _read_stl(os.path.join(cfg.config_dir, "tire_1.stl"))
+    v = v - v.mean(0)
+    v = v / np.abs(v).max()
+    v = v * half + np.asarray(center, np.float64)
+    return MergedTriMesh(v, t)
+
+
 # ---------------------------------------------------------------------------
 # Group 1: loader round-trip on the REAL config
 # ---------------------------------------------------------------------------
@@ -79,3 +92,114 @@ def test_loader_unknown_keys_expected():
         "solver_options_ns", "tauM_scale", "thetaTimeStepping",
     }
     assert set(cfg.unknown_keys) == expected_unknown
+
+
+# ---------------------------------------------------------------------------
+# Group 2: tiny truck-in-a-box — mesh build, dyadic slab carve, 3-step march
+# ---------------------------------------------------------------------------
+
+def test_slab_carve_dyadic_exact():
+    """The channel slab bounds (y=z=1/8) are dyadic => NO cell is cut; the
+    carve retains exactly the interior slab with zero intercepted cells."""
+    from truck_flow import _channel_box, slab_carve
+    from diffsim.octree.build import build_uniform
+    cfg = load_truck_config(_CFG_PATH)
+    for lvl in (3, 4, 5):
+        tree = build_uniform(lvl, dim=3)
+        cbox = _channel_box(cfg.domain_min, cfg.domain_max, cfg.domain_scale)
+        ret, n_cut = slab_carve(tree, cbox)
+        assert n_cut == 0
+        # slab is [0,1] x [0,1/8] x [0,1/8] => 1/64 of the full cube
+        assert len(ret) == len(tree) // 64
+
+
+def test_tiny_truck_march():
+    """Tiny one-tire case: mesh builds, slab carve exact, 3 BDF steps finite,
+    BOTH force observables recorded and nonzero."""
+    from truck_flow import run_truck
+    cfg = load_truck_config(_CFG_PATH)
+    merged = _tiny_tire_mesh(cfg)
+    res = run_truck(cfg, nsteps=3, base_level=5, truck_band_to=6,
+                    band_cells=2, merged=merged, region_refine=False,
+                    nu=1.0 / 50.0, dt=0.02, verbose=False)
+    # mesh built with a real carved body and surrogate faces
+    assert res["n_slab_cut"] == 0
+    assert res["n_excluded"] > 0
+    assert res["sf_faces"] > 0
+    assert res["n_rxn_nodes"] > 0
+    # 3 steps, both observables present and finite
+    for k in ("cd", "cd_surr", "cl_y", "cl_z", "cl_y_surr", "cl_z_surr"):
+        assert res[k].shape == (3,)
+        assert np.all(np.isfinite(res[k]))
+    # forces nonzero and O(1e3)-plausible (nondim by the tiny frontal area)
+    assert abs(res["cd"][-1]) > 0.0
+    assert abs(res["cd_surr"][-1]) > 0.0
+    assert abs(res["cd"][-1]) < 1e5
+    # canonical reaction drag is positive (downstream) at the final step
+    assert res["cd"][-1] > 0.0
+
+
+def test_nu_schedule_re_ramp():
+    """nu_schedule from Re_V/Re_ramping is a monotone-in-Re, positive nu(t)."""
+    from truck_flow import make_nu_schedule
+    cfg = load_truck_config(_CFG_PATH)
+    sched = make_nu_schedule(cfg, U_inf=1.0, L_ref=1.0)
+    # Re_ramping=[0,50,51], Re_V=[1e3,5e3,1e4]; nu = U*L/Re
+    nu0 = sched(0.0)
+    nu_mid = sched(50.0)
+    nu_end = sched(60.0)     # clamped to last Re=1e4
+    assert nu0 > nu_mid > nu_end > 0.0
+    assert abs(nu0 - 1.0 / 1e3) < 1e-9
+    assert abs(nu_end - 1.0 / 1e4) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Group 3: BC masks — dyadic planes nonempty and pairwise disjoint (where they
+# must be)
+# ---------------------------------------------------------------------------
+
+def test_bc_masks_nonempty_and_structure():
+    """Each dyadic plane carries >0 free nodes; the streamwise (inflow/outlet)
+    and the transverse (ground/ceiling, side_zlo/side_zhi) opposite pairs are
+    disjoint; strong-BC rows/vals are consistent length."""
+    from truck_flow import (build_truck_mesh, truck_strong_bc, truck_bc_masks)
+    cfg = load_truck_config(_CFG_PATH)
+    merged = _tiny_tire_mesh(cfg)
+    fx = build_truck_mesh(cfg, base_level=5, region_refine=False,
+                          truck_band_to=6, band_cells=2, merged=merged)
+    ndof, dim = 4, 3
+    masks, coords = truck_bc_masks(
+        fx["mesh"], fx["cons"], fx["scale"], cfg.slope_near_ground,
+        cfg.domain_max)
+    for name in ("inflow", "outlet", "ground", "ceiling", "side_zlo",
+                 "side_zhi"):
+        assert masks[name].sum() > 0, f"plane {name} empty"
+    # opposite planes are disjoint (a node cannot be on both x=0 and x=1, etc.)
+    assert not np.any(masks["inflow"] & masks["outlet"])
+    assert not np.any(masks["ground"] & masks["ceiling"])
+    assert not np.any(masks["side_zlo"] & masks["side_zhi"])
+
+    rows, vals, masks2, coords2 = truck_strong_bc(
+        fx["mesh"], fx["cons"], ndof, dim, fx["scale"],
+        cfg.slope_near_ground, cfg.domain_max)
+    assert len(rows) == len(vals)
+    assert len(rows) == len(set(rows.tolist()))   # unique DOF rows
+    # inflow ramp: u_x DOF values in [0,1], nonzero somewhere (ABL ramp)
+    coords_free = fx["mesh"].node_coords[fx["cons"].free_nodes]
+    infl = np.where(masks2["inflow"])[0]
+    ux_rows = {int(i) * ndof + 0: k for k, i in enumerate(infl)}
+    ux_vals = [vals[np.where(rows == r)[0][0]] for r in ux_rows
+               if r in set(rows.tolist())]
+    ux_vals = np.asarray(ux_vals)
+    assert np.all(ux_vals >= -1e-12) and np.all(ux_vals <= 1.0 + 1e-12)
+    assert ux_vals.max() > 0.0
+
+    # ground no-slip: all 3 velocity components pinned to 0 on y=0
+    grd = np.where(masks2["ground"])[0]
+    rowset = set(rows.tolist())
+    val_of = {int(r): float(v) for r, v in zip(rows, vals)}
+    for i in grd:
+        for c in range(3):
+            r = int(i) * ndof + c
+            assert r in rowset, f"ground node {i} comp {c} not constrained"
+            assert val_of[r] == 0.0
