@@ -217,6 +217,35 @@ def test_truck_warm_start_reduces_iters(monkeypatch):
     assert sum(warm) < sum(cold), f"warm {warm} vs cold {cold}"
 
 
+def test_truck_viz_hook_fires_in_march(tmp_path, monkeypatch):
+    """P3 (T5): the viz hook fires during a (device) march and writes frames at
+    viz_interval.  Runs >= 2 intervals; asserts the per-frame extracts + a .vtu
+    checkpoint land on disk and the hook's written-log records >= 2 frames."""
+    from truck_flow import run_truck
+    monkeypatch.setenv("SADDLE_DEVICE_CSR", "1")
+    cfg = load_truck_config(_CFG_PATH)
+    merged = _tiny_tire_mesh(cfg)
+    res = run_truck(cfg, nsteps=4, base_level=5, truck_band_to=6, band_cells=2,
+                    merged=merged, region_refine=False, nu=1.0 / 50.0, dt=0.02,
+                    mono_solver="splu", device="cpu", assembly="device",
+                    viz_interval=2, viz_dir=str(tmp_path),
+                    viz_checkpoint_interval=4, verbose=False)
+    hook = res["viz_hook"]
+    assert hook is not None
+    # steps 1 and 3 (0-indexed) satisfy (step+1)%2==0 -> 2 frame batches
+    frame_steps = sorted({s for (_kind, s, _p) in hook.written
+                          if _kind in ("q_iso", "centerline", "surface_cp")})
+    assert len(frame_steps) >= 2, f"expected >=2 frame steps, got {frame_steps}"
+    # a checkpoint at step 4 (meshio .vtu, no pyvista dependency)
+    ckpts = list((tmp_path / "checkpoints").glob("*.vtu"))
+    assert len(ckpts) >= 1, "no .vtu checkpoint written"
+    # at least one per-frame extract landed on disk
+    on_disk = (list((tmp_path / "frames" / "q_iso").glob("*.vtp"))
+               + list((tmp_path / "frames" / "centerline").glob("*.vtp"))
+               + list((tmp_path / "frames" / "surface_cp").glob("*.vtp")))
+    assert len(on_disk) >= 1, "no per-frame extract written to disk"
+
+
 # ---------------------------------------------------------------------------
 # Group 3: BC masks — dyadic planes nonempty and pairwise disjoint (where they
 # must be)
