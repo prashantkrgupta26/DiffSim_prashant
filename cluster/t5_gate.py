@@ -181,6 +181,7 @@ res = run_truck(
     saddle_x0="extrap",
     saddle_equilibrate=EQUIL,
     nu_schedule=nu_sched,
+    saddle_restart=(int(os.environ["SADDLE_RESTART"]) if os.environ.get("SADDLE_RESTART") else None),
     nu=None,
     on_step=on_step,
     verbose=False,

@@ -342,6 +342,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               viz_interval=None, viz_dir=None,
               viz_checkpoint_interval=None, viz_Q_thresh=0.5, viz_roi=None,
               mesh_only=False, linsolve_tol=1e-10, linsolve_tol_schedule=None,
+              saddle_restart=None,
               saddle_equilibrate=False, soft_start=None):
     """Run the truck case: transient BDF2 monolithic march.
 
@@ -591,6 +592,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         _bd = {"ndof": ndof}
         if saddle_x0 is not None:
             _bd["saddle_x0"] = saddle_x0
+        if saddle_restart is not None:
+            _bd["saddle_restart"] = int(saddle_restart)
         if saddle_equilibrate:
             _bd["saddle_equilibrate"] = True     # T4b diagonal equilibration
         _pcd_cache[("blocktri_meta", "truck")] = _bd
