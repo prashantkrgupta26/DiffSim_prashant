@@ -519,7 +519,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         else:
             _LAST_ITERS[0] = None
             _slv_cache = (_pcd_cache if mono_solver in
-                          ("fgmres_pcd", "fgmres_bdiag") else None)
+                          ("fgmres_pcd", "fgmres_bdiag", "fused_bdiag") else None)
             x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
                                  tol=linsolve_tol,
                                  device=device, cache=_slv_cache,
