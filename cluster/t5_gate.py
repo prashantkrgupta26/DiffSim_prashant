@@ -97,6 +97,24 @@ print(f"[T5] scale={scale} dt_unit={dt} ramp_end_unit={ramp_end_unit} "
 
 from truck_flow import run_truck, make_nu_schedule
 nu_sched = make_nu_schedule(cfg, U_inf=1.0, L_ref=1.0, scale=scale)
+# C++-faithful low-Re startup (ReSolverRampInitial=10 heritage): env RE_START>0
+# overrides the schedule's early phase — Re ramps RE_START -> config Re over
+# RE_RAMP_STEPS steps (linear in step count), then hands off to the config
+# schedule. Zero solver changes; pure nu(t) shaping.
+_re_start = float(os.environ.get("RE_START", "0") or 0)
+_re_ramp_steps = int(os.environ.get("RE_RAMP_STEPS", "250"))
+if _re_start > 0:
+    _cfg_sched = nu_sched
+    _dtu = dt_unit
+    def nu_sched(t_unit, _s=_cfg_sched, _r0=_re_start,
+                 _n=_re_ramp_steps, _dt=_dtu, _scale=scale):
+        step = t_unit / _dt
+        nu_cfg = _s(t_unit)                      # config Re at this time
+        re_cfg = _scale / nu_cfg                 # invert: nu_unit = scale/Re
+        frac = min(1.0, step / max(_n, 1))
+        re_now = _r0 + frac * (re_cfg - _r0)
+        return _scale / re_now
+    print(f"[T5] RE_START={_re_start} ramp over {_re_ramp_steps} steps -> config Re", flush=True)
 print(f"[T5] nu_unit(0)={nu_sched(0.0):.3e} effRe={scale/nu_sched(0.0):.0f}",
       flush=True)
 
