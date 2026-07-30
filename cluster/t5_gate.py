@@ -105,7 +105,7 @@ _re_start = float(os.environ.get("RE_START", "0") or 0)
 _re_ramp_steps = int(os.environ.get("RE_RAMP_STEPS", "250"))
 if _re_start > 0:
     _cfg_sched = nu_sched
-    _dtu = dt_unit
+    _dtu = dt
     def nu_sched(t_unit, _s=_cfg_sched, _r0=_re_start,
                  _n=_re_ramp_steps, _dt=_dtu, _scale=scale):
         step = t_unit / _dt
