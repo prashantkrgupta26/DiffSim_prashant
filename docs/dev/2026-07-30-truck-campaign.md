@@ -569,10 +569,19 @@ pressure response develop smoothly instead of impulsively. Wired into
 schedule (loose 5e-4 through startup, tight 1e-6 after step ~200), `NSTEPS=600`,
 `viz_interval=20`, device path + warm-start. Gated on Mac (CPU host path) by
 three tests including a byte-identical-when-off check and a startup-response
-shrink check (full truck suite 13 passed). The GPU soft-start leg runs under the
-hold with the fixed logging; its result (does the spike disappear? does the
-march sustain past the old grind point?) and a CPU-vs-GPU parity spot-check
-(the miscompile sentinel guarding the clean warp reinstall) are recorded with
-the run's timestamped log.
+shrink check (full truck suite 13 passed).
+
+The miscompile-sentinel CPU-vs-GPU parity spot-check (guarding the clean warp
+reinstall) PASSED: `max|cd_react_h−cd_react_d|=1.308e-11` (< 1e-6),
+`docs/dev/evidence/t5-parity-cpu-vs-gpu.log`.
+
+**Soft-start GPU leg — result NOT yet on record.** The leg was launched under
+the hold (SOFT_START=30, NSTEPS=600, tol loose→tight at step 200, warm
+`.warp-cache-clean`) but the run was orphaned mid mesh-build when the nova
+ControlMaster was torn down during an SSH-saturation incident (the srun was not
+detached; see the TU5R task report). The physics answer — does the +201/−87
+startup spike disappear under the ramp, and does the march sustain past the old
+~step-25 grind — is still OPEN and needs a re-launched (detached) run from an
+interactive nova session. Frames/render/encode likewise pending that run.
 
 
