@@ -242,6 +242,71 @@ def test_fgmres_bdiag_result_carries_iterations():
     )
 
 
+def test_fgmres_bdiag_equilibrate_parity():
+    """T4b: symmetric diagonal equilibration must solve the same saddle to the
+    same accuracy as the plain fgmres_bdiag path (opt-in, correctness parity).
+
+    Equilibration solves (D^{-1/2} A D^{-1/2}) y = D^{-1/2} b, x = D^{-1/2} y.
+    It changes the KRYLOV SPACE and the residual metric but not the solution:
+    the recovered x must still match splu to the same tolerance as the
+    unequilibrated solve.  The knob rides ("blocktri_meta", cache_key)."""
+    from diffsim.solvers.linsolve import solve_linear
+
+    Acsr, b, x_splu = _get_system()
+    cache = {("blocktri_meta", "eq"): {"ndof": 3, "saddle_equilibrate": True}}
+    x = solve_linear(Acsr, b, solver="fgmres_bdiag", sym=False,
+                     device="cpu", tol=1e-10, cache=cache, cache_key="eq")
+    assert np.allclose(x, x_splu, rtol=1e-8, atol=1e-9), (
+        f"equilibrated max |x - x_splu| = {np.abs(x - x_splu).max():.3e}"
+    )
+
+
+def test_fgmres_bdiag_equilibrate_default_off_identical():
+    """T4b: without the knob (default), the solve is byte-identical to the
+    pre-T4b path — the equilibration code is fully opt-in."""
+    from diffsim.solvers.linsolve import solve_linear
+
+    Acsr, b, x_splu = _get_system()
+    x_plain = solve_linear(Acsr, b, solver="fgmres_bdiag", sym=False,
+                           device="cpu", tol=1e-10)
+    # explicit knob=False must equal no-knob
+    cache = {("blocktri_meta", "off"): {"ndof": 3, "saddle_equilibrate": False}}
+    x_off = solve_linear(Acsr, b, solver="fgmres_bdiag", sym=False,
+                         device="cpu", tol=1e-10, cache=cache, cache_key="off")
+    assert np.array_equal(x_plain, x_off), (
+        "saddle_equilibrate=False must be byte-identical to no-knob"
+    )
+
+
+def test_fused_bdiag_equilibrate_parity():
+    """T4b: fused_bdiag (BiCGStab) with equilibration must also match splu."""
+    from diffsim.solvers.linsolve import solve_linear
+
+    Acsr, b, x_splu = _get_system()
+    cache = {("blocktri_meta", "eqf"): {"ndof": 3, "saddle_equilibrate": True}}
+    x = solve_linear(Acsr, b, solver="fused_bdiag", sym=False,
+                     device="cpu", tol=1e-10, maxiter=40000,
+                     cache=cache, cache_key="eqf")
+    assert np.allclose(x, x_splu, rtol=1e-7, atol=1e-8), (
+        f"fused equilibrated max |x - x_splu| = {np.abs(x - x_splu).max():.3e}"
+    )
+
+
+def test_equilib_scale_diag_makes_unit_diagonal():
+    """T4b unit: after two-sided scaling by s = D^{-1/2}, the scaled diagonal
+    is sign(diag(A)) = +-1 on non-floored rows (so the bdiag apply on the
+    scaled system is ~identity — equilibration replaces the Jacobi role)."""
+    from diffsim.solvers.saddle_precond import _equilib_scale_from_diag
+
+    # a diagonal spanning 10 orders (the truck pathology in miniature)
+    diag = np.array([1.0, -2.5, 1e-8, 3e-10, 7.0, -1e-9], np.float64)
+    s = _equilib_scale_from_diag(diag)
+    scaled = diag * s * s
+    # non-floored rows -> exactly +-1
+    assert np.allclose(np.abs(scaled), 1.0, atol=1e-12), scaled
+    assert np.allclose(np.sign(scaled), np.sign(diag)), scaled
+
+
 # ---------------------------------------------------------------------------
 # Task A3: PCD (pressure convection-diffusion) Schur preconditioner
 # ---------------------------------------------------------------------------

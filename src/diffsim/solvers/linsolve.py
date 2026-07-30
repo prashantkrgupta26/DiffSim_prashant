@@ -1157,22 +1157,53 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         meta = (cache or {}).get(("blocktri_meta", cache_key), {})
         ndof = meta.get("ndof", 3)
 
+        # T4b equilibration knob (same semantics as fgmres_bdiag).
+        _equilibrate = bool(meta.get("saddle_equilibrate", False))
+
         _bdiag_block = meta.get("bdiag_block", "scalar")
+        _diag_host = None
         if _dev_handoff is not None and _bdiag_block == "scalar":
             # W2c device-resident fast path (see fgmres_bdiag for rationale).
             from .saddle_precond import make_bdiag_apply_from_diag
             op = _dev_handoff.device_operator()
-            apply_bdiag = make_bdiag_apply_from_diag(
-                _dev_handoff.diagonal_device(), ndof, device)
+            _diag_dev = _dev_handoff.diagonal_device()
+            apply_bdiag = make_bdiag_apply_from_diag(_diag_dev, ndof, device)
+            if _equilibrate:
+                _diag_host = (_diag_dev.numpy() if hasattr(_diag_dev, "numpy")
+                              else np.asarray(_diag_dev))
         else:
             if _dev_handoff is not None:
                 A = _dev_handoff.tocsr()   # node-block: needs host CSR blocks
             op = CSROperator(A, device)
             # W5d knob (same convention as fgmres_bdiag): opt-in node-block Jacobi.
             apply_bdiag = make_bdiag_apply(A, ndof, device, block=_bdiag_block)
+            if _equilibrate:
+                _diag_host = np.asarray(A.diagonal()).copy()
 
-        x, info = bicgstab_dev(op, b, tol=tol, atol=1e-13, maxiter=maxiter,
-                               check_every=100, apply_dev=apply_bdiag)
+        if _equilibrate:
+            # T4b: run BiCGStab on the equilibrated system A_hat = D^{-1/2} A
+            # D^{-1/2}.  The wrapped operator carries the scaled matvec; the
+            # apply is built from the scaled diagonal (~identity) — the same
+            # algebra as fgmres_bdiag.  The wrapper is not a CSROperator so
+            # this takes the legacy (apply_dev) loop, which is correct here.
+            import warp as wp
+            from .saddle_precond import make_equilibrated_solve
+            N = op.n_free
+            _mvh, _bhat, _recover, apply_bdiag = make_equilibrated_solve(
+                op.matvec, b, _diag_host, N, device, ndof)
+
+            class _EqOp:
+                device = op.device
+                n_free = N
+                def matvec(self, x, y):
+                    _mvh(x, y)
+            x_hat, info = bicgstab_dev(_EqOp(), _bhat.numpy(), tol=tol,
+                                       atol=1e-13, maxiter=maxiter,
+                                       check_every=100, apply_dev=apply_bdiag)
+            x = _recover(x_hat)
+        else:
+            x, info = bicgstab_dev(op, b, tol=tol, atol=1e-13, maxiter=maxiter,
+                                   check_every=100, apply_dev=apply_bdiag)
         _LAST_ITERS[0] = info.get("iters")
         if not info.get("converged"):
             raise ConvergenceError(
@@ -1576,7 +1607,21 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         # A3 knob A: restart length (opt-in, default 60)
         _restart = int(meta.get("saddle_restart", 60))
 
+        # T4b knob — symmetric diagonal EQUILIBRATION (opt-in via
+        # meta["saddle_equilibrate"], set by the driver from SADDLE_EQUILIBRATE).
+        # Solve (D^{-1/2} A D^{-1/2}) y = D^{-1/2} b, x = D^{-1/2} y with
+        # D = |diag(A)| (floored).  This collapses a many-order diagonal span
+        # (Cb_f Nitsche penalties on fine surrogate faces vs coarse bulk) to
+        # O(1), changing the metric the unpreconditioned-residual FGMRES
+        # minimizes and breaking the scalar-Jacobi relres floor.  After scaling
+        # diag(A_hat) = +-1, so the bdiag apply on the scaled system is
+        # ~identity — equilibration REPLACES the Jacobi preconditioner (the
+        # apply is built from the scaled diagonal, which keeps the pressure
+        # floor exact).  Default off = byte-identical.
+        _equilibrate = bool(meta.get("saddle_equilibrate", False))
+
         _bdiag_block = meta.get("bdiag_block", "scalar")
+        _diag_host = None                 # populated for the equilibrate path
         if _dev_handoff is not None and _bdiag_block == "scalar":
             # W2c device-resident fast path: SpMV over the resident CSR values
             # (no re-upload) + preconditioner diagonal from a device gather
@@ -1585,9 +1630,12 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
             # sub-blocks and takes the host fallback below.
             from .saddle_precond import make_bdiag_apply_from_diag
             op = _dev_handoff.device_operator()
-            apply_dev = make_bdiag_apply_from_diag(
-                _dev_handoff.diagonal_device(), ndof, device)
+            _diag_dev = _dev_handoff.diagonal_device()
+            apply_dev = make_bdiag_apply_from_diag(_diag_dev, ndof, device)
             N = _dev_handoff.shape[0]
+            if _equilibrate:
+                _diag_host = (_diag_dev.numpy() if hasattr(_diag_dev, "numpy")
+                              else np.asarray(_diag_dev))
         else:
             if _dev_handoff is not None:
                 A = _dev_handoff.tocsr()   # node-block: needs host CSR blocks
@@ -1596,9 +1644,22 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
             # ndof x ndof block Jacobi (opt-in via blocktri_meta; default scalar).
             apply_dev = make_bdiag_apply(A, ndof, device, block=_bdiag_block)
             N = A.shape[0]
+            if _equilibrate:
+                _diag_host = np.asarray(A.diagonal()).copy()
+
+        # T4b: replace op.matvec/rhs/apply with the equilibrated forms (the
+        # solution is recovered after fgmres via `recover`).
+        _matvec = op.matvec
+        _recover = None
+        if _equilibrate:
+            from .saddle_precond import make_equilibrated_solve
+            _matvec, b_dev_eq, _recover, apply_dev = make_equilibrated_solve(
+                op.matvec, b, _diag_host, N, device, ndof)
 
         b_dev = wp.array(np.ascontiguousarray(b, np.float64),
                          dtype=wp.float64, device=device)
+        if _equilibrate:
+            b_dev = b_dev_eq
         # cycles × restart bounds total inner iterations; divisor == restart
         cycles = min(200, max(1, maxiter // _restart))
 
@@ -1619,8 +1680,16 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                                   dtype=wp.float64, device=device)
             # else: first step — cold start (x0_dev stays None)
 
+        # T4b: under equilibration the outer solve is in the SCALED space
+        # (y = D^{1/2} x); the warm-start guess must be pre-scaled the same
+        # way: y0 = x0 / s  (s = D^{-1/2}).  We recover x = s .* y after.
+        if _equilibrate and x0_dev is not None:
+            _x0h = x0_dev.numpy() / _recover(np.ones(N))  # = x0 * D^{1/2}
+            x0_dev = wp.array(np.ascontiguousarray(_x0h, np.float64),
+                              dtype=wp.float64, device=device)
+
         x_dev, finfo = fgmres_dev(
-            op.matvec, b_dev, apply_dev, N, device,
+            _matvec, b_dev, apply_dev, N, device,
             tol=tol, atol=1e-13, restart=_restart, maxiter=cycles,
             x0_dev=x0_dev)
 
@@ -1629,6 +1698,12 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                 f"fgmres_bdiag: not converged after {finfo['inner']} inner "
                 f"iterations ({finfo['outer']} restarts); "
                 f"relres={finfo['relres']:.3e}")
+
+        # T4b: recover x = D^{-1/2} y from the scaled solution.
+        if _equilibrate:
+            _x_np = _recover(x_dev)
+            x_dev = wp.array(np.ascontiguousarray(_x_np, np.float64),
+                             dtype=wp.float64, device=device)
 
         # Publish iteration count to the module sentinel so the return_result
         # wrapper (which calls us without return_result=True) can surface it.

@@ -178,6 +178,77 @@ def make_bdiag_apply_from_diag(diag_d, ndof, device):
     return _scalar_bdiag_apply_from_diag(diag, ndof, device)
 
 
+def _equilib_scale_from_diag(diag, eps=1e-12):
+    """Symmetric-equilibration scale vector  s = D^{-1/2},  D = |diag(A)|
+    (floored).  Solving (D^{-1/2} A D^{-1/2}) y = D^{-1/2} b, x = D^{-1/2} y
+    is the classic Jacobi/diagonal EQUILIBRATION of the saddle: it rescales
+    every row/column so |diag| ~ 1, collapsing a many-order diagonal span
+    (e.g. Cb_f Nitsche penalties on fine surrogate faces vs coarse bulk rows)
+    to O(1).  This changes the METRIC the outer (unpreconditioned-residual)
+    FGMRES minimizes to the balanced ||D^{-1/2}(b - A x)||, which is what
+    breaks the scalar-Jacobi relres floor.
+
+    Floor: rows with |d_i| < eps*max|d| are floored to eps*max|d| before the
+    square root, mirroring make_bdiag_apply's pressure floor (a truly-zero or
+    negligible diagonal — e.g. a structurally-empty row — must not produce an
+    infinite scale).  Returns s (host float64, shape (N,)).
+
+    ALGEBRA (why equilibration REPLACES the Jacobi preconditioner): after the
+    two-sided scale, diag(A_hat) = D^{-1/2} diag(A) D^{-1/2} = sign(diag(A))
+    = +-1 on every non-floored row.  So a scalar-Jacobi apply built from the
+    SCALED diagonal is ~identity — equilibration subsumes the Jacobi role.  We
+    still build the bdiag apply from the scaled diagonal (not a hard identity)
+    so the pressure floor keeps guarding the few floored rows exactly."""
+    diag = np.ascontiguousarray(np.asarray(diag, dtype=np.float64))
+    ad = np.abs(diag)
+    max_d = float(ad.max()) if ad.size else 1.0
+    floor = eps * max_d if max_d > 0 else 1.0
+    d_safe = np.maximum(ad, floor)
+    return 1.0 / np.sqrt(d_safe)
+
+
+def make_equilibrated_solve(op_matvec, b, diag, N, device, ndof):
+    """Wrap a device matvec + rhs into the symmetrically-equilibrated system.
+
+    Given the UN-scaled operator (``op_matvec(x_wp, y_wp)`` device in-place),
+    the rhs ``b`` (host float64), and the matrix diagonal ``diag`` (host
+    float64), returns ``(matvec_hat, b_hat_dev, recover, apply_hat)`` where
+
+      * ``matvec_hat(z_in, w_out)`` computes  w = A_hat z = s .* (A (s .* z))
+        entirely on device (two elementwise scales around the base matvec),
+      * ``b_hat_dev`` is  s .* b  as a device wp.array,
+      * ``recover(y_dev)`` maps the scaled solution back:  x = s .* y  (host
+        numpy),
+      * ``apply_hat`` is the scalar-bdiag preconditioner built from the SCALED
+        diagonal (diag(A_hat) = +-1 on non-floored rows, so this is ~identity;
+        the pressure floor still guards floored rows) — see
+        ``_equilib_scale_from_diag`` for the algebra.
+
+    s = D^{-1/2} lives on device (uploaded once); the two scale kernels reuse
+    the cached _bdiag_kernel (elementwise multiply)."""
+    s = _equilib_scale_from_diag(diag)
+    s_d = wp.array(np.ascontiguousarray(s), dtype=wp.float64, device=device)
+    scaled_diag = np.asarray(diag, np.float64) * s * s   # = sign(diag) (+-1)
+    apply_hat = _scalar_bdiag_apply_from_diag(scaled_diag, ndof, device)
+    kmul = _bdiag_kernel()
+    _tmp = wp.zeros(N, dtype=wp.float64, device=device)
+
+    def matvec_hat(z_in, w_out):
+        # w = s .* (A (s .* z))
+        wp.launch(kmul, dim=N, inputs=[s_d, z_in, _tmp], device=device)
+        op_matvec(_tmp, w_out)
+        wp.launch(kmul, dim=N, inputs=[s_d, w_out, w_out], device=device)
+
+    b_hat = np.ascontiguousarray(np.asarray(b, np.float64) * s)
+    b_hat_dev = wp.array(b_hat, dtype=wp.float64, device=device)
+
+    def recover(y_dev):
+        y = y_dev.numpy() if hasattr(y_dev, "numpy") else np.asarray(y_dev)
+        return y * s
+
+    return matvec_hat, b_hat_dev, recover, apply_hat
+
+
 def make_bdiag_apply(A, ndof, device, block="scalar"):
     """Block-diagonal (Jacobi-by-block) preconditioner for the (u, p) saddle.
 
