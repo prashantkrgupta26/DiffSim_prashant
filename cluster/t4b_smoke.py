@@ -22,7 +22,11 @@ CONF = "/work/mech-ai/baskarg/DiffSim/local_code_old/truck_4case_fresh_inputs/Ne
 BASE_LEVEL = int(os.environ.get("BASE_LEVEL", "7"))
 BAND_TO    = int(os.environ.get("BAND_TO",    "12"))
 NSTEPS     = int(os.environ.get("NSTEPS",     "50"))
-EQUIL      = os.environ.get("SADDLE_EQUILIBRATE", "1") == "1"
+# DEFAULT OFF (T4b finding): on the corrected-unit mass-dominated saddle, plain
+# scalar-Jacobi converges ~200x tighter than equilibration; the unit fix (not
+# equilibration) breaks the T4 floor.  Opt IN with SADDLE_EQUILIBRATE=1 only for
+# a genuinely ill-scaled diagonal.
+EQUIL      = os.environ.get("SADDLE_EQUILIBRATE", "0") == "1"
 VIZ_DIR    = os.environ.get("VIZ_DIR", "/work/mech-ai/baskarg/DiffSim/results/truck-t4b-frames")
 
 _rss_peak = [0]

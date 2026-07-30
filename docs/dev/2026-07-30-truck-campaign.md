@@ -298,3 +298,77 @@ truck-enclosing indicator (exact momentum-flux + SBM-reaction identity, physical
 drag). cd_surr integrates `w·(p·n − nu·(∇u^T·n))` over the 94,980 surrogate faces with the
 `geo.corr` Surrogate2True area correction. The smoke prints F_surr_raw, F_react_raw and the
 shared ref_force per step for the quantified check (see below).
+
+## UPDATE — root-caused to the UNIT BUG; equilibration is NOT the truck's fix
+
+The diagonal stats above (span 1.15e10) were measured at the T4 regime (dt=0.01 PHYSICAL,
+nu=1e-3 ⇒ effRe=62.5, σ=b0/dt=100). That weak σM mass term is WHY the tiny level-12
+Nitsche diagonals dominated. Re-running the diagnostic at the CORRECTED units
+(dt_unit=6.25e-4 ⇒ σ=1600, nu_unit=6.25e-5 ⇒ true Re=1000) tells a different story:
+
+**Corrected-regime |diag| span = 5.37e8** (min 1.86e-9) — 20× smaller; the σM term lifts
+the small diagonals. relres-vs-iteration on that step-0 matrix, PLAIN vs EQUILIB:
+
+| inner | PLAIN relres | EQUILIB relres |
+|-------|--------------|----------------|
+| 60  | 1.02e-5 | 3.05e-3 |
+| 240 | 5.98e-6 | 1.70e-3 |
+| 480 | 3.93e-6 | 1.01e-3 |
+| 720 | **2.51e-6** | 4.94e-4 |
+
+**Plain scalar-Jacobi is ~200× tighter than equilibration** on the corrected saddle: with
+σ=1600 the diagonal is already well-scaled by the mass term, and equilibration destroys the
+(u,p) block structure Jacobi exploits. So the T4 "floor" was a UNIT-BUG artifact, not a hard
+preconditioner limit. **Equilibration is kept as an opt-in tool (default off); it is not
+enabled for the truck.**
+
+## Smoke re-run (base=7 band=12, 50-step target, corrected units)
+
+| Run | Steps | Outcome | s/step | Notes |
+|-----|-------|---------|--------|-------|
+| EQUILIB ON + tol-sched | 0 | step 0 conv (cd_react=-0.2855, t=413s JIT); **step 1 FAILED** relres 5.90e-4 (>5e-4) after 12000 it | — | equilibration weak on BDF2 |
+| **PLAIN (equilib OFF)** | **0–5 ALL CONVERGED** | **bounded=YES** | 170.5s avg (128s min) | the unit-fix-alone march |
+
+PLAIN plain-Jacobi at the corrected units marches cleanly through all 6 steps at tol=5e-4
+(no ConvergenceError) — the FLOOR IS BROKEN by the unit fix. cd_react=-0.0000 at steps 0–5
+is CORRECT: at dt_unit=6.25e-4 the flow front is at x≈0.004 after 6 steps, nowhere near the
+truck at x≈0.31 (the truck is reached at ~step 500), so the enclosing-box reaction is exactly
+zero. RSS peaked at 198 GB (host CSR surgery via .tolil/.tocsr — near the 200G cgroup edge, a
+scaling caveat for a full 50-step run). GPU SMI peak 41.7 GiB.
+
+## cd_surr arithmetic (item B) — QUANTIFIED
+
+Equilibrated step 0 raw forces + shared ref_force:
+- F_react_raw = -2.4384e-05 (variational reaction on the enclosing box — the CORRECT drag)
+- F_surr_raw  = -7.1167e+00 (surrogate traction ∮(p·n − nu ∇u·n) over 94,980 faces)
+- ref_force   =  8.5414e-05 (SHARED)  →  cd_react=-0.2855, cd_surr=-83,320
+
+FACTOR = F_surr_raw/F_react_raw ≈ 2.92e5. Same ref_force ⇒ NOT a normalization difference —
+a genuine ~5-order gap between the two RAW functionals. VERDICT: **not an artifact — a real
+surrogate-functional pathology at the impulsive start.** The ∮ p·n surrogate integral picks
+up the near-singular start-up pressure transient over the immersed surface (amplified by the
+geo.corr Surrogate2True area correction on level-12 faces); the reaction identity subtracts
+b_vol via the momentum balance and does not. In the PLAIN march the surrogate raw grows
+smoothly (F_surr_raw -1.07e-2 → -1.14e-1 over steps 0–5, cd_surr -125 → -1338) while the
+reaction stays 0 — the surrogate is picking up the developing near-field pressure, not truck
+drag (the flow hasn't reached the truck). cd_react is the correct observable; cd_surr is
+unusable as a start-up gate.
+
+## Fallback (nvmath blocktri = cuDSS-on-F) — DOES NOT FIT; not run
+
+F velocity block = 5.97M DOF / ~484M nnz. cuDSS 3D-FEM LU fill is 10–30×; at fill=20× the
+factor alone needs ~116 GB > 95 GiB HBM. Measured cuDSS NS wall is 1.1–2.9M DOF on 95 GiB;
+F at 5.97M is 2–5× ABOVE it. Reported rather than OOM'd. The real escalation (if BDF2 stalls
+at scale) is **blockch_dev** (block-preconditioned FGMRES, device inners, proven 202k→10.6M
+DOF) — the T5 path — NOT cuDSS-blocktri.
+
+## Decision point
+
+1. **Do NOT enable saddle_equilibrate for the truck** — the unit fix is the solver fix;
+   equilibration hurts on the mass-dominated saddle. Keep it opt-in for genuinely ill-scaled
+   systems.
+2. The PLAIN corrected-unit march is the correct T5 baseline. Confirm the march past the
+   ramp / once flow reaches the truck (~step 500) — the 6-step smoke only proves start-up.
+3. Address the host-CSR RSS (198 GB) before a long run — route the driver through the device
+   CSR handoff end-to-end (avoid .tolil/.tocsr surgery on host).
+4. cd_surr: real start-up surrogate-functional pathology; use cd_react.

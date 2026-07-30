@@ -49,10 +49,14 @@ def main():
     cfg = load_truck_config(CONF)
     dim = 3
     ndof = dim + 1
-    nu_sched = make_nu_schedule(cfg, U_inf=1.0, L_ref=1.0)
+    # T4b: use the CORRECTED unit-frame nu (scale=domain_scale) so the diagonal
+    # stats + relres curve reflect the Re=1000 regime the smoke actually runs
+    # (nu_unit = s/Re = 6.25e-5), not the old effRe=62.5 (nu=1e-3).
+    nu_sched = make_nu_schedule(cfg, U_inf=1.0, L_ref=1.0,
+                                scale=cfg.domain_scale)
     nu0 = float(nu_sched(0.0))
     alpha = cfg.cb_f
-    dt = float(cfg.dt_v[1])
+    dt = float(cfg.dt_v[1]) * cfg.domain_scale     # unit time (6.25e-4)
     print(f"[diag] cfg bodies={len(cfg.bodies)} Cb_f={alpha} nu0={nu0:.4f} "
           f"Re0={1.0/nu0:.0f} dt={dt}", flush=True)
 
@@ -167,25 +171,35 @@ def main():
     from diffsim.solvers.fgmres_dev import fgmres_dev
     from diffsim.solvers.saddle_precond import make_bdiag_apply
     import warp as wp
+    from diffsim.solvers.saddle_precond import make_equilibrated_solve
     op = CSROperator(Acsr, DEVICE)
-    apply_dev = make_bdiag_apply(Acsr, ndof, DEVICE, block="scalar")
-    b_dev = wp.array(np.ascontiguousarray(b, np.float64), dtype=wp.float64,
-                     device=DEVICE)
-    # capture the curve: run with restart=60, a handful of cycles, print each
-    # cycle's entry relres by calling fgmres_dev with maxiter=1 repeatedly and
-    # warm-starting.  Cheaper: single call, rely on info; but we want the
-    # curve, so step cycles.
-    x0 = None
-    for cyc in range(1, 9):
-        xd, info = fgmres_dev(op.matvec, b_dev, apply_dev, N, DEVICE,
-                              tol=1e-8, atol=1e-13, restart=60, maxiter=cyc,
-                              x0_dev=x0)
-        print(f"  cycles={cyc:>2d}  inner={info['inner']:>4d}  "
-              f"relres={info['relres']:.6e}  converged={info['converged']}",
-              flush=True)
-        x0 = xd
-        if info["converged"]:
-            break
+
+    def _curve(label, matvec, b_use, apply_use, ncyc=12):
+        b_dev = wp.array(np.ascontiguousarray(b_use, np.float64),
+                         dtype=wp.float64, device=DEVICE)
+        x0 = None
+        print(f"[diag] --- {label} ---", flush=True)
+        for cyc in range(1, ncyc + 1):
+            xd, info = fgmres_dev(matvec, b_dev, apply_use, N, DEVICE,
+                                  tol=1e-8, atol=1e-13, restart=60,
+                                  maxiter=cyc, x0_dev=x0)
+            print(f"  [{label}] cycles={cyc:>2d}  inner={info['inner']:>4d}  "
+                  f"relres={info['relres']:.6e}  conv={info['converged']}",
+                  flush=True)
+            x0 = xd
+            if info["converged"]:
+                break
+
+    # PLAIN scalar-Jacobi
+    apply_plain = make_bdiag_apply(Acsr, ndof, DEVICE, block="scalar")
+    _curve("PLAIN", op.matvec, b, apply_plain)
+
+    # EQUILIBRATED
+    diag_h = np.asarray(Acsr.diagonal()).copy()
+    mvh, bhat, recover, apply_hat = make_equilibrated_solve(
+        op.matvec, b, diag_h, N, DEVICE, ndof)
+    _curve("EQUILIB", mvh, bhat.numpy(), apply_hat)
+
     print(f"[diag] DONE ({time.time()-t0:.0f}s)", flush=True)
 
 
