@@ -320,7 +320,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               truck_band_to=None, band_cells=3, region_refine=True,
               L_ref=None, bodies=None, merged=None, reaction_band=None,
               viz_interval=None, viz_dir=None,
-              viz_checkpoint_interval=None, viz_Q_thresh=0.5, viz_roi=None):
+              viz_checkpoint_interval=None, viz_Q_thresh=0.5, viz_roi=None,
+              mesh_only=False):
     """Run the truck case: transient BDF2 monolithic march.
 
     Returns a history dict with keys:
@@ -347,6 +348,11 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
           Q-criterion isosurface threshold (default 0.5).
       viz_roi : tuple or None
           [x0,x1,y0,y1,z0,z1] ROI clip box in unit-cube coords.
+      mesh_only : bool
+          If True, build the mesh/carve/surrogate only and return immediately
+          (no time-stepping).  Returns the same dict as the full driver with
+          the mesh stats filled in and all force arrays empty/zero.  Used for
+          the T4 mesh+carve probe leg.
     """
     dim = 3
     ndof = dim + 1
@@ -363,6 +369,26 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
     scale = fx["scale"]
     merged = fx["merged"]
+
+    if mesh_only:
+        # Return mesh stats without time-stepping.
+        if verbose:
+            nn = len(mesh.node_coords)
+            nfree_nodes = cons.T.shape[1]
+            ndof_free = nfree_nodes * (dim + 1)
+            print(f"[truck][mesh_only] cells={fx['n_cells']} carved={fx['n_excluded']} "
+                  f"slab_cut={fx['n_slab_cut']} sf_faces={fx['sf'].elem.size} "
+                  f"nodes={nn} free_nodes={nfree_nodes} free_dofs={ndof_free} "
+                  f"mesh_time={time.time()-t0:.1f}s", flush=True)
+        return dict(cd=np.zeros(0), cd_surr=np.zeros(0),
+                    cl_y=np.zeros(0), cl_z=np.zeros(0),
+                    cl_y_surr=np.zeros(0), cl_z_surr=np.zeros(0),
+                    n_excluded=fx["n_excluded"], n_slab_cut=fx["n_slab_cut"],
+                    n_cells=fx["n_cells"], n_rxn_nodes=0,
+                    sf_faces=int(fx["sf"].elem.size), L_ref=0.0,
+                    nsteps=0, viz_hook=None,
+                    mesh=mesh, cons=cons, dm=dm, merged=merged, sf=fx["sf"],
+                    mesh_time=time.time() - t0)
 
     if verbose:
         print(f"[truck] cells={fx['n_cells']} carved={fx['n_excluded']} "
