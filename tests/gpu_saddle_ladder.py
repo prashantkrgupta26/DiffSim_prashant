@@ -178,7 +178,7 @@ ALL_POINTS = [LADDER_2D_R9, LADDER_2D_R11, LADDER_3D_L6, LADDER_3D_L7,
 
 def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
                      pcd_inner=None, pcd_ap_inner=None,
-                     saddle_restart=None, saddle_x0=None, **cfg):
+                     saddle_restart=None, saddle_x0=None, bdiag_block=None, **cfg):
     """March nsteps of the MONOLITHIC driver and capture per-step iteration counts.
 
     Parameters
@@ -255,6 +255,8 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
             saddle_kw["saddle_restart"] = int(saddle_restart)
         if saddle_x0 is not None:
             saddle_kw["saddle_x0"] = saddle_x0
+        if bdiag_block is not None:
+            saddle_kw["bdiag_block"] = bdiag_block
 
         t0 = time.time()
         res = run_flow_past(
@@ -310,6 +312,8 @@ def run_ladder_point(tag, solver, dim, nsteps=5, device="cpu", assembly=None,
             saddle_kw["saddle_restart"] = int(saddle_restart)
         if saddle_x0 is not None:
             saddle_kw["saddle_x0"] = saddle_x0
+        if bdiag_block is not None:
+            saddle_kw["bdiag_block"] = bdiag_block
 
         t0 = time.time()
         res = run_flow_past_3d(
@@ -482,6 +486,9 @@ if __name__ == "__main__":
     # "extrap" => linear extrapolation from prior two steps; unset => None (cold start).
     _x0_env = os.environ.get("SADDLE_X0", "").strip()
     SADDLE_X0 = _x0_env if _x0_env else None
+    # W5d knob — SADDLE_BDIAG_BLOCK: "node" => per-node block Jacobi.
+    _bb_env = os.environ.get("SADDLE_BDIAG_BLOCK", "").strip()
+    SADDLE_BDIAG_BLOCK = _bb_env if _bb_env else None
 
     # SADDLE_POINTS: comma-separated subset of point tags to run in this process.
     # Used to run each ladder point in a SEPARATE PROCESS (the brief requirement:
@@ -524,6 +531,7 @@ if __name__ == "__main__":
                     pcd_ap_inner=PCD_AP_INNER,
                     saddle_restart=SADDLE_RESTART,
                     saddle_x0=SADDLE_X0,
+                    bdiag_block=SADDLE_BDIAG_BLOCK,
                     **{k: v for k, v in point.items()
                        if k not in ("tag", "dim", "nsteps")},
                 )

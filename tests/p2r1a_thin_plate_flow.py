@@ -383,6 +383,7 @@ def run_flow_past(
     pcd_ap_inner="jacobi",  # (T5) PCD Ap-block inner-solve backend: "jacobi" | "amgx"
     saddle_restart=None,  # A3 knob A: FGMRES restart length; None => default 60
     saddle_x0=None,       # A3 knob B: warm-start mode; "extrap" | None (cold)
+    bdiag_block=None,     # W5d knob: "node" => per-node block Jacobi; None => scalar
 ):
     """Run flow past a finite thin plate with transient BDF2 march.
 
@@ -729,12 +730,14 @@ def run_flow_past(
     # fgmres_bdiag reads ndof and A3 knobs via ("blocktri_meta", cache_key).
     _pcd_cache = {}           # {("pcd_meta", key): meta, ...}
     _pcd_last_order = None    # track when to rebuild pcd_meta (sigma change)
-    if mono_solver == "fgmres_bdiag":
+    if mono_solver in ("fgmres_bdiag", "fused_bdiag"):
         _bdiag_meta = {"ndof": ndof}
         if saddle_restart is not None:
             _bdiag_meta["saddle_restart"] = int(saddle_restart)
         if saddle_x0 is not None:
             _bdiag_meta["saddle_x0"] = saddle_x0
+        if bdiag_block is not None:
+            _bdiag_meta["bdiag_block"] = bdiag_block
         _pcd_cache[("blocktri_meta", "ns2d")] = _bdiag_meta
 
     # ---- BDF2 march ---------------------------------------------------------

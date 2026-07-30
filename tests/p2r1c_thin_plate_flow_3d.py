@@ -314,6 +314,7 @@ def run_flow_past_3d(
     pcd_ap_inner="jacobi",  # (T5) PCD Ap-block inner-solve backend: "jacobi" | "amgx"
     saddle_restart=None,  # A3 knob A: FGMRES restart length; None => default 60
     saddle_x0=None,       # A3 knob B: warm-start mode; "extrap" | None (cold)
+    bdiag_block=None,     # W5d knob: "node" => per-node block Jacobi; None => scalar
 ):
     """Run 3-D flow past a finite thin plate with transient BDF2 march.
 
@@ -492,13 +493,17 @@ def run_flow_past_3d(
     # so the 3-D bdiag backend gets ndof=4 (not the default 3).
     _pcd_cache = {"ndof": ndof}   # carry ndof for fgmres_bdiag (blocktri_meta slot)
     _pcd_last_order = None        # track when to rebuild pcd_meta (sigma change)
-    if mono_solver == "fgmres_bdiag":
-        # fgmres_bdiag reads ndof (and A3 knobs) via ("blocktri_meta", cache_key)
+    if mono_solver in ("fgmres_bdiag", "fused_bdiag"):
+        # both bdiag backends read ndof (and knobs) via ("blocktri_meta", key);
+        # the gate previously covered fgmres_bdiag only, leaving fused_bdiag
+        # with the default ndof=3 (wrong masks on the 3-D saddle).
         _bdiag_meta = {"ndof": ndof}
         if saddle_restart is not None:
             _bdiag_meta["saddle_restart"] = int(saddle_restart)
         if saddle_x0 is not None:
             _bdiag_meta["saddle_x0"] = saddle_x0
+        if bdiag_block is not None:
+            _bdiag_meta["bdiag_block"] = bdiag_block
         _pcd_cache[("blocktri_meta", "ns3d")] = _bdiag_meta
 
     # ---- BDF2 march ---------------------------------------------------------
