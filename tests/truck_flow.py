@@ -321,7 +321,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               L_ref=None, bodies=None, merged=None, reaction_band=None,
               viz_interval=None, viz_dir=None,
               viz_checkpoint_interval=None, viz_Q_thresh=0.5, viz_roi=None,
-              mesh_only=False):
+              mesh_only=False, linsolve_tol=1e-10):
     """Run the truck case: transient BDF2 monolithic march.
 
     Returns a history dict with keys:
@@ -353,6 +353,12 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
           (no time-stepping).  Returns the same dict as the full driver with
           the mesh stats filled in and all force arrays empty/zero.  Used for
           the T4 mesh+carve probe leg.
+      linsolve_tol : float
+          Convergence tolerance for iterative linear solvers (default 1e-10 —
+          matches solve_linear default, byte-identical to prior behaviour).
+          For production transient NS at large DOF counts, 1e-5 or 1e-6 is
+          sufficient and dramatically reduces iteration counts; set via the
+          T4 smoke gate.
     """
     dim = 3
     ndof = dim + 1
@@ -515,6 +521,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             _slv_cache = (_pcd_cache if mono_solver in
                           ("fgmres_pcd", "fgmres_bdiag") else None)
             x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
+                                 tol=linsolve_tol,
                                  device=device, cache=_slv_cache,
                                  cache_key="truck")
 
