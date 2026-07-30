@@ -1085,7 +1085,7 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
     A = A.tocsr()
     if cache is not None and cache_key is not None \
             and solver not in ("blockch", "blockamgx",
-                               "fgmres_bdiag", "fgmres_pcd"):
+                               "fgmres_bdiag", "fgmres_pcd", "fused_bdiag"):
         # cheap staleness guard (evaluation solver-review item): cached
         # factorizations are for CONSTANT matrices — catch reuse of a key
         # after the matrix changed shape/pattern (values are the caller's
@@ -1133,6 +1133,30 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                          diag=diag, check_every=100)
         if not info.get("converged"):
             raise ConvergenceError(f"fused solve failed: {info}")
+        return x
+
+    if solver == "fused_bdiag":
+        # W5a: block-diagonal preconditioned BiCGStab for the (u, p) saddle.
+        # CSROperator + make_bdiag_apply feed bicgstab_dev via the apply_dev
+        # hook (general right-preconditioner, legacy loop — no Krylov basis).
+        # ndof recovered from blocktri_meta (same convention as fgmres_bdiag).
+        from ..assembly.operators import CSROperator
+        from .krylov_dev import bicgstab_dev
+        from .saddle_precond import make_bdiag_apply
+
+        meta = (cache or {}).get(("blocktri_meta", cache_key), {})
+        ndof = meta.get("ndof", 3)
+
+        op = CSROperator(A, device)
+        apply_bdiag = make_bdiag_apply(A, ndof, device)
+
+        x, info = bicgstab_dev(op, b, tol=tol, atol=1e-13, maxiter=maxiter,
+                               check_every=100, apply_dev=apply_bdiag)
+        _LAST_ITERS[0] = info.get("iters")
+        if not info.get("converged"):
+            raise ConvergenceError(
+                f"fused_bdiag: not converged after {info.get('iters')} "
+                f"iterations; relres={info.get('relres', float('inf')):.3e}")
         return x
 
     if solver == "gpu_cg":

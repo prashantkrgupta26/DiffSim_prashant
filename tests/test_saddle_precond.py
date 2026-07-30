@@ -579,3 +579,73 @@ def test_fgmres_pcd_ap_amgx_real():
     _assert_pcd_accuracy(r.x, x_splu)
     # Ap-inner telemetry must be populated from AMGX last_solve_stats
     assert r.inner_stats["Ap"]["applies"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Task W5a: fused_bdiag backend — BiCGStab + block-diagonal preconditioner
+# ---------------------------------------------------------------------------
+
+def test_fused_bdiag_solves_real_saddle():
+    """fused_bdiag must solve the real level-4 saddle to the same rtol gates
+    as fgmres_bdiag (rtol=1e-8, atol=1e-9 vs splu), record iterations > 0,
+    and match the splu reference at comparable accuracy."""
+    from diffsim.solvers.linsolve import solve_linear, _LAST_ITERS
+
+    Acsr, b, x_splu = _get_system()
+
+    x = solve_linear(Acsr, b, solver="fused_bdiag", sym=False,
+                     device="cpu", tol=1e-10)
+
+    assert np.allclose(x, x_splu, rtol=1e-8, atol=1e-9), (
+        f"fused_bdiag: max |x - x_splu| = {np.abs(x - x_splu).max():.3e}"
+    )
+    it = _LAST_ITERS[0]
+    assert it is not None and it > 0, (
+        f"fused_bdiag: _LAST_ITERS={it!r}, expected > 0")
+
+
+def test_fused_bdiag_result_carries_iterations():
+    """return_result=True must give LinearSolveResult with iterations > 0."""
+    from diffsim.solvers.linsolve import solve_linear
+    from diffsim.solvers.result import LinearSolveResult
+
+    Acsr, b, x_splu = _get_system()
+
+    result = solve_linear(Acsr, b, solver="fused_bdiag", sym=False,
+                          device="cpu", tol=1e-10, return_result=True)
+
+    assert isinstance(result, LinearSolveResult), type(result)
+    assert result.converged, "result.converged is False"
+    assert result.iterations is not None, "result.iterations is None"
+    assert result.iterations > 0, f"result.iterations={result.iterations}"
+    assert np.allclose(result.x, x_splu, rtol=1e-8, atol=1e-9), (
+        f"fused_bdiag: max |x - x_splu| = {np.abs(result.x - x_splu).max():.3e}"
+    )
+
+
+def test_fused_bdiag_vs_fgmres_bdiag_iterations():
+    """Report fused_bdiag vs fgmres_bdiag iteration counts on the level-4
+    saddle.  Both must solve correctly; we print counts for the W5a campaign
+    record (fused_bdiag=BiCGStab+bdiag, fgmres_bdiag=FGMRES+bdiag).
+    No iteration-count ordering enforced: the point is the measurement."""
+    from diffsim.solvers.linsolve import solve_linear
+
+    Acsr, b, x_splu = _get_system()
+
+    r_fused = solve_linear(Acsr, b, solver="fused_bdiag", sym=False,
+                           device="cpu", tol=1e-10, return_result=True)
+    r_fgmres = solve_linear(Acsr, b, solver="fgmres_bdiag", sym=False,
+                            device="cpu", tol=1e-10, return_result=True)
+
+    it_fused = r_fused.iterations
+    it_fgmres = r_fgmres.iterations
+    print(f"\n[W5a] fused_bdiag (BiCGStab) vs fgmres_bdiag (FGMRES) "
+          f"iterations on level-4 saddle: "
+          f"fused_bdiag={it_fused}  fgmres_bdiag={it_fgmres}")
+
+    assert np.allclose(r_fused.x, x_splu, rtol=1e-8, atol=1e-9), (
+        f"fused_bdiag: max |x - x_splu| = "
+        f"{np.abs(r_fused.x - x_splu).max():.3e}")
+    assert np.allclose(r_fgmres.x, x_splu, rtol=1e-8, atol=1e-9), (
+        f"fgmres_bdiag: max |x - x_splu| = "
+        f"{np.abs(r_fgmres.x - x_splu).max():.3e}")
