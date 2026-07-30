@@ -726,3 +726,52 @@ def test_ae_batch_default_bound(device):
     nb = asm._ae_batch_for(npair)
     assert nb * npair * 8 <= AE_BATCH_BYTES
     assert nb >= ne          # toy mesh: single batch, unchanged path
+
+
+def test_incremental_assembly_static_set_is_empty():
+    """T-B4 (T5) escape clause — HONEST static/dynamic split derivation.
+
+    An incremental fill_static()+fill_dynamic() only pays if a meaningful
+    fraction of CSR entries is velocity-INDEPENDENT (fillable once per
+    mesh/BDF-order).  Assemble the linearized rbVMS NS operator at two
+    DIFFERENT advecting fields with sigma/nu/dt/mesh FIXED; any entry that
+    changes is velocity-dependent (dynamic).
+
+    Finding: the tau_m(|a|)-weighted SUPG/PSPG/grad-div stabilization lands
+    in EVERY dof-block (u-u, u-p, p-u, p-p), and those tau-weighted terms
+    share CSR slots with the Galerkin mass/viscous/pressure/continuity
+    terms (atomic-add accumulation into shared slots).  So the static set is
+    EMPTY: 0% of the nonzero entries are velocity-independent.  Splitting is
+    therefore all-loss (fill_static fills nothing; fill_dynamic == the full
+    fill) and the T-B4 sub-item is honorably STOPPED.
+    """
+    tree = build_uniform(3, dim=3)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3), "cpu")
+    _ = gauss_points(mesh, dm.tables_by_p)
+    ndof = 4
+    sigma, nu = 1600.0, 6.25e-5    # corrected-unit truck regime
+
+    def _fields(seed):
+        rng = np.random.default_rng(seed)
+        aq, dq, fq = {}, {}, {}
+        for pv in dm.bins:
+            n = len(mesh.conn_of[pv]) * dm.tables_by_p[pv].N.shape[0]
+            aq[pv] = rng.standard_normal((n, 3))
+            dq[pv] = rng.standard_normal(n)
+            fq[pv] = np.zeros((n, 3))
+        return aq, dq, fq
+
+    A1, _ = assemble_linear_ns(dm, *_fields(1), nu, sigma=sigma)
+    A2, _ = assemble_linear_ns(dm, *_fields(2), nu, sigma=sigma)
+    A1, A2 = A1.tocsr(), A2.tocsr()
+    assert np.array_equal(A1.indptr, A2.indptr)
+    assert np.array_equal(A1.indices, A2.indices)
+    nz = (A1.data != 0) | (A2.data != 0)
+    static = (A1.data == A2.data) & nz
+    frac_static = static.sum() / max(1, nz.sum())
+    # The static set is empty (every entry carries a tau_m(|a|) contribution).
+    assert frac_static == 0.0, (
+        f"static fraction {frac_static:.4f} — if this becomes nonzero the "
+        f"T-B4 incremental-assembly split may be worth revisiting")
