@@ -205,3 +205,96 @@ The surrogate traction Cd is systematically large negative (O(1000s)) and non-ph
 - **blockch_dev:** Not attempted in T4 (requires wiring into run_truck, ~50 lines)
 - **ASM_PROFILE:** DIFFSIM_ASM_PROFILE=1 set but breakdown not captured in current logs
 - **Note on geometry:** `cover_*.stl` files exist in config dir but are not active (commented out in config); only 22 active bodies loaded
+
+---
+
+# T4b — Solver-Floor Diagnosis + Equilibration Fix + Unit-Mapping Correction
+
+**Date:** 2026-07-30  **Branch:** `truck-bringup`  **Hold job:** 11783474 (nova24-gh-1, GH200)
+
+## Diagnosis — diagonal-range hypothesis CONFIRMED (cluster/t4b_diag.py)
+
+Probe on the assembled 7.96M-DOF truck saddle at step 0 (Re=1000 ramp start, Cb_f=20):
+
+**|diag(A)| statistics (span = max/min):**
+
+| Subset | n | min | max | span | pct[0,1,50,99,100] |
+|--------|---|-----|-----|------|---------------------|
+| ALL | 7,962,772 | 1.167e-10 | 1.347e+00 | **1.15e10** | 1.17e-10, 4.67e-10, 1.40e-06, 1.00, 1.35 |
+| u | 5,972,079 | 1.143e-07 | 1.347e+00 | 1.18e07 | 1.14e-07, 8.50e-07, 1.40e-06, 1.00, 1.35 |
+| p | 1,990,693 | 1.167e-10 | 1.00 | 8.57e09 | 1.17e-10, 4.67e-10, 9.34e-10, 2.94e-05, 1.00 |
+
+**|diag| by node level** — the span is LEVEL-driven (finest surrogate band = smallest diagonals):
+
+| lvl | u med | p med |
+|-----|-------|-------|
+| 7 | 6.00e-05 | 2.94e-05 |
+| 10 | 5.64e-06 | 5.97e-08 |
+| 12 | 1.40e-06 | 9.34e-10 |
+
+The pressure diagonal spans ~5 orders across levels 7→12 (2.9e-5 → 9.3e-10); combined with
+the O(1) velocity/BC rows the FULL span is 1.15e10. This is the Cb_f=20 Nitsche penalty on the
+94,980 level-12 surrogate faces vs the level-7 bulk — the classic scalar-Jacobi floor mechanism.
+
+**relres-vs-iteration curve (current fgmres_bdiag, restart=60):** flat stall —
+
+| cycles | inner | relres |
+|--------|-------|--------|
+| 1 | 60 | 2.26e-04 |
+| 4 | 240 | 1.17e-04 |
+| 8 | 480 | 9.44e-05 |
+
+480 inner iterations only reach 9.44e-5, crawling asymptotically toward a floor — never
+converging to a useful tol. This matches T4's reported ~2-3e-4 floor. **Hypothesis confirmed.**
+
+## Fix 1 — symmetric diagonal equilibration (opt-in `saddle_equilibrate`)
+
+Solve (D^{-1/2} A D^{-1/2}) y = D^{-1/2} b, x = D^{-1/2} y with D = |diag(A)| (floored like the
+PSPG pressure floor). **Algebra:** after scaling, diag(A_hat) = D^{-1/2} diag(A) D^{-1/2} =
+sign(diag(A)) = ±1 on every non-floored row, so the bdiag apply on the scaled system is
+~identity — **equilibration REPLACES the Jacobi preconditioner** (the apply is built from the
+SCALED diagonal so the pressure floor stays exact on the few floored rows). The FGMRES outer
+measures the UNPRECONDITIONED residual ||b - Ax||; with a 10-order diagonal span that residual
+is dominated by the Nitsche-penalty rows and saturates. Equilibration changes the minimized
+metric to the balanced ||D^{-1/2}(b - Ax)||, which is what breaks the floor.
+
+Wired into `fgmres_bdiag` and `fused_bdiag` (`saddle_precond.make_equilibrated_solve`), default
+off = byte-identical. CPU parity vs splu (both solvers), default-off byte-identical, and
+unit-diagonal algebra tests in `tests/test_saddle_precond.py`.
+
+## Fix 2 — UNIT MAPPING (the #1 recurring bug class)
+
+The C++ prior art (`chenghauy-nshtsbm_shell` NSHTInputData.h: `Coe_diff = 1/Re` for mix_conv;
+VMSparams tauM uses dt in the mesh frame; MatVecCommon BC flags use physical [16,2,2] extents)
+computes on the PHYSICAL channel frame domain=[16,2,2], dt=0.01, ramp times in physical seconds.
+Our octree remaps to the unit cube via s = domain_scale = 1/16 (x_unit = s·x_phys). Under this
+pure spatial rescaling with U held at 1 (Re preserved: Re = U·L/nu):
+
+| Quantity | C++ (physical) | Unit-cube (correct) | T4 driver (WRONG) |
+|----------|----------------|---------------------|-------------------|
+| domain | [16,2,2] | [1, 1/8, 1/8] | [1,1/8,1/8] |
+| nu | 1/Re = 1e-3 | **s/Re = 6.25e-5** | 1/Re = 1e-3 |
+| dt | 0.01 | **s·0.01 = 6.25e-4** | 0.01 |
+| ramp times | [0,50,51] | **s·[.] = [0,3.125,3.1875]** | [0,50,51] |
+| effective Re | 1000 | 1000 | **62.5 (16× too viscous)** |
+| CFL at band-12 | — | 2.56 | 40.96 |
+
+The T4 driver used nu=1/Re and dt=0.01 directly on the UNIT geometry → **effective Re=62.5, not
+1000** (16× viscosity error), and CFL=41 at the truck band. Fixed: `make_nu_schedule(scale=
+cfg.domain_scale)` returns nu_unit=s/Re and interprets ramp times in unit time; the smoke passes
+dt_unit = dt_phys·scale. `scale=None` keeps the legacy mapping (back-compat).
+
+## Fix 3 — tolerance schedule (Baskar directive)
+
+`run_truck(linsolve_tol_schedule=...)`: t_unit → tol callable, loose (5e-4) during the Re ramp,
+tight (1e-6) post-ramp. Default None = fixed tol.
+
+## cd_surr arithmetic (item B)
+
+Both observables share ref_force = 0.5·U²·L_ref (L_ref = unit-cube frontal area = 1.71e-4), so
+the O(600×) gap between cd_surr and cd_react is NOT a ref_force difference — it is a genuine
+difference in the two RAW force functionals. cd_react is the variational reaction on a
+truck-enclosing indicator (exact momentum-flux + SBM-reaction identity, physically-correct O(1)
+drag). cd_surr integrates `w·(p·n − nu·(∇u^T·n))` over the 94,980 surrogate faces with the
+`geo.corr` Surrogate2True area correction. The smoke prints F_surr_raw, F_react_raw and the
+shared ref_force per step for the quantified check (see below).
