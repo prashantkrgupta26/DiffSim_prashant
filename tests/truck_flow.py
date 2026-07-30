@@ -457,6 +457,67 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         w_rxn[dof_ux] = 1.0
         n_rxn_nodes += 1
 
+    # ---- device-resident CSR handoff setup (opt-in: assembly="device") ------
+    # P1 (T5): mirror run_flow_past_3d's device path.  The host march does a
+    # per-step (A + Af).tolil() row-surgery then .tocsr() -> ~200 GB RSS at
+    # 8 M DOF (LIL of a 500 M-nnz matrix).  The device path builds A_vol on
+    # the GPU, atomically adds the geometry-cached SBM face system (Af_c) at
+    # fixed CSR slots, applies the static strong rows on device, and hands off
+    # a DeviceSaddleCSR (values stay resident) — NO host CSR, NO LIL surgery.
+    #
+    # BC surgery slots are STATIC (BC rows + pressure pin are fixed for the
+    # mesh), so set_strong_rows() precomputes the zero-span + unit-diag plan
+    # ONCE here (the W2c pattern the brief calls out) — per step is just a
+    # device kernel that re-applies the plan to the fresh fill.
+    _dev_asm = None
+    _af_slots_d = _af_vals_d = _bf_dofs_d = _bf_vals_d = None
+    _strong_rows = _Af_csr = _Af_csr_nnz = None
+    _w_rxn_dofs = _w_rxn_vals = None       # sparse reaction indicator (host)
+    if assembly == "device":
+        from diffsim.assembly.device_assembly import DeviceNSAssembler
+        from diffsim.errors import BackendError
+        import warp as wp
+
+        _dev_asm = DeviceNSAssembler(dm, ndof=ndof)   # symbolic pattern once
+
+        # SBM face system -> fixed device slots + values (geometry-cached).
+        _Af_csr = Af_c.tocsr()
+        _Af_csr_nnz = _Af_csr.nnz
+        _af_rows, _af_cols = _Af_csr.nonzero()
+        try:
+            _af_slots = _dev_asm.csr_slots(_af_rows, _af_cols)
+        except BackendError as _e:
+            raise ValueError(
+                f"assembly='device': SBM face system (Af_c) has entries "
+                f"absent from the device CSR pattern — the constraint-aware "
+                f"face entries exceed the element-pair graph on this mesh. "
+                f"Use assembly='host'. Original: {_e}") from _e
+        _af_slots_d = wp.array(_af_slots.astype(_dev_asm._idx_np),
+                               dtype=_dev_asm._idx_dtype, device=dm.device)
+        _af_vals_d = wp.array(np.ascontiguousarray(_Af_csr.data, np.float64),
+                              dtype=wp.float64, device=dm.device)
+        _bf_nz = np.nonzero(bf_c)[0]
+        _bf_dofs_d = wp.array(_bf_nz.astype(np.int32), dtype=wp.int32,
+                              device=dm.device)
+        _bf_vals_d = wp.array(np.ascontiguousarray(bf_c[_bf_nz], np.float64),
+                              dtype=wp.float64, device=dm.device)
+
+        # Static strong rows = BC rows + pressure pin (fixed for the mesh).
+        # np.unique sorts -> canonical order for the per-step strong_b_vals.
+        _strong_rows = np.unique(np.concatenate(
+            [np.asarray(bc_rows, np.int64), np.array([int(p_pin)], np.int64)]))
+        _dev_asm.set_strong_rows(_strong_rows)     # precompute surgery slots
+
+        # Reaction arbiter on device: F_raw = w^T(A_vol x - b_vol).  The device
+        # fill gives A_full = A_vol + Af + surgery.  w is orthogonal to surgery
+        # rows, so on its (non-surgery) rows A_full = A_vol + Af and b = b_vol +
+        # bf, giving F_raw = w^T(A_full x) - w^T(Af x) - w^T b + w^T bf.  Store w
+        # as a sparse (dofs, vals) pair for cheap host dots against the pulled
+        # A_full x and the host Af_c @ x / bf_c.
+        _w_nz = np.nonzero(w_rxn)[0]
+        _w_rxn_dofs = _w_nz.astype(np.int64)
+        _w_rxn_vals = w_rxn[_w_nz]
+
     # ---- viz hook setup (opt-in; None = no-op, byte-identical march) --------
     _viz_hook = None
     if viz_interval is not None and viz_dir is not None:
@@ -517,30 +578,95 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                 dm, fx["sf"], fx["geo"], noslip, nu_step, ndof, alpha=alpha)
             Af_c = (T_vec.T @ Af_raw @ T_vec).tocsr()
             bf_c = np.asarray(T_vec.T @ bf_raw)
+            if _dev_asm is not None:
+                # refresh geometry-cached device SBM values/rhs (pattern fixed)
+                _Af_csr = Af_c.tocsr()
+                assert _Af_csr.nnz == _Af_csr_nnz, (
+                    f"Af_c sparsity changed under nu ramp: {_Af_csr.nnz} vs "
+                    f"{_Af_csr_nnz}")
+                _af_vals_d = wp.array(
+                    np.ascontiguousarray(_Af_csr.data, np.float64),
+                    dtype=wp.float64, device=dm.device)
+                _bf_nz = np.nonzero(bf_c)[0]
+                _bf_dofs_d = wp.array(_bf_nz.astype(np.int32),
+                                      dtype=wp.int32, device=dm.device)
+                _bf_vals_d = wp.array(
+                    np.ascontiguousarray(bf_c[_bf_nz], np.float64),
+                    dtype=wp.float64, device=dm.device)
 
-        A, b = assemble_linear_ns(dm, aq, dq, fq_raw, nu_step, sigma=sigma)
-        _A_vol = A.tocsr()          # pre-SBM, pre-surgery (reaction arbiter)
-        _b_vol = b.copy()
-        A = (A + Af_c).tolil()
-        b = b + bf_c
-        for r, v in zip(bc_rows, bc_vals):
-            A.rows[r] = [int(r)]; A.data[r] = [1.0]; b[r] = v
-        A.rows[p_pin] = [p_pin]; A.data[p_pin] = [1.0]; b[p_pin] = 0.0
+        _tol = (float(linsolve_tol_schedule(t_new))
+                if linsolve_tol_schedule is not None else linsolve_tol)
 
-        Acsr = A.tocsr()
-        if mono_solver == "splu":
-            x_cur = splu(Acsr.tocsc()).solve(b)
+        if assembly == "device":
+            # ---- Device-resident CSR handoff path (P1) ----------------------
+            # A_vol on device + atomic-add Af_c at fixed slots + static strong
+            # rows.  SADDLE_DEVICE_CSR=1 keeps the ~19 GB values resident
+            # (assemble_handoff); the fgmres_bdiag / fused_bdiag saddle paths
+            # in solve_linear consume vals_d directly.  Read the env live so
+            # parity harnesses can toggle it (default byte-identical to host).
+            _val_of = {int(r): float(v) for r, v in zip(bc_rows, bc_vals)}
+            _val_of[int(p_pin)] = 0.0
+            _sb = np.array([_val_of[int(r)] for r in _strong_rows])
+            _dev_csr = os.environ.get(
+                "SADDLE_DEVICE_CSR", "0").strip() not in ("", "0")
+            _asm_call = (_dev_asm.assemble_handoff if _dev_csr
+                         else _dev_asm.assemble)
+            Acsr, b = _asm_call(
+                aq, dq, fq_raw, nu_step, sigma,
+                strong_b_vals=_sb,
+                extra_matrix=(_af_slots_d, _af_vals_d),
+                extra_rhs=(_bf_dofs_d, _bf_vals_d))
+            if mono_solver == "splu":
+                x_cur = splu(Acsr.tocsc()).solve(b)
+            else:
+                _LAST_ITERS[0] = None
+                _slv_cache = (_pcd_cache if mono_solver in
+                              ("fgmres_pcd", "fgmres_bdiag", "fused_bdiag")
+                              else None)
+                x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
+                                     tol=_tol, device=device,
+                                     cache=_slv_cache, cache_key="truck")
+
+            # Reaction arbiter (device): F_raw = w^T(A_full x) - w^T(Af x)
+            #                                    - w^T b + w^T bf
+            _op = Acsr.device_operator() if hasattr(Acsr, "device_operator") \
+                else _dev_asm.device_operator()
+            _x_d = wp.array(np.ascontiguousarray(x_cur, np.float64),
+                            dtype=wp.float64, device=dm.device)
+            _Ax_d = wp.zeros(_dev_asm.Nfull, dtype=wp.float64,
+                             device=dm.device)
+            _op.matvec(_x_d, _Ax_d)
+            _Ax = _Ax_d.numpy()
+            _wAx = float(_w_rxn_vals @ _Ax[_w_rxn_dofs])
+            _wAfx = float(_w_rxn_vals @ (Af_c @ x_cur)[_w_rxn_dofs])
+            _wb = float(_w_rxn_vals @ b[_w_rxn_dofs])
+            _wbf = float(_w_rxn_vals @ bf_c[_w_rxn_dofs])
+            F_raw = _wAx - _wAfx - _wb + _wbf
         else:
-            _LAST_ITERS[0] = None
-            _slv_cache = (_pcd_cache if mono_solver in
-                          ("fgmres_pcd", "fgmres_bdiag", "fused_bdiag") else None)
-            # T4b: per-step tolerance schedule (loose in ramp, tight after).
-            _tol = (float(linsolve_tol_schedule(t_new))
-                    if linsolve_tol_schedule is not None else linsolve_tol)
-            x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
-                                 tol=_tol,
-                                 device=device, cache=_slv_cache,
-                                 cache_key="truck")
+            # ---- Host assembly path (default; bit-for-bit unchanged) --------
+            A, b = assemble_linear_ns(dm, aq, dq, fq_raw, nu_step, sigma=sigma)
+            _A_vol = A.tocsr()      # pre-SBM, pre-surgery (reaction arbiter)
+            _b_vol = b.copy()
+            A = (A + Af_c).tolil()
+            b = b + bf_c
+            for r, v in zip(bc_rows, bc_vals):
+                A.rows[r] = [int(r)]; A.data[r] = [1.0]; b[r] = v
+            A.rows[p_pin] = [p_pin]; A.data[p_pin] = [1.0]; b[p_pin] = 0.0
+
+            Acsr = A.tocsr()
+            if mono_solver == "splu":
+                x_cur = splu(Acsr.tocsc()).solve(b)
+            else:
+                _LAST_ITERS[0] = None
+                _slv_cache = (_pcd_cache if mono_solver in
+                              ("fgmres_pcd", "fgmres_bdiag", "fused_bdiag")
+                              else None)
+                x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
+                                     tol=_tol, device=device,
+                                     cache=_slv_cache, cache_key="truck")
+            # consistent reaction (x-drag): F_raw = w^T (A_vol x - b_vol)
+            F_raw = (float(np.asarray(_A_vol.T @ w_rxn) @ x_cur)
+                     - float(w_rxn @ _b_vol))
 
         u_new = x_cur.reshape(nfree, ndof)[:, :dim]
         x_all = np.asarray(T_vec @ x_cur)
@@ -551,8 +677,6 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         cl_y_surr[step] = Fs[1] / ref_force
         cl_z_surr[step] = Fs[2] / ref_force
 
-        # consistent reaction (x-drag): F_raw = w^T (A_vol x - b_vol)
-        F_raw = float(np.asarray(_A_vol.T @ w_rxn) @ x_cur) - float(w_rxn @ _b_vol)
         cd[step] = -F_raw / ref_force
         # reuse surrogate transverse for cl (reaction indicator is x-only)
         cl_y[step] = cl_y_surr[step]

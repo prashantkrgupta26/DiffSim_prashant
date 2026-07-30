@@ -154,6 +154,70 @@ def test_nu_schedule_re_ramp():
 
 
 # ---------------------------------------------------------------------------
+# Group 2b: device-resident CSR handoff parity (P1, T5)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("saddle_device_csr", ["0", "1"])
+def test_truck_device_assembly_parity(saddle_device_csr, monkeypatch):
+    """assembly='device' reproduces the host march's forces trajectory-tight,
+    both with SADDLE_DEVICE_CSR off (host CSR pull) and on (device-resident
+    handoff).  Gates the P1 device path + the device reaction arbiter
+    (w^T(A_full x) - w^T(Af x) - w^T b + w^T bf) against the host
+    w^T(A_vol x - b_vol).  splu solver -> the linear solve is deterministic;
+    the only host/device delta is the atomic-add scatter order (~1e-12)."""
+    from truck_flow import run_truck
+    monkeypatch.setenv("SADDLE_DEVICE_CSR", saddle_device_csr)
+    cfg = load_truck_config(_CFG_PATH)
+    merged = _tiny_tire_mesh(cfg)
+    common = dict(nsteps=3, base_level=5, truck_band_to=6, band_cells=2,
+                  merged=merged, region_refine=False, nu=1.0 / 50.0, dt=0.02,
+                  mono_solver="splu", device="cpu", verbose=False)
+    res_h = run_truck(cfg, assembly="host", **common)
+    res_d = run_truck(cfg, assembly="device", **common)
+    for k in ("cd", "cd_surr"):
+        assert np.all(np.isfinite(res_d[k]))
+        assert np.allclose(res_h[k], res_d[k], rtol=0, atol=1e-8), (
+            f"{k}: host {res_h[k]} vs device {res_d[k]}")
+    # reaction sign/magnitude preserved (the physics observable)
+    assert res_d["cd"][-1] > 0.0
+
+
+def test_truck_warm_start_reduces_iters(monkeypatch):
+    """P2 (T5): saddle_x0='extrap' warm-start flows through the truck march and
+    reduces the summed inner-iteration count vs a cold start (x0=0).  Gates the
+    knob end-to-end on the device CSR path (fgmres_bdiag)."""
+    from truck_flow import run_truck
+    from diffsim.solvers import linsolve
+    monkeypatch.setenv("SADDLE_DEVICE_CSR", "1")
+    cfg = load_truck_config(_CFG_PATH)
+    merged = _tiny_tire_mesh(cfg)
+
+    def _run(x0):
+        iters = []
+        orig = linsolve.solve_linear
+
+        def _wrap(*a, **k):
+            out = orig(*a, **k)
+            if linsolve._LAST_ITERS[0] is not None:
+                iters.append(int(linsolve._LAST_ITERS[0]))
+            return out
+        monkeypatch.setattr("truck_flow.solve_linear", _wrap)
+        run_truck(cfg, nsteps=5, base_level=5, truck_band_to=6, band_cells=2,
+                  merged=merged, region_refine=False, nu=1.0 / 50.0, dt=0.02,
+                  mono_solver="fgmres_bdiag", saddle_x0=x0, device="cpu",
+                  assembly="device", linsolve_tol=1e-7, verbose=False)
+        monkeypatch.setattr("truck_flow.solve_linear", orig)
+        return iters
+
+    warm = _run("extrap")
+    cold = _run(None)
+    # warm-start only affects steps >= 2 (first two are cold by construction);
+    # over the whole march the summed iterations must not exceed cold and
+    # should be strictly fewer once extrapolation kicks in.
+    assert sum(warm) < sum(cold), f"warm {warm} vs cold {cold}"
+
+
+# ---------------------------------------------------------------------------
 # Group 3: BC masks — dyadic planes nonempty and pairwise disjoint (where they
 # must be)
 # ---------------------------------------------------------------------------
