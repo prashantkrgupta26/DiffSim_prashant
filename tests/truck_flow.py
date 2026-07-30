@@ -654,10 +654,18 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               f"Ap={pcd_ap_inner}, meta {time.time()-_t_fb:.1f}s)", flush=True)
 
     def _iter_solve(Acsr, b, _tol, sigma, nu_step, step):
-        """Primary iterative solve with optional one-shot PCD re-solve."""
+        """Primary iterative solve with optional one-shot PCD re-solve.
+
+        The fallback solve runs OUTSIDE the except block: solving inside it
+        keeps the caught exception's traceback alive, which pins the failed
+        primary solve's entire Krylov workspace (~7.6 GB at restart=120 on
+        the 7.96M truck) through the fallback — the measured cause of the
+        fallback-time VRAM OOM.  gc.collect() then actually releases it
+        before the PCD allocations."""
         _slv_cache = (_pcd_cache if mono_solver in
                       ("fgmres_pcd", "fgmres_bdiag", "fused_bdiag")
                       else None)
+        _fb_msg = None
         try:
             return solve_linear(Acsr, b, solver=mono_solver, sym=False,
                                 tol=_tol, device=device,
@@ -665,19 +673,25 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         except Exception as e:
             if _fb_meta is None or type(e).__name__ != "ConvergenceError":
                 raise
-            print(f"[truck] step {step}: {mono_solver} exhausted ({e}) -> "
-                  f"fgmres_pcd fallback", flush=True)
-            _fb_meta["sigma"] = float(sigma)
-            _fb_meta["nu"] = float(nu_step)
-            _t0 = time.time()
-            A_host = Acsr if sp.issparse(Acsr) else Acsr.tocsr()
-            x = solve_linear(A_host, b, solver="fgmres_pcd", sym=False,
-                             tol=_tol, device=device,
-                             cache=_pcd_cache, cache_key="truck")
-            print(f"[truck] step {step}: PCD fallback CONVERGED "
-                  f"(iters={_LAST_ITERS[0]}, {time.time()-_t0:.1f}s)",
-                  flush=True)
-            return x
+            _fb_msg = str(e)
+        # ---- fallback path (traceback released, workspace reclaimable) ----
+        import gc
+        gc.collect()
+        print(f"[truck] step {step}: {mono_solver} exhausted ({_fb_msg}) -> "
+              f"fgmres_pcd fallback", flush=True)
+        _fb_meta["sigma"] = float(sigma)
+        _fb_meta["nu"] = float(nu_step)
+        _t0 = time.time()
+        # Pass Acsr as-is: the fgmres_pcd branch reuses a DeviceSaddleCSR's
+        # resident SpMV for the outer matvec (no 19 GB duplicate upload) and
+        # pulls host values only for the preconditioner block extraction.
+        x = solve_linear(Acsr, b, solver="fgmres_pcd", sym=False,
+                         tol=_tol, device=device,
+                         cache=_pcd_cache, cache_key="truck")
+        print(f"[truck] step {step}: PCD fallback CONVERGED "
+              f"(iters={_LAST_ITERS[0]}, {time.time()-_t0:.1f}s)",
+              flush=True)
+        return x
 
     t_cur = 0.0
     dt_prev_step = None

@@ -1745,7 +1745,18 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                 "it once per mesh via saddle_precond.build_pcd_meta(dm, nu, "
                 "sigma) and pass cache=/cache_key=")
 
-        op = CSROperator(A, device)
+        # Truck-fallback memory fix: when A is a DeviceSaddleCSR (device-
+        # resident handoff), reuse its resident SpMV for the outer matvec
+        # instead of uploading a SECOND full device CSR (the ~19 GB duplicate
+        # that OOMed the truck fallback at 77 GB committed).  The
+        # preconditioner blocks (F/G/Ap/Mp extraction) still need one host
+        # pull — only F is re-uploaded to device (~half the saddle nnz).
+        if hasattr(A, "device_operator"):
+            op = A.device_operator()          # resident CSR, no re-upload
+            A_pc = A.tocsr()                  # host pull for block extraction
+        else:
+            op = CSROperator(A, device)
+            A_pc = A
         # T1: per-block inner-solve telemetry — create the accumulator dict
         # and pass it to make_pcd_apply; after the solve, publish it to the
         # module sentinel so return_result=True can copy it to inner_stats.
@@ -1754,7 +1765,7 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                   "cap_hits": 0, "max_exit_relres": 0.0}
             for blk in ("F", "Ap", "Mp")
         }
-        apply_dev = make_pcd_apply(A, meta, device, stats=_inner_stats)
+        apply_dev = make_pcd_apply(A_pc, meta, device, stats=_inner_stats)
         N = A.shape[0]
 
         b_dev = wp.array(np.ascontiguousarray(b, np.float64),
