@@ -221,6 +221,11 @@ print(f"[T5] tau_m_scale={TAU_M_SCALE} (config {cfg.tau_m_scale})", flush=True)
 CARVE_LAM = float(os.environ.get("CARVE_LAM", "1.0"))
 # SLOPE_NG: inlet profile override — "" = config (0.25 sloped); "0" = UNIFORM
 # inlet (the paper 4.8 BC).
+MARCH_CKPT = int(os.environ.get("MARCH_CKPT", "0") or 0)
+RESUME = os.environ.get("RESUME", "0").strip() not in ("", "0")
+if MARCH_CKPT > 0:
+    print(f"[T5] march checkpoints every {MARCH_CKPT} steps"
+          + (" (RESUME requested)" if RESUME else ""), flush=True)
 GROUND_LVL = int(os.environ.get("GROUND_LVL", "0") or 0)
 GROUND_BAND = float(os.environ.get("GROUND_BAND", "0.0156"))
 if GROUND_LVL > 0:
@@ -330,6 +335,9 @@ res = run_truck(
     slope_near_ground=SLOPE_NG,
     ground_refine_to=(GROUND_LVL if GROUND_LVL > 0 else None),
     ground_band=GROUND_BAND,
+    checkpoint_interval=(MARCH_CKPT if MARCH_CKPT > 0 else None),
+    checkpoint_dir=(VIZ_DIR if MARCH_CKPT > 0 else None),
+    resume=RESUME,
 )
 t_total = time.time() - t_run
 

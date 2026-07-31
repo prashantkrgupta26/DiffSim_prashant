@@ -449,7 +449,9 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               sbm_start_step=None, tau_m_scale=1.0, carve_lam=1.0,
               nonlin_iters=1, nonlin_tol=1e-3,
               slope_near_ground=None,
-              ground_refine_to=None, ground_band=0.0156):
+              ground_refine_to=None, ground_band=0.0156,
+              checkpoint_interval=None, checkpoint_dir=None,
+              resume=False):
     """Run the truck case: transient BDF2 monolithic march.
 
     Returns a history dict with keys:
@@ -870,7 +872,37 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
 
     t_cur = 0.0
     dt_prev_step = None
-    for step in range(nsteps):
+    _step0 = 0
+    _ckpt_dir = None
+    if checkpoint_dir is not None:
+        import pathlib as _pl
+        _ckpt_dir = _pl.Path(checkpoint_dir)
+        _ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if resume and _ckpt_dir is not None:
+        _cands = sorted(_ckpt_dir.glob("march_ckpt_*.npz"),
+                        key=lambda q: q.stat().st_mtime)
+        if _cands:
+            _ck = np.load(_cands[-1])
+            _step0 = int(_ck["step"]) + 1
+            t_cur = float(_ck["t_cur"])
+            dt_prev_step = (float(_ck["dt_prev"])
+                            if np.isfinite(_ck["dt_prev"]) else None)
+            x_cur = _ck["x_cur"].copy()
+            u_pre1 = _ck["u_pre1"].copy()
+            u_pre2 = _ck["u_pre2"].copy()
+            _n0 = min(_step0, nsteps)
+            cd[:_n0] = _ck["cd"][:_n0]; cd_surr[:_n0] = _ck["cd_surr"][:_n0]
+            cl_y[:_n0] = _ck["cl_y"][:_n0]; cl_z[:_n0] = _ck["cl_z"][:_n0]
+            cl_y_surr[:_n0] = _ck["cl_y_surr"][:_n0]
+            cl_z_surr[:_n0] = _ck["cl_z_surr"][:_n0]
+            # seed the warm-start cache so the first resumed solve is warm
+            _pcd_cache[("bdiag_x_prev", "truck")] = x_cur.copy()
+            print(f"[truck] RESUME from {_cands[-1].name}: step {_step0}, "
+                  f"t={t_cur:.6f}", flush=True)
+        else:
+            print("[truck] resume requested but no checkpoint found — "
+                  "starting from step 0", flush=True)
+    for step in range(_step0, nsteps):
         dt_step = (float(dt_schedule(step)) if dt_schedule is not None
                    else dt)
         order = 1 if step == 0 else 2
@@ -1075,6 +1107,20 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         u_pre1 = u_new.copy()
         t_cur = t_new
         dt_prev_step = dt_step
+
+        if (_ckpt_dir is not None and checkpoint_interval
+                and (step + 1) % int(checkpoint_interval) == 0):
+            _slot = (step // int(checkpoint_interval)) % 2
+            _tmp = _ckpt_dir / f".march_ckpt_{_slot}.tmp.npz"
+            np.savez(_tmp, step=step, t_cur=t_cur,
+                     dt_prev=(dt_prev_step if dt_prev_step is not None
+                              else np.nan),
+                     x_cur=x_cur, u_pre1=u_pre1, u_pre2=u_pre2,
+                     cd=cd, cd_surr=cd_surr, cl_y=cl_y, cl_z=cl_z,
+                     cl_y_surr=cl_y_surr, cl_z_surr=cl_z_surr)
+            _tmp.rename(_ckpt_dir / f"march_ckpt_{_slot}.npz")
+            print(f"[truck] checkpoint @ step {step} -> "
+                  f"march_ckpt_{_slot}.npz", flush=True)
 
         if verbose:
             print(f"[truck] step {step:3d}  Cd_react={cd[step]:+.4f}  "
