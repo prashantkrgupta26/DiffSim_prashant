@@ -245,6 +245,10 @@ RESUME = os.environ.get("RESUME", "0").strip() not in ("", "0")
 if MARCH_CKPT > 0:
     print(f"[T5] march checkpoints every {MARCH_CKPT} steps"
           + (" (RESUME requested)" if RESUME else ""), flush=True)
+BACKFLOW = os.environ.get("BACKFLOW_STAB", "0").strip() not in ("", "0")
+if BACKFLOW:
+    print("[T5] outlet backflow stabilization ON (C++ BACKFLOW_STAB, lumped)",
+          flush=True)
 WALLS_LVL = int(os.environ.get("WALLS_LVL", "0") or 0)
 if WALLS_LVL > 0:
     print(f"[T5] all-walls refine: lvl {WALLS_LVL} (C++ refine_walls in full)",
@@ -360,6 +364,7 @@ res = run_truck(
     slope_near_ground=SLOPE_NG,
     ground_refine_to=(GROUND_LVL if GROUND_LVL > 0 else None),
     walls_refine_to=(WALLS_LVL if WALLS_LVL > 0 else None),
+    backflow_stab=BACKFLOW,
     ground_band=GROUND_BAND,
     checkpoint_interval=(MARCH_CKPT if MARCH_CKPT > 0 else None),
     checkpoint_dir=(VIZ_DIR if MARCH_CKPT > 0 else None),

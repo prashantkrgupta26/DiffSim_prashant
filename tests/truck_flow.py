@@ -601,6 +601,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               slope_near_ground=None,
               ground_refine_to=None, ground_band=0.0156,
               walls_refine_to=None, carve_delta=None,
+              backflow_stab=False,
               checkpoint_interval=None, checkpoint_dir=None,
               resume=False):
     """Run the truck case: transient BDF2 monolithic march.
@@ -858,6 +859,38 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         w_rxn[dof_ux] = 1.0
         n_rxn_nodes += 1
 
+    # ---- outlet backflow stabilization (C++ BACKFLOW_STAB, lumped) ----------
+    # NSEquation.h:2589: Ae += -0.5 N_a min(0, u.n) N_b on outlet faces,
+    # Picard-linearized about the current state.  Lumped first cut: the
+    # face mass matrix row-sum -> nodal area A_i; per step add
+    # -0.5*min(0, a_x)*A_i to the three velocity diagonals of outlet nodes
+    # (outlet normal = +x, so u.n = u_x).  Off by default = byte-identical.
+    _bf_rows = _bf_area = None
+    if backflow_stab:
+        _coords_all = mesh.node_coords[cons.free_nodes]
+        _on_outlet = np.abs(_coords_all[:, 0] - 1.0) < 1e-12
+        _out_nodes = np.where(_on_outlet)[0]
+        # lumped nodal area from outlet cells (anchor_x + h == 1)
+        _tree = fx["tree"]
+        _anch = _tree.anchors() * (2.0 ** -21)  # unit coords (lmax=21 for 3D)
+        # robust: use per-node local h from nearest outlet cell size — approximate
+        # with the finest wall cell area (walls-refined): h_loc via node spacing
+        _area = np.zeros(len(_out_nodes))
+        if len(_out_nodes):
+            # per-node area ~ (median neighbor spacing)^2: use the y/z grid of
+            # outlet nodes to estimate local spacing per node (kd-lite: sort)
+            _yz = _coords_all[_out_nodes][:, 1:]
+            from scipy.spatial import cKDTree as _KD
+            _kd = _KD(_yz)
+            _dd, _ = _kd.query(_yz, k=2)
+            _hloc = _dd[:, 1]
+            _area = _hloc ** 2
+        _bf_rows = (_out_nodes[:, None] * ndof
+                    + np.arange(dim)[None, :]).ravel().astype(np.int64)
+        _bf_area = np.repeat(_area, dim)
+        print(f"[truck] backflow stabilization armed: {len(_out_nodes)} "
+              f"outlet nodes", flush=True)
+
     # ---- device-resident CSR handoff setup (opt-in: assembly="device") ------
     # P1 (T5): mirror run_flow_past_3d's device path.  The host march does a
     # per-step (A + Af).tolil() row-surgery then .tocsr() -> ~200 GB RSS at
@@ -902,6 +935,17 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                               device=dm.device)
         _bf_vals_d = wp.array(np.ascontiguousarray(bf_c[_bf_nz], np.float64),
                               dtype=wp.float64, device=dm.device)
+
+        # Backflow-stab diagonal slots (outlet velocity dofs), device path.
+        _bf_slots_d = _bf_comb_slots_d = None
+        if _bf_rows is not None:
+            _bf_slots = _dev_asm.csr_slots(_bf_rows, _bf_rows)
+            _bf_slots_d = wp.array(_bf_slots.astype(_dev_asm._idx_np),
+                                   dtype=_dev_asm._idx_dtype, device=dm.device)
+            _bf_comb_slots = np.concatenate([_af_slots, _bf_slots])
+            _bf_comb_slots_d = wp.array(
+                _bf_comb_slots.astype(_dev_asm._idx_np),
+                dtype=_dev_asm._idx_dtype, device=dm.device)
 
         # Static strong rows = BC rows + pressure pin (fixed for the mesh).
         # np.unique sorts -> canonical order for the per-step strong_b_vals.
@@ -1155,11 +1199,27 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                     "SADDLE_DEVICE_CSR", "0").strip() not in ("", "0")
                 _asm_call = (_dev_asm.assemble_handoff if _dev_csr
                              else _dev_asm.assemble)
+                # outlet backflow stabilization (Picard: u.n = u_x from
+                # the advection iterate at outlet nodes)
+                _extra_m = (_af_slots_d, _af_vals_d) if _sbm_on else None
+                if _bf_rows is not None:
+                    _ax = u_iter[(_bf_rows[::dim] // ndof), 0]
+                    _bfv = (np.repeat(-0.5 * np.minimum(0.0, _ax), dim)
+                            * _bf_area)
+                    if _sbm_on:
+                        _cv = np.concatenate([_Af_csr.data, _bfv])
+                        _extra_m = (_bf_comb_slots_d, wp.array(
+                            np.ascontiguousarray(_cv, np.float64),
+                            dtype=wp.float64, device=dm.device))
+                    else:
+                        _extra_m = (_bf_slots_d, wp.array(
+                            np.ascontiguousarray(_bfv, np.float64),
+                            dtype=wp.float64, device=dm.device))
                 Acsr, b = _asm_call(
                     aq, dq, fq_raw, nu_step, sigma,
                     sig2tau=_sig2tau, tau_scale=float(tau_m_scale),
                     strong_b_vals=_sb,
-                    extra_matrix=((_af_slots_d, _af_vals_d) if _sbm_on else None),
+                    extra_matrix=_extra_m,
                     extra_rhs=((_bf_dofs_d, _bf_vals_d) if _sbm_on else None))
                 if mono_solver == "splu":
                     x_cur = splu(Acsr.tocsc()).solve(b)
@@ -1194,6 +1254,12 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                                           tau_scale=float(tau_m_scale))
                 _A_vol = A.tocsr()      # pre-SBM, pre-surgery (reaction arbiter)
                 _b_vol = b.copy()
+                if _bf_rows is not None:
+                    _ax = u_iter[(_bf_rows[::dim] // ndof), 0]
+                    _bfv = (np.repeat(-0.5 * np.minimum(0.0, _ax), dim)
+                            * _bf_area)
+                    A = A + sp.csr_matrix((_bfv, (_bf_rows, _bf_rows)),
+                                          shape=A.shape)
                 if _sbm_on:
                     A = (A + Af_c).tolil()
                     b = b + bf_c
