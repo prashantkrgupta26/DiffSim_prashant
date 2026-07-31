@@ -212,6 +212,11 @@ print(f"[T5] tau_m_scale={TAU_M_SCALE} (config {cfg.tau_m_scale})", flush=True)
 # CARVE_LAM (paper-faithful carve): 0.0 removes intercepted cells (ThinShell
 # T~h / C++), eliminating the ground-contact sliver cells; 1.0 = legacy keep.
 CARVE_LAM = float(os.environ.get("CARVE_LAM", "1.0"))
+NONLIN_ITERS = int(os.environ.get("NONLIN_ITERS", "1"))
+NONLIN_TOL = float(os.environ.get("NONLIN_TOL", "1e-3"))
+if NONLIN_ITERS > 1:
+    print(f"[T5] nonlinear Picard sub-iterations: up to {NONLIN_ITERS} "
+          f"(tol {NONLIN_TOL}) -- C++ iterMaxBlock heritage", flush=True)
 print(f"[T5] carve_lam={CARVE_LAM}"
       + (" (paper-faithful: intercepted cells REMOVED)" if CARVE_LAM == 0.0
          else " (legacy: intercepted cells kept)"), flush=True)
@@ -244,6 +249,9 @@ def on_step(step, info):
     _um_s = (f" umax={_um:.3f}@({_ul[0]:.4f},{_ul[1]:.4f},{_ul[2]:.4f})"
              if _um is not None and _ul is not None else
              (f" umax={_um:.3f}" if _um is not None else ""))
+    _nl = info.get("nonlin")
+    if _nl is not None and NONLIN_ITERS > 1:
+        _um_s += " nl=" + str(_nl)
     print(f"[T5] step {step:4d} cd_react={cd:+.5f} cd_surr={cds:+.2f} "
           f"iters={iters} t={dt_step:.1f}s rss={_rss_peak[0]/1024/1024:.1f}G "
           f"smi={_smi_peak[0]}MiB{_um_s}", flush=True)
@@ -283,6 +291,8 @@ res = run_truck(
     sbm_start_step=(SBM_START_STEP if SBM_START_STEP > 0 else None),
     tau_m_scale=TAU_M_SCALE,
     carve_lam=CARVE_LAM,
+    nonlin_iters=NONLIN_ITERS,
+    nonlin_tol=NONLIN_TOL,
 )
 t_total = time.time() - t_run
 

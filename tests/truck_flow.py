@@ -353,7 +353,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               saddle_equilibrate=False, soft_start=None, dt_schedule=None,
               saddle_fallback=None, pcd_f_inner="amgx", pcd_ap_inner="amgx",
               tau_dt=None, accept_miss_until=None, u_cap=50.0,
-              sbm_start_step=None, tau_m_scale=1.0, carve_lam=1.0):
+              sbm_start_step=None, tau_m_scale=1.0, carve_lam=1.0,
+              nonlin_iters=1, nonlin_tol=1e-3):
     """Run the truck case: transient BDF2 monolithic march.
 
     Returns a history dict with keys:
@@ -783,7 +784,6 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                  else t_cur + dt_step)
         nu_step = float(nu_schedule(t_new)) if nu_schedule is not None else nu
 
-        aq, dq = _gp_field(dm, mesh, T, u_pre1, dim)
         if order == 1:
             fq_raw = {}
             for pv in dm.bins:
@@ -844,83 +844,100 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         else:
             bc_vals_step = bc_vals
 
-        if assembly == "device":
-            # ---- Device-resident CSR handoff path (P1) ----------------------
-            # A_vol on device + atomic-add Af_c at fixed slots + static strong
-            # rows.  SADDLE_DEVICE_CSR=1 keeps the ~19 GB values resident
-            # (assemble_handoff); the fgmres_bdiag / fused_bdiag saddle paths
-            # in solve_linear consume vals_d directly.  Read the env live so
-            # parity harnesses can toggle it (default byte-identical to host).
-            _val_of = {int(r): float(v) for r, v in zip(bc_rows, bc_vals_step)}
-            _val_of[int(p_pin)] = 0.0
-            # staged BC phase 1: truck surrogate-boundary rows -> 0.0 (the
-            # .get default); phase 2 uses the base row set (no truck rows).
-            _sb = np.array([_val_of.get(int(r), 0.0) for r in _strong_rows])
-            _dev_csr = os.environ.get(
-                "SADDLE_DEVICE_CSR", "0").strip() not in ("", "0")
-            _asm_call = (_dev_asm.assemble_handoff if _dev_csr
-                         else _dev_asm.assemble)
-            Acsr, b = _asm_call(
-                aq, dq, fq_raw, nu_step, sigma,
-                sig2tau=_sig2tau, tau_scale=float(tau_m_scale),
-                strong_b_vals=_sb,
-                extra_matrix=((_af_slots_d, _af_vals_d) if _sbm_on else None),
-                extra_rhs=((_bf_dofs_d, _bf_vals_d) if _sbm_on else None))
-            if mono_solver == "splu":
-                x_cur = splu(Acsr.tocsc()).solve(b)
-            else:
-                _LAST_ITERS[0] = None
-                x_cur = _iter_solve(Acsr, b, _tol, sigma, nu_step, step)
+        # C++ iterMaxBlock heritage: Picard sub-iterations — the
+        # advection field re-linearized about the current iterate.
+        u_iter = u_pre1
+        _nl_done = 1
+        for _nl in range(max(1, int(nonlin_iters))):
+            aq, dq = _gp_field(dm, mesh, T, u_iter, dim)
+            if assembly == "device":
+                # ---- Device-resident CSR handoff path (P1) ----------------------
+                # A_vol on device + atomic-add Af_c at fixed slots + static strong
+                # rows.  SADDLE_DEVICE_CSR=1 keeps the ~19 GB values resident
+                # (assemble_handoff); the fgmres_bdiag / fused_bdiag saddle paths
+                # in solve_linear consume vals_d directly.  Read the env live so
+                # parity harnesses can toggle it (default byte-identical to host).
+                _val_of = {int(r): float(v) for r, v in zip(bc_rows, bc_vals_step)}
+                _val_of[int(p_pin)] = 0.0
+                # staged BC phase 1: truck surrogate-boundary rows -> 0.0 (the
+                # .get default); phase 2 uses the base row set (no truck rows).
+                _sb = np.array([_val_of.get(int(r), 0.0) for r in _strong_rows])
+                _dev_csr = os.environ.get(
+                    "SADDLE_DEVICE_CSR", "0").strip() not in ("", "0")
+                _asm_call = (_dev_asm.assemble_handoff if _dev_csr
+                             else _dev_asm.assemble)
+                Acsr, b = _asm_call(
+                    aq, dq, fq_raw, nu_step, sigma,
+                    sig2tau=_sig2tau, tau_scale=float(tau_m_scale),
+                    strong_b_vals=_sb,
+                    extra_matrix=((_af_slots_d, _af_vals_d) if _sbm_on else None),
+                    extra_rhs=((_bf_dofs_d, _bf_vals_d) if _sbm_on else None))
+                if mono_solver == "splu":
+                    x_cur = splu(Acsr.tocsc()).solve(b)
+                else:
+                    _LAST_ITERS[0] = None
+                    x_cur = _iter_solve(Acsr, b, _tol, sigma, nu_step, step)
 
-            # Reaction arbiter (device): F_raw = w^T(A_full x) - w^T(Af x)
-            #                                    - w^T b + w^T bf
-            _op = Acsr.device_operator() if hasattr(Acsr, "device_operator") \
-                else _dev_asm.device_operator()
-            _x_d = wp.array(np.ascontiguousarray(x_cur, np.float64),
-                            dtype=wp.float64, device=dm.device)
-            _Ax_d = wp.zeros(_dev_asm.Nfull, dtype=wp.float64,
-                             device=dm.device)
-            _op.matvec(_x_d, _Ax_d)
-            _Ax = _Ax_d.numpy()
-            _wAx = float(_w_rxn_vals @ _Ax[_w_rxn_dofs])
-            _wb = float(_w_rxn_vals @ b[_w_rxn_dofs])
-            if _sbm_on:
-                _wAfx = float(_w_rxn_vals @ (Af_c @ x_cur)[_w_rxn_dofs])
-                _wbf = float(_w_rxn_vals @ bf_c[_w_rxn_dofs])
-                F_raw = _wAx - _wAfx - _wb + _wbf
+                # Reaction arbiter (device): F_raw = w^T(A_full x) - w^T(Af x)
+                #                                    - w^T b + w^T bf
+                _op = Acsr.device_operator() if hasattr(Acsr, "device_operator") \
+                    else _dev_asm.device_operator()
+                _x_d = wp.array(np.ascontiguousarray(x_cur, np.float64),
+                                dtype=wp.float64, device=dm.device)
+                _Ax_d = wp.zeros(_dev_asm.Nfull, dtype=wp.float64,
+                                 device=dm.device)
+                _op.matvec(_x_d, _Ax_d)
+                _Ax = _Ax_d.numpy()
+                _wAx = float(_w_rxn_vals @ _Ax[_w_rxn_dofs])
+                _wb = float(_w_rxn_vals @ b[_w_rxn_dofs])
+                if _sbm_on:
+                    _wAfx = float(_w_rxn_vals @ (Af_c @ x_cur)[_w_rxn_dofs])
+                    _wbf = float(_w_rxn_vals @ bf_c[_w_rxn_dofs])
+                    F_raw = _wAx - _wAfx - _wb + _wbf
+                else:
+                    # staged phase 1: no Af/bf in A_full; DIAGNOSTIC only (the
+                    # indicator overlaps the phase-1 truck surgery rows).
+                    F_raw = _wAx - _wb
             else:
-                # staged phase 1: no Af/bf in A_full; DIAGNOSTIC only (the
-                # indicator overlaps the phase-1 truck surgery rows).
-                F_raw = _wAx - _wb
-        else:
-            # ---- Host assembly path (default; bit-for-bit unchanged) --------
-            A, b = assemble_linear_ns(dm, aq, dq, fq_raw, nu_step, sigma=sigma,
-                                      sig2tau=_sig2tau,
-                                      tau_scale=float(tau_m_scale))
-            _A_vol = A.tocsr()      # pre-SBM, pre-surgery (reaction arbiter)
-            _b_vol = b.copy()
-            if _sbm_on:
-                A = (A + Af_c).tolil()
-                b = b + bf_c
-            else:
-                A = A.tolil()       # staged phase 1: no SBM face system
-            for r, v in zip(bc_rows, bc_vals_step):
-                A.rows[r] = [int(r)]; A.data[r] = [1.0]; b[r] = v
-            A.rows[p_pin] = [p_pin]; A.data[p_pin] = [1.0]; b[p_pin] = 0.0
-            if not _sbm_on:
-                # staged phase 1: strong no-slip on the carved-out boundary
-                for r in _truck_rows:
-                    A.rows[r] = [int(r)]; A.data[r] = [1.0]; b[r] = 0.0
+                # ---- Host assembly path (default; bit-for-bit unchanged) --------
+                A, b = assemble_linear_ns(dm, aq, dq, fq_raw, nu_step, sigma=sigma,
+                                          sig2tau=_sig2tau,
+                                          tau_scale=float(tau_m_scale))
+                _A_vol = A.tocsr()      # pre-SBM, pre-surgery (reaction arbiter)
+                _b_vol = b.copy()
+                if _sbm_on:
+                    A = (A + Af_c).tolil()
+                    b = b + bf_c
+                else:
+                    A = A.tolil()       # staged phase 1: no SBM face system
+                for r, v in zip(bc_rows, bc_vals_step):
+                    A.rows[r] = [int(r)]; A.data[r] = [1.0]; b[r] = v
+                A.rows[p_pin] = [p_pin]; A.data[p_pin] = [1.0]; b[p_pin] = 0.0
+                if not _sbm_on:
+                    # staged phase 1: strong no-slip on the carved-out boundary
+                    for r in _truck_rows:
+                        A.rows[r] = [int(r)]; A.data[r] = [1.0]; b[r] = 0.0
 
-            Acsr = A.tocsr()
-            if mono_solver == "splu":
-                x_cur = splu(Acsr.tocsc()).solve(b)
-            else:
-                _LAST_ITERS[0] = None
-                x_cur = _iter_solve(Acsr, b, _tol, sigma, nu_step, step)
-            # consistent reaction (x-drag): F_raw = w^T (A_vol x - b_vol)
-            F_raw = (float(np.asarray(_A_vol.T @ w_rxn) @ x_cur)
-                     - float(w_rxn @ _b_vol))
+                Acsr = A.tocsr()
+                if mono_solver == "splu":
+                    x_cur = splu(Acsr.tocsc()).solve(b)
+                else:
+                    _LAST_ITERS[0] = None
+                    x_cur = _iter_solve(Acsr, b, _tol, sigma, nu_step, step)
+                # consistent reaction (x-drag): F_raw = w^T (A_vol x - b_vol)
+                F_raw = (float(np.asarray(_A_vol.T @ w_rxn) @ x_cur)
+                         - float(w_rxn @ _b_vol))
+
+
+            _u_it = x_cur.reshape(nfree, ndof)[:, :dim]
+            _nl_done = _nl + 1
+            if int(nonlin_iters) <= 1:
+                break
+            _dn = float(np.linalg.norm(_u_it - u_iter))
+            _un = max(float(np.linalg.norm(_u_it)), 1e-300)
+            u_iter = _u_it
+            if _dn / _un < float(nonlin_tol):
+                break
 
         u_new = x_cur.reshape(nfree, ndof)[:, :dim]
         x_all = np.asarray(T_vec @ x_cur)
@@ -975,6 +992,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                                F_react_raw=float(-F_raw),
                                ref_force=float(ref_force),
                                umax=_umax, umax_loc=_uloc,
+                               nonlin=_nl_done,
                                x=x_cur))
         if _viz_hook is not None:
             _viz_hook(step, dict(x=x_cur))
