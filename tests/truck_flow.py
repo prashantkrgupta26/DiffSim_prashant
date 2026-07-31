@@ -345,7 +345,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               saddle_restart=None,
               saddle_equilibrate=False, soft_start=None, dt_schedule=None,
               saddle_fallback=None, pcd_f_inner="amgx", pcd_ap_inner="amgx",
-              tau_dt=None):
+              tau_dt=None, accept_miss_until=None, blowup_cap=1e4):
     """Run the truck case: transient BDF2 monolithic march.
 
     Returns a history dict with keys:
@@ -439,6 +439,20 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                              dropped entirely.
           Approximates tau only; the discrete time derivative (sigma, BDF
           history) always uses the TRUE marching dt.
+      accept_miss_until : int or None
+          Baskar directive (T5): solver misses during the initial transient
+          are acceptable.  For steps < this value, a budget-exhausted primary
+          solve ACCEPTS the truncated iterate (logged "[saddle] ACCEPT-MISS"
+          with achieved relres) instead of raising / falling back; from this
+          step on, strict semantics (raise -> optional PCD fallback) return.
+          Guarded by ``blowup_cap`` so drift cannot masquerade as progress.
+          None (default) = strict everywhere, byte-identical.
+      blowup_cap : float
+          March blow-up sentinel: after every step, |cd_react| must be finite
+          and below this cap (and the solution finite), else RuntimeError with
+          step context.  Physical startup spikes reached |cd|~470 only during
+          a diagnosed instability; legitimate transients stayed under ~210.
+          Default 1e4.
     """
     dim = 3
     ndof = dim + 1
@@ -754,6 +768,12 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         _tol = (float(linsolve_tol_schedule(t_new))
                 if linsolve_tol_schedule is not None else linsolve_tol)
 
+        # Accept-miss window (Baskar T5): per-step flag on the bdiag meta.
+        if accept_miss_until is not None and mono_solver in (
+                "fgmres_bdiag", "fused_bdiag"):
+            _pcd_cache[("blocktri_meta", "truck")]["saddle_accept_miss"] = \
+                bool(step < int(accept_miss_until))
+
         # Soft-start: scale the inflow x-velocity strong-BC values this step.
         # bc_vals_step == bc_vals when soft_start is off (byte-identical).
         if _inflow_x_rows is not None:
@@ -839,6 +859,15 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         # reuse surrogate transverse for cl (reaction indicator is x-only)
         cl_y[step] = cl_y_surr[step]
         cl_z[step] = cl_z_surr[step]
+
+        # Blow-up sentinel (guards the accept-miss window; always active):
+        # drift/instability must fail LOUDLY, never masquerade as progress.
+        if not np.isfinite(cd[step]) or abs(cd[step]) > blowup_cap or \
+                not np.all(np.isfinite(u_new)):
+            raise RuntimeError(
+                f"[truck] MARCH BLOW-UP at step {step}: cd_react={cd[step]} "
+                f"(cap {blowup_cap}), u finite={bool(np.all(np.isfinite(u_new)))}"
+                f" — aborting (accept-miss window is not a license to drift)")
 
         u_pre2 = u_pre1.copy()
         u_pre1 = u_new.copy()

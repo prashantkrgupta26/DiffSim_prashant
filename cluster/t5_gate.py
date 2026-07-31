@@ -186,6 +186,15 @@ if TAU_DT is not None:
     print(f"[T5] TAU_DT={TAU_DT} (tau_m transient frozen; marching dt free)",
           flush=True)
 
+# ACCEPT-MISS window (Baskar directive): solver misses during the initial
+# transient are logged and accepted (truncated iterate marches on); strict
+# semantics return at this step.  Blow-up sentinel always active.
+ACCEPT_MISS_UNTIL = int(os.environ.get("ACCEPT_MISS_UNTIL", "0") or 0)
+BLOWUP_CAP = float(os.environ.get("BLOWUP_CAP", "1e4"))
+if ACCEPT_MISS_UNTIL > 0:
+    print(f"[T5] accept-miss window: steps < {ACCEPT_MISS_UNTIL} "
+          f"(blowup_cap={BLOWUP_CAP})", flush=True)
+
 from diffsim.solvers import linsolve
 _step_times = []
 _last_step_t = [time.time()]
@@ -243,6 +252,8 @@ res = run_truck(
     pcd_f_inner=PCD_F_INNER,
     pcd_ap_inner=PCD_AP_INNER,
     tau_dt=TAU_DT,
+    accept_miss_until=(ACCEPT_MISS_UNTIL if ACCEPT_MISS_UNTIL > 0 else None),
+    blowup_cap=BLOWUP_CAP,
 )
 t_total = time.time() - t_run
 

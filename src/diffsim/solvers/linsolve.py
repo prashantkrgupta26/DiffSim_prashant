@@ -46,6 +46,11 @@ _LAST_ITERS = [None]
 # None when the last solve was not fgmres_pcd or stats were not collected.
 _LAST_INNER_STATS = [None]
 
+# Accept-miss sentinel (Baskar T5 directive): when the fgmres_bdiag branch
+# accepts a truncated iterate under meta["saddle_accept_miss"], the achieved
+# relres lands here; None = last solve converged normally.
+_LAST_MISS = [None]
+
 
 def cudss_options():
     """DirectSolverOptions with multithreaded host planning
@@ -1716,10 +1721,25 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                 finfo["converged"] = True   # polish never gates
 
         if not finfo["converged"]:
-            raise ConvergenceError(
-                f"fgmres_bdiag: not converged after {finfo['inner']} inner "
-                f"iterations ({finfo['outer']} restarts); "
-                f"relres={finfo['relres']:.3e}")
+            # Baskar directive (T5): solve misses during the initial
+            # transient are acceptable — accept the truncated iterate, LOG
+            # the achieved relres, and march on (the caller's blow-up
+            # sentinel guards against drift masquerading as progress).
+            # Windowing is the caller's job: it sets/clears the meta flag
+            # per step.  Default (flag absent) = strict raise, byte-
+            # identical.
+            if meta.get("saddle_accept_miss"):
+                print(f"[saddle] ACCEPT-MISS: relres={finfo['relres']:.3e} "
+                      f"after {finfo['inner']} inner ({finfo['outer']} "
+                      f"restarts) vs tol={tol:.1e}", flush=True)
+                _LAST_MISS[0] = float(finfo["relres"])
+            else:
+                raise ConvergenceError(
+                    f"fgmres_bdiag: not converged after {finfo['inner']} inner "
+                    f"iterations ({finfo['outer']} restarts); "
+                    f"relres={finfo['relres']:.3e}")
+        else:
+            _LAST_MISS[0] = None
 
         # T4b: recover x = D^{-1/2} y from the scaled solution.
         if _equilibrate:
