@@ -103,18 +103,25 @@ nu_sched = make_nu_schedule(cfg, U_inf=1.0, L_ref=1.0, scale=scale)
 # schedule. Zero solver changes; pure nu(t) shaping.
 _re_start = float(os.environ.get("RE_START", "0") or 0)
 _re_ramp_steps = int(os.environ.get("RE_RAMP_STEPS", "250"))
+_re_target = float(os.environ.get("RE_TARGET", "0") or 0)
 if _re_start > 0:
     _cfg_sched = nu_sched
     _dtu = dt
     def nu_sched(t_unit, _s=_cfg_sched, _r0=_re_start,
-                 _n=_re_ramp_steps, _dt=_dtu, _scale=scale):
+                 _n=_re_ramp_steps, _dt=_dtu, _scale=scale,
+                 _tgt=_re_target):
         step = t_unit / _dt
-        nu_cfg = _s(t_unit)                      # config Re at this time
-        re_cfg = _scale / nu_cfg                 # invert: nu_unit = scale/Re
+        if _tgt > 0:
+            re_cfg = _tgt                        # compressed ramp target
+        else:
+            nu_cfg = _s(t_unit)                  # config Re at this time
+            re_cfg = _scale / nu_cfg             # invert: nu_unit = scale/Re
         frac = min(1.0, step / max(_n, 1))
         re_now = _r0 + frac * (re_cfg - _r0)
         return _scale / re_now
-    print(f"[T5] RE_START={_re_start} ramp over {_re_ramp_steps} steps -> config Re", flush=True)
+    print(f"[T5] RE_START={_re_start} ramp over {_re_ramp_steps} steps -> "
+          + (f"Re={_re_target}" if _re_target > 0 else "config Re"),
+          flush=True)
 print(f"[T5] nu_unit(0)={nu_sched(0.0):.3e} effRe={scale/nu_sched(0.0):.0f}",
       flush=True)
 
