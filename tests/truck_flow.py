@@ -218,7 +218,8 @@ def flood_fill_retain(ret):
 def build_truck_mesh(cfg, base_level, region_refine=True, truck_band_to=None,
                      band_cells=3, device="cpu", merged=None,
                      bodies=None, carve_lam=1.0,
-                     ground_refine_to=None, ground_band=0.0156):
+                     ground_refine_to=None, ground_band=0.0156,
+                     carve_delta=None):
     """Build the incomplete-octree mesh + volumetric surrogate for the truck.
 
     Returns a dict: dm, mesh, cons, sf, geo, merged, scale, n_excluded,
@@ -253,6 +254,28 @@ def build_truck_mesh(cfg, base_level, region_refine=True, truck_band_to=None,
 
     n_before = len(tree)
 
+    # 4a. distance-threshold carve (Baskar fragmentation finding): the cab
+    # interior and sub-resolution front details (mirrors, grille slits,
+    # cab-trailer gap ~1-3 cells at lvl 12) fragment the lam-carve into
+    # salt-and-pepper retained specks — the measured chaos nursery at the
+    # truck front.  carve_delta > 0 retains only cells whose CENTER is at
+    # least delta*h_cell OUTSIDE the surface: thin features and interior
+    # slits are absorbed into the solid (a one-sided morphological closing),
+    # the staircase smooths, and flood-fill sweeps what gets sealed.
+    if carve_delta is not None:
+        centers = tree.centers()
+        hcell = tree.h()
+        psi = merged.classify(centers)
+        keepm = psi > float(carve_delta) * hcell
+        from diffsim.octree.build import Octree as _Oc
+        ret = _Oc(tree.keys[keepm], tree.levels[keepm], dim=3,
+                  periodic=tree.periodic)
+        print(f"[truck] delta-carve: kept {int(keepm.sum())}/{len(tree)} "
+              f"(delta={carve_delta}h)", flush=True)
+        _frac = None
+    else:
+        ret = None
+
     # 4. truck carve (flow AROUND the solid: domain="outside").  carve_lam
     # picks the intercepted-cell convention: 1.0 KEEPS cut cells (surrogate
     # hugs Gamma from outside — RatioGPSBM default); 0.0 REMOVES them (the
@@ -262,8 +285,9 @@ def build_truck_mesh(cfg, base_level, region_refine=True, truck_band_to=None,
     # contact line — mostly-inside-solid cells squeezed between strong truck
     # dofs and strong ground dofs — the measured epicenter of the underbody
     # instability.  lam=0.0 removes them (paper-faithful).
-    ret, _frac = classify_lambda(tree, merged, lam=float(carve_lam),
-                                 domain="outside")
+    if ret is None:
+        ret, _frac = classify_lambda(tree, merged, lam=float(carve_lam),
+                                     domain="outside")
 
     # 5. flood-fill: single fluid domain (face-adjacency components)
     ret, n_pockets, n_pocket_cells = flood_fill_retain(ret)
@@ -539,6 +563,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               nonlin_iters=1, nonlin_tol=1e-3,
               slope_near_ground=None,
               ground_refine_to=None, ground_band=0.0156,
+              carve_delta=None,
               checkpoint_interval=None, checkpoint_dir=None,
               resume=False):
     """Run the truck case: transient BDF2 monolithic march.
@@ -687,7 +712,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                           device=device, merged=merged, bodies=bodies,
                           carve_lam=carve_lam,
                           ground_refine_to=ground_refine_to,
-                          ground_band=ground_band)
+                          ground_band=ground_band,
+                          carve_delta=carve_delta)
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
     scale = fx["scale"]
     merged = fx["merged"]

@@ -222,6 +222,22 @@ print(f"[T5] tau_m_scale={TAU_M_SCALE} (config {cfg.tau_m_scale})", flush=True)
 # CARVE_LAM (paper-faithful carve): 0.0 removes intercepted cells (ThinShell
 # T~h / C++), eliminating the ground-contact sliver cells; 1.0 = legacy keep.
 CARVE_LAM = float(os.environ.get("CARVE_LAM", "1.0"))
+# TRUCK_STL: consolidated single-body geometry override (Baskar's clean
+# watertight Truck.stl — same source frame as the 22-body assembly, same
+# config position applies; eliminates cab-interior/assembly-gap carve
+# fragmentation at the source).
+TRUCK_STL = os.environ.get("TRUCK_STL", "").strip()
+BODIES = None
+if TRUCK_STL:
+    from diffsim.cases.truck_config import BodySpec
+    BODIES = [BodySpec(mesh_path=TRUCK_STL, position=(0.0, -0.002, -7.0),
+                       refine_lvl=12, is_static=True)]
+    print(f"[T5] geometry override: single-body {TRUCK_STL}", flush=True)
+_cd_env = os.environ.get("CARVE_DELTA", "").strip()
+CARVE_DELTA = None if _cd_env == "" else float(_cd_env)
+if CARVE_DELTA is not None:
+    print(f"[T5] delta-carve: centers > {CARVE_DELTA}*h outside the surface "
+          f"(fragmentation closing)", flush=True)
 # SLOPE_NG: inlet profile override — "" = config (0.25 sloped); "0" = UNIFORM
 # inlet (the paper 4.8 BC).
 MARCH_CKPT = int(os.environ.get("MARCH_CKPT", "0") or 0)
@@ -333,6 +349,8 @@ res = run_truck(
     sbm_start_step=(SBM_START_STEP if SBM_START_STEP > 0 else None),
     tau_m_scale=TAU_M_SCALE,
     carve_lam=CARVE_LAM,
+    carve_delta=CARVE_DELTA,
+    bodies=BODIES,
     nonlin_iters=NONLIN_ITERS,
     nonlin_tol=NONLIN_TOL,
     slope_near_ground=SLOPE_NG,
