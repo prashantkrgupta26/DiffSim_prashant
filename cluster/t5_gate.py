@@ -190,10 +190,10 @@ if TAU_DT is not None:
 # transient are logged and accepted (truncated iterate marches on); strict
 # semantics return at this step.  Blow-up sentinel always active.
 ACCEPT_MISS_UNTIL = int(os.environ.get("ACCEPT_MISS_UNTIL", "0") or 0)
-BLOWUP_CAP = float(os.environ.get("BLOWUP_CAP", "1e4"))
+U_CAP = float(os.environ.get("U_CAP", "50"))
 if ACCEPT_MISS_UNTIL > 0:
     print(f"[T5] accept-miss window: steps < {ACCEPT_MISS_UNTIL} "
-          f"(blowup_cap={BLOWUP_CAP})", flush=True)
+          f"(u_cap={U_CAP})", flush=True)
 
 # STAGED BC (Baskar): strong no-slip on the carved-out boundary through the
 # transient; SBM (true-geometry Nitsche) from SBM_START_STEP on.  Put the
@@ -261,7 +261,7 @@ res = run_truck(
     pcd_ap_inner=PCD_AP_INNER,
     tau_dt=TAU_DT,
     accept_miss_until=(ACCEPT_MISS_UNTIL if ACCEPT_MISS_UNTIL > 0 else None),
-    blowup_cap=BLOWUP_CAP,
+    u_cap=U_CAP,
     sbm_start_step=(SBM_START_STEP if SBM_START_STEP > 0 else None),
 )
 t_total = time.time() - t_run

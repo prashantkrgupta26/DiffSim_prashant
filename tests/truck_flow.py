@@ -345,7 +345,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               saddle_restart=None,
               saddle_equilibrate=False, soft_start=None, dt_schedule=None,
               saddle_fallback=None, pcd_f_inner="amgx", pcd_ap_inner="amgx",
-              tau_dt=None, accept_miss_until=None, blowup_cap=1e4,
+              tau_dt=None, accept_miss_until=None, u_cap=50.0,
               sbm_start_step=None):
     """Run the truck case: transient BDF2 monolithic march.
 
@@ -446,14 +446,15 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
           solve ACCEPTS the truncated iterate (logged "[saddle] ACCEPT-MISS"
           with achieved relres) instead of raising / falling back; from this
           step on, strict semantics (raise -> optional PCD fallback) return.
-          Guarded by ``blowup_cap`` so drift cannot masquerade as progress.
+          Guarded by ``u_cap`` so drift cannot masquerade as progress.
           None (default) = strict everywhere, byte-identical.
-      blowup_cap : float
-          March blow-up sentinel: after every step, |cd_react| must be finite
-          and below this cap (and the solution finite), else RuntimeError with
-          step context.  Physical startup spikes reached |cd|~470 only during
-          a diagnosed instability; legitimate transients stayed under ~210.
-          Default 1e4.
+      u_cap : float
+          March blow-up sentinel (STATE-based, leg-6 lesson): after every
+          step, |u|_inf must be finite and below this cap (cd_react must be
+          finite).  cd_react itself is NOT capped — it is a residual
+          functional and conflates solve error with physics under an
+          accepted miss.  U_inf-normalized flow: legitimate startup peaks
+          are O(1-5); default 50.
       sbm_start_step : int or None
           Baskar staged-BC strategy: for steps < this value, the truck is
           the CARVED-OUT geometry with STRONG no-slip (identity rows on
@@ -919,12 +920,17 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
 
         # Blow-up sentinel (guards the accept-miss window; always active):
         # drift/instability must fail LOUDLY, never masquerade as progress.
-        if not np.isfinite(cd[step]) or abs(cd[step]) > blowup_cap or \
-                not np.all(np.isfinite(u_new)):
+        # STATE-based (leg-6 lesson): cd_react is a residual functional and
+        # conflates solve error with physics under a miss — the honest
+        # measure is the velocity magnitude itself (U_inf-normalized flow;
+        # legitimate startup peaks are O(1-5), instabilities run away).
+        _umax = float(np.abs(u_new).max())
+        if not np.isfinite(cd[step]) or not np.isfinite(_umax) or \
+                _umax > u_cap:
             raise RuntimeError(
-                f"[truck] MARCH BLOW-UP at step {step}: cd_react={cd[step]} "
-                f"(cap {blowup_cap}), u finite={bool(np.all(np.isfinite(u_new)))}"
-                f" — aborting (accept-miss window is not a license to drift)")
+                f"[truck] MARCH BLOW-UP at step {step}: |u|_inf={_umax:.3e} "
+                f"(cap {u_cap}), cd_react={cd[step]} — aborting (accept-miss "
+                f"window is not a license to drift)")
 
         u_pre2 = u_pre1.copy()
         u_pre1 = u_new.copy()
