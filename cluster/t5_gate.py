@@ -212,6 +212,14 @@ print(f"[T5] tau_m_scale={TAU_M_SCALE} (config {cfg.tau_m_scale})", flush=True)
 # CARVE_LAM (paper-faithful carve): 0.0 removes intercepted cells (ThinShell
 # T~h / C++), eliminating the ground-contact sliver cells; 1.0 = legacy keep.
 CARVE_LAM = float(os.environ.get("CARVE_LAM", "1.0"))
+# SLOPE_NG: inlet profile override — "" = config (0.25 sloped); "0" = UNIFORM
+# inlet (the paper 4.8 BC).
+_sng = os.environ.get("SLOPE_NG", "").strip()
+SLOPE_NG = None if _sng == "" else float(_sng)
+if SLOPE_NG is not None:
+    print(f"[T5] inlet slope override: {SLOPE_NG}"
+          + (" (UNIFORM inlet, paper 4.8)" if SLOPE_NG <= 0 else ""),
+          flush=True)
 NONLIN_ITERS = int(os.environ.get("NONLIN_ITERS", "1"))
 NONLIN_TOL = float(os.environ.get("NONLIN_TOL", "1e-3"))
 if NONLIN_ITERS > 1:
@@ -307,6 +315,7 @@ res = run_truck(
     carve_lam=CARVE_LAM,
     nonlin_iters=NONLIN_ITERS,
     nonlin_tol=NONLIN_TOL,
+    slope_near_ground=SLOPE_NG,
 )
 t_total = time.time() - t_run
 

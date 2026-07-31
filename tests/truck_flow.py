@@ -421,7 +421,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               saddle_fallback=None, pcd_f_inner="amgx", pcd_ap_inner="amgx",
               tau_dt=None, accept_miss_until=None, u_cap=50.0,
               sbm_start_step=None, tau_m_scale=1.0, carve_lam=1.0,
-              nonlin_iters=1, nonlin_tol=1e-3):
+              nonlin_iters=1, nonlin_tol=1e-3,
+              slope_near_ground=None):
     """Run the truck case: transient BDF2 monolithic march.
 
     Returns a history dict with keys:
@@ -601,8 +602,15 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
     nfree = T.shape[1]
 
     # ---- BCs ----------------------------------------------------------------
+    # slope_near_ground=None -> config value; 0/inf-like -> UNIFORM inlet
+    # (the paper 4.8 BC: u_inf=(1,0,0); the slope is this config variant's
+    # addition and its 2-base-cell shear layer is the u-probe wave nursery).
+    _slope = (cfg.slope_near_ground if slope_near_ground is None
+              else float(slope_near_ground))
+    if _slope <= 0:
+        _slope = 1e-12          # min(y/slope,1) -> 1 everywhere: uniform
     bc_rows, bc_vals, masks, coords = truck_strong_bc(
-        mesh, cons, ndof, dim, scale, cfg.slope_near_ground, cfg.domain_max)
+        mesh, cons, ndof, dim, scale, _slope, cfg.domain_max)
     p_pin = _pressure_pin(coords, ndof, dim)
 
     # ---- soft-start inlet ramp bookkeeping (TU5R; opt-in) -------------------
