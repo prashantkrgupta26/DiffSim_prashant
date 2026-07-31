@@ -252,6 +252,20 @@ def on_step(step, info):
     _nl = info.get("nonlin")
     if _nl is not None and NONLIN_ITERS > 1:
         _um_s += " nl=" + str(_nl)
+    # hotspot field dump (forensics): DUMP_BOX="x0,x1,y0,y1,z0,z1"
+    if os.environ.get("DUMP_BOX") and info.get("coords") is not None:
+        import numpy as _np
+        _bx = [float(v) for v in os.environ["DUMP_BOX"].split(",")]
+        _cc = info["coords"]
+        _m = ((_cc[:, 0] >= _bx[0]) & (_cc[:, 0] <= _bx[1]) &
+              (_cc[:, 1] >= _bx[2]) & (_cc[:, 1] <= _bx[3]) &
+              (_cc[:, 2] >= _bx[4]) & (_cc[:, 2] <= _bx[5]))
+        _dd = pathlib.Path(os.environ.get("DUMP_DIR", VIZ_DIR))
+        _dd.mkdir(parents=True, exist_ok=True)
+        _ndof_l = 4
+        _xfull = info["x"].reshape(-1, _ndof_l)
+        _np.savez(_dd / f"dump_{step:04d}.npz", coords=_cc[_m],
+                  u=info["u"][_m], p=_xfull[_m, 3])
     print(f"[T5] step {step:4d} cd_react={cd:+.5f} cd_surr={cds:+.2f} "
           f"iters={iters} t={dt_step:.1f}s rss={_rss_peak[0]/1024/1024:.1f}G "
           f"smi={_smi_peak[0]}MiB{_um_s}", flush=True)

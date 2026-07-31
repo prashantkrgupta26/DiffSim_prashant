@@ -1060,6 +1060,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                                ref_force=float(ref_force),
                                umax=_umax, umax_loc=_uloc,
                                nonlin=_nl_done,
+                               coords=coords, u=u_new,
                                x=x_cur))
         if _viz_hook is not None:
             _viz_hook(step, dict(x=x_cur))
