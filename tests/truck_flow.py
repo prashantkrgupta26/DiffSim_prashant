@@ -298,7 +298,12 @@ def build_truck_mesh(cfg, base_level, region_refine=True, truck_band_to=None,
         centers = tree.centers()
         hcell = tree.h()
         psi = merged.classify(centers)
-        keepm = psi > float(carve_delta) * hcell
+        # threshold in ABSOLUTE length (units of the FINEST band cell, not
+        # per-cell h): a per-cell threshold carves fine cells deeper than
+        # coarse neighbors at 2:1 interfaces -> partially exposed surrogate
+        # faces (M1a violation, hit at band 13).  h_ref = min cell size.
+        _h_ref = float(hcell.min())
+        keepm = psi > float(carve_delta) * _h_ref
         from diffsim.octree.build import Octree as _Oc
         ret = _Oc(tree.keys[keepm], tree.levels[keepm], dim=3,
                   periodic=tree.periodic)
