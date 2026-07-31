@@ -203,6 +203,12 @@ if SBM_START_STEP > 0:
     print(f"[T5] staged BC: strong carved-out no-slip until step "
           f"{SBM_START_STEP}, then SBM", flush=True)
 
+# tauM_scale (C++ heritage, config-faithful): default = the case config's
+# value (0.1 for the truck); TAU_M_SCALE env overrides (set 1.0 to reproduce
+# the pre-fix marches).
+TAU_M_SCALE = float(os.environ.get("TAU_M_SCALE", "") or cfg.tau_m_scale)
+print(f"[T5] tau_m_scale={TAU_M_SCALE} (config {cfg.tau_m_scale})", flush=True)
+
 from diffsim.solvers import linsolve
 _step_times = []
 _last_step_t = [time.time()]
@@ -226,9 +232,14 @@ def on_step(step, info):
     _rows.append(dict(step=step, cd=cd, cd_surr=cds, F_surr_raw=fs,
                       F_react_raw=fr, ref_force=rf, iters=iters,
                       t_step=dt_step))
+    _um = info.get("umax")
+    _ul = info.get("umax_loc")
+    _um_s = (f" umax={_um:.3f}@({_ul[0]:.4f},{_ul[1]:.4f},{_ul[2]:.4f})"
+             if _um is not None and _ul is not None else
+             (f" umax={_um:.3f}" if _um is not None else ""))
     print(f"[T5] step {step:4d} cd_react={cd:+.5f} cd_surr={cds:+.2f} "
           f"iters={iters} t={dt_step:.1f}s rss={_rss_peak[0]/1024/1024:.1f}G "
-          f"smi={_smi_peak[0]}MiB", flush=True)
+          f"smi={_smi_peak[0]}MiB{_um_s}", flush=True)
 
 t_run = time.time()
 res = run_truck(
@@ -263,6 +274,7 @@ res = run_truck(
     accept_miss_until=(ACCEPT_MISS_UNTIL if ACCEPT_MISS_UNTIL > 0 else None),
     u_cap=U_CAP,
     sbm_start_step=(SBM_START_STEP if SBM_START_STEP > 0 else None),
+    tau_m_scale=TAU_M_SCALE,
 )
 t_total = time.time() - t_run
 

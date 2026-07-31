@@ -346,7 +346,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               saddle_equilibrate=False, soft_start=None, dt_schedule=None,
               saddle_fallback=None, pcd_f_inner="amgx", pcd_ap_inner="amgx",
               tau_dt=None, accept_miss_until=None, u_cap=50.0,
-              sbm_start_step=None):
+              sbm_start_step=None, tau_m_scale=1.0):
     """Run the truck case: transient BDF2 monolithic march.
 
     Returns a history dict with keys:
@@ -469,6 +469,15 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
           are DIAGNOSTIC ONLY (the reaction indicator overlaps the
           phase-1 surgery rows).  None (default) = SBM from step 0,
           byte-identical.
+      tau_m_scale : float
+          C++ tauM_scale heritage (NSEquation.h:530; config key the loader
+          previously warned-ignored — the truck case runs 0.1): direct
+          multiplier on tauM in the volume kernels; tauC = 1/(tauM*gg)
+          computed from the SCALED tauM inherits the inverse (C++-exact).
+          The u-probe forensics motivated honoring it: a spurious
+          near-ground wave born in the 2-cell sloped-inlet shear layer
+          grows ~x1.2/step under tau_m_scale=1 and detonates at the truck;
+          the C++ ran this exact case at 0.1.  Default 1.0 byte-identical.
     """
     dim = 3
     ndof = dim + 1
@@ -845,7 +854,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                          else _dev_asm.assemble)
             Acsr, b = _asm_call(
                 aq, dq, fq_raw, nu_step, sigma,
-                sig2tau=_sig2tau,
+                sig2tau=_sig2tau, tau_scale=float(tau_m_scale),
                 strong_b_vals=_sb,
                 extra_matrix=((_af_slots_d, _af_vals_d) if _sbm_on else None),
                 extra_rhs=((_bf_dofs_d, _bf_vals_d) if _sbm_on else None))
@@ -878,7 +887,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         else:
             # ---- Host assembly path (default; bit-for-bit unchanged) --------
             A, b = assemble_linear_ns(dm, aq, dq, fq_raw, nu_step, sigma=sigma,
-                                      sig2tau=_sig2tau)
+                                      sig2tau=_sig2tau,
+                                      tau_scale=float(tau_m_scale))
             _A_vol = A.tocsr()      # pre-SBM, pre-surgery (reaction arbiter)
             _b_vol = b.copy()
             if _sbm_on:
@@ -945,10 +955,18 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             # so the harness can arithmetically diagnose the cd_surr magnitude
             # (Fs[0] is the raw surrogate x-traction; F_raw is the raw reaction;
             # both are divided by the SAME ref_force to form cd).
+            # state telemetry (instability forensics): |u|_inf + its location
+            _uarg = int(np.argmax(np.abs(u_new)))
+            _unode = _uarg // dim
+            try:
+                _uloc = tuple(float(c) for c in coords[_unode])
+            except Exception:
+                _uloc = None
             on_step(step, dict(cd=cd[step], cd_surr=cd_surr[step],
                                F_surr_raw=float(Fs[0]),
                                F_react_raw=float(-F_raw),
                                ref_force=float(ref_force),
+                               umax=_umax, umax_loc=_uloc,
                                x=x_cur))
         if _viz_hook is not None:
             _viz_hook(step, dict(x=x_cur))

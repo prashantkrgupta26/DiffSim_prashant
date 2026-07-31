@@ -234,6 +234,9 @@ class TruckConfig:
     # penalty
     cb_f: float                        # Nitsche penalty coeff (-> alpha)
     ci_f: float
+    tau_m_scale: float                 # C++ tauM_scale (NSEquation.h:530) —
+                                       # direct multiplier on tauM; tauC
+                                       # inherits the inverse (1/(tauM*gg))
     # Re ramp (time-based)
     re_v: tuple                        # [Re0, Re1, Re2]
     re_ramping: tuple                  # [t0, t1, t2]
@@ -259,7 +262,7 @@ class TruckConfig:
 # Top-level keys the driver actively consumes (everything else -> unknown_keys).
 _CONSUMED = {
     "SBMGeo", "slopeNearGround", "channel_mesh", "geometries", "region_refine",
-    "boundary", "Cb_f", "Ci_f", "Re_V", "Re_ramping", "NondimensionType",
+    "boundary", "Cb_f", "Ci_f", "tauM_scale", "Re_V", "Re_ramping", "NondimensionType",
     "DoReSolverRamp", "ReSolverRampInitial", "ReSolverRampTarget",
     "ReSolverRampIncrement", "dt_V", "totalT_V", "NSTimestepper",
     "OutputInterval",
@@ -342,6 +345,7 @@ def load_truck_config(path: str) -> TruckConfig:
         region_refine=regions,
         cb_f=float(top.get("Cb_f", 20.0)),
         ci_f=float(top.get("Ci_f", 36.0)),
+        tau_m_scale=float(top.get("tauM_scale", 1.0)),
         re_v=_as_tuple(top.get("Re_V", [1e3, 5e3, 1e4])),
         re_ramping=_as_tuple(top.get("Re_ramping", [0, 50, 51])),
         nondim_type=str(top.get("NondimensionType", "mix_conv")),

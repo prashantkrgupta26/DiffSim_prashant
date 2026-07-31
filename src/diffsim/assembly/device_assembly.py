@@ -1022,7 +1022,7 @@ class DeviceNSAssembler:
 
     # ------------------------------------------------------------------
     def assemble(self, aq_by_bin, div_aq_by_bin, fq_by_bin, nu, sigma,
-                 sig2tau=None, s_skew=0.5, strong_b_vals=None,
+                 sig2tau=None, tau_scale=1.0, s_skew=0.5, strong_b_vals=None,
                  extra_matrix=None, extra_rhs=None):
         """Numeric fill on device; returns (csr, F) with HOST copies for
         now (the solver interface); vals stay resident in self.vals_d.
@@ -1116,12 +1116,14 @@ class DeviceNSAssembler:
                                       aq_v, dq_v, gaq_v, wp.float64(nu),
                                       wp.float64(sigma),
                                       wp.float64(sig2tau),
+                                      wp.float64(tau_scale),
                                       wp.float64(s_skew), wp.int32(0), Ae],
                               device=d)
                     wp.launch(kb, dim=nb,
                               inputs=[conn_v, h_v, b["N"], b["dN"], b["w"],
                                       aq_v, fq_v, wp.float64(nu),
-                                      wp.float64(sig2tau), be], device=d)
+                                      wp.float64(sig2tau),
+                                      wp.float64(tau_scale), be], device=d)
                     if _ASM_PROFILE:
                         wp.synchronize()
                         _t_ae += (time.perf_counter() - _t_ae0) * 1e3
@@ -1160,6 +1162,7 @@ class DeviceNSAssembler:
                                       b["lapN"], b["w"], aq_v, dq_v, gaq_v,
                                       wp.float64(nu), wp.float64(sigma),
                                       wp.float64(sig2tau),
+                                      wp.float64(tau_scale),
                                       wp.float64(s_skew), wp.int32(0), Ae],
                               device=d)
                     if _ASM_PROFILE:
@@ -1179,7 +1182,8 @@ class DeviceNSAssembler:
                 wp.launch(kb, dim=ne,
                           inputs=[b["conn"], b["h"], b["N"], b["dN"],
                                   b["w"], aq, fq, wp.float64(nu),
-                                  wp.float64(sig2tau), be], device=d)
+                                  wp.float64(sig2tau),
+                                  wp.float64(tau_scale), be], device=d)
                 scat_bw = _scatter_vec_weighted_kernel()
                 wp.launch(scat_bw, dim=len(self._exp_bins[k_bin][4]),
                           inputs=[be.reshape((-1,)), self._bsrc_d[k_bin],
@@ -1197,12 +1201,13 @@ class DeviceNSAssembler:
                               b["w"],
                               aq, dq, gaq, wp.float64(nu),
                               wp.float64(sigma), wp.float64(sig2tau),
+                              wp.float64(tau_scale),
                               wp.float64(s_skew), wp.int32(0), Ae],
                       device=d)
             wp.launch(kb, dim=ne,
                       inputs=[b["conn"], b["h"], b["N"], b["dN"], b["w"],
                               aq, fq, wp.float64(nu), wp.float64(sig2tau),
-                              be], device=d)
+                              wp.float64(tau_scale), be], device=d)
             if _ASM_PROFILE:
                 wp.synchronize()
                 _t_ae += (time.perf_counter() - _t_ae0) * 1e3
