@@ -345,7 +345,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               saddle_restart=None,
               saddle_equilibrate=False, soft_start=None, dt_schedule=None,
               saddle_fallback=None, pcd_f_inner="amgx", pcd_ap_inner="amgx",
-              tau_dt=None, accept_miss_until=None, blowup_cap=1e4):
+              tau_dt=None, accept_miss_until=None, blowup_cap=1e4,
+              sbm_start_step=None):
     """Run the truck case: transient BDF2 monolithic march.
 
     Returns a history dict with keys:
@@ -453,6 +454,20 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
           step context.  Physical startup spikes reached |cd|~470 only during
           a diagnosed instability; legitimate transients stayed under ~210.
           Default 1e4.
+      sbm_start_step : int or None
+          Baskar staged-BC strategy: for steps < this value, the truck is
+          the CARVED-OUT geometry with STRONG no-slip (identity rows on
+          every velocity dof supporting the surrogate boundary = the
+          nonzero rows of Af_c; the paper's 4.8 treatment) and the SBM
+          face system is NOT assembled; from this step on, the strong
+          truck rows are released and the true-geometry SBM Nitsche
+          system takes over.  The CSR pattern is the superset (built once);
+          the device strong-row plan is re-set once at the switch.  Put
+          the switch inside the accept_miss window so the O(h) boundary
+          shift's transition kick is absorbed.  Phase-1 cd_react/cd_surr
+          are DIAGNOSTIC ONLY (the reaction indicator overlaps the
+          phase-1 surgery rows).  None (default) = SBM from step 0,
+          byte-identical.
     """
     dim = 3
     ndof = dim + 1
@@ -524,6 +539,18 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         dm, fx["sf"], fx["geo"], noslip, nu, ndof, alpha=alpha)
     Af_c = (T_vec.T @ Af_raw @ T_vec).tocsr()
     bf_c = np.asarray(T_vec.T @ bf_raw)
+
+    # ---- staged BC (Baskar): phase-1 strong truck rows ----------------------
+    # The velocity dofs supporting the surrogate boundary are exactly the
+    # nonzero rows of the (condensed) SBM face system.  Pressure rows are NOT
+    # strongified (only velocity no-slip).
+    _truck_rows = None
+    if sbm_start_step is not None and int(sbm_start_step) > 0:
+        _af_sup = np.unique(Af_c.nonzero()[0])
+        _truck_rows = _af_sup[_af_sup % ndof != dim].astype(np.int64)
+        print(f"[truck] staged BC: strong carved-out no-slip on "
+              f"{len(_truck_rows)} velocity dofs until step "
+              f"{int(sbm_start_step)}, then SBM", flush=True)
 
     _ = gauss_points(mesh, dm.tables_by_p)   # warm the GP cache
 
@@ -600,8 +627,15 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
 
         # Static strong rows = BC rows + pressure pin (fixed for the mesh).
         # np.unique sorts -> canonical order for the per-step strong_b_vals.
-        _strong_rows = np.unique(np.concatenate(
+        _strong_rows_base = np.unique(np.concatenate(
             [np.asarray(bc_rows, np.int64), np.array([int(p_pin)], np.int64)]))
+        # Staged BC: phase 1 additionally strongifies the truck's surrogate-
+        # boundary velocity dofs; the plan is re-set once at the switch step.
+        if _truck_rows is not None:
+            _strong_rows = np.unique(np.concatenate(
+                [_strong_rows_base, _truck_rows]))
+        else:
+            _strong_rows = _strong_rows_base
         _dev_asm.set_strong_rows(_strong_rows)     # precompute surgery slots
 
         # Reaction arbiter on device: F_raw = w^T(A_vol x - b_vol).  The device
@@ -774,6 +808,15 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             _pcd_cache[("blocktri_meta", "truck")]["saddle_accept_miss"] = \
                 bool(step < int(accept_miss_until))
 
+        # Staged BC (Baskar): phase flag + one-time switch to SBM.
+        _sbm_on = (sbm_start_step is None) or (step >= int(sbm_start_step))
+        if (_truck_rows is not None and step == int(sbm_start_step)):
+            if _dev_asm is not None:
+                _strong_rows = _strong_rows_base
+                _dev_asm.set_strong_rows(_strong_rows)
+            print(f"[truck] staged BC: SWITCH to SBM at step {step} "
+                  f"(strong truck rows released)", flush=True)
+
         # Soft-start: scale the inflow x-velocity strong-BC values this step.
         # bc_vals_step == bc_vals when soft_start is off (byte-identical).
         if _inflow_x_rows is not None:
@@ -792,7 +835,9 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             # parity harnesses can toggle it (default byte-identical to host).
             _val_of = {int(r): float(v) for r, v in zip(bc_rows, bc_vals_step)}
             _val_of[int(p_pin)] = 0.0
-            _sb = np.array([_val_of[int(r)] for r in _strong_rows])
+            # staged BC phase 1: truck surrogate-boundary rows -> 0.0 (the
+            # .get default); phase 2 uses the base row set (no truck rows).
+            _sb = np.array([_val_of.get(int(r), 0.0) for r in _strong_rows])
             _dev_csr = os.environ.get(
                 "SADDLE_DEVICE_CSR", "0").strip() not in ("", "0")
             _asm_call = (_dev_asm.assemble_handoff if _dev_csr
@@ -801,8 +846,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                 aq, dq, fq_raw, nu_step, sigma,
                 sig2tau=_sig2tau,
                 strong_b_vals=_sb,
-                extra_matrix=(_af_slots_d, _af_vals_d),
-                extra_rhs=(_bf_dofs_d, _bf_vals_d))
+                extra_matrix=((_af_slots_d, _af_vals_d) if _sbm_on else None),
+                extra_rhs=((_bf_dofs_d, _bf_vals_d) if _sbm_on else None))
             if mono_solver == "splu":
                 x_cur = splu(Acsr.tocsc()).solve(b)
             else:
@@ -820,21 +865,33 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             _op.matvec(_x_d, _Ax_d)
             _Ax = _Ax_d.numpy()
             _wAx = float(_w_rxn_vals @ _Ax[_w_rxn_dofs])
-            _wAfx = float(_w_rxn_vals @ (Af_c @ x_cur)[_w_rxn_dofs])
             _wb = float(_w_rxn_vals @ b[_w_rxn_dofs])
-            _wbf = float(_w_rxn_vals @ bf_c[_w_rxn_dofs])
-            F_raw = _wAx - _wAfx - _wb + _wbf
+            if _sbm_on:
+                _wAfx = float(_w_rxn_vals @ (Af_c @ x_cur)[_w_rxn_dofs])
+                _wbf = float(_w_rxn_vals @ bf_c[_w_rxn_dofs])
+                F_raw = _wAx - _wAfx - _wb + _wbf
+            else:
+                # staged phase 1: no Af/bf in A_full; DIAGNOSTIC only (the
+                # indicator overlaps the phase-1 truck surgery rows).
+                F_raw = _wAx - _wb
         else:
             # ---- Host assembly path (default; bit-for-bit unchanged) --------
             A, b = assemble_linear_ns(dm, aq, dq, fq_raw, nu_step, sigma=sigma,
                                       sig2tau=_sig2tau)
             _A_vol = A.tocsr()      # pre-SBM, pre-surgery (reaction arbiter)
             _b_vol = b.copy()
-            A = (A + Af_c).tolil()
-            b = b + bf_c
+            if _sbm_on:
+                A = (A + Af_c).tolil()
+                b = b + bf_c
+            else:
+                A = A.tolil()       # staged phase 1: no SBM face system
             for r, v in zip(bc_rows, bc_vals_step):
                 A.rows[r] = [int(r)]; A.data[r] = [1.0]; b[r] = v
             A.rows[p_pin] = [p_pin]; A.data[p_pin] = [1.0]; b[p_pin] = 0.0
+            if not _sbm_on:
+                # staged phase 1: strong no-slip on the carved-out boundary
+                for r in _truck_rows:
+                    A.rows[r] = [int(r)]; A.data[r] = [1.0]; b[r] = 0.0
 
             Acsr = A.tocsr()
             if mono_solver == "splu":

@@ -195,6 +195,14 @@ if ACCEPT_MISS_UNTIL > 0:
     print(f"[T5] accept-miss window: steps < {ACCEPT_MISS_UNTIL} "
           f"(blowup_cap={BLOWUP_CAP})", flush=True)
 
+# STAGED BC (Baskar): strong no-slip on the carved-out boundary through the
+# transient; SBM (true-geometry Nitsche) from SBM_START_STEP on.  Put the
+# switch inside the accept-miss window.
+SBM_START_STEP = int(os.environ.get("SBM_START_STEP", "0") or 0)
+if SBM_START_STEP > 0:
+    print(f"[T5] staged BC: strong carved-out no-slip until step "
+          f"{SBM_START_STEP}, then SBM", flush=True)
+
 from diffsim.solvers import linsolve
 _step_times = []
 _last_step_t = [time.time()]
@@ -254,6 +262,7 @@ res = run_truck(
     tau_dt=TAU_DT,
     accept_miss_until=(ACCEPT_MISS_UNTIL if ACCEPT_MISS_UNTIL > 0 else None),
     blowup_cap=BLOWUP_CAP,
+    sbm_start_step=(SBM_START_STEP if SBM_START_STEP > 0 else None),
 )
 t_total = time.time() - t_run
 
