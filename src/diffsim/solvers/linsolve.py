@@ -1693,6 +1693,28 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
             tol=tol, atol=1e-13, restart=_restart, maxiter=cycles,
             x0_dev=x0_dev)
 
+        # SADDLE_MIN_WORK drift-guard (truck five-leg forensics): under a
+        # loose tol + warm start, entry residuals below tol get accepted
+        # with ZERO iterations, and the unsolved drift compounds across
+        # steps until the march collapses (the tol=1e-3 failure mode).
+        # When enabled, an iters==0 acceptance is followed by ONE polishing
+        # restart cycle targeting a 4x residual reduction; its result is
+        # accepted regardless of the convergence flag (it is a polish, not
+        # a gate).  Default off = byte-identical.
+        import os as _os
+        if (_os.environ.get("SADDLE_MIN_WORK", "0").strip() not in ("", "0")
+                and finfo.get("converged") and finfo.get("inner", 0) == 0):
+            _r0 = float(finfo.get("relres", 0.0))
+            if _r0 > 0.0:
+                x_dev, _finfo2 = fgmres_dev(
+                    _matvec, b_dev, apply_dev, N, device,
+                    tol=0.25 * _r0, atol=1e-13, restart=_restart,
+                    maxiter=1, x0_dev=x_dev)
+                finfo = dict(finfo)
+                finfo["inner"] = int(_finfo2.get("inner", 0))
+                finfo["relres"] = _finfo2.get("relres", _r0)
+                finfo["converged"] = True   # polish never gates
+
         if not finfo["converged"]:
             raise ConvergenceError(
                 f"fgmres_bdiag: not converged after {finfo['inner']} inner "
