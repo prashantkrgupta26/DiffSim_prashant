@@ -209,6 +209,13 @@ if SBM_START_STEP > 0:
 TAU_M_SCALE = float(os.environ.get("TAU_M_SCALE", "") or cfg.tau_m_scale)
 print(f"[T5] tau_m_scale={TAU_M_SCALE} (config {cfg.tau_m_scale})", flush=True)
 
+# CARVE_LAM (paper-faithful carve): 0.0 removes intercepted cells (ThinShell
+# T~h / C++), eliminating the ground-contact sliver cells; 1.0 = legacy keep.
+CARVE_LAM = float(os.environ.get("CARVE_LAM", "1.0"))
+print(f"[T5] carve_lam={CARVE_LAM}"
+      + (" (paper-faithful: intercepted cells REMOVED)" if CARVE_LAM == 0.0
+         else " (legacy: intercepted cells kept)"), flush=True)
+
 from diffsim.solvers import linsolve
 _step_times = []
 _last_step_t = [time.time()]
@@ -275,6 +282,7 @@ res = run_truck(
     u_cap=U_CAP,
     sbm_start_step=(SBM_START_STEP if SBM_START_STEP > 0 else None),
     tau_m_scale=TAU_M_SCALE,
+    carve_lam=CARVE_LAM,
 )
 t_total = time.time() - t_run
 

@@ -136,7 +136,7 @@ def refine_truck_band(tree, merged, band_cells, refine_to):
 
 def build_truck_mesh(cfg, base_level, region_refine=True, truck_band_to=None,
                      band_cells=3, device="cpu", merged=None,
-                     bodies=None):
+                     bodies=None, carve_lam=1.0):
     """Build the incomplete-octree mesh + volumetric surrogate for the truck.
 
     Returns a dict: dm, mesh, cons, sf, geo, merged, scale, n_excluded,
@@ -164,10 +164,17 @@ def build_truck_mesh(cfg, base_level, region_refine=True, truck_band_to=None,
 
     n_before = len(tree)
 
-    # 4. truck carve (flow AROUND the solid: domain="outside"), lam=1.0 keeps
-    # intercepted cells so the surrogate hugs Gamma from OUTSIDE (production
-    # RatioGPSBM default).
-    ret, _frac = classify_lambda(tree, merged, lam=1.0, domain="outside")
+    # 4. truck carve (flow AROUND the solid: domain="outside").  carve_lam
+    # picks the intercepted-cell convention: 1.0 KEEPS cut cells (surrogate
+    # hugs Gamma from outside — RatioGPSBM default); 0.0 REMOVES them (the
+    # ThinShell paper's T~h := {T : T cap Gamma = 0} and the C++ carve).
+    # u-probe forensics: with the truck touching the ground (position clips
+    # y to 0.000), lam=1.0 retains PINCHED SLIVER cells along the whole
+    # contact line — mostly-inside-solid cells squeezed between strong truck
+    # dofs and strong ground dofs — the measured epicenter of the underbody
+    # instability.  lam=0.0 removes them (paper-faithful).
+    ret, _frac = classify_lambda(tree, merged, lam=float(carve_lam),
+                                 domain="outside")
     n_excluded = n_before - len(ret)
 
     sf = extract_surrogate(ret)
@@ -346,7 +353,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               saddle_equilibrate=False, soft_start=None, dt_schedule=None,
               saddle_fallback=None, pcd_f_inner="amgx", pcd_ap_inner="amgx",
               tau_dt=None, accept_miss_until=None, u_cap=50.0,
-              sbm_start_step=None, tau_m_scale=1.0):
+              sbm_start_step=None, tau_m_scale=1.0, carve_lam=1.0):
     """Run the truck case: transient BDF2 monolithic march.
 
     Returns a history dict with keys:
@@ -490,7 +497,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
 
     fx = build_truck_mesh(cfg, base_level, region_refine=region_refine,
                           truck_band_to=truck_band_to, band_cells=band_cells,
-                          device=device, merged=merged, bodies=bodies)
+                          device=device, merged=merged, bodies=bodies,
+                          carve_lam=carve_lam)
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
     scale = fx["scale"]
     merged = fx["merged"]
