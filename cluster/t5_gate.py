@@ -249,6 +249,13 @@ BACKFLOW = os.environ.get("BACKFLOW_STAB", "0").strip() not in ("", "0")
 if BACKFLOW:
     print("[T5] outlet backflow stabilization ON (C++ BACKFLOW_STAB, lumped)",
           flush=True)
+# WALLS_BANDS="9:0.0156,8:0.05" — nested wall banding (overrides WALLS_LVL)
+_wb_env = os.environ.get("WALLS_BANDS", "").strip()
+WALLS_BANDS = None
+if _wb_env:
+    WALLS_BANDS = [(int(p.split(":")[0]), float(p.split(":")[1]))
+                   for p in _wb_env.split(",")]
+    print(f"[T5] nested wall bands: {WALLS_BANDS}", flush=True)
 WALLS_LVL = int(os.environ.get("WALLS_LVL", "0") or 0)
 if WALLS_LVL > 0:
     print(f"[T5] all-walls refine: lvl {WALLS_LVL} (C++ refine_walls in full)",
@@ -363,7 +370,8 @@ res = run_truck(
     nonlin_tol=NONLIN_TOL,
     slope_near_ground=SLOPE_NG,
     ground_refine_to=(GROUND_LVL if GROUND_LVL > 0 else None),
-    walls_refine_to=(WALLS_LVL if WALLS_LVL > 0 else None),
+    walls_refine_to=(WALLS_BANDS if WALLS_BANDS is not None
+                     else (WALLS_LVL if WALLS_LVL > 0 else None)),
     backflow_stab=BACKFLOW,
     ground_band=GROUND_BAND,
     checkpoint_interval=(MARCH_CKPT if MARCH_CKPT > 0 else None),

@@ -262,16 +262,23 @@ def build_truck_mesh(cfg, base_level, region_refine=True, truck_band_to=None,
     if region_refine and cfg.region_refine:
         tree = refine_region_boxes(tree, cfg.region_refine, scale)
 
-    # 2a-walls. all-walls refine (C++ refine_walls=true, in full)
+    # 2a-walls. all-walls refine (C++ refine_walls=true, in full).
+    # walls_refine_to: int (single band = ground_band) or list of
+    # (lvl, band) pairs — NESTED banding so the growing Re-hold boundary
+    # layer (delta = sqrt(nu t)) never crosses a stacked transition: the
+    # step-locked hard-solve window at steps ~35-50 across g/h/i legs is
+    # the layer's shear edge straddling the band-edge interface.
     if walls_refine_to is not None:
         ymax = float(cfg.domain_max[1]) * scale
         zmax = float(cfg.domain_max[2]) * scale
-        n0 = len(tree)
-        tree = refine_walls(tree, int(walls_refine_to), float(ground_band),
-                            ymax, zmax)
-        print(f"[truck] walls refine: lvl>={walls_refine_to} within "
-              f"{ground_band} of all walls ({n0} -> {len(tree)} cells)",
-              flush=True)
+        _wspec = (walls_refine_to
+                  if isinstance(walls_refine_to, (list, tuple))
+                  else [(int(walls_refine_to), float(ground_band))])
+        for _wl, _wb in _wspec:
+            n0 = len(tree)
+            tree = refine_walls(tree, int(_wl), float(_wb), ymax, zmax)
+            print(f"[truck] walls refine: lvl>={_wl} within {_wb} "
+                  f"({n0} -> {len(tree)} cells)", flush=True)
 
     # 2b. ground refine (C++ refine_walls; Baskar directive)
     if ground_refine_to is not None:
