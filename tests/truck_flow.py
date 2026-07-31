@@ -134,6 +134,24 @@ def refine_truck_band(tree, merged, band_cells, refine_to):
     return tree
 
 
+
+def refine_ground(tree, target_lvl, height):
+    """Refine cells whose center lies within ``height`` of the ground (y=0)
+    up to ``target_lvl`` — the C++ refine_walls heritage (Baskar: refine near
+    the floor).  Resolves the near-ground shear layer (the sloped-inlet
+    profile rises over y<0.0156 = TWO base-level cells unrefined — the
+    u-probe wave nursery)."""
+    for _ in range(64):
+        centers = tree.centers()
+        lvl = tree.levels.astype(np.int64)
+        mask = (centers[:, 1] < height) & (lvl < target_lvl)
+        if not mask.any():
+            break
+        tree = refine_elements(tree, mask)
+        tree = balance2to1(tree)
+    return tree
+
+
 def _face_components(tree):
     """Cell connected components under FACE adjacency (Baskar: two cells are
     the same fluid domain only if they SHARE A FACE — corner/edge contact is
@@ -199,7 +217,8 @@ def flood_fill_retain(ret):
 
 def build_truck_mesh(cfg, base_level, region_refine=True, truck_band_to=None,
                      band_cells=3, device="cpu", merged=None,
-                     bodies=None, carve_lam=1.0):
+                     bodies=None, carve_lam=1.0,
+                     ground_refine_to=None, ground_band=0.0156):
     """Build the incomplete-octree mesh + volumetric surrogate for the truck.
 
     Returns a dict: dm, mesh, cons, sf, geo, merged, scale, n_excluded,
@@ -220,6 +239,13 @@ def build_truck_mesh(cfg, base_level, region_refine=True, truck_band_to=None,
     # 2. region refine
     if region_refine and cfg.region_refine:
         tree = refine_region_boxes(tree, cfg.region_refine, scale)
+
+    # 2b. ground refine (C++ refine_walls; Baskar directive)
+    if ground_refine_to is not None:
+        n0 = len(tree)
+        tree = refine_ground(tree, int(ground_refine_to), float(ground_band))
+        print(f"[truck] ground refine: lvl>={ground_refine_to} within "
+              f"y<{ground_band} ({n0} -> {len(tree)} cells)", flush=True)
 
     # 3. truck-band refine
     if truck_band_to is not None:
@@ -422,7 +448,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               tau_dt=None, accept_miss_until=None, u_cap=50.0,
               sbm_start_step=None, tau_m_scale=1.0, carve_lam=1.0,
               nonlin_iters=1, nonlin_tol=1e-3,
-              slope_near_ground=None):
+              slope_near_ground=None,
+              ground_refine_to=None, ground_band=0.0156):
     """Run the truck case: transient BDF2 monolithic march.
 
     Returns a history dict with keys:
@@ -567,7 +594,9 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
     fx = build_truck_mesh(cfg, base_level, region_refine=region_refine,
                           truck_band_to=truck_band_to, band_cells=band_cells,
                           device=device, merged=merged, bodies=bodies,
-                          carve_lam=carve_lam)
+                          carve_lam=carve_lam,
+                          ground_refine_to=ground_refine_to,
+                          ground_band=ground_band)
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
     scale = fx["scale"]
     merged = fx["merged"]

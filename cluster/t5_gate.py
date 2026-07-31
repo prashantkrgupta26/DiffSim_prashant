@@ -214,6 +214,11 @@ print(f"[T5] tau_m_scale={TAU_M_SCALE} (config {cfg.tau_m_scale})", flush=True)
 CARVE_LAM = float(os.environ.get("CARVE_LAM", "1.0"))
 # SLOPE_NG: inlet profile override — "" = config (0.25 sloped); "0" = UNIFORM
 # inlet (the paper 4.8 BC).
+GROUND_LVL = int(os.environ.get("GROUND_LVL", "0") or 0)
+GROUND_BAND = float(os.environ.get("GROUND_BAND", "0.0156"))
+if GROUND_LVL > 0:
+    print(f"[T5] ground refine: lvl {GROUND_LVL} within y<{GROUND_BAND} "
+          f"(C++ refine_walls / Baskar)", flush=True)
 _sng = os.environ.get("SLOPE_NG", "").strip()
 SLOPE_NG = None if _sng == "" else float(_sng)
 if SLOPE_NG is not None:
@@ -316,6 +321,8 @@ res = run_truck(
     nonlin_iters=NONLIN_ITERS,
     nonlin_tol=NONLIN_TOL,
     slope_near_ground=SLOPE_NG,
+    ground_refine_to=(GROUND_LVL if GROUND_LVL > 0 else None),
+    ground_band=GROUND_BAND,
 )
 t_total = time.time() - t_run
 
