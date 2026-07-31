@@ -40,7 +40,7 @@ from scipy.sparse.linalg import splu
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from diffsim.octree.build import build_uniform, refine_elements
+from diffsim.octree.build import build_uniform, refine_elements, Octree
 from diffsim.octree.balance import balance2to1
 from diffsim.mesh.nodes import build_mesh
 from diffsim.mesh.constraints import build_constraints
@@ -134,6 +134,69 @@ def refine_truck_band(tree, merged, band_cells, refine_to):
     return tree
 
 
+def _face_components(tree):
+    """Cell connected components under FACE adjacency (Baskar: two cells are
+    the same fluid domain only if they SHARE A FACE — corner/edge contact is
+    not a flow passage).  Mirrors extract_surrogate's neighbor probe: for
+    each face, sub-face quarter probes catch finer neighbors; the reverse
+    direction catches coarser ones."""
+    from itertools import product as _iproduct
+    from diffsim.octree import morton as _morton
+    from diffsim.octree.lookup import LeafLookup as _LeafLookup, \
+        face_offsets as _face_offsets
+    dim = tree.dim
+    lk = _LeafLookup(tree)
+    L = _morton.lmax(dim)
+    anchors = tree.anchors()
+    size = (1 << (L - tree.levels.astype(np.int64)))
+    center = anchors + size[:, None] // 2
+    offs = _face_offsets(dim)
+    tang = np.array(list(_iproduct((-1, 1), repeat=dim - 1)), np.int64)
+    n = len(tree)
+    src, dst = [], []
+    for f in range(2 * dim):
+        ax = f // 2
+        off = offs[f]
+        tang_axes = [d for d in range(dim) if d != ax]
+        base = center + off[None, :] * (size[:, None] // 2 + 1)
+        for combo in tang:
+            probe = base.copy()
+            for j, d in enumerate(tang_axes):
+                probe[:, d] += combo[j] * (size // 4)
+            nb = lk.find(probe)
+            m = nb >= 0
+            src.append(np.where(m)[0])
+            dst.append(nb[m])
+    g = sp.coo_matrix((np.ones(sum(len(x) for x in src)),
+                       (np.concatenate(src), np.concatenate(dst))),
+                      shape=(n, n))
+    ncomp, labels = sp.csgraph.connected_components(g, directed=False)
+    return ncomp, labels
+
+
+def flood_fill_retain(ret):
+    """Single-fluid-domain retention (Baskar directive): drop every face-
+    connected component except the largest.  The 22-body truck assembly
+    encloses internal cavities (engine bay, cab, tank gaps) that the carve
+    otherwise retains as isolated "fluid" pockets — each carries its own
+    pressure nullspace (only one global pin exists), making the saddle
+    singular (the measured underbody instability + solver floor).  Removing
+    a pocket exposes no new main-domain faces (no shared face by
+    definition), so the surrogate extraction is unaffected."""
+    ncomp, labels = _face_components(ret)
+    if ncomp <= 1:
+        return ret, 0, 0
+    sizes = np.bincount(labels)
+    main = int(np.argmax(sizes))
+    keepm = labels == main
+    n_dropped = int((~keepm).sum())
+    print(f"[truck] flood-fill: dropped {n_dropped} cells in {ncomp - 1} "
+          f"enclosed pocket(s) (face-adjacency); single fluid domain = "
+          f"{int(sizes[main])} cells", flush=True)
+    return (Octree(ret.keys[keepm], ret.levels[keepm], dim=ret.dim,
+                   periodic=ret.periodic), ncomp - 1, n_dropped)
+
+
 def build_truck_mesh(cfg, base_level, region_refine=True, truck_band_to=None,
                      band_cells=3, device="cpu", merged=None,
                      bodies=None, carve_lam=1.0):
@@ -175,6 +238,9 @@ def build_truck_mesh(cfg, base_level, region_refine=True, truck_band_to=None,
     # instability.  lam=0.0 removes them (paper-faithful).
     ret, _frac = classify_lambda(tree, merged, lam=float(carve_lam),
                                  domain="outside")
+
+    # 5. flood-fill: single fluid domain (face-adjacency components)
+    ret, n_pockets, n_pocket_cells = flood_fill_retain(ret)
     n_excluded = n_before - len(ret)
 
     sf = extract_surrogate(ret)
@@ -185,7 +251,8 @@ def build_truck_mesh(cfg, base_level, region_refine=True, truck_band_to=None,
                                 domain="outside")
     return dict(dm=dm, mesh=mesh, cons=cons, sf=sf, geo=geo, merged=merged,
                 scale=scale, n_excluded=int(n_excluded), n_slab_cut=int(n_slab_cut),
-                n_cells=len(ret))
+                n_cells=len(ret), n_pockets=int(n_pockets),
+                n_pocket_cells=int(n_pocket_cells))
 
 
 # ---------------------------------------------------------------------------
