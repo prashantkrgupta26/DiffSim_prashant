@@ -245,6 +245,10 @@ RESUME = os.environ.get("RESUME", "0").strip() not in ("", "0")
 if MARCH_CKPT > 0:
     print(f"[T5] march checkpoints every {MARCH_CKPT} steps"
           + (" (RESUME requested)" if RESUME else ""), flush=True)
+WALLS_LVL = int(os.environ.get("WALLS_LVL", "0") or 0)
+if WALLS_LVL > 0:
+    print(f"[T5] all-walls refine: lvl {WALLS_LVL} (C++ refine_walls in full)",
+          flush=True)
 GROUND_LVL = int(os.environ.get("GROUND_LVL", "0") or 0)
 GROUND_BAND = float(os.environ.get("GROUND_BAND", "0.0156"))
 if GROUND_LVL > 0:
@@ -355,6 +359,7 @@ res = run_truck(
     nonlin_tol=NONLIN_TOL,
     slope_near_ground=SLOPE_NG,
     ground_refine_to=(GROUND_LVL if GROUND_LVL > 0 else None),
+    walls_refine_to=(WALLS_LVL if WALLS_LVL > 0 else None),
     ground_band=GROUND_BAND,
     checkpoint_interval=(MARCH_CKPT if MARCH_CKPT > 0 else None),
     checkpoint_dir=(VIZ_DIR if MARCH_CKPT > 0 else None),

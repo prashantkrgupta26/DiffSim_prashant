@@ -135,6 +135,27 @@ def refine_truck_band(tree, merged, band_cells, refine_to):
 
 
 
+def refine_walls(tree, target_lvl, band, y_max, z_max):
+    """Refine cells within ``band`` of ANY channel wall (ground y=0, ceiling
+    y=y_max, side walls z=0/z_max) to ``target_lvl`` — the C++
+    refine_walls=true, taken fully.  The g-leg located the post-fix
+    disturbance resonator in base-level cells near the ceiling above the
+    truck (umax doubling at (0.34, 0.109, 0.109)): the displaced startup
+    wave is under-resolved at the outer walls just as the shear layer was
+    at the ground."""
+    for _ in range(64):
+        centers = tree.centers()
+        lvl = tree.levels.astype(np.int64)
+        near = ((centers[:, 1] < band) | (centers[:, 1] > y_max - band)
+                | (centers[:, 2] < band) | (centers[:, 2] > z_max - band))
+        mask = near & (lvl < target_lvl)
+        if not mask.any():
+            break
+        tree = refine_elements(tree, mask)
+        tree = balance2to1(tree)
+    return tree
+
+
 def refine_ground(tree, target_lvl, height):
     """Refine cells whose center lies within ``height`` of the ground (y=0)
     up to ``target_lvl`` — the C++ refine_walls heritage (Baskar: refine near
@@ -219,7 +240,7 @@ def build_truck_mesh(cfg, base_level, region_refine=True, truck_band_to=None,
                      band_cells=3, device="cpu", merged=None,
                      bodies=None, carve_lam=1.0,
                      ground_refine_to=None, ground_band=0.0156,
-                     carve_delta=None):
+                     walls_refine_to=None, carve_delta=None):
     """Build the incomplete-octree mesh + volumetric surrogate for the truck.
 
     Returns a dict: dm, mesh, cons, sf, geo, merged, scale, n_excluded,
@@ -240,6 +261,17 @@ def build_truck_mesh(cfg, base_level, region_refine=True, truck_band_to=None,
     # 2. region refine
     if region_refine and cfg.region_refine:
         tree = refine_region_boxes(tree, cfg.region_refine, scale)
+
+    # 2a-walls. all-walls refine (C++ refine_walls=true, in full)
+    if walls_refine_to is not None:
+        ymax = float(cfg.domain_max[1]) * scale
+        zmax = float(cfg.domain_max[2]) * scale
+        n0 = len(tree)
+        tree = refine_walls(tree, int(walls_refine_to), float(ground_band),
+                            ymax, zmax)
+        print(f"[truck] walls refine: lvl>={walls_refine_to} within "
+              f"{ground_band} of all walls ({n0} -> {len(tree)} cells)",
+              flush=True)
 
     # 2b. ground refine (C++ refine_walls; Baskar directive)
     if ground_refine_to is not None:
@@ -563,7 +595,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               nonlin_iters=1, nonlin_tol=1e-3,
               slope_near_ground=None,
               ground_refine_to=None, ground_band=0.0156,
-              carve_delta=None,
+              walls_refine_to=None, carve_delta=None,
               checkpoint_interval=None, checkpoint_dir=None,
               resume=False):
     """Run the truck case: transient BDF2 monolithic march.
@@ -713,7 +745,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                           carve_lam=carve_lam,
                           ground_refine_to=ground_refine_to,
                           ground_band=ground_band,
-                          carve_delta=carve_delta)
+                          carve_delta=carve_delta,
+                          walls_refine_to=walls_refine_to)
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
     scale = fx["scale"]
     merged = fx["merged"]
