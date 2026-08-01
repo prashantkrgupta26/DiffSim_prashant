@@ -149,10 +149,23 @@ TOL_TIGHTEN_STEP = int(os.environ.get("TOL_TIGHTEN_STEP", "200"))
 # tighten-step -> unit time boundary (t_new = (step+1)*dt is passed in)
 _tol_tighten_t = (TOL_TIGHTEN_STEP + 1) * dt
 
+_tol_tighten_logged = [False]
+
 def tol_sched(t_unit):
     # loose through startup (step < TOL_TIGHTEN_STEP), tight after.  The Re ramp
     # is far longer than the leg, so this is the operative schedule.
-    return TOL_LOOSE if t_unit < _tol_tighten_t else TOL_TIGHT
+    if t_unit < _tol_tighten_t:
+        return TOL_LOOSE
+    if not _tol_tighten_logged[0]:
+        # Item 2 (cleanup): log the ACTUAL step and t at which the tight tol
+        # first engages.  Under a DT ladder t_unit != (step+1)*dt, so the
+        # step label TOL_TIGHTEN_STEP may differ from the real fire step; this
+        # site is the single ground-truth source.
+        _step_actual = round(t_unit / dt) - 1   # approximate step from t
+        print(f"[T5] TOL-TIGHTEN engaged: step~{_step_actual} "
+              f"t_unit={t_unit:.6f} -> tol={TOL_TIGHT:.1e}", flush=True)
+        _tol_tighten_logged[0] = True
+    return TOL_TIGHT
 
 print(f"[T5] soft_start={SOFT_START} dt-units  tol_loose={TOL_LOOSE} -> "
       f"tol_tight={TOL_TIGHT} at step>{TOL_TIGHTEN_STEP}", flush=True)
