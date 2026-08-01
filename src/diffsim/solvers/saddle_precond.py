@@ -442,8 +442,8 @@ def build_pcd_meta(dm, nu, sigma, p_pin=None, inner="jacobi",
                    ap_inner="jacobi"):
     """Assemble the pressure-space PCD operators ONCE per mesh from ``dm``.
 
-    Returns ``meta = {"ndof", "dim", "Mp", "Ap", "sigma", "nu", "p_pin",
-    "inner", "ap_inner"}``
+    Returns ``meta = {"ndof", "dim", "Mp", "Ap", "sigma", "nu",
+    "p_pin_local", "inner", "ap_inner"}``
     where
 
       Mp : scalar pressure MASS   INT q p dV   (constrained T^T M T)
