@@ -603,3 +603,45 @@ def test_dump_system_snapshot(tmp_path):
                     region_refine=False, nu=1.0 / 50.0, dt=0.02,
                     verbose=False)
     np.testing.assert_array_equal(res["cd"], ref["cd"])
+
+
+# ---------------------------------------------------------------------------
+# solver-escalation Task 3: offline solver lab on dumped snapshots
+# ---------------------------------------------------------------------------
+
+def test_solver_lab_on_snapshot(tmp_path):
+    """The lab reproduces a converged solve on a dumped tiny system for
+    the bdiag control and the pcd-jacobi candidate.
+
+    Budget rule (per solver-escalation Task-3 brief): pcd-jacobi with
+    Jacobi-CG inner solves is inherently slow on 3-D BDF2 steps (measured
+    ~490 ms/outer-iter on CPU; ~170-250 s to convergence).  When pcd-jacobi
+    exceeds the 90 s budget, it is relaxed to tol=1e-6 / assert relres<1e-5
+    while bdiag stays at tol=1e-8.  The timing and outer-count are
+    campaign-relevant (motivates the amgx-inner upgrade in later tasks).
+    """
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "..",
+                                      "cluster"))
+    from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
+    from diffsim.cases.truck_config import load_truck_config
+    from diffsim.cases.truck import run_truck
+    cfg = load_truck_config(_CFG_PATH)
+    run_truck(cfg, nsteps=3, base_level=5, truck_band_to=6, band_cells=2,
+              merged=_tiny_tire_mesh(cfg), region_refine=False,
+              nu=1.0 / 50.0, dt=0.02, verbose=False,
+              dump_system_steps=(1,), dump_system_dir=str(tmp_path))
+    from solver_lab import run_config
+    snap = str(tmp_path / "sys_step0001.npz")
+
+    # bdiag control: must converge to tight tol (not relaxed)
+    row = run_config(snap, "bdiag", device="cpu", tol=1e-8)
+    assert row["converged"], row
+    assert row["relres"] < 1e-7
+    assert row["n"] > 0 and row["wall_s"] > 0
+
+    # pcd-jacobi: slow on CPU BDF2 (budget rule — relaxed to tol=1e-6)
+    row = run_config(snap, "pcd-jacobi", device="cpu", tol=1e-6)
+    assert row["converged"], row
+    assert row["relres"] < 1e-5
+    assert row["n"] > 0 and row["wall_s"] > 0
