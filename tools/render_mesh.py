@@ -133,10 +133,23 @@ if __name__ == "__main__":
         sys.exit(1)
     if "--stl" in args:
         def _get(flag, default=None):
-            return (args[args.index(flag) + 1]
-                    if flag in args else default)
-        pos = tuple(float(x) for x in
-                    _get("--position", "0,0,0").split(","))
+            if flag not in args:
+                return default
+            i = args.index(flag) + 1
+            if i >= len(args) or args[i].startswith("--"):
+                sys.exit(f"[render_mesh] ERROR: {flag} requires a value "
+                         f"(usage: --stl PATH [--out-prefix P] "
+                         f"[--position x,y,z] [--scale s])")
+            return args[i]
+        _pos_raw = _get("--position", "0,0,0")
+        try:
+            pos = tuple(float(x) for x in _pos_raw.split(","))
+        except ValueError:
+            sys.exit(f"[render_mesh] ERROR: --position must be three "
+                     f"comma-separated numbers, got {_pos_raw!r}")
+        if len(pos) != 3:
+            sys.exit(f"[render_mesh] ERROR: --position needs exactly 3 "
+                     f"components (x,y,z), got {len(pos)}: {_pos_raw!r}")
         render_stl_in_domain(_get("--stl"),
                              _get("--out-prefix", "results/mesh_renders/body"),
                              position=pos,
