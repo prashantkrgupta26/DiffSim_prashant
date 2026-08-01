@@ -69,6 +69,7 @@ encode_shot() {
     echo "[encode_video] shot '${shot}': ${n_pngs} frames -> ${outfile}"
     # Write ffmpeg output to a log file.  On success, quiet (-loglevel error keeps
     # stderr clean); on failure, the full log is printed so the problem is visible.
+    local rc=0
     ffmpeg -y \
         -loglevel error \
         -framerate "${FPS}" \
@@ -79,8 +80,7 @@ encode_shot() {
         -preset slow \
         -movflags +faststart \
         "${outfile}" \
-        2>"${logfile}"
-    local rc=$?
+        2>"${logfile}" || rc=$?    # || : keep errexit from killing the handler
     if [[ ${rc} -ne 0 ]]; then
         echo "[encode_video] ERROR: ffmpeg failed for shot '${shot}' (exit ${rc})" >&2
         echo "[encode_video] full ffmpeg output (${logfile}):" >&2
@@ -109,6 +109,7 @@ if [[ "${all_exist}" == "true" ]]; then
     COMPOSITE="${RENDERS_DIR}/composite.mp4"
     COMPOSITE_LOG="${RENDERS_DIR}/composite_ffmpeg.log"
     echo "[encode_video] creating composite (q_iso+centerline | surface_cp)..."
+    composite_rc=0
     # hstack q_iso and centerline (top row), pad surface_cp to same width
     ffmpeg -y \
         -loglevel error \
@@ -124,8 +125,7 @@ if [[ "${all_exist}" == "true" ]]; then
         -c:v libx264 -pix_fmt yuv420p -crf 18 -preset slow \
         -movflags +faststart \
         "${COMPOSITE}" \
-        2>"${COMPOSITE_LOG}"
-    composite_rc=$?
+        2>"${COMPOSITE_LOG}" || composite_rc=$?    # || : survive errexit
     if [[ ${composite_rc} -ne 0 ]]; then
         echo "[encode_video] ERROR: composite ffmpeg failed (exit ${composite_rc})" >&2
         echo "[encode_video] full ffmpeg output (${COMPOSITE_LOG}):" >&2
