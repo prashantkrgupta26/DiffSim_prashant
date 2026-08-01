@@ -645,9 +645,16 @@ def test_solver_lab_on_snapshot(tmp_path):
     # pcd-jacobi: bounded honest-report leg (see docstring budget rule)
     row = run_config(snap, "pcd-jacobi", device="cpu", tol=1e-4, maxiter=60)
     assert row["n"] > 0 and row["wall_s"] > 0
-    assert row["outer"] > 0 or not row["converged"]   # sentinel plumbing
+    # F6: key renamed "iters" (total inner iterations); "outer" is gone.
+    assert row["iters"] > 0 or not row["converged"]   # sentinel plumbing
     if row["converged"]:
         assert row["relres"] < 1e-3
+
+    # F2: warm-start keys always present in snapshot (empty sentinels for a
+    # fresh march where no prior step has populated the bdiag cache).
+    import numpy as _np2
+    d = _np2.load(snap)
+    assert "x_prev" in d and "x_prev2" in d   # keys exist
 
 
 def test_pcd_primary_bdf1_wiring():

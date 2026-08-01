@@ -31,7 +31,7 @@ A_LEN = float(os.environ.get("AHMED_LENGTH", "0.06"))
 A_CLR = float(os.environ.get("AHMED_CLEARANCE", "0.003"))
 A_XF = float(os.environ.get("AHMED_XFRONT", "0.32"))
 ASSEMBLY = os.environ.get("TRUCK_ASSEMBLY", "device")
-CKPT_DIR = os.environ.get("MARCH_CKPT", "") or None
+CKPT_DIR = os.environ.get("MARCH_CKPT_DIR", "") or None
 RESUME = os.environ.get("RESUME", "0") == "1"
 OUT = pathlib.Path(os.environ.get(
     "OUT_DIR", "/work/mech-ai/baskarg/DiffSim/results/ahmed-r2"))
@@ -60,6 +60,9 @@ _miss_post = [0]
 
 def on_step(step, info):
     miss = bool(info.get("accepted_miss", False))
+    # F4(c): count misses for ALL solver configs (accepted_miss is sourced
+    # from _bd in the march driver — correct for bdiag primary and inert/False
+    # for pcd primary which raises on miss instead of accepting).
     if step >= SOFT_START and miss:
         _miss_post[0] += 1
     _rows.append(dict(step=step, cd=info.get("cd"),
@@ -96,16 +99,34 @@ res = run_truck(cfg, NSTEPS,
                 checkpoint_dir=CKPT_DIR,
                 resume=RESUME,
                 verbose=False)
+
+# F10: flush any tail rows not yet written (up to 9 rows buffered by the
+# every-10-step write cadence).
+_tail_start = (len(_rows) // 10) * 10
+if _tail_start < len(_rows):
+    with (OUT / "rows.jsonl").open("a") as _f:
+        _f.write("\n".join(json.dumps(q) for q in _rows[_tail_start:]) + "\n")
+
 post = [r for r in _rows if r["step"] >= SOFT_START]
+# F4(a): track running umax max over ALL post-transient rows (spec §6:
+# "always < U_CAP/10"), not just the final row.
+_umax_max = max((r["umax"] for r in post), default=float("nan"))
+# F4(b): assert cd finiteness across post-transient rows (spec §6 bar (c)).
+_cd_finite = all(
+    r["cd"] is not None and not (r["cd"] != r["cd"])  # not NaN
+    for r in post
+)
 _umax_final = post[-1]["umax"] if post else float("nan")
 print(f"[AHMED] DONE {time.time()-t0:.0f}s steps={len(_rows)} "
       f"post-transient={len(post)} misses_post={_miss_post[0]} "
-      f"umax_final={_umax_final}",
+      f"umax_max={_umax_max:.3f} umax_final={_umax_final:.3f}",
       flush=True)
 _steps_ok = len(post) >= 500
 _miss_ok = _miss_post[0] == 0
-_umax_ok = _umax_final < U_CAP / 10.0
+# F4(a): use running max, not final-row only.
+_umax_ok = _umax_max < U_CAP / 10.0
 print(f"[AHMED] PASS-BAR: steps_at_amp1={len(post)}>=500? {_steps_ok} "
       f"misses=0? {_miss_ok} "
-      f"umax<U_CAP/10? {_umax_ok}",
+      f"umax_max<U_CAP/10? {_umax_ok} "
+      f"cd_finite? {_cd_finite}",
       flush=True)

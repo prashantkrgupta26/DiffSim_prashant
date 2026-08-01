@@ -75,7 +75,8 @@ threading.Thread(target=_smi_sampler, daemon=True).start()
 print("=" * 72, flush=True)
 print(f"[T5] GATE LEG  base={BASE_LEVEL} band={BAND_TO} nsteps={NSTEPS} "
       f"viz_interval={VIZ_INT} ckpt={CKPT_INT} equilibrate={EQUIL} "
-      f"assembly={ASSEMBLY}", flush=True)
+      f"assembly={ASSEMBLY} mono_solver={MONO_SOLVER} "
+      f"F={PCD_F_INNER} Ap={PCD_AP_INNER}", flush=True)
 
 import torch, warp as wp
 wp.init()
@@ -185,6 +186,13 @@ if DT_START_FACTOR > 0 and DT_START_STEPS > 0:
         return _dt / _f if step < _n else _dt
     print(f"[T5] DT ladder: dt/{DT_START_FACTOR} for first {DT_START_STEPS} "
           f"steps (sigma x{DT_START_FACTOR}), then dt={dt}", flush=True)
+
+# MONO_SOLVER: the primary saddle solver class for the march.  Default
+# "fgmres_bdiag" (block-diagonal Jacobi, the validated T1-T5 solver).  Set
+# MONO_SOLVER=fgmres_pcd to run Rung 3 with the PCD primary (winning inners
+# from Rung 1).  NOTE: with MONO_SOLVER=fgmres_pcd, SADDLE_FALLBACK must be
+# unset — the self-fallback guard in run_truck raises at setup.
+MONO_SOLVER = os.environ.get("MONO_SOLVER", "fgmres_bdiag")
 
 # PCD PER-STEP FALLBACK (five-leg Jacobi-class verdict): bdiag stays the fast
 # primary; any step that exhausts its budget is re-solved with the Track-A
@@ -403,7 +411,9 @@ res = run_truck(
     cfg, NSTEPS,
     device="cuda",
     assembly=ASSEMBLY,
-    mono_solver="fgmres_bdiag",
+    mono_solver=MONO_SOLVER,
+    pcd_f_inner=PCD_F_INNER,
+    pcd_ap_inner=PCD_AP_INNER,
     saddle_x0="extrap",
     saddle_equilibrate=EQUIL,
     nu_schedule=nu_sched,
@@ -426,8 +436,6 @@ res = run_truck(
     soft_start=(SOFT_START if SOFT_START > 0 else None),
     dt_schedule=dt_sched,
     saddle_fallback=SADDLE_FALLBACK,
-    pcd_f_inner=PCD_F_INNER,
-    pcd_ap_inner=PCD_AP_INNER,
     tau_dt=TAU_DT,
     accept_miss_until=(ACCEPT_MISS_UNTIL if ACCEPT_MISS_UNTIL > 0 else None),
     u_cap=U_CAP,

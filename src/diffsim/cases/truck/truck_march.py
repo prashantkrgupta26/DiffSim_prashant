@@ -56,8 +56,18 @@ def _gp_history_fq(dm, mesh, T, u_pre1, u_pre2, b1, b2, dt, dim):
 # ---------------------------------------------------------------------------
 
 def _dump_saddle_system(path, Acsr, b, *, ndof, nfree, tol, sigma, nu,
-                        dt, step, pcd_meta, bd):
-    """Write a self-contained solver-lab snapshot (see solver_lab.py)."""
+                        dt, step, pcd_meta, bd,
+                        x_prev=None, x_prev2=None):
+    """Write a self-contained solver-lab snapshot (see solver_lab.py).
+
+    Optional warm-start vectors (F2: snapshot warm-start fidelity):
+      x_prev  — the most recent converged solution (n^th step), used as the
+                 first extrapolation point for bdiag saddle_x0="extrap".
+      x_prev2 — the step before that (n-1), used as the second point.
+    Both are stored as optional npz keys.  When absent from the march cache
+    (first step or cold-start leg) a zero-length sentinel array is written,
+    matching the checkpoint writer convention.
+    """
     import json
     import scipy.sparse as sp
     if not sp.issparse(Acsr):
@@ -67,6 +77,8 @@ def _dump_saddle_system(path, Acsr, b, *, ndof, nfree, tol, sigma, nu,
     A = Acsr.tocsr()
     Mp = pcd_meta["Mp"].tocsr()
     Ap = pcd_meta["Ap"].tocsr()
+    _xp = x_prev if x_prev is not None else np.zeros(0)
+    _xp2 = x_prev2 if x_prev2 is not None else np.zeros(0)
     tmp = str(path) + ".tmp.npz"
     np.savez_compressed(
         tmp,
@@ -80,7 +92,9 @@ def _dump_saddle_system(path, Acsr, b, *, ndof, nfree, tol, sigma, nu,
         Ap_shape=np.asarray(Ap.shape),
         p_pin=int(pcd_meta["p_pin_local"]),
         bd_json=json.dumps({k: v for k, v in bd.items()
-                            if isinstance(v, (int, float, str, bool))}))
+                            if isinstance(v, (int, float, str, bool))}),
+        x_prev=np.asarray(_xp, np.float64),
+        x_prev2=np.asarray(_xp2, np.float64))
     os.replace(tmp, str(path))
 
 
@@ -834,7 +848,9 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                         _pl_dump / f"sys_step{step:04d}.npz", Acsr, b,
                         ndof=ndof, nfree=nfree, tol=_tol, sigma=sigma,
                         nu=nu_step, dt=dt_step, step=step,
-                        pcd_meta=_dump_meta, bd=_bd)
+                        pcd_meta=_dump_meta, bd=_bd,
+                        x_prev=_pcd_cache.get(("bdiag_x_prev", "truck")),
+                        x_prev2=_pcd_cache.get(("bdiag_x_prev2", "truck")))
                 if mono_solver == "splu":
                     x_cur = splu(Acsr.tocsc()).solve(b)
                 else:
@@ -893,7 +909,9 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                         _pl_dump / f"sys_step{step:04d}.npz", Acsr, b,
                         ndof=ndof, nfree=nfree, tol=_tol, sigma=sigma,
                         nu=nu_step, dt=dt_step, step=step,
-                        pcd_meta=_dump_meta, bd=_bd)
+                        pcd_meta=_dump_meta, bd=_bd,
+                        x_prev=_pcd_cache.get(("bdiag_x_prev", "truck")),
+                        x_prev2=_pcd_cache.get(("bdiag_x_prev2", "truck")))
                 if mono_solver == "splu":
                     x_cur = splu(Acsr.tocsc()).solve(b)
                 else:
