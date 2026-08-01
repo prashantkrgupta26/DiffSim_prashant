@@ -1070,8 +1070,10 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             "'fgmres_bdiag' (the fused_bdiag branch raises strictly; "
             "final-review I-1)")
     _pcd_cache = {"ndof": ndof}
+    # _bd always exists (on_step reads last_solve_miss from it); it is only
+    # installed as the solver meta for the bdiag solvers below.
+    _bd = {"ndof": ndof}
     if mono_solver in ("fgmres_bdiag", "fused_bdiag"):
-        _bd = {"ndof": ndof}
         if saddle_x0 is not None:
             _bd["saddle_x0"] = saddle_x0
         if saddle_restart is not None:
