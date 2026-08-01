@@ -645,3 +645,21 @@ def test_solver_lab_on_snapshot(tmp_path):
     assert row["converged"], row
     assert row["relres"] < 1e-5
     assert row["n"] > 0 and row["wall_s"] > 0
+
+
+def test_pcd_primary_bdf1_wiring():
+    """Always-on CPU coverage of the fgmres_pcd PRIMARY wiring (meta build
+    + sigma/nu refresh + cache consumption): one BDF1 bootstrap step with
+    jacobi inners (~27 outers, seconds).  Trajectory quality is covered by
+    the pyamgx-gated test; this one guards the plumbing (task-2 review)."""
+    from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
+    from diffsim.cases.truck_config import load_truck_config
+    from diffsim.cases.truck import run_truck
+    cfg = load_truck_config(_CFG_PATH)
+    res = run_truck(cfg, nsteps=1, base_level=5, truck_band_to=6,
+                    band_cells=2, merged=_tiny_tire_mesh(cfg),
+                    region_refine=False, nu=1.0 / 50.0, dt=0.02,
+                    verbose=False, mono_solver="fgmres_pcd",
+                    pcd_f_inner="jacobi", pcd_ap_inner="jacobi")
+    assert np.all(np.isfinite(res["cd"]))
+    assert np.all(np.isfinite(res["cd_surr"]))
