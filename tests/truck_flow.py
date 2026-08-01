@@ -1139,6 +1139,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         print(f"[truck] step {step}: PCD fallback CONVERGED "
               f"(iters={_LAST_ITERS[0]}, {time.time()-_t0:.1f}s)",
               flush=True)
+        # the step's final state DID meet tol — clear the primary's miss flag
+        _bd["last_solve_miss"] = False
         return x
 
     t_cur = 0.0
@@ -1477,6 +1479,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                                ref_force=float(ref_force),
                                umax=_umax, umax_loc=_uloc,
                                nonlin=_nl_done,
+                               accepted_miss=bool(_bd.get("last_solve_miss",
+                                                          False)),
                                coords=coords, u=u_new,
                                x=x_cur))
         if _viz_hook is not None:

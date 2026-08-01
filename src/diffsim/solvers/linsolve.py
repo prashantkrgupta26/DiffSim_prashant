@@ -1744,6 +1744,11 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                 finfo["relres"] = _finfo2.get("relres", _r0)
                 finfo["converged"] = True   # polish never gates
 
+        # Per-solve miss telemetry for the driver, via the same meta side
+        # channel as the accept-miss flag: True iff this solve ended
+        # non-converged (the driver clears it if a fallback then converges).
+        meta["last_solve_miss"] = not bool(finfo["converged"])
+
         if not finfo["converged"]:
             # Baskar directive (T5): solve misses during the initial
             # transient are acceptable — accept the truncated iterate, LOG

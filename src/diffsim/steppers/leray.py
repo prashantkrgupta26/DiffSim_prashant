@@ -962,7 +962,8 @@ class LerayProjectionStepper:
 
             # Device predictor path (Task 6b): Picard only.
             # Newton mode uses the host path (DeviceNSAssembler hardcodes
-            # newton=0 — gaq is not consumed on device).
+            # newton=0 — the kernel does read gaq (ns_bricks.py), but it is
+            # passed zero-filled at newton=0, so it is numerically inert).
             _use_device_pred = (self.device_assembly
                                 and self._pred_asm is not None
                                 and not newton)

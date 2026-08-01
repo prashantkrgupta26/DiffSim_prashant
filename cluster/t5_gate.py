@@ -341,7 +341,11 @@ def on_step(step, info):
     fr = info.get("F_react_raw", float("nan"))
     rf = info.get("ref_force", float("nan"))
     iters = linsolve._LAST_ITERS[0]
-    if _arrival[0] is None and abs(cd) > 1e-6:
+    # only arm FIRST CONTACT on a step whose solve actually met tol — an
+    # accepted miss pollutes cd_react (documented conflation) and must not
+    # trigger the quotable line; the first CLEAN contact still logs.
+    if (_arrival[0] is None and abs(cd) > 1e-6
+            and not info.get("accepted_miss", False)):
         _arrival[0] = step
         print(f"[T5] *** FIRST CONTACT at step {step}: cd_react={cd:+.5f} ***",
               flush=True)
