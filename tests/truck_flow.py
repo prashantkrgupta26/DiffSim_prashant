@@ -241,7 +241,7 @@ def build_truck_mesh(cfg, base_level, region_refine=True, truck_band_to=None,
                      bodies=None, carve_lam=1.0,
                      ground_refine_to=None, ground_band=0.0156,
                      walls_refine_to=None, carve_delta=None,
-                     seal_underbody=False, seal_y=0.003):
+                     seal_underbody=False, seal_y=0.003, seal_boxes=None):
     """Build the incomplete-octree mesh + volumetric surrogate for the truck.
 
     Returns a dict: dm, mesh, cons, sf, geo, merged, scale, n_excluded,
@@ -354,6 +354,21 @@ def build_truck_mesh(cfg, base_level, region_refine=True, truck_band_to=None,
         print(f"[truck] underbody seal: excised {n_seal} cells under "
               f"footprint x[{_x0:.4f},{_x1:.4f}] z[{_z0:.4f},{_z1:.4f}] "
               f"y<{seal_y}", flush=True)
+
+    # 4c. box seals (gap fairings): excise cells inside arbitrary boxes —
+    # e.g. the cab-trailer slot (a real aero device: gap fairing).  Each box
+    # = (x0, x1, y0, y1, z0, z1) in unit coords.
+    if seal_boxes:
+        _c2 = ret.centers()
+        for (bx0, bx1, by0, by1, bz0, bz1) in seal_boxes:
+            _mb = ((_c2[:, 0] > bx0) & (_c2[:, 0] < bx1)
+                   & (_c2[:, 1] > by0) & (_c2[:, 1] < by1)
+                   & (_c2[:, 2] > bz0) & (_c2[:, 2] < bz1))
+            print(f"[truck] box seal: excised {int(_mb.sum())} cells in "
+                  f"[{bx0},{bx1}]x[{by0},{by1}]x[{bz0},{bz1}]", flush=True)
+            ret = Octree(ret.keys[~_mb], ret.levels[~_mb], dim=ret.dim,
+                         periodic=ret.periodic)
+            _c2 = ret.centers()
 
     # 5. flood-fill: single fluid domain (face-adjacency components)
     ret, n_pockets, n_pocket_cells = flood_fill_retain(ret)
@@ -630,7 +645,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               slope_near_ground=None,
               ground_refine_to=None, ground_band=0.0156,
               walls_refine_to=None, carve_delta=None,
-              seal_underbody=False, seal_y=0.003,
+              seal_underbody=False, seal_y=0.003, seal_boxes=None,
               backflow_stab=False,
               checkpoint_interval=None, checkpoint_dir=None,
               resume=False):
@@ -783,7 +798,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                           ground_band=ground_band,
                           carve_delta=carve_delta,
                           walls_refine_to=walls_refine_to,
-                          seal_underbody=seal_underbody, seal_y=seal_y)
+                          seal_underbody=seal_underbody, seal_y=seal_y,
+                          seal_boxes=seal_boxes)
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
     scale = fx["scale"]
     merged = fx["merged"]

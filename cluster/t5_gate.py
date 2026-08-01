@@ -245,6 +245,13 @@ RESUME = os.environ.get("RESUME", "0").strip() not in ("", "0")
 if MARCH_CKPT > 0:
     print(f"[T5] march checkpoints every {MARCH_CKPT} steps"
           + (" (RESUME requested)" if RESUME else ""), flush=True)
+# SEAL_BOXES="x0:x1:y0:y1:z0:z1[;...]" — gap fairings (cab-trailer slot etc.)
+_sb_env = os.environ.get("SEAL_BOXES", "").strip()
+SEAL_BOXES = None
+if _sb_env:
+    SEAL_BOXES = [tuple(float(v) for v in b.split(":"))
+                  for b in _sb_env.split(";")]
+    print(f"[T5] box seals: {SEAL_BOXES}", flush=True)
 SEAL = os.environ.get("SEAL_UNDERBODY", "0").strip() not in ("", "0")
 SEAL_Y = float(os.environ.get("SEAL_Y", "0.003"))
 if SEAL:
@@ -379,6 +386,7 @@ res = run_truck(
     backflow_stab=BACKFLOW,
     seal_underbody=SEAL,
     seal_y=SEAL_Y,
+    seal_boxes=SEAL_BOXES,
     ground_band=GROUND_BAND,
     checkpoint_interval=(MARCH_CKPT if MARCH_CKPT > 0 else None),
     checkpoint_dir=(VIZ_DIR if MARCH_CKPT > 0 else None),
