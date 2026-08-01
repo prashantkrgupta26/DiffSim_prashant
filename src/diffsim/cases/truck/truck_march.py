@@ -52,6 +52,39 @@ def _gp_history_fq(dm, mesh, T, u_pre1, u_pre2, b1, b2, dt, dim):
 
 
 # ---------------------------------------------------------------------------
+# Solver-lab snapshot helper (solver-escalation Task 1)
+# ---------------------------------------------------------------------------
+
+def _dump_saddle_system(path, Acsr, b, *, ndof, nfree, tol, sigma, nu,
+                        dt, step, pcd_meta, bd):
+    """Write a self-contained solver-lab snapshot (see solver_lab.py)."""
+    import json
+    import scipy.sparse as sp
+    if not sp.issparse(Acsr):
+        raise ValueError(
+            "dump_system requires host assembly (scipy CSR); re-run the "
+            "capture leg with TRUCK_ASSEMBLY=host / assembly='host'")
+    A = Acsr.tocsr()
+    Mp = pcd_meta["Mp"].tocsr()
+    Ap = pcd_meta["Ap"].tocsr()
+    tmp = str(path) + ".tmp.npz"
+    np.savez_compressed(
+        tmp,
+        A_indptr=A.indptr, A_indices=A.indices, A_data=A.data,
+        A_shape=np.asarray(A.shape), b=np.asarray(b, np.float64),
+        ndof=ndof, nfree=nfree, tol=float(tol), sigma=float(sigma),
+        nu=float(nu), dt=float(dt), step=int(step),
+        Mp_indptr=Mp.indptr, Mp_indices=Mp.indices, Mp_data=Mp.data,
+        Mp_shape=np.asarray(Mp.shape),
+        Ap_indptr=Ap.indptr, Ap_indices=Ap.indices, Ap_data=Ap.data,
+        Ap_shape=np.asarray(Ap.shape),
+        p_pin=int(pcd_meta["p_pin_local"]),
+        bd_json=json.dumps({k: v for k, v in bd.items()
+                            if isinstance(v, (int, float, str, bool))}))
+    os.replace(tmp, str(path))
+
+
+# ---------------------------------------------------------------------------
 # Main driver
 # ---------------------------------------------------------------------------
 
@@ -75,7 +108,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               seal_underbody=False, seal_y=0.003, seal_boxes=None,
               backflow_stab=False,
               checkpoint_interval=None, checkpoint_dir=None,
-              resume=False):
+              resume=False,
+              dump_system_steps=(), dump_system_dir=None):
     """Run the truck case: transient BDF2 monolithic march.
 
     Returns a history dict with keys:
@@ -209,6 +243,13 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
           near-ground wave born in the 2-cell sloped-inlet shear layer
           grows ~x1.2/step under tau_m_scale=1 and detonates at the truck;
           the C++ ran this exact case at 0.1.  Default 1.0 byte-identical.
+      dump_system_steps / dump_system_dir : dump the assembled saddle
+          system (A, b) plus the PCD pressure operators (Mp, Ap) at the
+          listed step indices to ``sys_step{N:04d}.npz`` for the offline
+          solver lab.  HOST-ASSEMBLY ONLY (device parity is trajectory-
+          tight, so host-captured systems are the same matrices): a
+          device-handoff Acsr raises ValueError.  Default () = OFF,
+          byte-identical.
     """
     dim = 3
     ndof = dim + 1
@@ -628,6 +669,21 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         else:
             print("[truck] resume requested but no checkpoint found — "
                   "starting from step 0", flush=True)
+
+    # ---- dump_system setup (solver-escalation Task 1; off by default) -------
+    _dump_steps = set(int(s) for s in (dump_system_steps or ()))
+    _dump_meta = None
+    _pl_dump = None
+    if _dump_steps:
+        if dump_system_dir is None:
+            raise ValueError("dump_system_steps set but dump_system_dir=None")
+        import pathlib as _pl
+        _pl_dump = _pl.Path(dump_system_dir)
+        _pl_dump.mkdir(parents=True, exist_ok=True)
+        from diffsim.solvers.saddle_precond import build_pcd_meta as _bpm
+        _dump_meta = _bpm(dm, nu if nu is not None else 1.0, 1.0 / dt,
+                          p_pin=int(p_pin))
+
     for step in range(_step0, nsteps):
         dt_step = (float(dt_schedule(step)) if dt_schedule is not None
                    else dt)
@@ -803,6 +859,12 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                         A.rows[r] = [int(r)]; A.data[r] = [1.0]; b[r] = 0.0
 
                 Acsr = A.tocsr()
+                if step in _dump_steps:
+                    _dump_saddle_system(
+                        _pl_dump / f"sys_step{step:04d}.npz", Acsr, b,
+                        ndof=ndof, nfree=nfree, tol=_tol, sigma=sigma,
+                        nu=nu_step, dt=dt_step, step=step,
+                        pcd_meta=_dump_meta, bd=_bd)
                 if mono_solver == "splu":
                     x_cur = splu(Acsr.tocsc()).solve(b)
                 else:

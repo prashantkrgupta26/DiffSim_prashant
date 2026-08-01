@@ -513,3 +513,46 @@ def test_tau_scale_device_parity():
         assert np.all(np.isfinite(res_d[k]))
         assert np.allclose(res_h[k], res_d[k], rtol=0, atol=1e-8), (
             f"tau device parity {k}: host {res_h[k]} vs device {res_d[k]}")
+
+
+# ---------------------------------------------------------------------------
+# solver-escalation Task 1: dump_system knob — portable saddle snapshots
+# ---------------------------------------------------------------------------
+
+def test_dump_system_snapshot(tmp_path):
+    """dump_system_steps writes a self-contained solvable saddle snapshot."""
+    import json
+    import scipy.sparse as sp
+    from scipy.sparse.linalg import splu as _splu
+    from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
+    from diffsim.cases.truck_config import load_truck_config
+    from diffsim.cases.truck import run_truck
+    cfg = load_truck_config(_CFG_PATH)
+    res = run_truck(cfg, nsteps=3, base_level=5, truck_band_to=6,
+                    band_cells=2, merged=_tiny_tire_mesh(cfg),
+                    region_refine=False, nu=1.0 / 50.0, dt=0.02,
+                    verbose=False,
+                    dump_system_steps=(1,), dump_system_dir=str(tmp_path))
+    f = tmp_path / "sys_step0001.npz"
+    assert f.exists()
+    d = np.load(f)
+    A = sp.csr_matrix((d["A_data"], d["A_indices"], d["A_indptr"]),
+                      shape=tuple(d["A_shape"]))
+    n = int(d["nfree"]) * int(d["ndof"])
+    assert A.shape == (n, n)
+    assert np.all(np.isfinite(d["b"])) and d["b"].shape == (n,)
+    # snapshot must be solvable standalone
+    x = _splu(A.tocsc()).solve(d["b"])
+    assert np.all(np.isfinite(x))
+    # PCD operators present and square in the pressure space (nfree x nfree)
+    Ap = sp.csr_matrix((d["Ap_data"], d["Ap_indices"], d["Ap_indptr"]),
+                       shape=tuple(d["Ap_shape"]))
+    assert Ap.shape == (int(d["nfree"]), int(d["nfree"]))
+    assert int(d["p_pin"]) >= 0
+    json.loads(str(d["bd_json"]))          # knob record parses
+    # knob OFF byte-identity: default run unaffected
+    ref = run_truck(cfg, nsteps=3, base_level=5, truck_band_to=6,
+                    band_cells=2, merged=_tiny_tire_mesh(cfg),
+                    region_refine=False, nu=1.0 / 50.0, dt=0.02,
+                    verbose=False)
+    np.testing.assert_array_equal(res["cd"], ref["cd"])
