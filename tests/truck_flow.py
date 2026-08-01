@@ -55,6 +55,7 @@ from diffsim.api.ns_bricks import assemble_linear_ns
 from diffsim.physics.poisson import gauss_points
 from diffsim.solvers.timestepping import bdf_coeffs
 from diffsim.solvers.linsolve import solve_linear, _LAST_ITERS
+from diffsim.errors import ConvergenceError
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +98,6 @@ def slab_carve(tree, channel_box):
 
 def refine_region_boxes(tree, regions, scale):
     """Refine cells whose center is inside each region box, up to its level."""
-    import torch
     for r in regions:
         lo = np.asarray(r.min_c, np.float64) * scale
         hi = np.asarray(r.max_c, np.float64) * scale
@@ -561,7 +561,12 @@ def interpolate_checkpoint(ckpt_path, fx_old, fx_new, out_dir):
     from diffsim.octree import morton as _morton
     from diffsim.octree.lookup import LeafLookup as _LeafLookup
 
-    ck = np.load(ckpt_path)
+    # Read every needed member into memory before touching the output directory.
+    # When out_dir == the source directory, the unlink loop below would otherwise
+    # delete the source file while we still hold a lazy npz handle — safe today
+    # via the POSIX open-file guarantee but fragile across OS / zip backends.
+    with np.load(ckpt_path) as _ck_f:
+        ck = {k: np.array(_ck_f[k]) for k in _ck_f.files}
     mesh_o, cons_o, tree_o = fx_old["mesh"], fx_old["cons"], fx_old["tree"]
     mesh_n, cons_n = fx_new["mesh"], fx_new["cons"]
     ndof = 4
@@ -756,6 +761,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
           step on, strict semantics (raise -> optional PCD fallback) return.
           Guarded by ``u_cap`` so drift cannot masquerade as progress.
           None (default) = strict everywhere, byte-identical.
+          RESTRICTION: only supported with ``mono_solver="fgmres_bdiag"``; any
+          other solver raises ``ValueError`` at march start.
       u_cap : float
           March blow-up sentinel (STATE-based, leg-6 lesson): after every
           step, |u|_inf must be finite and below this cap (cd_react must be
@@ -918,29 +925,36 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
     # face mass matrix row-sum -> nodal area A_i; per step add
     # -0.5*min(0, a_x)*A_i to the three velocity diagonals of outlet nodes
     # (outlet normal = +x, so u.n = u_x).  Off by default = byte-identical.
-    _bf_rows = _bf_area = None
+    _obf_rows = _obf_area = None
     if backflow_stab:
         _coords_all = mesh.node_coords[cons.free_nodes]
-        _on_outlet = np.abs(_coords_all[:, 0] - 1.0) < 1e-12
+        _x_max = _coords_all[:, 0].max()
+        _on_outlet = np.abs(_coords_all[:, 0] - _x_max) < 1e-10
         _out_nodes = np.where(_on_outlet)[0]
-        # lumped nodal area from outlet cells (anchor_x + h == 1)
-        _tree = fx["tree"]
-        _anch = _tree.anchors() * (2.0 ** -21)  # unit coords (lmax=21 for 3D)
         # robust: use per-node local h from nearest outlet cell size — approximate
         # with the finest wall cell area (walls-refined): h_loc via node spacing
         _area = np.zeros(len(_out_nodes))
         if len(_out_nodes):
-            # per-node area ~ (median neighbor spacing)^2: use the y/z grid of
-            # outlet nodes to estimate local spacing per node (kd-lite: sort)
+            # per-node area ~ (kNN nearest-neighbor spacing)^2: use the y/z grid
+            # of outlet nodes to estimate local spacing per node.  This is an
+            # O(1) approximation — ~2x off at 2:1 interface nodes — and is
+            # adequate as a stabilization coefficient (not a geometric area).
             _yz = _coords_all[_out_nodes][:, 1:]
             from scipy.spatial import cKDTree as _KD
             _kd = _KD(_yz)
             _dd, _ = _kd.query(_yz, k=2)
             _hloc = _dd[:, 1]
             _area = _hloc ** 2
-        _bf_rows = (_out_nodes[:, None] * ndof
-                    + np.arange(dim)[None, :]).ravel().astype(np.int64)
-        _bf_area = np.repeat(_area, dim)
+        _obf_rows = (_out_nodes[:, None] * ndof
+                     + np.arange(dim)[None, :]).ravel().astype(np.int64)
+        _obf_area = np.repeat(_area, dim)
+        # host/device cd_react parity: the reaction indicator w_rxn must be zero
+        # on all backflow rows — the host path captures A_vol pre-backflow while
+        # the device path subtracts Af and bf but not the backflow diagonal.
+        # Correctness requires that w_rxn has zero support on outlet nodes.
+        assert np.all(w_rxn[_obf_rows] == 0.0), (
+            "w_rxn is nonzero on backflow rows — reaction bbox overlaps outlet; "
+            "host/device cd_react parity violated")
         print(f"[truck] backflow stabilization armed: {len(_out_nodes)} "
               f"outlet nodes", flush=True)
 
@@ -990,14 +1004,14 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                               dtype=wp.float64, device=dm.device)
 
         # Backflow-stab diagonal slots (outlet velocity dofs), device path.
-        _bf_slots_d = _bf_comb_slots_d = None
-        if _bf_rows is not None:
-            _bf_slots = _dev_asm.csr_slots(_bf_rows, _bf_rows)
-            _bf_slots_d = wp.array(_bf_slots.astype(_dev_asm._idx_np),
-                                   dtype=_dev_asm._idx_dtype, device=dm.device)
-            _bf_comb_slots = np.concatenate([_af_slots, _bf_slots])
-            _bf_comb_slots_d = wp.array(
-                _bf_comb_slots.astype(_dev_asm._idx_np),
+        _obf_slots_d = _obf_comb_slots_d = None
+        if _obf_rows is not None:
+            _obf_slots = _dev_asm.csr_slots(_obf_rows, _obf_rows)
+            _obf_slots_d = wp.array(_obf_slots.astype(_dev_asm._idx_np),
+                                    dtype=_dev_asm._idx_dtype, device=dm.device)
+            _obf_comb_slots = np.concatenate([_af_slots, _obf_slots])
+            _obf_comb_slots_d = wp.array(
+                _obf_comb_slots.astype(_dev_asm._idx_np),
                 dtype=_dev_asm._idx_dtype, device=dm.device)
 
         # Static strong rows = BC rows + pressure pin (fixed for the mesh).
@@ -1101,7 +1115,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                                 tol=_tol, device=device,
                                 cache=_slv_cache, cache_key="truck")
         except Exception as e:
-            if _fb_meta is None or type(e).__name__ != "ConvergenceError":
+            if _fb_meta is None or not isinstance(e, ConvergenceError):
                 raise
             _fb_msg = str(e)
         # ---- fallback path (traceback released, workspace reclaimable) ----
@@ -1148,6 +1162,12 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                     f"{int(_ck['nfree'])} vs current {nfree} — mesh knobs "
                     "changed; use interpolate_checkpoint for mesh-sequenced "
                     "restarts")
+            if "n_cells" in _ck and int(_ck["n_cells"]) != fx["n_cells"]:
+                raise ValueError(
+                    f"resume checkpoint mesh mismatch: ckpt n_cells="
+                    f"{int(_ck['n_cells'])} vs current {fx['n_cells']} — "
+                    "mesh knobs changed; use interpolate_checkpoint for "
+                    "mesh-sequenced restarts")
             if _ck["x_cur"].shape != (nfree * ndof,):
                 raise ValueError(
                     f"resume checkpoint shape mismatch: {_ck['x_cur'].shape}"
@@ -1291,17 +1311,17 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                 # outlet backflow stabilization (Picard: u.n = u_x from
                 # the advection iterate at outlet nodes)
                 _extra_m = (_af_slots_d, _af_vals_d) if _sbm_on else None
-                if _bf_rows is not None:
-                    _ax = u_iter[(_bf_rows[::dim] // ndof), 0]
+                if _obf_rows is not None:
+                    _ax = u_iter[(_obf_rows[::dim] // ndof), 0]
                     _bfv = (np.repeat(-0.5 * np.minimum(0.0, _ax), dim)
-                            * _bf_area)
+                            * _obf_area)
                     if _sbm_on:
                         _cv = np.concatenate([_Af_csr.data, _bfv])
-                        _extra_m = (_bf_comb_slots_d, wp.array(
+                        _extra_m = (_obf_comb_slots_d, wp.array(
                             np.ascontiguousarray(_cv, np.float64),
                             dtype=wp.float64, device=dm.device))
                     else:
-                        _extra_m = (_bf_slots_d, wp.array(
+                        _extra_m = (_obf_slots_d, wp.array(
                             np.ascontiguousarray(_bfv, np.float64),
                             dtype=wp.float64, device=dm.device))
                 Acsr, b = _asm_call(
@@ -1343,11 +1363,11 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                                           tau_scale=float(tau_m_scale))
                 _A_vol = A.tocsr()      # pre-SBM, pre-surgery (reaction arbiter)
                 _b_vol = b.copy()
-                if _bf_rows is not None:
-                    _ax = u_iter[(_bf_rows[::dim] // ndof), 0]
+                if _obf_rows is not None:
+                    _ax = u_iter[(_obf_rows[::dim] // ndof), 0]
                     _bfv = (np.repeat(-0.5 * np.minimum(0.0, _ax), dim)
-                            * _bf_area)
-                    A = A + sp.csr_matrix((_bfv, (_bf_rows, _bf_rows)),
+                            * _obf_area)
+                    A = A + sp.csr_matrix((_bfv, (_obf_rows, _obf_rows)),
                                           shape=A.shape)
                 if _sbm_on:
                     A = (A + Af_c).tolil()
@@ -1423,8 +1443,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             _xp = _pcd_cache.get(("bdiag_x_prev", "truck"))
             _xp2 = _pcd_cache.get(("bdiag_x_prev2", "truck"))
             np.savez(_tmp, step=step, t_cur=t_cur,
-                     dt_prev=(dt_prev_step if dt_prev_step is not None
-                              else np.nan),
+                     dt_prev=dt_prev_step,
                      x_cur=x_cur, u_pre1=u_pre1, u_pre2=u_pre2,
                      cd=cd, cd_surr=cd_surr, cl_y=cl_y, cl_z=cl_z,
                      cl_y_surr=cl_y_surr, cl_z_surr=cl_z_surr,
