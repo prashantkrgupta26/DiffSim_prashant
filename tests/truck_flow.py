@@ -32,3 +32,19 @@ from diffsim.cases.truck import (
     run_truck,
     make_nu_schedule,
 )
+
+
+if __name__ == "__main__":
+    import os
+    from diffsim.cases.truck_config import load_truck_config
+    cfgp = os.environ.get("TRUCK_CONFIG", os.path.join(
+        os.path.dirname(__file__), "..", "local_code_old",
+        "truck_4case_fresh_inputs", "NewRun-no-shell-slope0p25", "config.txt"))
+    cfg = load_truck_config(cfgp)
+    base_level = int(os.environ.get("BASE_LEVEL", "6"))
+    nsteps = int(os.environ.get("NSTEPS", "3"))
+    res = run_truck(cfg, nsteps=nsteps, base_level=base_level,
+                    truck_band_to=int(os.environ.get("BAND_TO", str(base_level + 2))),
+                    verbose=True)
+    print("Cd_react", res["cd"])
+    print("Cd_surr", res["cd_surr"])
