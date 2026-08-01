@@ -259,6 +259,21 @@ RESUME = os.environ.get("RESUME", "0").strip() not in ("", "0")
 if MARCH_CKPT > 0:
     print(f"[T5] march checkpoints every {MARCH_CKPT} steps"
           + (" (RESUME requested)" if RESUME else ""), flush=True)
+# DUMP_SYSTEM: capture assembled saddle system at listed step indices for the
+# offline solver lab (Task 1).  Requires TRUCK_ASSEMBLY=host (device handoff
+# raises; see run_truck docstring).  Eager validation: steps-but-no-dir fails
+# HERE at leg start, not hours into a march.
+DUMP_SYS_STEPS = tuple(int(s) for s in
+                       os.environ.get("DUMP_SYSTEM_STEPS", "").split(",")
+                       if s.strip())
+DUMP_SYS_DIR = os.environ.get("DUMP_SYSTEM_DIR", "") or None
+if DUMP_SYS_STEPS and DUMP_SYS_DIR is None:
+    raise ValueError(
+        "DUMP_SYSTEM_STEPS is set but DUMP_SYSTEM_DIR is empty — "
+        "set DUMP_SYSTEM_DIR to the capture output directory")
+if DUMP_SYS_STEPS:
+    print(f"[T5] dump-system at steps {DUMP_SYS_STEPS} -> {DUMP_SYS_DIR}",
+          flush=True)
 # SEAL_BOXES="x0:x1:y0:y1:z0:z1[;...]" — gap fairings (cab-trailer slot etc.)
 def _parse_knob(env_name, item_sep, field_sep, nfields, cast):
     """Eager multi-part env-knob parsing (final-review I-7): malformed
@@ -429,6 +444,8 @@ res = run_truck(
     checkpoint_interval=(MARCH_CKPT if MARCH_CKPT > 0 else None),
     checkpoint_dir=(VIZ_DIR if MARCH_CKPT > 0 else None),
     resume=RESUME,
+    dump_system_steps=DUMP_SYS_STEPS,
+    dump_system_dir=DUMP_SYS_DIR,
 )
 t_total = time.time() - t_run
 
