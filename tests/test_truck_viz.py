@@ -38,7 +38,7 @@ def _tiny_tire_mesh(cfg, half=0.05, center=(0.35, 0.0625, 0.0625)):
 
 def _build_tiny(cfg):
     """Build tiny mesh fx dict for unit tests."""
-    from truck_flow import build_truck_mesh
+    from diffsim.cases.truck import build_truck_mesh
     merged = _tiny_tire_mesh(cfg)
     return build_truck_mesh(cfg, base_level=5, region_refine=False,
                             truck_band_to=6, band_cells=2, merged=merged)
@@ -158,7 +158,7 @@ def test_three_frame_export_files_exist():
     merged = _tiny_tire_mesh(cfg)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        from truck_flow import run_truck
+        from diffsim.cases.truck import run_truck
         res = run_truck(cfg, nsteps=3, base_level=5, truck_band_to=6,
                         band_cells=2, merged=merged, region_refine=False,
                         nu=1.0 / 50.0, dt=0.02, verbose=False,
@@ -196,7 +196,7 @@ def test_three_frame_export_meshio_reread():
     merged = _tiny_tire_mesh(cfg)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        from truck_flow import run_truck
+        from diffsim.cases.truck import run_truck
         run_truck(cfg, nsteps=3, base_level=5, truck_band_to=6,
                   band_cells=2, merged=merged, region_refine=False,
                   nu=1.0 / 50.0, dt=0.02, verbose=False,
@@ -243,7 +243,7 @@ def test_checkpoint_vtu_meshio_reread():
     merged = _tiny_tire_mesh(cfg)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        from truck_flow import run_truck
+        from diffsim.cases.truck import run_truck
         run_truck(cfg, nsteps=3, base_level=5, truck_band_to=6,
                   band_cells=2, merged=merged, region_refine=False,
                   nu=1.0 / 50.0, dt=0.02, verbose=False,
@@ -281,7 +281,7 @@ def test_viz_none_byte_identical_march():
     merged_a = _tiny_tire_mesh(cfg)
     merged_b = _tiny_tire_mesh(cfg)
 
-    from truck_flow import run_truck
+    from diffsim.cases.truck import run_truck
 
     # Reference: no viz
     res_ref = run_truck(cfg, nsteps=3, base_level=5, truck_band_to=6,
@@ -335,7 +335,7 @@ def test_render_three_pngs_per_shot():
     merged = _tiny_tire_mesh(cfg)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        from truck_flow import run_truck
+        from diffsim.cases.truck import run_truck
         run_truck(cfg, nsteps=3, base_level=5, truck_band_to=6,
                   band_cells=2, merged=merged, region_refine=False,
                   nu=1.0 / 50.0, dt=0.02, verbose=False,

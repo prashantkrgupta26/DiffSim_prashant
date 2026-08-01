@@ -29,7 +29,6 @@ os.environ.setdefault("DIFFSIM_ASM_PROFILE", "1")
 
 MIN_WORK = os.environ.get("SADDLE_MIN_WORK", "0").strip() not in ("", "0")
 
-sys.path.insert(0, "/work/mech-ai/baskarg/DiffSim/tests")
 sys.path.insert(0, "/work/mech-ai/baskarg/DiffSim/src")
 
 CONF = ("/work/mech-ai/baskarg/DiffSim/local_code_old/truck_4case_fresh_inputs/"
@@ -97,7 +96,7 @@ print(f"[T5] scale={scale} dt_unit={dt} ramp_end_unit={ramp_end_unit} "
       f"-> ramp_end_step={ramp_end_unit/dt:.0f}  arrival~step{arrival_step}",
       flush=True)
 
-from truck_flow import run_truck, make_nu_schedule
+from diffsim.cases.truck import run_truck, make_nu_schedule
 nu_sched = make_nu_schedule(cfg, U_inf=1.0, L_ref=1.0, scale=scale)
 # C++-faithful low-Re startup (ReSolverRampInitial=10 heritage): env RE_START>0
 # overrides the schedule's early phase — Re ramps RE_START -> config Re over

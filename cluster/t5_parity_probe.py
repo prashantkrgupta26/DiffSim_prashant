@@ -7,7 +7,6 @@ truck case on both paths and asserts the reaction/surrogate drag match tightly.
 Small, fast, fully logged (via the t5_hdr.sh-style wrapper that launches it)."""
 import os, sys, time
 os.environ["SADDLE_DEVICE_CSR"] = "1"
-sys.path.insert(0, "/work/mech-ai/baskarg/DiffSim/tests")
 sys.path.insert(0, "/work/mech-ai/baskarg/DiffSim/src")
 import numpy as np
 import torch, warp as wp
@@ -17,7 +16,7 @@ print(f"[parity] WARP {wp.__version__} cuda={torch.cuda.is_available()} "
 
 from diffsim.cases.truck_config import load_truck_config
 from diffsim.geometry.merged_trimesh import MergedTriMesh, _read_stl
-from truck_flow import run_truck
+from diffsim.cases.truck import run_truck
 
 CONF = ("/work/mech-ai/baskarg/DiffSim/local_code_old/truck_4case_fresh_inputs/"
         "NewRun-no-shell-slope0p25/config.txt")

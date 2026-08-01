@@ -18,7 +18,6 @@ import scipy.sparse as sp
 
 os.environ.setdefault("SADDLE_DEVICE_CSR", "0")   # host CSR: we need A.diagonal()
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tests"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 CONF = os.environ.get("TRUCK_CONFIG", os.path.join(
@@ -30,8 +29,8 @@ DEVICE = os.environ.get("DIAG_DEVICE", "cuda")
 
 from diffsim.cases.truck_config import load_truck_config
 from diffsim.octree.build import build_uniform
-from truck_flow import (build_truck_mesh, truck_strong_bc, _pressure_pin,
-                        make_nu_schedule)
+from diffsim.cases.truck import (build_truck_mesh, truck_strong_bc, _pressure_pin,
+                                  make_nu_schedule)
 from diffsim.sbm.vector import sbm_vector_dirichlet
 from diffsim.api.ns_bricks import assemble_linear_ns
 from diffsim.solvers.timestepping import bdf_coeffs
