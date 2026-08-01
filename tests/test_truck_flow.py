@@ -429,6 +429,53 @@ def test_interpolate_checkpoint_identity(tmp_path):
     np.testing.assert_array_equal(res["cd"], ref["cd"])
 
 
+# ---------------------------------------------------------------------------
+# solver-escalation Task 2: fgmres_pcd as a first-class primary solver
+# ---------------------------------------------------------------------------
+
+def test_pcd_primary_fallback_guard():
+    """mono_solver='fgmres_pcd' with saddle_fallback='pcd' raises ValueError
+    (PCD cannot be its own fallback).  This guard fires before any solve, so
+    it does not require pyamgx to be installed."""
+    from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
+    from diffsim.cases.truck_config import load_truck_config
+    from diffsim.cases.truck import run_truck
+    cfg = load_truck_config(_CFG_PATH)
+    common = dict(nsteps=3, base_level=5, truck_band_to=6, band_cells=2,
+                  region_refine=False, nu=1.0 / 50.0, dt=0.02, verbose=False)
+    with pytest.raises(ValueError, match="fallback"):
+        run_truck(cfg, merged=_tiny_tire_mesh(cfg),
+                  mono_solver="fgmres_pcd", saddle_fallback="pcd", **common)
+
+
+@pytest.mark.skipif(
+    __import__("importlib").util.find_spec("pyamgx") is None,
+    reason="pyamgx not installed — fgmres_pcd primary requires AMGX "
+           "inners to converge in reasonable time on 3-D BDF2 steps")
+def test_pcd_primary_march():
+    """mono_solver='fgmres_pcd' marches and tracks the splu trajectory."""
+    from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
+    from diffsim.cases.truck_config import load_truck_config
+    from diffsim.cases.truck import run_truck
+    cfg = load_truck_config(_CFG_PATH)
+    # linsolve_tol default is 1e-10 (< 1e-8) so the 1e-5 atol assert is valid
+    # without an explicit tol override.
+    # pcd_f_inner/pcd_ap_inner default to "amgx" (the driver default); requires
+    # pyamgx (GPU box) — this test is skipped on CPU-only / no-pyamgx machines
+    # (jacobi-CG inner diverges the 3-D BDF2 saddle without AMG strength).
+    common = dict(nsteps=3, base_level=5, truck_band_to=6, band_cells=2,
+                  region_refine=False, nu=1.0 / 50.0, dt=0.02, verbose=False)
+    ref = run_truck(cfg, merged=_tiny_tire_mesh(cfg),
+                    mono_solver="splu", **common)
+    res = run_truck(cfg, merged=_tiny_tire_mesh(cfg),
+                    mono_solver="fgmres_pcd", **common)
+    for k in ("cd", "cd_surr"):
+        assert np.all(np.isfinite(res[k]))
+        np.testing.assert_allclose(res[k], ref[k], rtol=0, atol=1e-5)
+    # PCD-as-primary cannot also be the fallback (moved to separate guard test
+    # that runs unconditionally without amgx)
+
+
 def test_dt_schedule_identity_and_variable_table():
     """(a) a constant dt_schedule equals dt_schedule=None bit-for-bit;
     (b) a mid-run dt switch (variable BDF2 table) marches finite/bounded,

@@ -541,6 +541,21 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             _bd["saddle_min_work"] = True        # drift-guard polish cycle
         _pcd_cache[("blocktri_meta", "truck")] = _bd
 
+    # ---- PCD-as-primary guard + setup (solver-escalation Task 2) -----------
+    if mono_solver == "fgmres_pcd" and saddle_fallback == "pcd":
+        raise ValueError(
+            "mono_solver='fgmres_pcd' cannot use saddle_fallback='pcd' "
+            "(PCD is already the primary; no fallback for the fallback)")
+    if mono_solver == "fgmres_pcd":
+        from diffsim.solvers.saddle_precond import build_pcd_meta
+        _t_pm = time.time()
+        _pcd_cache[("pcd_meta", "truck")] = build_pcd_meta(
+            dm, nu if nu is not None else 1.0, 1.0 / dt,
+            p_pin=int(p_pin), inner=pcd_f_inner, ap_inner=pcd_ap_inner)
+        print(f"[truck] PCD PRIMARY armed (F={pcd_f_inner}, "
+              f"Ap={pcd_ap_inner}, meta {time.time()-_t_pm:.1f}s)",
+              flush=True)
+
     # ---- per-step PCD fallback (five-leg Jacobi-class verdict) --------------
     _fb_meta = None
     if saddle_fallback == "pcd" and mono_solver in ("fgmres_bdiag",
@@ -568,6 +583,12 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         _slv_cache = (_pcd_cache if mono_solver in
                       ("fgmres_pcd", "fgmres_bdiag", "fused_bdiag")
                       else None)
+        # PCD primary: refresh per-step sigma/nu before every solve (mirrors
+        # the fallback path; Mp/Ap are geometry-only and stay fixed).
+        if mono_solver == "fgmres_pcd":
+            _pm = _pcd_cache[("pcd_meta", "truck")]
+            _pm["sigma"] = float(sigma)
+            _pm["nu"] = float(nu_step)
         _fb_msg = None
         try:
             return solve_linear(Acsr, b, solver=mono_solver, sym=False,
