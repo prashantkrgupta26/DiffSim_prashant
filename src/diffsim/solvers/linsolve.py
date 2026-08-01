@@ -1608,6 +1608,34 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         # A3 knob A: restart length (opt-in, default 60)
         _restart = int(meta.get("saddle_restart", 60))
 
+        # Krylov restart advisor: when running on a CUDA device, estimate the
+        # flexible-FGMRES V+Z storage (2·restart·8·N bytes) and warn once per
+        # cache key if it exceeds 50% of free VRAM.  LOG-ONLY: never changes
+        # _restart.  No-op on CPU paths (guarded by is_cuda) and safe against
+        # API mismatches (free_memory query wrapped in try/except).
+        _advisor_key = ("_bdiag_restart_advised", cache_key)
+        if (cache is not None and cache_key is not None
+                and not cache.get(_advisor_key)):
+            try:
+                _wd = wp.get_device(device)
+                if _wd.is_cuda:
+                    _N_adv = len(b)
+                    _krylov_bytes = 2 * _restart * 8 * _N_adv
+                    _free_vram = _wd.free_memory
+                    if _free_vram > 0 and _krylov_bytes > 0.5 * _free_vram:
+                        _suggested = max(
+                            1, int(0.4 * _free_vram / (8 * _N_adv)))
+                        print(
+                            f"[saddle] RESTART-ADVISOR: restart={_restart} "
+                            f"needs V+Z≈{_krylov_bytes/2**30:.2f} GiB "
+                            f"(>50% of {_free_vram/2**30:.2f} GiB free VRAM "
+                            f"at N={_N_adv}); "
+                            f"suggested restart≤{_suggested}",
+                            flush=True)
+            except Exception:
+                pass   # API mismatch or non-CUDA build — skip silently
+            cache[_advisor_key] = True
+
         # T4b knob — symmetric diagonal EQUILIBRATION (opt-in via
         # meta["saddle_equilibrate"], set by the driver from SADDLE_EQUILIBRATE).
         # Solve (D^{-1/2} A D^{-1/2}) y = D^{-1/2} b, x = D^{-1/2} y with
@@ -1729,6 +1757,10 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                       f"after {finfo['inner']} inner ({finfo['outer']} "
                       f"restarts) vs tol={tol:.1e}", flush=True)
             else:
+                print(f"[saddle] BUDGET-EXHAUSTED fgmres_bdiag: "
+                      f"relres={finfo['relres']:.3e} after {finfo['inner']} "
+                      f"inner ({finfo['outer']} restarts) — primary budget "
+                      f"exhausted, raising for caller fallback", flush=True)
                 raise ConvergenceError(
                     f"fgmres_bdiag: not converged after {finfo['inner']} inner "
                     f"iterations ({finfo['outer']} restarts); "
