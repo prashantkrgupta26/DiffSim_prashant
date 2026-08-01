@@ -3,6 +3,9 @@
 
 # --- Python / env ---
 .venv/
+.venv-nova/
+.venv-nova-arm/
+.warp-cache*/
 __pycache__/
 *.egg-info/
 *.pyc

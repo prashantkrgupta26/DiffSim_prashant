@@ -1,0 +1,70 @@
+[t5-gate] 2026-07-30T09:42:52Z start
+GPU 0: NVIDIA GH200 480GB (UUID: GPU-14a8b48f-cb9d-f6f4-fb9d-f4b0b5b76fd9)
+WARP 1.15.0
+========================================================================
+[T5] GATE LEG  base=7 band=12 nsteps=400 viz_interval=20 ckpt=100 equilibrate=False assembly=device
+Warp 1.15.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "aarch64"
+     "cuda:0"   : "NVIDIA GH200 480GB" (95 GiB, sm_90, mempool enabled)
+   Kernel cache:
+     /work/mech-ai/baskarg/DiffSim/.warp-cache-hdr/1.15.0
+[T5] torch 2.13.0+cu126  cuda=True
+[T5] GPU: NVIDIA GH200 480GB
+/work/mech-ai/baskarg/DiffSim/cluster/t5_gate.py:87: UserWarning: load_truck_config: ignoring unrecognized top-level keys: AverageOutput, AverageOutputInterval, Cb_e, Cb_f_bulk, CheckpointInterval, CheckpointNumbackup, Ci_e, G_dir, Gr_V, Gr_ramping, HeatSolverType, HeatTimestepper, NavierStokesSolverType, OutputStartTime, Pe_V, Pe_ramping, PostProcessingInterval, ReSolverRampMaxEffort, ReSolverRampOutput, ReSolverRampReduceOnStruggle, ReSolverRampReduction, ReSolverRampStableSteps, RemoveInterceptedForShell_CompleteOctree, SolveHT, SolveNS, blockTolerance, ifInter, initial_condition, iterMaxBlock, solver_options_ht, solver_options_ns, tauM_scale, thetaTimeStepping
+  cfg = load_truck_config(CONF)
+[T5] scale=0.0625 dt_unit=0.000625 ramp_end_unit=3.1875 -> ramp_end_step=5100  arrival~step500
+[T5] nu_unit(0)=6.250e-05 effRe=1000
+Module _make_query_kernel__locals__trimesh_query_7504a757 7504a75 load on device 'cuda:0' took 2.57 ms  (cached)
+Module make_sbm_dirichlet_Ae__locals__sbm_dir_Ae_1913307a 1913307 load on device 'cuda:0' took 2.97 ms  (cached)
+Module make_sbm_dirichlet_be__locals__sbm_dir_be_f3d53b05 f3d53b0 load on device 'cuda:0' took 1.72 ms  (cached)
+Module make_linear_ns_Ae__locals__lin_ns_Ae_23b38efa 23b38ef load on device 'cuda:0' took 2.42 ms  (cached)
+Module _scatter_weighted_kernel_chunked__locals__scwc_5494f6ff 5494f6f load on device 'cuda:0' took 1.79 ms  (cached)
+Module make_linear_ns_be__locals__lin_ns_be_fd4cb29b fd4cb29 load on device 'cuda:0' took 1.97 ms  (cached)
+Module _scatter_vec_weighted_kernel__locals__scvw_58216abb 58216ab load on device 'cuda:0' took 9.31 ms  (cached)
+Module _scatter_kernel_chunked__locals__scat_18c49925 18c4992 load on device 'cuda:0' took 1.53 ms  (cached)
+Module _zero_slots_kernel_chunked__locals__zk_5a9c7c9a 5a9c7c9 load on device 'cuda:0' took 1.56 ms  (cached)
+Module _diag_one_kernel_chunked__locals__dk_1783be85 1783be8 load on device 'cuda:0' took 1.59 ms  (cached)
+Module _gather_kernel_chunked__locals__gat_58889783 5888978 load on device 'cuda:0' took 2.19 ms  (cached)
+Module _make_kernels__locals__dot_partial_73c59ca3 73c59ca load on device 'cuda:0' took 2.15 ms  (cached)
+Module _make_kernels__locals__reduce_to_9929054e 9929054 load on device 'cuda:0' took 1.61 ms  (cached)
+Module _make_kernels__locals__store_normed_7e8b3877 7e8b387 load on device 'cuda:0' took 1.93 ms  (cached)
+Module _make_kernels__locals__zero_g_set0_d53a08ce d53a08c load on device 'cuda:0' took 1.81 ms  (cached)
+Module _make_kernels__locals__copy_from_row_0839d18d 0839d18 load on device 'cuda:0' took 1.56 ms  (cached)
+Module _bdiag_kernel__locals__bdiag_apply_1ee3faa0 1ee3faa load on device 'cuda:0' took 1.48 ms  (cached)
+Module _make_kernels__locals__copy_to_row_65801df7 65801df load on device 'cuda:0' took 1.36 ms  (cached)
+Module make_csr_spmv_chunked__locals__spmv_ch_35afa75b 35afa75 load on device 'cuda:0' took 1.63 ms  (cached)
+Module _make_kernels__locals__dot_row_773e847e 773e847 load on device 'cuda:0' took 36.20 ms  (cached)
+Module _make_kernels__locals__dot_to_H_bfc9737c bfc9737 load on device 'cuda:0' took 1.45 ms  (cached)
+Module _make_kernels__locals__axpy_row_22ea1b41 22ea1b4 load on device 'cuda:0' took 1.43 ms  (cached)
+Module _make_kernels__locals__hnorm_from_scal_0b18accd 0b18acc load on device 'cuda:0' took 1.38 ms  (cached)
+Module _make_kernels__locals__givens_apply_and_update_cde3ea31 cde3ea3 load on device 'cuda:0' took 1.59 ms  (cached)
+Module _make_kernels__locals__back_solve_c57ff9e4 c57ff9e load on device 'cuda:0' took 1.56 ms  (cached)
+Module _make_combine_kernel__locals__combine_9b752ff3 9b752ff load on device 'cuda:0' took 1.52 ms  (cached)
+[T5] step    0 cd_react=-0.00000 cd_surr=-82.57 iters=3 t=514.8s rss=283.9G smi=65312MiB
+Module _sub__locals__vsub_889c699d 889c699 load on device 'cuda:0' took 35.31 ms  (cached)
+[T5] step    1 cd_react=-0.00000 cd_surr=-110.19 iters=1 t=7.0s rss=283.9G smi=67391MiB
+[T5] step    2 cd_react=-0.00000 cd_surr=-137.81 iters=0 t=12.8s rss=283.9G smi=67425MiB
+[T5] step    3 cd_react=-0.00000 cd_surr=-193.58 iters=1 t=7.0s rss=283.9G smi=67487MiB
+[T5] step    4 cd_react=-0.00000 cd_surr=-282.50 iters=1 t=6.9s rss=283.9G smi=67487MiB
+[T5] step    5 cd_react=-0.00000 cd_surr=-464.80 iters=2 t=6.9s rss=283.9G smi=67489MiB
+[T5] step    6 cd_react=-0.00000 cd_surr=-678.08 iters=1 t=7.4s rss=283.9G smi=68737MiB
+[T5] step    7 cd_react=-0.00000 cd_surr=-1002.81 iters=2 t=7.3s rss=283.9G smi=68737MiB
+[T5] step    8 cd_react=-0.00000 cd_surr=-1366.25 iters=1 t=7.3s rss=283.9G smi=68737MiB
+[T5] step    9 cd_react=-0.00000 cd_surr=-1855.26 iters=2 t=9.3s rss=283.9G smi=68737MiB
+[T5] step   10 cd_react=-0.00000 cd_surr=-2413.88 iters=2 t=11.2s rss=283.9G smi=68737MiB
+[T5] step   11 cd_react=-0.00000 cd_surr=-3105.12 iters=2 t=7.7s rss=283.9G smi=68737MiB
+[T5] step   12 cd_react=-0.00000 cd_surr=-3971.09 iters=2 t=10.9s rss=283.9G smi=69985MiB
+[T5] step   13 cd_react=-0.00000 cd_surr=-4947.24 iters=2 t=7.8s rss=283.9G smi=69985MiB
+[T5] step   14 cd_react=-0.00000 cd_surr=-5999.29 iters=2 t=9.4s rss=283.9G smi=69985MiB
+[T5] step   15 cd_react=-0.00000 cd_surr=-7106.84 iters=2 t=8.9s rss=283.9G smi=69985MiB
+[T5] step   16 cd_react=-0.00000 cd_surr=-8473.57 iters=3 t=7.3s rss=283.9G smi=69985MiB
+[T5] step   17 cd_react=-0.00000 cd_surr=-10698.46 iters=4 t=12.2s rss=283.9G smi=69985MiB
+[T5] step   18 cd_react=-0.00000 cd_surr=-13556.79 iters=4 t=7.6s rss=283.9G smi=69985MiB
+[T5] step   19 cd_react=-0.00000 cd_surr=-16930.54 iters=4 t=7.7s rss=283.9G smi=69985MiB
+[T5] step   20 cd_react=-0.00000 cd_surr=-20777.15 iters=4 t=22.9s rss=283.9G smi=69985MiB
+[T5] step   21 cd_react=-0.00000 cd_surr=-24861.40 iters=4 t=12.6s rss=283.9G smi=69985MiB
+[T5] step   22 cd_react=+0.00000 cd_surr=-28146.59 iters=5 t=7.9s rss=283.9G smi=69985MiB
+[T5] *** FIRST CONTACT at step 23: cd_react=+0.00022 ***
+[T5] step   23 cd_react=+0.00022 cd_surr=-29135.30 iters=5 t=9.0s rss=283.9G smi=69985MiB

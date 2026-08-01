@@ -1,0 +1,32 @@
+[parity] 2026-07-30T10:17:55Z start (miscompile sentinel, clean warp) log=cluster/results/t5-parity-20260730T101755Z.log
+Warp 1.15.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "aarch64"
+     "cuda:0"   : "NVIDIA GH200 480GB" (95 GiB, sm_90, mempool enabled)
+   Kernel cache:
+     /work/mech-ai/baskarg/DiffSim/.warp-cache-clean/1.15.0
+[parity] WARP 1.15.0 cuda=True cache=/work/mech-ai/baskarg/DiffSim/.warp-cache-clean
+/work/mech-ai/baskarg/DiffSim/cluster/t5_parity_probe.py:24: UserWarning: load_truck_config: ignoring unrecognized top-level keys: AverageOutput, AverageOutputInterval, Cb_e, Cb_f_bulk, CheckpointInterval, CheckpointNumbackup, Ci_e, G_dir, Gr_V, Gr_ramping, HeatSolverType, HeatTimestepper, NavierStokesSolverType, OutputStartTime, Pe_V, Pe_ramping, PostProcessingInterval, ReSolverRampMaxEffort, ReSolverRampOutput, ReSolverRampReduceOnStruggle, ReSolverRampReduction, ReSolverRampStableSteps, RemoveInterceptedForShell_CompleteOctree, SolveHT, SolveNS, blockTolerance, ifInter, initial_condition, iterMaxBlock, solver_options_ht, solver_options_ns, tauM_scale, thetaTimeStepping
+  cfg = load_truck_config(CONF)
+Module _make_query_kernel__locals__trimesh_query_7504a757 7504a75 load on device 'cuda:0' took 2.35 ms  (cached)
+Module make_sbm_dirichlet_Ae__locals__sbm_dir_Ae_1913307a 948642a load on device 'cpu' took 2691.08 ms  (compiled)
+Module make_sbm_dirichlet_be__locals__sbm_dir_be_f3d53b05 4084f87 load on device 'cpu' took 278.04 ms  (compiled)
+Module make_linear_ns_Ae__locals__lin_ns_Ae_23b38efa d0a0161 load on device 'cpu' took 152.72 ms  (compiled)
+Module make_linear_ns_be__locals__lin_ns_be_fd4cb29b 5a3603c load on device 'cpu' took 111.94 ms  (compiled)
+[parity] host  done t=4.7s cd=[np.float64(37.121702032383354), np.float64(29.757775218931734), np.float64(31.012026293003416)]
+Module make_sbm_dirichlet_Ae__locals__sbm_dir_Ae_1913307a 1913307 load on device 'cuda:0' took 2.92 ms  (cached)
+Module make_sbm_dirichlet_be__locals__sbm_dir_be_f3d53b05 f3d53b0 load on device 'cuda:0' took 1.74 ms  (cached)
+Module make_linear_ns_Ae__locals__lin_ns_Ae_23b38efa 23b38ef load on device 'cuda:0' took 2.21 ms  (cached)
+Module make_linear_ns_be__locals__lin_ns_be_fd4cb29b fd4cb29 load on device 'cuda:0' took 3.04 ms  (cached)
+Module _scatter_weighted_kernel__locals__scw_39e5a390 39e5a39 load on device 'cuda:0' took 380.05 ms  (compiled)
+Module _scatter_vec_weighted_kernel__locals__scvw_58216abb 58216ab load on device 'cuda:0' took 1.86 ms  (cached)
+Module _scatter_kernel__locals__scat_8d5ebe2a 8d5ebe2 load on device 'cuda:0' took 95.46 ms  (compiled)
+Module _zero_slots_kernel__locals__zk_3c4a690d 3c4a690 load on device 'cuda:0' took 89.64 ms  (compiled)
+Module _diag_one_kernel__locals__dk_4a1e0764 4a1e076 load on device 'cuda:0' took 89.94 ms  (compiled)
+Module diffsim.assembly.operators 057ea88 load on device 'cuda:0' took 88.79 ms  (compiled)
+[parity] device done t=2.4s cd=[np.float64(37.12170203238062), np.float64(29.757775218918656), np.float64(31.0120262930026)]
+[parity] max|cd_react_h - cd_react_d| = 1.308e-11
+[parity] max|cd_surr_h  - cd_surr_d | = 1.793e-11
+[parity] PASS (tol 1e-06) -- miscompile sentinel clear
+[parity] 2026-07-30T10:18:04Z done rc=0
