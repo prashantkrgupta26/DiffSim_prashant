@@ -337,8 +337,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
 
     # ---- outlet backflow stabilization (C++ BACKFLOW_STAB, lumped) ----------
     # NSEquation.h:2589: Ae += -0.5 N_a min(0, u.n) N_b on outlet faces,
-    # Picard-linearized about the current state.  Lumped first cut: the
-    # face mass matrix row-sum -> nodal area A_i; per step add
+    # Picard-linearized about the current state.  Lumped first cut: an
+    # approximate nodal area A_i (kNN spacing squared, see below); per step add
     # -0.5*min(0, a_x)*A_i to the three velocity diagonals of outlet nodes
     # (outlet normal = +x, so u.n = u_x).  Off by default = byte-identical.
     _obf_rows = _obf_area = None
