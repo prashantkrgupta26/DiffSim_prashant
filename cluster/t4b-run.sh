@@ -13,7 +13,8 @@ export PYTHONPATH=src:tests
 RES=cluster/results
 mkdir -p "$RES"
 LOG="$RES/${TAG}.log"
-echo "[t4b] $(date -u +%FT%TZ) TAG=$TAG cmd: $*" | tee "$LOG"
+echo "[t4b] $(date -u +%FT%TZ) start TAG=$TAG (log=$LOG)" | tee -a "$LOG"
+echo "[t4b] $(date -u +%FT%TZ) cmd: $*" | tee -a "$LOG"
 nvidia-smi -L | tee -a "$LOG"
 "$@" 2>&1 | tee -a "$LOG"
 RC=${PIPESTATUS[0]}

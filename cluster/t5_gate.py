@@ -29,7 +29,6 @@ os.environ.setdefault("DIFFSIM_ASM_PROFILE", "1")
 
 MIN_WORK = os.environ.get("SADDLE_MIN_WORK", "0").strip() not in ("", "0")
 
-sys.path.insert(0, "/work/mech-ai/baskarg/DiffSim/tests")
 sys.path.insert(0, "/work/mech-ai/baskarg/DiffSim/src")
 
 CONF = ("/work/mech-ai/baskarg/DiffSim/local_code_old/truck_4case_fresh_inputs/"
@@ -97,7 +96,7 @@ print(f"[T5] scale={scale} dt_unit={dt} ramp_end_unit={ramp_end_unit} "
       f"-> ramp_end_step={ramp_end_unit/dt:.0f}  arrival~step{arrival_step}",
       flush=True)
 
-from truck_flow import run_truck, make_nu_schedule
+from diffsim.cases.truck import run_truck, make_nu_schedule
 nu_sched = make_nu_schedule(cfg, U_inf=1.0, L_ref=1.0, scale=scale)
 # C++-faithful low-Re startup (ReSolverRampInitial=10 heritage): env RE_START>0
 # overrides the schedule's early phase — Re ramps RE_START -> config Re over
@@ -149,10 +148,23 @@ TOL_TIGHTEN_STEP = int(os.environ.get("TOL_TIGHTEN_STEP", "200"))
 # tighten-step -> unit time boundary (t_new = (step+1)*dt is passed in)
 _tol_tighten_t = (TOL_TIGHTEN_STEP + 1) * dt
 
+_tol_tighten_logged = [False]
+
 def tol_sched(t_unit):
     # loose through startup (step < TOL_TIGHTEN_STEP), tight after.  The Re ramp
     # is far longer than the leg, so this is the operative schedule.
-    return TOL_LOOSE if t_unit < _tol_tighten_t else TOL_TIGHT
+    if t_unit < _tol_tighten_t:
+        return TOL_LOOSE
+    if not _tol_tighten_logged[0]:
+        # Item 2 (cleanup): log the ACTUAL step and t at which the tight tol
+        # first engages.  Under a DT ladder t_unit != (step+1)*dt, so the
+        # step label TOL_TIGHTEN_STEP may differ from the real fire step; this
+        # site is the single ground-truth source.
+        _step_actual = round(t_unit / dt) - 1   # approximate step from t
+        print(f"[T5] TOL-TIGHTEN engaged: step~{_step_actual} "
+              f"t_unit={t_unit:.6f} -> tol={TOL_TIGHT:.1e}", flush=True)
+        _tol_tighten_logged[0] = True
+    return TOL_TIGHT
 
 print(f"[T5] soft_start={SOFT_START} dt-units  tol_loose={TOL_LOOSE} -> "
       f"tol_tight={TOL_TIGHT} at step>{TOL_TIGHTEN_STEP}", flush=True)
@@ -328,7 +340,11 @@ def on_step(step, info):
     fr = info.get("F_react_raw", float("nan"))
     rf = info.get("ref_force", float("nan"))
     iters = linsolve._LAST_ITERS[0]
-    if _arrival[0] is None and abs(cd) > 1e-6:
+    # only arm FIRST CONTACT on a step whose solve actually met tol — an
+    # accepted miss pollutes cd_react (documented conflation) and must not
+    # trigger the quotable line; the first CLEAN contact still logs.
+    if (_arrival[0] is None and abs(cd) > 1e-6
+            and not info.get("accepted_miss", False)):
         _arrival[0] = step
         print(f"[T5] *** FIRST CONTACT at step {step}: cd_react={cd:+.5f} ***",
               flush=True)

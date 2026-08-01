@@ -15,7 +15,6 @@ import os, sys, time, resource, subprocess, threading, json, pathlib
 os.environ.setdefault("SADDLE_DEVICE_CSR", "1")
 os.environ.setdefault("DIFFSIM_ASM_PROFILE", "1")
 
-sys.path.insert(0, "/work/mech-ai/baskarg/DiffSim/tests")
 sys.path.insert(0, "/work/mech-ai/baskarg/DiffSim/src")
 
 CONF = "/work/mech-ai/baskarg/DiffSim/local_code_old/truck_4case_fresh_inputs/NewRun-no-shell-slope0p25/config.txt"
@@ -73,7 +72,7 @@ ramp_end_unit = ramp_end_phys * scale     # 3.1875 unit
 print(f"[T4b] scale={scale}  dt_phys={dt_phys}  dt_unit={dt}  "
       f"ramp_end_unit={ramp_end_unit}", flush=True)
 
-from truck_flow import run_truck, make_nu_schedule
+from diffsim.cases.truck import run_truck, make_nu_schedule
 nu_sched = make_nu_schedule(cfg, U_inf=1.0, L_ref=1.0, scale=scale)
 print(f"[T4b] nu_unit(0)={nu_sched(0.0):.3e} -> effRe={scale/nu_sched(0.0):.0f}  "
       f"(unit-frame Re with L=1)", flush=True)

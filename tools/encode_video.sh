@@ -52,6 +52,7 @@ encode_shot() {
     local indir="${RENDERS_DIR}/${shot}"
     local pattern="${indir}/shot_${shot}_%06d.png"
     local outfile="${indir}/${shot}.mp4"
+    local logfile="${indir}/${shot}_ffmpeg.log"
 
     if [[ ! -d "${indir}" ]]; then
         echo "[encode_video] shot '${shot}': directory not found: ${indir} — skipping"
@@ -66,7 +67,11 @@ encode_shot() {
     fi
 
     echo "[encode_video] shot '${shot}': ${n_pngs} frames -> ${outfile}"
+    # Write ffmpeg output to a log file.  On success, quiet (-loglevel error keeps
+    # stderr clean); on failure, the full log is printed so the problem is visible.
+    local rc=0
     ffmpeg -y \
+        -loglevel error \
         -framerate "${FPS}" \
         -i "${pattern}" \
         -c:v libx264 \
@@ -75,7 +80,13 @@ encode_shot() {
         -preset slow \
         -movflags +faststart \
         "${outfile}" \
-        2>&1 | tail -5
+        2>"${logfile}" || rc=$?    # || : keep errexit from killing the handler
+    if [[ ${rc} -ne 0 ]]; then
+        echo "[encode_video] ERROR: ffmpeg failed for shot '${shot}' (exit ${rc})" >&2
+        echo "[encode_video] full ffmpeg output (${logfile}):" >&2
+        cat "${logfile}" >&2
+        return ${rc}
+    fi
     echo "[encode_video]   wrote ${outfile}"
 }
 
@@ -96,9 +107,12 @@ done
 
 if [[ "${all_exist}" == "true" ]]; then
     COMPOSITE="${RENDERS_DIR}/composite.mp4"
+    COMPOSITE_LOG="${RENDERS_DIR}/composite_ffmpeg.log"
     echo "[encode_video] creating composite (q_iso+centerline | surface_cp)..."
+    composite_rc=0
     # hstack q_iso and centerline (top row), pad surface_cp to same width
     ffmpeg -y \
+        -loglevel error \
         -i "${RENDERS_DIR}/q_iso/q_iso.mp4" \
         -i "${RENDERS_DIR}/centerline/centerline.mp4" \
         -i "${RENDERS_DIR}/surface_cp/surface_cp.mp4" \
@@ -111,8 +125,16 @@ if [[ "${all_exist}" == "true" ]]; then
         -c:v libx264 -pix_fmt yuv420p -crf 18 -preset slow \
         -movflags +faststart \
         "${COMPOSITE}" \
-        2>&1 | tail -5
-    echo "[encode_video]   wrote ${COMPOSITE}"
+        2>"${COMPOSITE_LOG}" || composite_rc=$?    # || : survive errexit
+    if [[ ${composite_rc} -ne 0 ]]; then
+        echo "[encode_video] ERROR: composite ffmpeg failed (exit ${composite_rc})" >&2
+        echo "[encode_video] full ffmpeg output (${COMPOSITE_LOG}):" >&2
+        cat "${COMPOSITE_LOG}" >&2
+        # composite failure was fatal pre-cleanup (pipefail) — keep it fatal
+        exit "${composite_rc}"
+    else
+        echo "[encode_video]   wrote ${COMPOSITE}"
+    fi
 fi
 
 echo "[encode_video] done."

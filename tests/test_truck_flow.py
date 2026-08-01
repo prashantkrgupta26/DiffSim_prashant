@@ -21,6 +21,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from diffsim.cases.truck_config import load_truck_config, TruckConfig
 
+# Detect CUDA availability for device-parity legs (skip on this Mac dev loop).
+try:
+    import warp as _wp
+    _wp.init()
+    _HAS_CUDA = _wp.get_cuda_device_count() > 0
+except Exception:
+    _HAS_CUDA = False
+
 _CFG_PATH = os.path.join(
     os.path.dirname(__file__), "..", "local_code_old",
     "truck_4case_fresh_inputs", "NewRun-no-shell-slope0p25", "config.txt")
@@ -101,7 +109,7 @@ def test_loader_unknown_keys_expected():
 def test_slab_carve_dyadic_exact():
     """The channel slab bounds (y=z=1/8) are dyadic => NO cell is cut; the
     carve retains exactly the interior slab with zero intercepted cells."""
-    from truck_flow import _channel_box, slab_carve
+    from diffsim.cases.truck import _channel_box, slab_carve
     from diffsim.octree.build import build_uniform
     cfg = load_truck_config(_CFG_PATH)
     for lvl in (3, 4, 5):
@@ -116,7 +124,7 @@ def test_slab_carve_dyadic_exact():
 def test_tiny_truck_march():
     """Tiny one-tire case: mesh builds, slab carve exact, 3 BDF steps finite,
     BOTH force observables recorded and nonzero."""
-    from truck_flow import run_truck
+    from diffsim.cases.truck import run_truck
     cfg = load_truck_config(_CFG_PATH)
     merged = _tiny_tire_mesh(cfg)
     res = run_truck(cfg, nsteps=3, base_level=5, truck_band_to=6,
@@ -141,7 +149,7 @@ def test_tiny_truck_march():
 
 def test_nu_schedule_re_ramp():
     """nu_schedule from Re_V/Re_ramping is a monotone-in-Re, positive nu(t)."""
-    from truck_flow import make_nu_schedule
+    from diffsim.cases.truck import make_nu_schedule
     cfg = load_truck_config(_CFG_PATH)
     sched = make_nu_schedule(cfg, U_inf=1.0, L_ref=1.0)
     # Re_ramping=[0,50,51], Re_V=[1e3,5e3,1e4]; nu = U*L/Re
@@ -165,7 +173,7 @@ def test_truck_device_assembly_parity(saddle_device_csr, monkeypatch):
     (w^T(A_full x) - w^T(Af x) - w^T b + w^T bf) against the host
     w^T(A_vol x - b_vol).  splu solver -> the linear solve is deterministic;
     the only host/device delta is the atomic-add scatter order (~1e-12)."""
-    from truck_flow import run_truck
+    from diffsim.cases.truck import run_truck
     monkeypatch.setenv("SADDLE_DEVICE_CSR", saddle_device_csr)
     cfg = load_truck_config(_CFG_PATH)
     merged = _tiny_tire_mesh(cfg)
@@ -186,7 +194,7 @@ def test_truck_warm_start_reduces_iters(monkeypatch):
     """P2 (T5): saddle_x0='extrap' warm-start flows through the truck march and
     reduces the summed inner-iteration count vs a cold start (x0=0).  Gates the
     knob end-to-end on the device CSR path (fgmres_bdiag)."""
-    from truck_flow import run_truck
+    from diffsim.cases.truck import run_truck
     from diffsim.solvers import linsolve
     monkeypatch.setenv("SADDLE_DEVICE_CSR", "1")
     cfg = load_truck_config(_CFG_PATH)
@@ -201,12 +209,12 @@ def test_truck_warm_start_reduces_iters(monkeypatch):
             if linsolve._LAST_ITERS[0] is not None:
                 iters.append(int(linsolve._LAST_ITERS[0]))
             return out
-        monkeypatch.setattr("truck_flow.solve_linear", _wrap)
+        monkeypatch.setattr("diffsim.cases.truck.truck_march.solve_linear", _wrap)
         run_truck(cfg, nsteps=5, base_level=5, truck_band_to=6, band_cells=2,
                   merged=merged, region_refine=False, nu=1.0 / 50.0, dt=0.02,
                   mono_solver="fgmres_bdiag", saddle_x0=x0, device="cpu",
                   assembly="device", linsolve_tol=1e-7, verbose=False)
-        monkeypatch.setattr("truck_flow.solve_linear", orig)
+        monkeypatch.setattr("diffsim.cases.truck.truck_march.solve_linear", orig)
         return iters
 
     warm = _run("extrap")
@@ -221,7 +229,7 @@ def test_truck_viz_hook_fires_in_march(tmp_path, monkeypatch):
     """P3 (T5): the viz hook fires during a (device) march and writes frames at
     viz_interval.  Runs >= 2 intervals; asserts the per-frame extracts + a .vtu
     checkpoint land on disk and the hook's written-log records >= 2 frames."""
-    from truck_flow import run_truck
+    from diffsim.cases.truck import run_truck
     monkeypatch.setenv("SADDLE_DEVICE_CSR", "1")
     cfg = load_truck_config(_CFG_PATH)
     merged = _tiny_tire_mesh(cfg)
@@ -255,7 +263,7 @@ def test_bc_masks_nonempty_and_structure():
     """Each dyadic plane carries >0 free nodes; the streamwise (inflow/outlet)
     and the transverse (ground/ceiling, side_zlo/side_zhi) opposite pairs are
     disjoint; strong-BC rows/vals are consistent length."""
-    from truck_flow import (build_truck_mesh, truck_strong_bc, truck_bc_masks)
+    from diffsim.cases.truck import (build_truck_mesh, truck_strong_bc, truck_bc_masks)
     cfg = load_truck_config(_CFG_PATH)
     merged = _tiny_tire_mesh(cfg)
     fx = build_truck_mesh(cfg, base_level=5, region_refine=False,
@@ -305,7 +313,7 @@ def test_bc_masks_nonempty_and_structure():
 def test_soft_start_amp_math():
     """soft_start_amp is a clamped linear ramp: 0->1 over soft_start*dt, then 1;
     off (None or <=0) is exactly 1.0."""
-    from truck_flow import soft_start_amp
+    from diffsim.cases.truck import soft_start_amp
     dt = 0.02
     N = 30.0
     # off
@@ -327,7 +335,7 @@ def test_soft_start_amp_math():
 def test_soft_start_off_is_byte_identical():
     """soft_start=None reproduces the default march EXACTLY (the knob is a pure
     opt-in; default path must be untouched)."""
-    from truck_flow import run_truck
+    from diffsim.cases.truck import run_truck
     cfg = load_truck_config(_CFG_PATH)
     merged = _tiny_tire_mesh(cfg)
     common = dict(nsteps=3, base_level=5, truck_band_to=6, band_cells=2,
@@ -344,7 +352,7 @@ def test_soft_start_reduces_startup_response():
     """A soft-start ramp shrinks the impulsive step-0 inlet drive: the early
     reaction-drag magnitude is strictly smaller than the impulsive (full-
     amplitude) start, because the inlet is only a fraction of U at step 0."""
-    from truck_flow import run_truck
+    from diffsim.cases.truck import run_truck
     cfg = load_truck_config(_CFG_PATH)
     merged = _tiny_tire_mesh(cfg)
     common = dict(nsteps=3, base_level=5, truck_band_to=6, band_cells=2,
@@ -378,7 +386,7 @@ def test_checkpoint_resume_bit_exact(tmp_path):
     a mesh-knob change is refused loudly (I-2 guard)."""
     from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
     from diffsim.cases.truck_config import load_truck_config
-    from truck_flow import run_truck
+    from diffsim.cases.truck import run_truck
     cfg = load_truck_config(_CFG_PATH)
     kw = _tiny_kw()
     ref = run_truck(cfg, nsteps=6, merged=_tiny_tire_mesh(cfg), **kw)
@@ -401,7 +409,7 @@ def test_interpolate_checkpoint_identity(tmp_path):
     straight-through splu march (validates the trilinear corner ordering)."""
     from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
     from diffsim.cases.truck_config import load_truck_config
-    from truck_flow import run_truck, build_truck_mesh, interpolate_checkpoint
+    from diffsim.cases.truck import run_truck, build_truck_mesh, interpolate_checkpoint
     import pathlib
     cfg = load_truck_config(_CFG_PATH)
     kw = _tiny_kw()
@@ -418,15 +426,17 @@ def test_interpolate_checkpoint_identity(tmp_path):
     res = run_truck(cfg, nsteps=6, merged=_tiny_tire_mesh(cfg),
                     checkpoint_interval=99, checkpoint_dir=db, resume=True,
                     **kw)
-    np.testing.assert_allclose(res["cd"], ref["cd"], atol=1e-12)
+    np.testing.assert_array_equal(res["cd"], ref["cd"])
 
 
 def test_dt_schedule_identity_and_variable_table():
     """(a) a constant dt_schedule equals dt_schedule=None bit-for-bit;
-    (b) a mid-run dt switch (variable BDF2 table) marches finite/bounded."""
+    (b) a mid-run dt switch (variable BDF2 table) marches finite/bounded,
+    and bdf_coeffs matches the analytic variable-step BDF2 table exactly."""
     from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
     from diffsim.cases.truck_config import load_truck_config
-    from truck_flow import run_truck
+    from diffsim.cases.truck import run_truck
+    from diffsim.solvers.timestepping import bdf_coeffs
     cfg = load_truck_config(_CFG_PATH)
     kw = _tiny_kw()
     ref = run_truck(cfg, nsteps=5, merged=_tiny_tire_mesh(cfg), **kw)
@@ -438,13 +448,37 @@ def test_dt_schedule_identity_and_variable_table():
     assert np.all(np.isfinite(sw["cd"]))
     assert np.all(np.abs(sw["cd"]) < 1e4)
 
+    # (b) Direct BDF2 table check.
+    # bdf_coeffs returns (b0, b1, b2) signed as the production convention:
+    # BDF2 constant-step = (1.5, -2.0, 0.5); variable-step uses
+    # r = dt/dt_prev: b0=(2r+1)/(r+1), b1=-(r+1), b2=r^2/(r+1).
+    # Constant-step path: both dt_prev=None and dt_prev==dt give the literal
+    # (1.5, -2.0, 0.5).
+    b0, b1, b2 = bdf_coeffs(2, 0.02)
+    np.testing.assert_allclose((b0, b1, b2), (1.5, -2.0, 0.5), rtol=1e-15)
+    b0, b1, b2 = bdf_coeffs(2, 0.02, dt_prev=0.02)
+    np.testing.assert_allclose((b0, b1, b2), (1.5, -2.0, 0.5), rtol=1e-15)
+
+    # Variable-step: check r=0.5 and r=2.0 against the analytic formula
+    # derived from the same double arithmetic as the code.
+    for dt, dt_prev in ((0.005, 0.010), (0.020, 0.010)):
+        r = dt / dt_prev
+        c0_ref = (1.0 + 2.0 * r) / (1.0 + r)
+        c1_ref = -(1.0 + r)
+        c2_ref = r ** 2 / (1.0 + r)
+        b0, b1, b2 = bdf_coeffs(2, dt, dt_prev=dt_prev)
+        np.testing.assert_allclose((b0, b1, b2), (c0_ref, c1_ref, c2_ref),
+                                   rtol=1e-15,
+                                   err_msg=f"r={r}: code ({b0},{b1},{b2}) vs "
+                                           f"analytic ({c0_ref},{c1_ref},{c2_ref})")
+
 
 def test_tau_knobs_identity_and_engagement():
     """tau_dt matching the marching dt and tau_m_scale=1.0 are bit-identical
     to the defaults; tau_m_scale=0.1 changes the trajectory (knob engages)."""
     from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
     from diffsim.cases.truck_config import load_truck_config
-    from truck_flow import run_truck
+    from diffsim.cases.truck import run_truck
     cfg = load_truck_config(_CFG_PATH)
     kw = _tiny_kw()
     ref = run_truck(cfg, nsteps=4, merged=_tiny_tire_mesh(cfg), **kw)
@@ -456,3 +490,26 @@ def test_tau_knobs_identity_and_engagement():
     assert np.all(np.isfinite(scaled["cd"]))
     assert np.max(np.abs(np.asarray(scaled["cd"])
                          - np.asarray(ref["cd"]))) > 1e-3
+
+
+@pytest.mark.skipif(not _HAS_CUDA,
+                    reason="tau device-parity leg requires a CUDA device")
+def test_tau_scale_device_parity():
+    """tau_m_scale=0.1 host-vs-device forces agree.
+    Mirrors test_truck_device_assembly_parity (atol=1e-8; splu deterministic).
+    Skips on this Mac dev loop (no CUDA); passes on gpubox."""
+    from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
+    from diffsim.cases.truck_config import load_truck_config
+    from diffsim.cases.truck import run_truck
+    cfg = load_truck_config(_CFG_PATH)
+    merged = _tiny_tire_mesh(cfg)
+    common = dict(nsteps=3, base_level=5, truck_band_to=6, band_cells=2,
+                  merged=merged, region_refine=False, nu=1.0 / 50.0, dt=0.02,
+                  mono_solver="splu", device="cuda:0", tau_m_scale=0.1,
+                  verbose=False)
+    res_h = run_truck(cfg, assembly="host", **common)
+    res_d = run_truck(cfg, assembly="device", **common)
+    for k in ("cd", "cd_surr"):
+        assert np.all(np.isfinite(res_d[k]))
+        assert np.allclose(res_h[k], res_d[k], rtol=0, atol=1e-8), (
+            f"tau device parity {k}: host {res_h[k]} vs device {res_d[k]}")

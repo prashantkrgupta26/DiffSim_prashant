@@ -194,7 +194,13 @@ def surface_cp(
     p_tri = p_sf[tri_sf_idx]   # [Nt]
 
     denom = 0.5 * rho * U_inf ** 2
-    Cp = (p_tri - p_ref) / denom if denom != 0.0 else np.zeros_like(p_tri)
+    if denom == 0.0:
+        raise ValueError(
+            f"Cp denominator is zero (0.5*rho*U_inf^2=0); "
+            f"got rho={rho!r}, U_inf={U_inf!r}.  "
+            "Check that U_inf != 0 and rho != 0 before calling surface_cp."
+        )
+    Cp = (p_tri - p_ref) / denom
 
     return tri_centroids, Cp, tri_sf_idx
 

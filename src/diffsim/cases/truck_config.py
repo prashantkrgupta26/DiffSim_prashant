@@ -1,6 +1,6 @@
 """TRUCK case config loader (ThinShell.pdf case; libconfig-style config.txt).
 
-Parses ONLY what the truck driver (tests/truck_flow.py) consumes; every other
+Parses ONLY what the truck driver (diffsim.cases.truck) consumes; every other
 top-level key is warn-and-ignored (the ignored set is asserted by the test).
 
 Coordinate convention (VERIFIED by bounding-box inspection, see task report):

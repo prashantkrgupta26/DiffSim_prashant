@@ -1021,6 +1021,18 @@ class DeviceNSAssembler:
         return max(1, AE_BATCH_BYTES // (npair * 8))
 
     # ------------------------------------------------------------------
+    def _scatter_be_weighted(self, k_bin, be, d):
+        """Scatter element RHS `be` into F_d using the weighted (constraint-
+        expansion) kernel.  Factored from two call sites in assemble() that
+        have bit-identical scatter logic; floating-point summation order is
+        preserved — the launch dim and input arrays are unchanged."""
+        scat_bw = _scatter_vec_weighted_kernel()
+        wp.launch(scat_bw, dim=len(self._exp_bins[k_bin][4]),
+                  inputs=[be.reshape((-1,)), self._bsrc_d[k_bin],
+                          self._bw_d[k_bin], self._gdof_d[k_bin],
+                          self.F_d], device=d)
+
+    # ------------------------------------------------------------------
     def assemble(self, aq_by_bin, div_aq_by_bin, fq_by_bin, nu, sigma,
                  sig2tau=None, tau_scale=1.0, s_skew=0.5, strong_b_vals=None,
                  extra_matrix=None, extra_rhs=None):
@@ -1184,11 +1196,7 @@ class DeviceNSAssembler:
                                   b["w"], aq, fq, wp.float64(nu),
                                   wp.float64(sig2tau),
                                   wp.float64(tau_scale), be], device=d)
-                scat_bw = _scatter_vec_weighted_kernel()
-                wp.launch(scat_bw, dim=len(self._exp_bins[k_bin][4]),
-                          inputs=[be.reshape((-1,)), self._bsrc_d[k_bin],
-                                  self._bw_d[k_bin], self._gdof_d[k_bin],
-                                  self.F_d], device=d)
+                self._scatter_be_weighted(k_bin, be, d)
                 continue
             # constraint-aware / colored paths: whole-bin (unchanged).
             if _ASM_PROFILE:
@@ -1236,11 +1244,7 @@ class DeviceNSAssembler:
                           inputs=[be.reshape((-1,)), self._gdof_d[k_bin],
                                   self.F_d], device=d)
             else:
-                scat_bw = _scatter_vec_weighted_kernel()
-                wp.launch(scat_bw, dim=len(self._exp_bins[k_bin][4]),
-                          inputs=[be.reshape((-1,)), self._bsrc_d[k_bin],
-                                  self._bw_d[k_bin], self._gdof_d[k_bin],
-                                  self.F_d], device=d)
+                self._scatter_be_weighted(k_bin, be, d)
             if _ASM_PROFILE:
                 wp.synchronize()
                 _t_scat += (time.perf_counter() - _t_sc0) * 1e3
