@@ -271,6 +271,12 @@ if DUMP_SYS_STEPS and DUMP_SYS_DIR is None:
     raise ValueError(
         "DUMP_SYSTEM_STEPS is set but DUMP_SYSTEM_DIR is empty — "
         "set DUMP_SYSTEM_DIR to the capture output directory")
+if DUMP_SYS_STEPS and ASSEMBLY == "device":
+    # eager veto: the dump helper rejects device-handoff CSRs at the FIRST
+    # dump step — after a full mesh build. Fail here instead.
+    raise ValueError(
+        "DUMP_SYSTEM_STEPS requires TRUCK_ASSEMBLY=host (device parity is "
+        "trajectory-tight, so host-captured systems are the same matrices)")
 if DUMP_SYS_STEPS:
     print(f"[T5] dump-system at steps {DUMP_SYS_STEPS} -> {DUMP_SYS_DIR}",
           flush=True)

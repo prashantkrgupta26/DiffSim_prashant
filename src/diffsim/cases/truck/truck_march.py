@@ -988,6 +988,13 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                                ref_force=float(ref_force),
                                umax=_umax, umax_loc=_uloc,
                                nonlin=_nl_done,
+                               # NB: sourced from _bd (bdiag meta). The
+                               # fgmres_pcd PRIMARY writes its miss flag to
+                               # the pcd_meta dict instead, so this reads
+                               # False under PCD-primary — truthful today
+                               # only because PCD has no accept-miss mode
+                               # (a PCD miss raises and kills the march).
+                               # Wire pcd_meta through here if that changes.
                                accepted_miss=bool(_bd.get("last_solve_miss",
                                                           False)),
                                coords=coords, u=u_new,

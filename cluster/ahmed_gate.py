@@ -70,8 +70,8 @@ def on_step(step, info):
         print(f"[AHMED] step {step:4d} cd={r['cd']:+.5f} "
               f"umax={r['umax']:.2f} iters={r['iters']} miss={miss}",
               flush=True)
-        (OUT / "rows.jsonl").open("a").write(
-            "\n".join(json.dumps(q) for q in _rows[-10:]) + "\n")
+        with (OUT / "rows.jsonl").open("a") as _f:
+            _f.write("\n".join(json.dumps(q) for q in _rows[-10:]) + "\n")
 
 
 t0 = time.time()
