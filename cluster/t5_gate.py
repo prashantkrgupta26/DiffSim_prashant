@@ -245,6 +245,10 @@ RESUME = os.environ.get("RESUME", "0").strip() not in ("", "0")
 if MARCH_CKPT > 0:
     print(f"[T5] march checkpoints every {MARCH_CKPT} steps"
           + (" (RESUME requested)" if RESUME else ""), flush=True)
+SEAL = os.environ.get("SEAL_UNDERBODY", "0").strip() not in ("", "0")
+SEAL_Y = float(os.environ.get("SEAL_Y", "0.003"))
+if SEAL:
+    print(f"[T5] underbody seal ON (y<{SEAL_Y} under footprint)", flush=True)
 BACKFLOW = os.environ.get("BACKFLOW_STAB", "0").strip() not in ("", "0")
 if BACKFLOW:
     print("[T5] outlet backflow stabilization ON (C++ BACKFLOW_STAB, lumped)",
@@ -373,6 +377,8 @@ res = run_truck(
     walls_refine_to=(WALLS_BANDS if WALLS_BANDS is not None
                      else (WALLS_LVL if WALLS_LVL > 0 else None)),
     backflow_stab=BACKFLOW,
+    seal_underbody=SEAL,
+    seal_y=SEAL_Y,
     ground_band=GROUND_BAND,
     checkpoint_interval=(MARCH_CKPT if MARCH_CKPT > 0 else None),
     checkpoint_dir=(VIZ_DIR if MARCH_CKPT > 0 else None),

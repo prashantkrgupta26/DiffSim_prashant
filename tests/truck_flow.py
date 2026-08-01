@@ -240,7 +240,8 @@ def build_truck_mesh(cfg, base_level, region_refine=True, truck_band_to=None,
                      band_cells=3, device="cpu", merged=None,
                      bodies=None, carve_lam=1.0,
                      ground_refine_to=None, ground_band=0.0156,
-                     walls_refine_to=None, carve_delta=None):
+                     walls_refine_to=None, carve_delta=None,
+                     seal_underbody=False, seal_y=0.003):
     """Build the incomplete-octree mesh + volumetric surrogate for the truck.
 
     Returns a dict: dm, mesh, cons, sf, geo, merged, scale, n_excluded,
@@ -332,6 +333,27 @@ def build_truck_mesh(cfg, base_level, region_refine=True, truck_band_to=None,
     if ret is None:
         ret, _frac = classify_lambda(tree, merged, lam=float(carve_lam),
                                      domain="outside")
+
+    # 4b. underbody seal (Baskar directive): excise the ground-clearance
+    # gap under the truck footprint (an implicit skirt — sealed-underbody
+    # wind-tunnel practice).  The gap flow at band-12 resolution is the
+    # campaign's last instability wall (jet chaos beyond Re~1000-1500 per
+    # the k/l legs); sealing removes it for bring-up; the resolved-
+    # underbody physics returns with the band-13 mesh.
+    if seal_underbody:
+        _v = merged.verts.numpy()
+        _x0, _x1 = float(_v[:, 0].min()), float(_v[:, 0].max())
+        _z0, _z1 = float(_v[:, 2].min()), float(_v[:, 2].max())
+        _c = ret.centers()
+        _m = ((_c[:, 0] > _x0) & (_c[:, 0] < _x1)
+              & (_c[:, 2] > _z0) & (_c[:, 2] < _z1)
+              & (_c[:, 1] < float(seal_y)))
+        n_seal = int(_m.sum())
+        ret = Octree(ret.keys[~_m], ret.levels[~_m], dim=ret.dim,
+                     periodic=ret.periodic)
+        print(f"[truck] underbody seal: excised {n_seal} cells under "
+              f"footprint x[{_x0:.4f},{_x1:.4f}] z[{_z0:.4f},{_z1:.4f}] "
+              f"y<{seal_y}", flush=True)
 
     # 5. flood-fill: single fluid domain (face-adjacency components)
     ret, n_pockets, n_pocket_cells = flood_fill_retain(ret)
@@ -608,6 +630,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               slope_near_ground=None,
               ground_refine_to=None, ground_band=0.0156,
               walls_refine_to=None, carve_delta=None,
+              seal_underbody=False, seal_y=0.003,
               backflow_stab=False,
               checkpoint_interval=None, checkpoint_dir=None,
               resume=False):
@@ -759,7 +782,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                           ground_refine_to=ground_refine_to,
                           ground_band=ground_band,
                           carve_delta=carve_delta,
-                          walls_refine_to=walls_refine_to)
+                          walls_refine_to=walls_refine_to,
+                          seal_underbody=seal_underbody, seal_y=seal_y)
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
     scale = fx["scale"]
     merged = fx["merged"]
