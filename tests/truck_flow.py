@@ -226,7 +226,13 @@ def flood_fill_retain(ret):
     if ncomp <= 1:
         return ret, 0, 0
     sizes = np.bincount(labels)
-    main = int(np.argmax(sizes))
+    # main component by KNOWN-FLUID SEED, not cell count (final-review I-6:
+    # a heavily-refined enclosed cavity could out-count the coarse outer
+    # domain).  The inlet lower corner cell (min x+y+z center) is always in
+    # the channel fluid.
+    _cen = ret.centers()
+    _seed = int(np.argmin(_cen.sum(axis=1)))
+    main = int(labels[_seed])
     keepm = labels == main
     n_dropped = int((~keepm).sum())
     print(f"[truck] flood-fill: dropped {n_dropped} cells in {ncomp - 1} "
@@ -636,7 +642,7 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               viz_interval=None, viz_dir=None,
               viz_checkpoint_interval=None, viz_Q_thresh=0.5, viz_roi=None,
               mesh_only=False, linsolve_tol=1e-10, linsolve_tol_schedule=None,
-              saddle_restart=None,
+              saddle_restart=None, saddle_min_work=False,
               saddle_equilibrate=False, soft_start=None, dt_schedule=None,
               saddle_fallback=None, pcd_f_inner="amgx", pcd_ap_inner="amgx",
               tau_dt=None, accept_miss_until=None, u_cap=50.0,
@@ -1044,6 +1050,11 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
     cl_y = np.zeros(nsteps); cl_z = np.zeros(nsteps)
     cl_y_surr = np.zeros(nsteps); cl_z_surr = np.zeros(nsteps)
 
+    if accept_miss_until is not None and mono_solver != "fgmres_bdiag":
+        raise ValueError(
+            "accept_miss_until is only supported with mono_solver="
+            "'fgmres_bdiag' (the fused_bdiag branch raises strictly; "
+            "final-review I-1)")
     _pcd_cache = {"ndof": ndof}
     if mono_solver in ("fgmres_bdiag", "fused_bdiag"):
         _bd = {"ndof": ndof}
@@ -1053,6 +1064,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             _bd["saddle_restart"] = int(saddle_restart)
         if saddle_equilibrate:
             _bd["saddle_equilibrate"] = True     # T4b diagonal equilibration
+        if saddle_min_work:
+            _bd["saddle_min_work"] = True        # drift-guard polish cycle
         _pcd_cache[("blocktri_meta", "truck")] = _bd
 
     # ---- per-step PCD fallback (five-leg Jacobi-class verdict) --------------
@@ -1127,6 +1140,18 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                         key=lambda q: q.stat().st_mtime)
         if _cands:
             _ck = np.load(_cands[-1])
+            # mesh-compatibility guard (final-review I-2): plain resume is
+            # STRICT — a changed mesh must go through interpolate_checkpoint
+            if "nfree" in _ck and int(_ck["nfree"]) != nfree:
+                raise ValueError(
+                    f"resume checkpoint mesh mismatch: ckpt nfree="
+                    f"{int(_ck['nfree'])} vs current {nfree} — mesh knobs "
+                    "changed; use interpolate_checkpoint for mesh-sequenced "
+                    "restarts")
+            if _ck["x_cur"].shape != (nfree * ndof,):
+                raise ValueError(
+                    f"resume checkpoint shape mismatch: {_ck['x_cur'].shape}"
+                    f" vs {(nfree * ndof,)}")
             _step0 = int(_ck["step"]) + 1
             t_cur = float(_ck["t_cur"])
             dt_prev_step = (float(_ck["dt_prev"])
@@ -1139,8 +1164,25 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             cl_y[:_n0] = _ck["cl_y"][:_n0]; cl_z[:_n0] = _ck["cl_z"][:_n0]
             cl_y_surr[:_n0] = _ck["cl_y_surr"][:_n0]
             cl_z_surr[:_n0] = _ck["cl_z_surr"][:_n0]
-            # seed the warm-start cache so the first resumed solve is warm
-            _pcd_cache[("bdiag_x_prev", "truck")] = x_cur.copy()
+            # seed the warm-start cache (both slots when checkpointed —
+            # final-review I-4 — so the first resumed solve extrapolates)
+            if "x_prev" in _ck and _ck["x_prev"].size:
+                _pcd_cache[("bdiag_x_prev", "truck")] = _ck["x_prev"].copy()
+                if _ck["x_prev2"].size:
+                    _pcd_cache[("bdiag_x_prev2", "truck")] = \
+                        _ck["x_prev2"].copy()
+            else:
+                _pcd_cache[("bdiag_x_prev", "truck")] = x_cur.copy()
+            # time-base guard (final-review I-3): with dt_schedule=None the
+            # loop uses the closed form t=(step+1)*dt, which silently
+            # discards the checkpointed t_cur — require consistency so a
+            # dt/ladder mismatch between legs fails loudly
+            if dt_schedule is None and abs(t_cur - _step0 * dt) > 1e-9:
+                raise ValueError(
+                    f"resume time-base mismatch: checkpoint t={t_cur} but "
+                    f"(step0={_step0})*dt={_step0 * dt} — the original leg "
+                    "used a different dt/dt_schedule; rerun with matching "
+                    "knobs")
             print(f"[truck] RESUME from {_cands[-1].name}: step {_step0}, "
                   f"t={t_cur:.6f}", flush=True)
         else:
@@ -1201,8 +1243,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                 if linsolve_tol_schedule is not None else linsolve_tol)
 
         # Accept-miss window (Baskar T5): per-step flag on the bdiag meta.
-        if accept_miss_until is not None and mono_solver in (
-                "fgmres_bdiag", "fused_bdiag"):
+        # ONLY the fgmres_bdiag branch honors it (final-review I-1).
+        if accept_miss_until is not None and mono_solver == "fgmres_bdiag":
             _pcd_cache[("blocktri_meta", "truck")]["saddle_accept_miss"] = \
                 bool(step < int(accept_miss_until))
 
@@ -1378,12 +1420,19 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                 and (step + 1) % int(checkpoint_interval) == 0):
             _slot = (step // int(checkpoint_interval)) % 2
             _tmp = _ckpt_dir / f".march_ckpt_{_slot}.tmp.npz"
+            _xp = _pcd_cache.get(("bdiag_x_prev", "truck"))
+            _xp2 = _pcd_cache.get(("bdiag_x_prev2", "truck"))
             np.savez(_tmp, step=step, t_cur=t_cur,
                      dt_prev=(dt_prev_step if dt_prev_step is not None
                               else np.nan),
                      x_cur=x_cur, u_pre1=u_pre1, u_pre2=u_pre2,
                      cd=cd, cd_surr=cd_surr, cl_y=cl_y, cl_z=cl_z,
-                     cl_y_surr=cl_y_surr, cl_z_surr=cl_z_surr)
+                     cl_y_surr=cl_y_surr, cl_z_surr=cl_z_surr,
+                     nfree=nfree, n_cells=fx["n_cells"],
+                     # warm-start history (final-review I-4): both slots so
+                     # the first resumed iterative solve extrapolates
+                     x_prev=(_xp if _xp is not None else np.zeros(0)),
+                     x_prev2=(_xp2 if _xp2 is not None else np.zeros(0)))
             _tmp.rename(_ckpt_dir / f"march_ckpt_{_slot}.npz")
             print(f"[truck] checkpoint @ step {step} -> "
                   f"march_ckpt_{_slot}.npz", flush=True)

@@ -89,7 +89,7 @@ def test_loader_unknown_keys_expected():
         "ReSolverRampStableSteps", "RemoveInterceptedForShell_CompleteOctree",
         "SolveHT", "SolveNS", "blockTolerance", "ifInter",
         "initial_condition", "iterMaxBlock", "solver_options_ht",
-        "solver_options_ns", "tauM_scale", "thetaTimeStepping",
+        "solver_options_ns", "thetaTimeStepping",
     }
     assert set(cfg.unknown_keys) == expected_unknown
 
@@ -361,3 +361,98 @@ def test_soft_start_reduces_startup_response():
     # results still finite everywhere
     assert np.all(np.isfinite(res_soft["cd"]))
     assert np.all(np.isfinite(res_soft["cd_surr"]))
+
+
+# ---------------------------------------------------------------------------
+# Final-review I-8: regression tests for the late-campaign march machinery.
+# All tiny-tire + splu (deterministic) so bit-exactness assertions are valid.
+# ---------------------------------------------------------------------------
+
+def _tiny_kw():
+    return dict(base_level=5, truck_band_to=6, band_cells=2,
+                region_refine=False, nu=1.0 / 50.0, dt=0.02, verbose=False)
+
+
+def test_checkpoint_resume_bit_exact(tmp_path):
+    """N-step splu march == k-step + checkpoint + resume, bit-for-bit; and
+    a mesh-knob change is refused loudly (I-2 guard)."""
+    from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
+    from diffsim.cases.truck_config import load_truck_config
+    from truck_flow import run_truck
+    cfg = load_truck_config(_CFG_PATH)
+    kw = _tiny_kw()
+    ref = run_truck(cfg, nsteps=6, merged=_tiny_tire_mesh(cfg), **kw)
+    run_truck(cfg, nsteps=4, merged=_tiny_tire_mesh(cfg),
+              checkpoint_interval=2, checkpoint_dir=tmp_path, **kw)
+    res = run_truck(cfg, nsteps=6, merged=_tiny_tire_mesh(cfg),
+                    checkpoint_interval=2, checkpoint_dir=tmp_path,
+                    resume=True, **kw)
+    np.testing.assert_array_equal(ref["cd"], res["cd"])
+    # I-2: refusing a mesh mismatch (band 6 -> 7 changes nfree)
+    kw7 = dict(kw, truck_band_to=7)
+    with pytest.raises(ValueError, match="mesh mismatch"):
+        run_truck(cfg, nsteps=6, merged=_tiny_tire_mesh(cfg),
+                  checkpoint_interval=2, checkpoint_dir=tmp_path,
+                  resume=True, **kw7)
+
+
+def test_interpolate_checkpoint_identity(tmp_path):
+    """A->A transfer is exact: the interpolated-resume trajectory equals the
+    straight-through splu march (validates the trilinear corner ordering)."""
+    from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
+    from diffsim.cases.truck_config import load_truck_config
+    from truck_flow import run_truck, build_truck_mesh, interpolate_checkpoint
+    import pathlib
+    cfg = load_truck_config(_CFG_PATH)
+    kw = _tiny_kw()
+    ref = run_truck(cfg, nsteps=6, merged=_tiny_tire_mesh(cfg), **kw)
+    da, db = tmp_path / "a", tmp_path / "b"
+    run_truck(cfg, nsteps=4, merged=_tiny_tire_mesh(cfg),
+              checkpoint_interval=2, checkpoint_dir=da, **kw)
+    fxA = build_truck_mesh(cfg, base_level=5, truck_band_to=6, band_cells=2,
+                           region_refine=False, device="cpu",
+                           merged=_tiny_tire_mesh(cfg))
+    ck = sorted(pathlib.Path(da).glob("march_ckpt_*.npz"),
+                key=lambda q: q.stat().st_mtime)[-1]
+    interpolate_checkpoint(ck, fxA, fxA, db)
+    res = run_truck(cfg, nsteps=6, merged=_tiny_tire_mesh(cfg),
+                    checkpoint_interval=99, checkpoint_dir=db, resume=True,
+                    **kw)
+    np.testing.assert_allclose(res["cd"], ref["cd"], atol=1e-12)
+
+
+def test_dt_schedule_identity_and_variable_table():
+    """(a) a constant dt_schedule equals dt_schedule=None bit-for-bit;
+    (b) a mid-run dt switch (variable BDF2 table) marches finite/bounded."""
+    from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
+    from diffsim.cases.truck_config import load_truck_config
+    from truck_flow import run_truck
+    cfg = load_truck_config(_CFG_PATH)
+    kw = _tiny_kw()
+    ref = run_truck(cfg, nsteps=5, merged=_tiny_tire_mesh(cfg), **kw)
+    same = run_truck(cfg, nsteps=5, merged=_tiny_tire_mesh(cfg),
+                     dt_schedule=lambda s: 0.02, **kw)
+    np.testing.assert_array_equal(ref["cd"], same["cd"])
+    sw = run_truck(cfg, nsteps=5, merged=_tiny_tire_mesh(cfg),
+                   dt_schedule=lambda s: 0.005 if s < 2 else 0.02, **kw)
+    assert np.all(np.isfinite(sw["cd"]))
+    assert np.all(np.abs(sw["cd"]) < 1e4)
+
+
+def test_tau_knobs_identity_and_engagement():
+    """tau_dt matching the marching dt and tau_m_scale=1.0 are bit-identical
+    to the defaults; tau_m_scale=0.1 changes the trajectory (knob engages)."""
+    from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
+    from diffsim.cases.truck_config import load_truck_config
+    from truck_flow import run_truck
+    cfg = load_truck_config(_CFG_PATH)
+    kw = _tiny_kw()
+    ref = run_truck(cfg, nsteps=4, merged=_tiny_tire_mesh(cfg), **kw)
+    same = run_truck(cfg, nsteps=4, merged=_tiny_tire_mesh(cfg),
+                     tau_dt=0.02, tau_m_scale=1.0, **kw)
+    np.testing.assert_array_equal(ref["cd"], same["cd"])
+    scaled = run_truck(cfg, nsteps=4, merged=_tiny_tire_mesh(cfg),
+                       tau_m_scale=0.1, **kw)
+    assert np.all(np.isfinite(scaled["cd"]))
+    assert np.max(np.abs(np.asarray(scaled["cd"])
+                         - np.asarray(ref["cd"]))) > 1e-3

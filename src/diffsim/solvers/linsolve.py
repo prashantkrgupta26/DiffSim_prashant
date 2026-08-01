@@ -46,10 +46,6 @@ _LAST_ITERS = [None]
 # None when the last solve was not fgmres_pcd or stats were not collected.
 _LAST_INNER_STATS = [None]
 
-# Accept-miss sentinel (Baskar T5 directive): when the fgmres_bdiag branch
-# accepts a truncated iterate under meta["saddle_accept_miss"], the achieved
-# relres lands here; None = last solve converged normally.
-_LAST_MISS = [None]
 
 
 def cudss_options():
@@ -1698,7 +1694,8 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
             tol=tol, atol=1e-13, restart=_restart, maxiter=cycles,
             x0_dev=x0_dev)
 
-        # SADDLE_MIN_WORK drift-guard (truck five-leg forensics): under a
+        # min-work drift-guard (truck five-leg forensics; meta knob
+        # saddle_min_work like its siblings): under a
         # loose tol + warm start, entry residuals below tol get accepted
         # with ZERO iterations, and the unsolved drift compounds across
         # steps until the march collapses (the tol=1e-3 failure mode).
@@ -1706,8 +1703,7 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         # restart cycle targeting a 4x residual reduction; its result is
         # accepted regardless of the convergence flag (it is a polish, not
         # a gate).  Default off = byte-identical.
-        import os as _os
-        if (_os.environ.get("SADDLE_MIN_WORK", "0").strip() not in ("", "0")
+        if (meta.get("saddle_min_work")
                 and finfo.get("converged") and finfo.get("inner", 0) == 0):
             _r0 = float(finfo.get("relres", 0.0))
             if _r0 > 0.0:
@@ -1732,14 +1728,11 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                 print(f"[saddle] ACCEPT-MISS: relres={finfo['relres']:.3e} "
                       f"after {finfo['inner']} inner ({finfo['outer']} "
                       f"restarts) vs tol={tol:.1e}", flush=True)
-                _LAST_MISS[0] = float(finfo["relres"])
             else:
                 raise ConvergenceError(
                     f"fgmres_bdiag: not converged after {finfo['inner']} inner "
                     f"iterations ({finfo['outer']} restarts); "
                     f"relres={finfo['relres']:.3e}")
-        else:
-            _LAST_MISS[0] = None
 
         # T4b: recover x = D^{-1/2} y from the scaled solution.
         if _equilibrate:

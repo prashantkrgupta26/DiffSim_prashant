@@ -27,6 +27,8 @@ import os, sys, time, resource, subprocess, threading, json, pathlib
 os.environ.setdefault("SADDLE_DEVICE_CSR", "1")
 os.environ.setdefault("DIFFSIM_ASM_PROFILE", "1")
 
+MIN_WORK = os.environ.get("SADDLE_MIN_WORK", "0").strip() not in ("", "0")
+
 sys.path.insert(0, "/work/mech-ai/baskarg/DiffSim/tests")
 sys.path.insert(0, "/work/mech-ai/baskarg/DiffSim/src")
 
@@ -246,11 +248,30 @@ if MARCH_CKPT > 0:
     print(f"[T5] march checkpoints every {MARCH_CKPT} steps"
           + (" (RESUME requested)" if RESUME else ""), flush=True)
 # SEAL_BOXES="x0:x1:y0:y1:z0:z1[;...]" — gap fairings (cab-trailer slot etc.)
+def _parse_knob(env_name, item_sep, field_sep, nfields, cast):
+    """Eager multi-part env-knob parsing (final-review I-7): malformed
+    values fail HERE, at leg start, not hours into a march."""
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return None
+    out = []
+    for item in raw.split(item_sep):
+        parts = item.split(field_sep)
+        if len(parts) != nfields:
+            raise ValueError(
+                f"{env_name}: item {item!r} has {len(parts)} fields, "
+                f"expected {nfields}")
+        out.append(tuple(cast(v) for v in parts))
+    return out
+
+# eager validation of every multi-part knob (crash at start, not mid-leg)
+_DUMP_BOX_V = _parse_knob("DUMP_BOX", ";", ",", 6, float)
+if _DUMP_BOX_V is not None and len(_DUMP_BOX_V) != 1:
+    raise ValueError("DUMP_BOX: exactly one box expected")
+
 _sb_env = os.environ.get("SEAL_BOXES", "").strip()
-SEAL_BOXES = None
-if _sb_env:
-    SEAL_BOXES = [tuple(float(v) for v in b.split(":"))
-                  for b in _sb_env.split(";")]
+SEAL_BOXES = _parse_knob("SEAL_BOXES", ";", ":", 6, float)
+if SEAL_BOXES:
     print(f"[T5] box seals: {SEAL_BOXES}", flush=True)
 SEAL = os.environ.get("SEAL_UNDERBODY", "0").strip() not in ("", "0")
 SEAL_Y = float(os.environ.get("SEAL_Y", "0.003"))
@@ -264,8 +285,8 @@ if BACKFLOW:
 _wb_env = os.environ.get("WALLS_BANDS", "").strip()
 WALLS_BANDS = None
 if _wb_env:
-    WALLS_BANDS = [(int(p.split(":")[0]), float(p.split(":")[1]))
-                   for p in _wb_env.split(",")]
+    WALLS_BANDS = [(int(a), float(b)) for (a, b) in
+                   _parse_knob("WALLS_BANDS", ",", ":", 2, str)]
     print(f"[T5] nested wall bands: {WALLS_BANDS}", flush=True)
 WALLS_LVL = int(os.environ.get("WALLS_LVL", "0") or 0)
 if WALLS_LVL > 0:
@@ -323,9 +344,9 @@ def on_step(step, info):
     if _nl is not None and NONLIN_ITERS > 1:
         _um_s += " nl=" + str(_nl)
     # hotspot field dump (forensics): DUMP_BOX="x0,x1,y0,y1,z0,z1"
-    if os.environ.get("DUMP_BOX") and info.get("coords") is not None:
+    if _DUMP_BOX_V is not None and info.get("coords") is not None:
         import numpy as _np
-        _bx = [float(v) for v in os.environ["DUMP_BOX"].split(",")]
+        _bx = list(_DUMP_BOX_V[0])
         _cc = info["coords"]
         _m = ((_cc[:, 0] >= _bx[0]) & (_cc[:, 0] <= _bx[1]) &
               (_cc[:, 1] >= _bx[2]) & (_cc[:, 1] <= _bx[3]) &
@@ -350,6 +371,7 @@ res = run_truck(
     saddle_equilibrate=EQUIL,
     nu_schedule=nu_sched,
     saddle_restart=(int(os.environ["SADDLE_RESTART"]) if os.environ.get("SADDLE_RESTART") else None),
+    saddle_min_work=MIN_WORK,
     nu=None,
     on_step=on_step,
     verbose=False,
