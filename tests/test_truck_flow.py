@@ -21,6 +21,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from diffsim.cases.truck_config import load_truck_config, TruckConfig
 
+# Detect CUDA availability for device-parity legs (skip on this Mac dev loop).
+try:
+    import warp as _wp
+    _wp.init()
+    _HAS_CUDA = _wp.get_cuda_device_count() > 0
+except Exception:
+    _HAS_CUDA = False
+
 _CFG_PATH = os.path.join(
     os.path.dirname(__file__), "..", "local_code_old",
     "truck_4case_fresh_inputs", "NewRun-no-shell-slope0p25", "config.txt")
@@ -418,15 +426,17 @@ def test_interpolate_checkpoint_identity(tmp_path):
     res = run_truck(cfg, nsteps=6, merged=_tiny_tire_mesh(cfg),
                     checkpoint_interval=99, checkpoint_dir=db, resume=True,
                     **kw)
-    np.testing.assert_allclose(res["cd"], ref["cd"], atol=1e-12)
+    np.testing.assert_array_equal(res["cd"], ref["cd"])
 
 
 def test_dt_schedule_identity_and_variable_table():
     """(a) a constant dt_schedule equals dt_schedule=None bit-for-bit;
-    (b) a mid-run dt switch (variable BDF2 table) marches finite/bounded."""
+    (b) a mid-run dt switch (variable BDF2 table) marches finite/bounded,
+    and bdf_coeffs matches the analytic variable-step BDF2 table exactly."""
     from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
     from diffsim.cases.truck_config import load_truck_config
     from truck_flow import run_truck
+    from diffsim.solvers.timestepping import bdf_coeffs
     cfg = load_truck_config(_CFG_PATH)
     kw = _tiny_kw()
     ref = run_truck(cfg, nsteps=5, merged=_tiny_tire_mesh(cfg), **kw)
@@ -437,6 +447,30 @@ def test_dt_schedule_identity_and_variable_table():
                    dt_schedule=lambda s: 0.005 if s < 2 else 0.02, **kw)
     assert np.all(np.isfinite(sw["cd"]))
     assert np.all(np.abs(sw["cd"]) < 1e4)
+
+    # (b) Direct BDF2 table check.
+    # bdf_coeffs returns (b0, b1, b2) signed as the production convention:
+    # BDF2 constant-step = (1.5, -2.0, 0.5); variable-step uses
+    # r = dt/dt_prev: b0=(2r+1)/(r+1), b1=-(r+1), b2=r^2/(r+1).
+    # Constant-step path: both dt_prev=None and dt_prev==dt give the literal
+    # (1.5, -2.0, 0.5).
+    b0, b1, b2 = bdf_coeffs(2, 0.02)
+    np.testing.assert_allclose((b0, b1, b2), (1.5, -2.0, 0.5), rtol=1e-15)
+    b0, b1, b2 = bdf_coeffs(2, 0.02, dt_prev=0.02)
+    np.testing.assert_allclose((b0, b1, b2), (1.5, -2.0, 0.5), rtol=1e-15)
+
+    # Variable-step: check r=0.5 and r=2.0 against the analytic formula
+    # derived from the same double arithmetic as the code.
+    for dt, dt_prev in ((0.005, 0.010), (0.020, 0.010)):
+        r = dt / dt_prev
+        c0_ref = (1.0 + 2.0 * r) / (1.0 + r)
+        c1_ref = -(1.0 + r)
+        c2_ref = r ** 2 / (1.0 + r)
+        b0, b1, b2 = bdf_coeffs(2, dt, dt_prev=dt_prev)
+        np.testing.assert_allclose((b0, b1, b2), (c0_ref, c1_ref, c2_ref),
+                                   rtol=1e-15,
+                                   err_msg=f"r={r}: code ({b0},{b1},{b2}) vs "
+                                           f"analytic ({c0_ref},{c1_ref},{c2_ref})")
 
 
 def test_tau_knobs_identity_and_engagement():
@@ -456,3 +490,20 @@ def test_tau_knobs_identity_and_engagement():
     assert np.all(np.isfinite(scaled["cd"]))
     assert np.max(np.abs(np.asarray(scaled["cd"])
                          - np.asarray(ref["cd"]))) > 1e-3
+
+    # Device-parity leg: tau_m_scale=0.1 host-vs-device forces agree.
+    # Mirrors test_truck_device_assembly_parity (atol=1e-8; splu deterministic).
+    # Skips on this Mac dev loop (no CUDA); passes on gpubox.
+    if not _HAS_CUDA:
+        pytest.skip("tau device-parity leg requires a CUDA device")
+    merged = _tiny_tire_mesh(cfg)
+    common = dict(nsteps=3, base_level=5, truck_band_to=6, band_cells=2,
+                  merged=merged, region_refine=False, nu=1.0 / 50.0, dt=0.02,
+                  mono_solver="splu", device="cuda:0", tau_m_scale=0.1,
+                  verbose=False)
+    res_h = run_truck(cfg, assembly="host", **common)
+    res_d = run_truck(cfg, assembly="device", **common)
+    for k in ("cd", "cd_surr"):
+        assert np.all(np.isfinite(res_d[k]))
+        assert np.allclose(res_h[k], res_d[k], rtol=0, atol=1e-8), (
+            f"tau device parity {k}: host {res_h[k]} vs device {res_d[k]}")
