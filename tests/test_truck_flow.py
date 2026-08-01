@@ -491,11 +491,17 @@ def test_tau_knobs_identity_and_engagement():
     assert np.max(np.abs(np.asarray(scaled["cd"])
                          - np.asarray(ref["cd"]))) > 1e-3
 
-    # Device-parity leg: tau_m_scale=0.1 host-vs-device forces agree.
-    # Mirrors test_truck_device_assembly_parity (atol=1e-8; splu deterministic).
-    # Skips on this Mac dev loop (no CUDA); passes on gpubox.
-    if not _HAS_CUDA:
-        pytest.skip("tau device-parity leg requires a CUDA device")
+
+@pytest.mark.skipif(not _HAS_CUDA,
+                    reason="tau device-parity leg requires a CUDA device")
+def test_tau_scale_device_parity():
+    """tau_m_scale=0.1 host-vs-device forces agree.
+    Mirrors test_truck_device_assembly_parity (atol=1e-8; splu deterministic).
+    Skips on this Mac dev loop (no CUDA); passes on gpubox."""
+    from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
+    from diffsim.cases.truck_config import load_truck_config
+    from truck_flow import run_truck
+    cfg = load_truck_config(_CFG_PATH)
     merged = _tiny_tire_mesh(cfg)
     common = dict(nsteps=3, base_level=5, truck_band_to=6, band_cells=2,
                   merged=merged, region_refine=False, nu=1.0 / 50.0, dt=0.02,
