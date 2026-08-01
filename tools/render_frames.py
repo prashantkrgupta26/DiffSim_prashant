@@ -113,7 +113,13 @@ _CAMERAS = {
 # ---------------------------------------------------------------------------
 
 def _scan_range(files, scalar_name, pv):
-    """Scan all .vtp files for the min/max of a named scalar. Returns (lo, hi)."""
+    """Scan all .vtp files for the min/max of a named scalar. Returns (lo, hi).
+
+    Skipped files (unreadable or missing scalar) are logged to stderr.
+    NaN-containing fields are handled via np.nanmin/np.nanmax; a one-line
+    warning is printed to stderr naming the field and NaN count.
+    """
+    import numpy as np
     lo, hi = float("inf"), float("-inf")
     for f in files:
         try:
@@ -123,12 +129,23 @@ def _scan_range(files, scalar_name, pv):
             elif scalar_name in mesh.cell_data:
                 arr = mesh.cell_data[scalar_name]
             else:
+                print(f"[render_frames] skip {f}: scalar '{scalar_name}' not found",
+                      file=sys.stderr)
                 continue
             if len(arr) == 0:
+                print(f"[render_frames] skip {f}: scalar '{scalar_name}' is empty",
+                      file=sys.stderr)
                 continue
-            lo = min(lo, float(arr.min()))
-            hi = max(hi, float(arr.max()))
-        except Exception:
+            arr = np.asarray(arr, dtype=np.float64)
+            nan_count = int(np.isnan(arr).sum())
+            if nan_count > 0:
+                print(f"[render_frames] warning: {f}: field '{scalar_name}' "
+                      f"contains {nan_count} NaN(s); using nanmin/nanmax",
+                      file=sys.stderr)
+            lo = min(lo, float(np.nanmin(arr)))
+            hi = max(hi, float(np.nanmax(arr)))
+        except Exception as exc:
+            print(f"[render_frames] skip {f}: {exc}", file=sys.stderr)
             continue
     if lo > hi:
         return (0.0, 1.0)  # empty / fallback

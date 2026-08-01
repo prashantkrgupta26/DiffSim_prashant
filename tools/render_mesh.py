@@ -93,5 +93,15 @@ def render(npz_path):
 
 
 if __name__ == "__main__":
-    for f in sys.argv[1:]:
+    args = sys.argv[1:]
+    if not args:
+        print("Usage: render_mesh.py results/mesh_*.npz [more.npz ...]",
+              file=sys.stderr)
+        sys.exit(1)
+    missing = [f for f in args if not pathlib.Path(f).exists()]
+    if missing:
+        for m in missing:
+            print(f"[render_mesh] ERROR: input path not found: {m}", file=sys.stderr)
+        sys.exit(1)
+    for f in args:
         render(f)

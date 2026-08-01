@@ -61,6 +61,9 @@ def _read_binary_stl(path: str):
     # each 50-byte record: 12B normal + 3*12B verts + 2B attr
     coords = rec[:, 12:48].copy().view(np.float32).reshape(ntri, 3, 3)
     flat = coords.reshape(-1, 3).astype(np.float64)
+    # Vertex deduplication: round to 8 decimal places = absolute 1e-8 tolerance.
+    # This is appropriate for this project's unit-cube geometry where all
+    # coordinates are O(1); it would be too coarse for geometry scaled to metres.
     uniq, inv = np.unique(np.round(flat, 8), axis=0, return_inverse=True)
     tris = inv.reshape(ntri, 3).astype(np.int64)
     return np.ascontiguousarray(uniq), np.ascontiguousarray(tris)
@@ -171,13 +174,50 @@ class MergedTriMesh:
         with torch.no_grad():
             return (sign * (p - y).norm(dim=1)).numpy()
 
+    def _face_normals_torch(self, face_indices):
+        """Geometric face normals for the given triangle indices, shape [N, 3].
+
+        Computed as normalised (b-a) x (c-a) for each triangle.  Used as a
+        fallback when the query point is so close to the surface that the
+        displacement vector (x - y) is numerically near-zero and normalising
+        it would produce garbage.
+        """
+        tri = self.tris[face_indices]             # [N, 3]
+        a = self.verts[tri[:, 0]]                 # [N, 3]
+        b = self.verts[tri[:, 1]]
+        c = self.verts[tri[:, 2]]
+        n_raw = torch.cross(b - a, c - a, dim=1)  # [N, 3]
+        n_len = n_raw.norm(dim=1, keepdim=True).clamp_min(1e-300)
+        return n_raw / n_len                       # [N, 3] unit
+
     def distance_torch(self, pts):
         """(d, n_grad, ok) torch, graph-connected to verts.  n_grad =
-        sign*(x - y)/|x - y| — the direction of increasing psi."""
-        y, sign, p = self._closest_torch(pts)
+        sign*(x - y)/|x - y| — the direction of increasing psi.
+
+        When the query point is closer than 1e-14 to the surface the
+        displacement vector is numerically zero; fall back to the triangle's
+        geometric (face) normal instead of normalising the near-zero vector.
+        """
+        sign, face = self._query(pts)
+        p = torch.tensor(np.ascontiguousarray(pts, np.float64))
+        tri = self.tris[face]
+        a = self.verts[tri[:, 0]]
+        b = self.verts[tri[:, 1]]
+        c = self.verts[tri[:, 2]]
+        y = _closest_point_on_triangle(p, a, b, c)
+        sign_t = torch.tensor(sign, dtype=torch.float64)
+
         d = y - p
-        dist = d.norm(dim=1, keepdim=True).clamp_min(1e-300)
-        n = sign.unsqueeze(1) * (p - y) / dist
+        dist = d.norm(dim=1, keepdim=True)          # [N, 1]
+
+        # Normal from displacement vector where well-conditioned.
+        # Below 1e-14 the point is on (or inside floating-point epsilon of)
+        # the surface; fall back to the triangle's geometric normal.
+        near = (dist.squeeze(1) < 1e-14)            # [N] bool
+        n_disp = sign_t.unsqueeze(1) * (p - y) / dist.clamp_min(1e-300)
+        n_face = sign_t.unsqueeze(1) * self._face_normals_torch(face)
+        n = torch.where(near.unsqueeze(1), n_face, n_disp)
+
         ok = np.ones(len(pts), dtype=bool)
         return d, n, ok
 
@@ -193,11 +233,28 @@ class MergedTriMesh:
         dvec   : [N,3] shift vector query -> closest point on Gamma (y - x)
         normal : [N,3] unit boundary normal in the +psi direction
         sign   : [N]   winding sign (+1 outside, -1 inside)
+
+        When the query point is closer than 1e-14 to the surface the dvec is
+        near-zero; the normal falls back to the triangle's geometric (face)
+        normal so that normalisation does not produce garbage.
         """
-        y, sign, p = self._closest_torch(points)
+        sign_np, face = self._query(points)
+        p = torch.tensor(np.ascontiguousarray(points, np.float64))
+        tri = self.tris[face]
+        a = self.verts[tri[:, 0]]
+        b = self.verts[tri[:, 1]]
+        c = self.verts[tri[:, 2]]
+        y = _closest_point_on_triangle(p, a, b, c)
+        sign = torch.tensor(sign_np, dtype=torch.float64)
         with torch.no_grad():
-            dvec = (y - p)
-            dist = sign * dvec.norm(dim=1)
-            nrm = dvec.norm(dim=1, keepdim=True).clamp_min(1e-300)
-            normal = sign.unsqueeze(1) * (p - y) / nrm
-            return (dist.numpy(), dvec.numpy(), normal.numpy(), sign.numpy())
+            dvec = y - p
+            nrm = dvec.norm(dim=1, keepdim=True)        # [N, 1]
+            dist = sign * nrm.squeeze(1)
+
+            # Fall back to geometric face normal for near-vertex queries.
+            near = (nrm.squeeze(1) < 1e-14)             # [N] bool
+            n_disp = sign.unsqueeze(1) * (p - y) / nrm.clamp_min(1e-300)
+            n_face = sign.unsqueeze(1) * self._face_normals_torch(face)
+            normal = torch.where(near.unsqueeze(1), n_face, n_disp)
+
+            return (dist.numpy(), dvec.numpy(), normal.numpy(), sign_np)
