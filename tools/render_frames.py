@@ -147,8 +147,8 @@ def _scan_range(files, scalar_name, pv):
         except Exception as exc:
             print(f"[render_frames] skip {f}: {exc}", file=sys.stderr)
             continue
-    if lo > hi:
-        return (0.0, 1.0)  # empty / fallback
+    if lo > hi or not (np.isfinite(lo) and np.isfinite(hi)):
+        return (0.0, 1.0)  # empty / all-NaN fallback
     if lo == hi:
         return (lo - 0.5, hi + 0.5)
     return (lo, hi)

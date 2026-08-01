@@ -130,6 +130,8 @@ if [[ "${all_exist}" == "true" ]]; then
         echo "[encode_video] ERROR: composite ffmpeg failed (exit ${composite_rc})" >&2
         echo "[encode_video] full ffmpeg output (${COMPOSITE_LOG}):" >&2
         cat "${COMPOSITE_LOG}" >&2
+        # composite failure was fatal pre-cleanup (pipefail) — keep it fatal
+        exit "${composite_rc}"
     else
         echo "[encode_video]   wrote ${COMPOSITE}"
     fi
