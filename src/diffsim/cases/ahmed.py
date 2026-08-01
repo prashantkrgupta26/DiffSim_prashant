@@ -78,9 +78,9 @@ def ahmed_merged(length=0.06, clearance=0.003, x_front=0.32,
     clearance is the ground gap; it must be resolvable (>= 4 cells at the
     band level) — the T5 sub-resolution lesson, enforced here."""
     h_band = 2.0 ** (-int(band_level))
-    assert clearance >= h_band, (
-        f"Ahmed clearance {clearance} < 1 cell at band level {band_level} "
-        f"(h={h_band}) — unresolvable gap (T5 lesson)")
+    assert clearance >= 4.0 * h_band, (
+        f"Ahmed clearance {clearance} < 4 cells at band level {band_level} "
+        f"(h={h_band}) — under-resolved gap (spec §6 / T5 lesson)")
     from diffsim.geometry.merged_trimesh import MergedTriMesh
     verts, tris = ahmed_verts_tris(length=length, slant_deg=slant_deg)
     w = verts[:, 2].max()

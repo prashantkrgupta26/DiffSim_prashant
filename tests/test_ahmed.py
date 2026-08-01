@@ -56,7 +56,9 @@ def test_ahmed_tiny_march():
     from diffsim.cases.truck_config import load_truck_config
     from diffsim.cases.truck import run_truck
     cfg = load_truck_config(_CFG_PATH)
-    merged = ahmed_merged(length=0.2, clearance=0.02, x_front=0.28,
+    # 4-cell clearance at band 6 is 0.0625; length 0.16 keeps the roof
+    # inside the channel (top ~0.107 < 0.125)
+    merged = ahmed_merged(length=0.16, clearance=0.0625, x_front=0.28,
                           band_level=6)
     res = run_truck(cfg, nsteps=3, base_level=5, truck_band_to=6,
                     band_cells=2, merged=merged, region_refine=False,
