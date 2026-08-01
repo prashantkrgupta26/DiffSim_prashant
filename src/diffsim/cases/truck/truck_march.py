@@ -827,6 +827,14 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                     strong_b_vals=_sb,
                     extra_matrix=_extra_m,
                     extra_rhs=((_bf_dofs_d, _bf_vals_d) if _sbm_on else None))
+                if step in _dump_steps:
+                    # loud by design: the helper's issparse guard rejects the
+                    # device handoff — capture legs must use host assembly
+                    _dump_saddle_system(
+                        _pl_dump / f"sys_step{step:04d}.npz", Acsr, b,
+                        ndof=ndof, nfree=nfree, tol=_tol, sigma=sigma,
+                        nu=nu_step, dt=dt_step, step=step,
+                        pcd_meta=_dump_meta, bd=_bd)
                 if mono_solver == "splu":
                     x_cur = splu(Acsr.tocsc()).solve(b)
                 else:
