@@ -429,6 +429,53 @@ def test_interpolate_checkpoint_identity(tmp_path):
     np.testing.assert_array_equal(res["cd"], ref["cd"])
 
 
+# ---------------------------------------------------------------------------
+# solver-escalation Task 2: fgmres_pcd as a first-class primary solver
+# ---------------------------------------------------------------------------
+
+def test_pcd_primary_fallback_guard():
+    """mono_solver='fgmres_pcd' with saddle_fallback='pcd' raises ValueError
+    (PCD cannot be its own fallback).  This guard fires before any solve, so
+    it does not require pyamgx to be installed."""
+    from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
+    from diffsim.cases.truck_config import load_truck_config
+    from diffsim.cases.truck import run_truck
+    cfg = load_truck_config(_CFG_PATH)
+    common = dict(nsteps=3, base_level=5, truck_band_to=6, band_cells=2,
+                  region_refine=False, nu=1.0 / 50.0, dt=0.02, verbose=False)
+    with pytest.raises(ValueError, match="fallback"):
+        run_truck(cfg, merged=_tiny_tire_mesh(cfg),
+                  mono_solver="fgmres_pcd", saddle_fallback="pcd", **common)
+
+
+@pytest.mark.skipif(
+    __import__("importlib").util.find_spec("pyamgx") is None,
+    reason="pyamgx not installed — fgmres_pcd primary requires AMGX "
+           "inners to converge in reasonable time on 3-D BDF2 steps")
+def test_pcd_primary_march():
+    """mono_solver='fgmres_pcd' marches and tracks the splu trajectory."""
+    from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
+    from diffsim.cases.truck_config import load_truck_config
+    from diffsim.cases.truck import run_truck
+    cfg = load_truck_config(_CFG_PATH)
+    # linsolve_tol default is 1e-10 (< 1e-8) so the 1e-5 atol assert is valid
+    # without an explicit tol override.
+    # pcd_f_inner/pcd_ap_inner default to "amgx" (the driver default); requires
+    # pyamgx (GPU box) — this test is skipped on CPU-only / no-pyamgx machines
+    # (jacobi-CG inner diverges the 3-D BDF2 saddle without AMG strength).
+    common = dict(nsteps=3, base_level=5, truck_band_to=6, band_cells=2,
+                  region_refine=False, nu=1.0 / 50.0, dt=0.02, verbose=False)
+    ref = run_truck(cfg, merged=_tiny_tire_mesh(cfg),
+                    mono_solver="splu", **common)
+    res = run_truck(cfg, merged=_tiny_tire_mesh(cfg),
+                    mono_solver="fgmres_pcd", **common)
+    for k in ("cd", "cd_surr"):
+        assert np.all(np.isfinite(res[k]))
+        np.testing.assert_allclose(res[k], ref[k], rtol=0, atol=1e-5)
+    # PCD-as-primary cannot also be the fallback (moved to separate guard test
+    # that runs unconditionally without amgx)
+
+
 def test_dt_schedule_identity_and_variable_table():
     """(a) a constant dt_schedule equals dt_schedule=None bit-for-bit;
     (b) a mid-run dt switch (variable BDF2 table) marches finite/bounded,
@@ -513,3 +560,116 @@ def test_tau_scale_device_parity():
         assert np.all(np.isfinite(res_d[k]))
         assert np.allclose(res_h[k], res_d[k], rtol=0, atol=1e-8), (
             f"tau device parity {k}: host {res_h[k]} vs device {res_d[k]}")
+
+
+# ---------------------------------------------------------------------------
+# solver-escalation Task 1: dump_system knob — portable saddle snapshots
+# ---------------------------------------------------------------------------
+
+def test_dump_system_snapshot(tmp_path):
+    """dump_system_steps writes a self-contained solvable saddle snapshot."""
+    import json
+    import scipy.sparse as sp
+    from scipy.sparse.linalg import splu as _splu
+    from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
+    from diffsim.cases.truck_config import load_truck_config
+    from diffsim.cases.truck import run_truck
+    cfg = load_truck_config(_CFG_PATH)
+    res = run_truck(cfg, nsteps=3, base_level=5, truck_band_to=6,
+                    band_cells=2, merged=_tiny_tire_mesh(cfg),
+                    region_refine=False, nu=1.0 / 50.0, dt=0.02,
+                    verbose=False,
+                    dump_system_steps=(1,), dump_system_dir=str(tmp_path))
+    f = tmp_path / "sys_step0001.npz"
+    assert f.exists()
+    d = np.load(f)
+    A = sp.csr_matrix((d["A_data"], d["A_indices"], d["A_indptr"]),
+                      shape=tuple(d["A_shape"]))
+    n = int(d["nfree"]) * int(d["ndof"])
+    assert A.shape == (n, n)
+    assert np.all(np.isfinite(d["b"])) and d["b"].shape == (n,)
+    # snapshot must be solvable standalone
+    x = _splu(A.tocsc()).solve(d["b"])
+    assert np.all(np.isfinite(x))
+    # PCD operators present and square in the pressure space (nfree x nfree)
+    Ap = sp.csr_matrix((d["Ap_data"], d["Ap_indices"], d["Ap_indptr"]),
+                       shape=tuple(d["Ap_shape"]))
+    assert Ap.shape == (int(d["nfree"]), int(d["nfree"]))
+    assert int(d["p_pin"]) >= 0
+    json.loads(str(d["bd_json"]))          # knob record parses
+    # knob OFF byte-identity: default run unaffected
+    ref = run_truck(cfg, nsteps=3, base_level=5, truck_band_to=6,
+                    band_cells=2, merged=_tiny_tire_mesh(cfg),
+                    region_refine=False, nu=1.0 / 50.0, dt=0.02,
+                    verbose=False)
+    np.testing.assert_array_equal(res["cd"], ref["cd"])
+
+
+# ---------------------------------------------------------------------------
+# solver-escalation Task 3: offline solver lab on dumped snapshots
+# ---------------------------------------------------------------------------
+
+def test_solver_lab_on_snapshot(tmp_path):
+    """The lab reproduces a converged solve on a dumped tiny system for
+    the bdiag control and the pcd-jacobi candidate.
+
+    Budget rule (task-3 review): pcd-jacobi with Jacobi-CG inners is
+    inherently slow on 3-D BDF2 steps (measured ~490 ms/outer-iter on CPU,
+    ~347+ outers to convergence — campaign-relevant data motivating the
+    amgx inners).  The pcd-jacobi leg is therefore a bounded honest-report
+    check (maxiter=60: path exercised, sentinel plumbing verified, outcome
+    reported truthfully) rather than a convergence assert; bdiag stays a
+    strict tol=1e-8 convergence assert.  Convergence of the pcd path
+    itself is covered at BDF1 scale by test_pcd_primary_bdf1_wiring.
+    """
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "..",
+                                      "cluster"))
+    from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
+    from diffsim.cases.truck_config import load_truck_config
+    from diffsim.cases.truck import run_truck
+    cfg = load_truck_config(_CFG_PATH)
+    run_truck(cfg, nsteps=2, base_level=5, truck_band_to=6, band_cells=2,
+              merged=_tiny_tire_mesh(cfg), region_refine=False,
+              nu=1.0 / 50.0, dt=0.02, verbose=False,
+              dump_system_steps=(1,), dump_system_dir=str(tmp_path))
+    from solver_lab import run_config
+    snap = str(tmp_path / "sys_step0001.npz")
+
+    # bdiag control: must converge to tight tol (not relaxed)
+    row = run_config(snap, "bdiag", device="cpu", tol=1e-8)
+    assert row["converged"], row
+    assert row["relres"] < 1e-7
+    assert row["n"] > 0 and row["wall_s"] > 0
+
+    # pcd-jacobi: bounded honest-report leg (see docstring budget rule)
+    row = run_config(snap, "pcd-jacobi", device="cpu", tol=1e-4, maxiter=60)
+    assert row["n"] > 0 and row["wall_s"] > 0
+    # F6: key renamed "iters" (total inner iterations); "outer" is gone.
+    assert row["iters"] > 0 or not row["converged"]   # sentinel plumbing
+    if row["converged"]:
+        assert row["relres"] < 1e-3
+
+    # F2: warm-start keys always present in snapshot (empty sentinels for a
+    # fresh march where no prior step has populated the bdiag cache).
+    import numpy as _np2
+    d = _np2.load(snap)
+    assert "x_prev" in d and "x_prev2" in d   # keys exist
+
+
+def test_pcd_primary_bdf1_wiring():
+    """Always-on CPU coverage of the fgmres_pcd PRIMARY wiring (meta build
+    + sigma/nu refresh + cache consumption): one BDF1 bootstrap step with
+    jacobi inners (~27 outers, seconds).  Trajectory quality is covered by
+    the pyamgx-gated test; this one guards the plumbing (task-2 review)."""
+    from test_truck_viz import _tiny_tire_mesh, _CFG_PATH
+    from diffsim.cases.truck_config import load_truck_config
+    from diffsim.cases.truck import run_truck
+    cfg = load_truck_config(_CFG_PATH)
+    res = run_truck(cfg, nsteps=1, base_level=5, truck_band_to=6,
+                    band_cells=2, merged=_tiny_tire_mesh(cfg),
+                    region_refine=False, nu=1.0 / 50.0, dt=0.02,
+                    verbose=False, mono_solver="fgmres_pcd",
+                    pcd_f_inner="jacobi", pcd_ap_inner="jacobi")
+    assert np.all(np.isfinite(res["cd"]))
+    assert np.all(np.isfinite(res["cd_surr"]))

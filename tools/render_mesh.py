@@ -92,16 +92,73 @@ def render(npz_path):
     print("  wrote", vtu, "and 3-D view")
 
 
+def render_stl_in_domain(stl_path, out_prefix, *, position=(0.0, 0.0, 0.0),
+                         scale=1.0,
+                         domain=((0.0, 0.0, 0.0), (1.0, 0.125, 0.125))):
+    """Render the body STL placed inside the channel domain, 3 views.
+
+    position/scale mirror the config placement convention: rendered
+    verts = stl_verts * scale + position (apply the SAME transform the
+    mesh pipeline applies to this body before carving)."""
+    if not pathlib.Path(stl_path).exists():
+        raise FileNotFoundError(f"[render_mesh] STL not found: {stl_path}")
+    body = pv.read(str(stl_path))
+    body.points = body.points * float(scale) + np.asarray(position,
+                                                          np.float64)
+    lo, hi = np.asarray(domain[0], float), np.asarray(domain[1], float)
+    box = pv.Box(bounds=(lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))
+    ground = pv.Plane(center=((lo[0] + hi[0]) / 2, lo[1],
+                              (lo[2] + hi[2]) / 2),
+                      direction=(0, 1, 0),
+                      i_size=hi[0] - lo[0], j_size=hi[2] - lo[2])
+    for tag, cam in (("iso", "iso"), ("side", "xy"), ("front", "yz")):
+        p = pv.Plotter(off_screen=True, window_size=(1920, 1080))
+        p.add_mesh(box, style="wireframe", color="black", line_width=2)
+        p.add_mesh(ground, color="tan", opacity=0.4)
+        p.add_mesh(body, color="steelblue", show_edges=False)
+        p.camera_position = cam
+        p.add_text(f"{pathlib.Path(stl_path).name} in domain — {tag}",
+                   font_size=12)
+        png = f"{out_prefix}_{tag}.png"
+        p.screenshot(png)
+        p.close()
+        print("  wrote", png)
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     if not args:
         print("Usage: render_mesh.py results/mesh_*.npz [more.npz ...]",
               file=sys.stderr)
         sys.exit(1)
-    missing = [f for f in args if not pathlib.Path(f).exists()]
-    if missing:
-        for m in missing:
-            print(f"[render_mesh] ERROR: input path not found: {m}", file=sys.stderr)
-        sys.exit(1)
-    for f in args:
-        render(f)
+    if "--stl" in args:
+        def _get(flag, default=None):
+            if flag not in args:
+                return default
+            i = args.index(flag) + 1
+            if i >= len(args) or args[i].startswith("--"):
+                sys.exit(f"[render_mesh] ERROR: {flag} requires a value "
+                         f"(usage: --stl PATH [--out-prefix P] "
+                         f"[--position x,y,z] [--scale s])")
+            return args[i]
+        _pos_raw = _get("--position", "0,0,0")
+        try:
+            pos = tuple(float(x) for x in _pos_raw.split(","))
+        except ValueError:
+            sys.exit(f"[render_mesh] ERROR: --position must be three "
+                     f"comma-separated numbers, got {_pos_raw!r}")
+        if len(pos) != 3:
+            sys.exit(f"[render_mesh] ERROR: --position needs exactly 3 "
+                     f"components (x,y,z), got {len(pos)}: {_pos_raw!r}")
+        render_stl_in_domain(_get("--stl"),
+                             _get("--out-prefix", "results/mesh_renders/body"),
+                             position=pos,
+                             scale=float(_get("--scale", "1.0")))
+    else:
+        missing = [f for f in args if not pathlib.Path(f).exists()]
+        if missing:
+            for m in missing:
+                print(f"[render_mesh] ERROR: input path not found: {m}", file=sys.stderr)
+            sys.exit(1)
+        for f in args:
+            render(f)

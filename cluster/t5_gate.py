@@ -75,7 +75,8 @@ threading.Thread(target=_smi_sampler, daemon=True).start()
 print("=" * 72, flush=True)
 print(f"[T5] GATE LEG  base={BASE_LEVEL} band={BAND_TO} nsteps={NSTEPS} "
       f"viz_interval={VIZ_INT} ckpt={CKPT_INT} equilibrate={EQUIL} "
-      f"assembly={ASSEMBLY}", flush=True)
+      f"assembly={ASSEMBLY} mono_solver={MONO_SOLVER} "
+      f"F={PCD_F_INNER} Ap={PCD_AP_INNER}", flush=True)
 
 import torch, warp as wp
 wp.init()
@@ -186,6 +187,13 @@ if DT_START_FACTOR > 0 and DT_START_STEPS > 0:
     print(f"[T5] DT ladder: dt/{DT_START_FACTOR} for first {DT_START_STEPS} "
           f"steps (sigma x{DT_START_FACTOR}), then dt={dt}", flush=True)
 
+# MONO_SOLVER: the primary saddle solver class for the march.  Default
+# "fgmres_bdiag" (block-diagonal Jacobi, the validated T1-T5 solver).  Set
+# MONO_SOLVER=fgmres_pcd to run Rung 3 with the PCD primary (winning inners
+# from Rung 1).  NOTE: with MONO_SOLVER=fgmres_pcd, SADDLE_FALLBACK must be
+# unset — the self-fallback guard in run_truck raises at setup.
+MONO_SOLVER = os.environ.get("MONO_SOLVER", "fgmres_bdiag")
+
 # PCD PER-STEP FALLBACK (five-leg Jacobi-class verdict): bdiag stays the fast
 # primary; any step that exhausts its budget is re-solved with the Track-A
 # fgmres_pcd (Cahouet-Chabard Schur, AMGX inners per A4/A2).  SADDLE_FALLBACK=
@@ -259,6 +267,27 @@ RESUME = os.environ.get("RESUME", "0").strip() not in ("", "0")
 if MARCH_CKPT > 0:
     print(f"[T5] march checkpoints every {MARCH_CKPT} steps"
           + (" (RESUME requested)" if RESUME else ""), flush=True)
+# DUMP_SYSTEM: capture assembled saddle system at listed step indices for the
+# offline solver lab (Task 1).  Requires TRUCK_ASSEMBLY=host (device handoff
+# raises; see run_truck docstring).  Eager validation: steps-but-no-dir fails
+# HERE at leg start, not hours into a march.
+DUMP_SYS_STEPS = tuple(int(s) for s in
+                       os.environ.get("DUMP_SYSTEM_STEPS", "").split(",")
+                       if s.strip())
+DUMP_SYS_DIR = os.environ.get("DUMP_SYSTEM_DIR", "") or None
+if DUMP_SYS_STEPS and DUMP_SYS_DIR is None:
+    raise ValueError(
+        "DUMP_SYSTEM_STEPS is set but DUMP_SYSTEM_DIR is empty — "
+        "set DUMP_SYSTEM_DIR to the capture output directory")
+if DUMP_SYS_STEPS and ASSEMBLY == "device":
+    # eager veto: the dump helper rejects device-handoff CSRs at the FIRST
+    # dump step — after a full mesh build. Fail here instead.
+    raise ValueError(
+        "DUMP_SYSTEM_STEPS requires TRUCK_ASSEMBLY=host (device parity is "
+        "trajectory-tight, so host-captured systems are the same matrices)")
+if DUMP_SYS_STEPS:
+    print(f"[T5] dump-system at steps {DUMP_SYS_STEPS} -> {DUMP_SYS_DIR}",
+          flush=True)
 # SEAL_BOXES="x0:x1:y0:y1:z0:z1[;...]" — gap fairings (cab-trailer slot etc.)
 def _parse_knob(env_name, item_sep, field_sep, nfields, cast):
     """Eager multi-part env-knob parsing (final-review I-7): malformed
@@ -382,7 +411,9 @@ res = run_truck(
     cfg, NSTEPS,
     device="cuda",
     assembly=ASSEMBLY,
-    mono_solver="fgmres_bdiag",
+    mono_solver=MONO_SOLVER,
+    pcd_f_inner=PCD_F_INNER,
+    pcd_ap_inner=PCD_AP_INNER,
     saddle_x0="extrap",
     saddle_equilibrate=EQUIL,
     nu_schedule=nu_sched,
@@ -405,8 +436,6 @@ res = run_truck(
     soft_start=(SOFT_START if SOFT_START > 0 else None),
     dt_schedule=dt_sched,
     saddle_fallback=SADDLE_FALLBACK,
-    pcd_f_inner=PCD_F_INNER,
-    pcd_ap_inner=PCD_AP_INNER,
     tau_dt=TAU_DT,
     accept_miss_until=(ACCEPT_MISS_UNTIL if ACCEPT_MISS_UNTIL > 0 else None),
     u_cap=U_CAP,
@@ -429,6 +458,8 @@ res = run_truck(
     checkpoint_interval=(MARCH_CKPT if MARCH_CKPT > 0 else None),
     checkpoint_dir=(VIZ_DIR if MARCH_CKPT > 0 else None),
     resume=RESUME,
+    dump_system_steps=DUMP_SYS_STEPS,
+    dump_system_dir=DUMP_SYS_DIR,
 )
 t_total = time.time() - t_run
 

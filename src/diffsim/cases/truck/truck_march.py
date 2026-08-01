@@ -52,6 +52,53 @@ def _gp_history_fq(dm, mesh, T, u_pre1, u_pre2, b1, b2, dt, dim):
 
 
 # ---------------------------------------------------------------------------
+# Solver-lab snapshot helper (solver-escalation Task 1)
+# ---------------------------------------------------------------------------
+
+def _dump_saddle_system(path, Acsr, b, *, ndof, nfree, tol, sigma, nu,
+                        dt, step, pcd_meta, bd,
+                        x_prev=None, x_prev2=None):
+    """Write a self-contained solver-lab snapshot (see solver_lab.py).
+
+    Optional warm-start vectors (F2: snapshot warm-start fidelity):
+      x_prev  — the most recent converged solution (n^th step), used as the
+                 first extrapolation point for bdiag saddle_x0="extrap".
+      x_prev2 — the step before that (n-1), used as the second point.
+    Both are stored as optional npz keys.  When absent from the march cache
+    (first step or cold-start leg) a zero-length sentinel array is written,
+    matching the checkpoint writer convention.
+    """
+    import json
+    import scipy.sparse as sp
+    if not sp.issparse(Acsr):
+        raise ValueError(
+            "dump_system requires host assembly (scipy CSR); re-run the "
+            "capture leg with TRUCK_ASSEMBLY=host / assembly='host'")
+    A = Acsr.tocsr()
+    Mp = pcd_meta["Mp"].tocsr()
+    Ap = pcd_meta["Ap"].tocsr()
+    _xp = x_prev if x_prev is not None else np.zeros(0)
+    _xp2 = x_prev2 if x_prev2 is not None else np.zeros(0)
+    tmp = str(path) + ".tmp.npz"
+    np.savez_compressed(
+        tmp,
+        A_indptr=A.indptr, A_indices=A.indices, A_data=A.data,
+        A_shape=np.asarray(A.shape), b=np.asarray(b, np.float64),
+        ndof=ndof, nfree=nfree, tol=float(tol), sigma=float(sigma),
+        nu=float(nu), dt=float(dt), step=int(step),
+        Mp_indptr=Mp.indptr, Mp_indices=Mp.indices, Mp_data=Mp.data,
+        Mp_shape=np.asarray(Mp.shape),
+        Ap_indptr=Ap.indptr, Ap_indices=Ap.indices, Ap_data=Ap.data,
+        Ap_shape=np.asarray(Ap.shape),
+        p_pin=int(pcd_meta["p_pin_local"]),
+        bd_json=json.dumps({k: v for k, v in bd.items()
+                            if isinstance(v, (int, float, str, bool))}),
+        x_prev=np.asarray(_xp, np.float64),
+        x_prev2=np.asarray(_xp2, np.float64))
+    os.replace(tmp, str(path))
+
+
+# ---------------------------------------------------------------------------
 # Main driver
 # ---------------------------------------------------------------------------
 
@@ -75,7 +122,8 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
               seal_underbody=False, seal_y=0.003, seal_boxes=None,
               backflow_stab=False,
               checkpoint_interval=None, checkpoint_dir=None,
-              resume=False):
+              resume=False,
+              dump_system_steps=(), dump_system_dir=None):
     """Run the truck case: transient BDF2 monolithic march.
 
     Returns a history dict with keys:
@@ -209,6 +257,13 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
           near-ground wave born in the 2-cell sloped-inlet shear layer
           grows ~x1.2/step under tau_m_scale=1 and detonates at the truck;
           the C++ ran this exact case at 0.1.  Default 1.0 byte-identical.
+      dump_system_steps / dump_system_dir : dump the assembled saddle
+          system (A, b) plus the PCD pressure operators (Mp, Ap) at the
+          listed step indices to ``sys_step{N:04d}.npz`` for the offline
+          solver lab.  HOST-ASSEMBLY ONLY (device parity is trajectory-
+          tight, so host-captured systems are the same matrices): a
+          device-handoff Acsr raises ValueError.  Default () = OFF,
+          byte-identical.
     """
     dim = 3
     ndof = dim + 1
@@ -500,6 +555,21 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
             _bd["saddle_min_work"] = True        # drift-guard polish cycle
         _pcd_cache[("blocktri_meta", "truck")] = _bd
 
+    # ---- PCD-as-primary guard + setup (solver-escalation Task 2) -----------
+    if mono_solver == "fgmres_pcd" and saddle_fallback == "pcd":
+        raise ValueError(
+            "mono_solver='fgmres_pcd' cannot use saddle_fallback='pcd' "
+            "(PCD is already the primary; no fallback for the fallback)")
+    if mono_solver == "fgmres_pcd":
+        from diffsim.solvers.saddle_precond import build_pcd_meta
+        _t_pm = time.time()
+        _pcd_cache[("pcd_meta", "truck")] = build_pcd_meta(
+            dm, nu if nu is not None else 1.0, 1.0 / dt,
+            p_pin=int(p_pin), inner=pcd_f_inner, ap_inner=pcd_ap_inner)
+        print(f"[truck] PCD PRIMARY armed (F={pcd_f_inner}, "
+              f"Ap={pcd_ap_inner}, meta {time.time()-_t_pm:.1f}s)",
+              flush=True)
+
     # ---- per-step PCD fallback (five-leg Jacobi-class verdict) --------------
     _fb_meta = None
     if saddle_fallback == "pcd" and mono_solver in ("fgmres_bdiag",
@@ -527,6 +597,12 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         _slv_cache = (_pcd_cache if mono_solver in
                       ("fgmres_pcd", "fgmres_bdiag", "fused_bdiag")
                       else None)
+        # PCD primary: refresh per-step sigma/nu before every solve (mirrors
+        # the fallback path; Mp/Ap are geometry-only and stay fixed).
+        if mono_solver == "fgmres_pcd":
+            _pm = _pcd_cache[("pcd_meta", "truck")]
+            _pm["sigma"] = float(sigma)
+            _pm["nu"] = float(nu_step)
         _fb_msg = None
         try:
             return solve_linear(Acsr, b, solver=mono_solver, sym=False,
@@ -628,6 +704,21 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
         else:
             print("[truck] resume requested but no checkpoint found — "
                   "starting from step 0", flush=True)
+
+    # ---- dump_system setup (solver-escalation Task 1; off by default) -------
+    _dump_steps = set(int(s) for s in (dump_system_steps or ()))
+    _dump_meta = None
+    _pl_dump = None
+    if _dump_steps:
+        if dump_system_dir is None:
+            raise ValueError("dump_system_steps set but dump_system_dir=None")
+        import pathlib as _pl
+        _pl_dump = _pl.Path(dump_system_dir)
+        _pl_dump.mkdir(parents=True, exist_ok=True)
+        from diffsim.solvers.saddle_precond import build_pcd_meta as _bpm
+        _dump_meta = _bpm(dm, nu if nu is not None else 1.0, 1.0 / dt,
+                          p_pin=int(p_pin))
+
     for step in range(_step0, nsteps):
         dt_step = (float(dt_schedule(step)) if dt_schedule is not None
                    else dt)
@@ -750,6 +841,16 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                     strong_b_vals=_sb,
                     extra_matrix=_extra_m,
                     extra_rhs=((_bf_dofs_d, _bf_vals_d) if _sbm_on else None))
+                if step in _dump_steps:
+                    # loud by design: the helper's issparse guard rejects the
+                    # device handoff — capture legs must use host assembly
+                    _dump_saddle_system(
+                        _pl_dump / f"sys_step{step:04d}.npz", Acsr, b,
+                        ndof=ndof, nfree=nfree, tol=_tol, sigma=sigma,
+                        nu=nu_step, dt=dt_step, step=step,
+                        pcd_meta=_dump_meta, bd=_bd,
+                        x_prev=_pcd_cache.get(("bdiag_x_prev", "truck")),
+                        x_prev2=_pcd_cache.get(("bdiag_x_prev2", "truck")))
                 if mono_solver == "splu":
                     x_cur = splu(Acsr.tocsc()).solve(b)
                 else:
@@ -803,6 +904,14 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                         A.rows[r] = [int(r)]; A.data[r] = [1.0]; b[r] = 0.0
 
                 Acsr = A.tocsr()
+                if step in _dump_steps:
+                    _dump_saddle_system(
+                        _pl_dump / f"sys_step{step:04d}.npz", Acsr, b,
+                        ndof=ndof, nfree=nfree, tol=_tol, sigma=sigma,
+                        nu=nu_step, dt=dt_step, step=step,
+                        pcd_meta=_dump_meta, bd=_bd,
+                        x_prev=_pcd_cache.get(("bdiag_x_prev", "truck")),
+                        x_prev2=_pcd_cache.get(("bdiag_x_prev2", "truck")))
                 if mono_solver == "splu":
                     x_cur = splu(Acsr.tocsc()).solve(b)
                 else:
@@ -897,6 +1006,13 @@ def run_truck(cfg, nsteps, device="cpu", assembly="host", mono_solver="splu",
                                ref_force=float(ref_force),
                                umax=_umax, umax_loc=_uloc,
                                nonlin=_nl_done,
+                               # NB: sourced from _bd (bdiag meta). The
+                               # fgmres_pcd PRIMARY writes its miss flag to
+                               # the pcd_meta dict instead, so this reads
+                               # False under PCD-primary — truthful today
+                               # only because PCD has no accept-miss mode
+                               # (a PCD miss raises and kills the march).
+                               # Wire pcd_meta through here if that changes.
                                accepted_miss=bool(_bd.get("last_solve_miss",
                                                           False)),
                                coords=coords, u=u_new,
