@@ -17,21 +17,23 @@ finding (m1a findings 4b) is about: a p2 element next to a p1 element does
 NOT get to keep its quadratic face modes.
 
 EXPECTED RESULTS (measured; each is a lesson):
-    rich-L: 4.31e-3 / 1.30e-3 / 3.56e-4   orders 1.73 / 1.87
-    rich-R: 6.52e-3 / 1.64e-3 / 4.11e-4   orders 1.99 / 2.00
+    rich-L: 1.25e-3 / 3.11e-4 / 7.75e-5   orders 2.01 / 2.00
+    rich-R: 6.43e-3 / 1.61e-3 / 4.04e-4   orders 1.99 / 2.00
   (i) Both cases converge at order ~2: the p1 half sets the RATE — a chain
       is as slow as its weakest link. p-refinement buys ORDER only if it
       covers the whole domain.
- (ii) Spending p2 on the rich half helps (rich-L beats rich-R at every
-      level) — but only by a CONSTANT (1.5x at level 4), and the margin
-      SHRINKS under refinement. Why? Decompose the error by half (we did:
-      at strong oscillation the rich half's error is ~the same under p1
-      and p2!) — the minimum-rule interface constraints hold the p2 side
-      to p1 accuracy in a band along the interface, and the interface here
-      sits right where case L's field is still rich. The p2 payoff needs
-      the p2/p1 interface pushed away from the rich region — which is
-      EXACTLY the m1a Neumann-band finding (4b) wearing steady-state
-      clothes.
+ (ii) Spending p2 on the rich half helps a LOT (rich-L beats rich-R by a
+      ~5.2x CONSTANT factor at every level, 5.14/5.19/5.21x from level 4 to
+      6 — stable, even mildly growing, under refinement, not shrinking).
+      Why stable rather than shrinking? The minimum-rule interface
+      constraints still hold the p2 side to p1 accuracy in a band along
+      the interface at x=0.5, capping the RATE (lesson i) — but with a
+      true half-domain p2 region, most of case L's rich zone (near x=0,
+      away from the interface) still gets full p2 accuracy, so the
+      interface band only eats a fixed fraction of the benefit rather than
+      most of it. Pushing the p2/p1 interface away from the rich region
+      (Explore b) grows the benefit further — EXACTLY the m1a Neumann-band
+      finding (4b) wearing steady-state clothes.
 
 Run:  python tutorials/A_foundations/A4_mixed_elements.py
 """
@@ -78,8 +80,7 @@ def solve(level, rich_side):
     anchors = tree.anchors() / (tree.anchors().max() + (
         tree.anchors().max() == 0))
     # p2 on the LEFT half, p1 on the right (uniform level => one-knob safe)
-    G = 1 << level
-    xs = tree.anchors()[:, 0] / float(G)
+    xs = anchors[:, 0]
     p_elem = np.where(xs < 0.5, 2, 1).astype(np.int8)
     mesh = build_mesh(tree, p=p_elem)
     cons = build_constraints(mesh)

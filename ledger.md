@@ -183,3 +183,55 @@ level 5 -> 6: 2.63
 | 6 | 0.0156 | 6.401e-04 |
 
 Observed orders were `1.30` and `2.57`. These are very close to the earlier exact-circle `lambda=1.0` results (`1.31`, `2.63`) at these levels, but the sampled geometry introduces projection failures and a small error change. The temporary code changes were restored after testing; this is a diagnostic result, not a permanent change to the A3 tutorial.
+
+## Task A4 - Mixed p1/p2 Elements and Minimum Rule
+**Date:** August 1, 2026  
+**Script:** `tutorials/A_foundations/A4_mixed_elements.py`
+
+### Bug fix: p2 region was a thin column, not a half-domain
+
+`solve()` normalized `xs` by `1 << level` instead of `tree.anchors().max()`, so p2 covered only the leftmost element column (`2^-level` of the mesh) instead of the claimed left half. Fixed to use `anchors[:, 0]` (already computed, previously unused); verified 50.00% p2 at levels 4/5/6. The old ledger entry above (`1.73`/`1.87` orders) was measured on the buggy mesh and is superseded below.
+
+### Observed Results (corrected, true 50/50 split)
+
+- **rich-L (p2 on left):** errors `[1.251e-03, 3.108e-04, 7.751e-05]`, orders `2.01`, `2.00` (finest mesh: `10401` DOFs).
+- **rich-R (p2 on left):** errors `[6.426e-03, 1.614e-03, 4.039e-04]`, orders `1.99`, `2.00` (finest mesh: `10401` DOFs).
+
+### Interpretation
+
+Both cases still converge at order ~2 — the p1 half caps the global rate regardless of where p2 sits. Now rich-L is a stable ~5.2x more accurate than rich-R at every level (5.14x/5.19x/5.21x), unlike the buggy run's shrinking 1.5x margin (an artifact of the p2 fraction itself shrinking each level). With a real half-domain split, most of rich-L's rich zone near `x=0` sits clear of the p2/p1 interface and keeps full p2 accuracy; only a fixed-width band near `x=0.5` is taxed to p1.
+
+### Explore (a) — Constraint counts at the p2/p1 interface
+
+Level-4 mesh (128 p2, 128 p1 elements): `Nn=697`, free=`681`, hanging=`16`. All 16 hanging nodes sit on `x=0.5`, one per interface element (16 p2 elements border it). Sample interpolation row: node `(0.5, 0.03125) = 0.5*(0.5, 0.0) + 0.5*(0.5, 0.0625)`.
+
+**Interpretation:** the minimum rule pins exactly one DOF per interface element — the quadratic mid-face mode — to the linear average of its two corners, i.e. a hat function riding on what would be a quadratic edge trace.
+
+### Explore (b) — Strip `|x-0.5|<0.25` vs. half-domain, same p2 budget
+
+| region | rich-L errors (lv 4/5/6) | rich-R errors (lv 4/5/6) | p2 frac |
+|---|---|---|---|
+| p1 | 6.537e-3 / 1.642e-3 / 4.110e-4 | 6.537e-3 / 1.642e-3 / 4.110e-4 | 0.0 |
+| half | 1.251e-3 / 3.108e-4 / 7.751e-5 | 6.426e-3 / 1.614e-3 / 4.039e-4 | 0.5 |
+| strip | 5.811e-3 / 1.463e-3 / 3.663e-4 | 5.811e-3 / 1.463e-3 / 3.663e-4 | 0.5 |
+| p2 | 2.183e-4 / 2.733e-5 / 3.418e-6 | 2.183e-4 / 2.733e-5 / 3.418e-6 | 1.0 |
+
+**Interpretation:** no — half the budget does not buy most of the benefit; placement dominates budget. The symmetric strip gives identical, modest gains (~11% over p1) for both L and R. `half` at the same budget swings from ~5.2x better (rich-L, well-placed) to ~1.7% better (rich-R, misplaced). `half`'s gap to the full-p2 ceiling also widens under refinement for rich-L (5.7x -> 22.7x, level 4 to 6), since full p2 holds order 3 while the interface-capped half is stuck at order 2.
+
+### Explore (c) — Connection to m1a finding 4b (Neumann band)
+
+`docs/dev/m1a-deferred-findings.md` 4b(c): band elements carrying the Hessian must be decoupled from the minimum-rule p1 trace constraints — thin rings (1-2 layers) cap order at ~1; >=3-4 layers restore order 2.
+
+**Restated for A4:** the SBM Neumann p2-band's outer face is subject to the same minimum-rule constraint measured in Explore (a). A too-thin band lets the constrained trace strip overlap the elements meant to carry the Hessian, capping order at ~1. Explore (b) is the steady-state analogue: `half` keeps its rich zone several elements clear of the interface (thick enough), while `strip` puts the constrained band directly on the region that would benefit (too thin), and the payoff nearly vanishes.
+
+### Explore (d) — Assembly time: p1 vs p2 vs mixed (level 6, 4096 elements each)
+
+| config | DOFs | nnz | assemble median/min (ms) |
+|---|---:|---:|---:|
+| p1-uniform | 4225 | 37249 | 1.083 / 1.028 |
+| p2-uniform | 16641 | 263169 | 6.694 / 5.766 |
+| mixed 50/50 | 10401 | 149281 | 3.768 / 3.635 |
+
+**Interpretation:** DOF ratio p2/p1 measured `3.94x`, not the docstring's predicted `(3/2)^2=2.25x` (same-level p2 node density approaches 4x p1 asymptotically). Assembly time ratio `6.18x` is close to the predicted per-element `(9/4)^2=5.06x` (matches the `nbf^2` scatter-size ratio 81/16). Mixed time (`3.768 ms`) matches `mean(p1,p2)=3.889 ms` within 3%: `volume_triplets` launches one Warp kernel per p-bin over its own disjoint elements, so a 50/50 split is just the mean of the two uniform costs, no cross term.
+
+Both cases converge at approximately second order rather than third order because the p1 half and the constrained p2/p1 interface limit the global convergence rate. The p2 region improves the error constant when it covers the rich part of the solution, but it does not change the overall rate. The identical DOF count is expected because both runs use the same mesh and p1/p2 layout; only the manufactured solution changes.
