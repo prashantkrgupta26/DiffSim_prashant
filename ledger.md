@@ -234,4 +234,55 @@ Level-4 mesh (128 p2, 128 p1 elements): `Nn=697`, free=`681`, hanging=`16`. All 
 
 **Interpretation:** DOF ratio p2/p1 measured `3.94x`, not the docstring's predicted `(3/2)^2=2.25x` (same-level p2 node density approaches 4x p1 asymptotically). Assembly time ratio `6.18x` is close to the predicted per-element `(9/4)^2=5.06x` (matches the `nbf^2` scatter-size ratio 81/16). Mixed time (`3.768 ms`) matches `mean(p1,p2)=3.889 ms` within 3%: `volume_triplets` launches one Warp kernel per p-bin over its own disjoint elements, so a 50/50 split is just the mean of the two uniform costs, no cross term.
 
-Both cases converge at approximately second order rather than third order because the p1 half and the constrained p2/p1 interface limit the global convergence rate. The p2 region improves the error constant when it covers the rich part of the solution, but it does not change the overall rate. The identical DOF count is expected because both runs use the same mesh and p1/p2 layout; only the manufactured solution changes.
+## Task A5 - Going 3-D
+**Date:** August 2, 2026  
+**Script:** `tutorials/A_foundations/A5_three_dimensions.py`
+
+### Observed Results
+
+- **box p1** (levels 3/4/5): errors `[4.548e-03, 1.136e-03, 2.840e-04]`, orders `2.00`, `2.00`.
+- **box p2** (levels 2/3/4): errors `[1.386e-03, 1.772e-04, 2.227e-05]`, orders `2.97`, `2.99`.
+- **sphere p1, immersed** (levels 3/4): errors `[3.014e-03, 1.190e-03]`, order `1.34` (preasymptotic, as the docstring predicts).
+
+Matches the docstring's EXPECTED RESULTS exactly — no bug this time.
+
+### Explore (a) — Staged cost table, levels 3-6
+
+| level | DOFs | nnz | mesh+cons | assemble | solve (factorize+backsolve) | solve/assemble |
+|---|---:|---:|---:|---:|---:|---:|
+| 3 | 729 | 15,625 | 0.001s | 0.002s | 0.003s | 1.3x |
+| 4 | 4,913 | 117,649 | 0.002s | 0.008s | 0.105s | 13.6x |
+| 5 | 35,937 | 912,673 | 0.019s | 0.061s | 13.40s | 220x |
+| 6 | 274,625 | ~7.1M | — | — | **OOM-killed** | — |
+
+Level 6 (p1-uniform box) was attempted directly and the process was killed by the OS OOM killer mid-factorization, `anon-rss` at `14.6 GB` on this machine's `15 GiB` RAM, before finishing.
+
+**Interpretation:** solve time scaling exponent measured `1.83` (lv 3->4) then `2.44` (lv 4->5) — consistent with the docstring's ~O(n^2) claim (and trending above it, likely early swap pressure at level 5). Solve overtakes assembly by level 3 already (`n=729`) in 3-D; the 2-D crossover (from A1's performance-corner table) doesn't happen until between level 5 and 6 (`n≈1089-4225`). Extrapolating O(n^2) from level 5 predicts a ~13-minute level-6 solve, but that number is moot — the real bottleneck is **memory**, not time: splu fill-in in 3-D (~O(n^{4/3})) exhausted RAM before finishing. This is exactly why track-P's iterative solvers exist: a direct solver doesn't just get slow in 3-D, it becomes infeasible on commodity RAM well before it gets slow enough to notice.
+
+### Explore (b) — k=4 estimate (no run)
+
+| level | elements | p2 DOFs | nnz (~`5^4`/row) | assembled matrix (~16B/nnz) |
+|---:|---:|---:|---:|---:|
+| 2 | 256 | 6,561 | 4.1M | 0.07 GB |
+| 3 | 4,096 | 83,521 | 52.2M | 0.84 GB |
+| 4 | 65,536 | 1,185,921 | 741.2M | **11.9 GB** |
+
+**Interpretation:** level-4 k=4 p2 needs `65,536` elements and `1,185,921` DOFs. Just the assembled matrix already approaches this machine's 16 GiB GPU budget, before counting solver fill-in or host-side triplet staging — level 3 fits comfortably, level 4 is right at the edge / likely over. Matches the m1a finding-6 reference point (~7,105 nodes was the practical scale for 4D p2 in the test suite) — that's between this table's level 2 and level 3.
+
+### Explore (c) — Profile the sphere solve at level 5
+
+| stage | time | share |
+|---|---:|---:|
+| solve | 0.102s | 42.9% |
+| classify | 0.076s | 31.9% |
+| geometry_data | 0.021s | 8.9% |
+| extract_surrogate | 0.012s | 5.1% |
+| build_constraints | 0.012s | 5.0% |
+| build_mesh | 0.009s | 3.8% |
+| build_uniform | 0.003s | 1.2% |
+| sbm_setup | 0.002s | 0.7% |
+| device_mesh | 0.001s | 0.5% |
+
+(`n_elems=2968`, `n_dofs=3791`, total wall `0.27s`.)
+
+**Interpretation:** this does NOT match what the explore prompt hints at ("the m0.5 findings say constraints") — here `build_constraints` is only 5% of the time; `solve` and `classify` dominate. Checked the referenced finding directly: m1a finding 6 measured `build_constraints` at `48s` for a 4D p2 mesh, but that was the OLD, unvectorized host-probe-loop implementation (one `LeafLookup.find` call per node per probe). The current `build_constraints` (vectorized campaign, 2026-07-05) batches all probes into one call and was already confirmed elsewhere (P1 tutorial) to drop from `222s` to `0.71s` at 66k 2-D DOFs. At this sphere mesh's tiny scale (3,791 DOFs), that fix means constraints is no longer the bottleneck — the old finding describes code that no longer exists in this form. Re-measuring beats trusting a stale reference.
