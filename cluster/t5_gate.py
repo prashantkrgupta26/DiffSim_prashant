@@ -45,6 +45,14 @@ EQUIL      = os.environ.get("SADDLE_EQUILIBRATE", "0") == "1"
 # fall back on the ARM venv where warp lacks native/ headers (JIT of a
 # module="unique" kernel raises "cannot open source file builtin.h").
 ASSEMBLY   = os.environ.get("TRUCK_ASSEMBLY", "device")
+# MONO_SOLVER: the primary saddle solver class for the march.  Default
+# "fgmres_bdiag" (block-diagonal Jacobi, the validated T1-T5 solver).  Set
+# MONO_SOLVER=fgmres_pcd to run Rung 3 with the PCD primary (winning inners
+# from Rung 1).  NOTE: with MONO_SOLVER=fgmres_pcd, SADDLE_FALLBACK must be
+# unset — the self-fallback guard in run_truck raises at setup.
+MONO_SOLVER = os.environ.get("MONO_SOLVER", "fgmres_bdiag")
+PCD_F_INNER = os.environ.get("PCD_F_INNER", "amgx")
+PCD_AP_INNER = os.environ.get("PCD_AP_INNER", "amgx")
 VIZ_DIR    = os.environ.get(
     "VIZ_DIR", "/work/mech-ai/baskarg/DiffSim/results/truck-t5-frames")
 
@@ -187,20 +195,13 @@ if DT_START_FACTOR > 0 and DT_START_STEPS > 0:
     print(f"[T5] DT ladder: dt/{DT_START_FACTOR} for first {DT_START_STEPS} "
           f"steps (sigma x{DT_START_FACTOR}), then dt={dt}", flush=True)
 
-# MONO_SOLVER: the primary saddle solver class for the march.  Default
-# "fgmres_bdiag" (block-diagonal Jacobi, the validated T1-T5 solver).  Set
-# MONO_SOLVER=fgmres_pcd to run Rung 3 with the PCD primary (winning inners
-# from Rung 1).  NOTE: with MONO_SOLVER=fgmres_pcd, SADDLE_FALLBACK must be
-# unset — the self-fallback guard in run_truck raises at setup.
-MONO_SOLVER = os.environ.get("MONO_SOLVER", "fgmres_bdiag")
-
 # PCD PER-STEP FALLBACK (five-leg Jacobi-class verdict): bdiag stays the fast
 # primary; any step that exhausts its budget is re-solved with the Track-A
 # fgmres_pcd (Cahouet-Chabard Schur, AMGX inners per A4/A2).  SADDLE_FALLBACK=
 # pcd enables; PCD_F_INNER / PCD_AP_INNER pick the inner backends.
+# (MONO_SOLVER / PCD_* are read at module top with the other knobs — they are
+# referenced by the banner print.)
 SADDLE_FALLBACK = os.environ.get("SADDLE_FALLBACK", "") or None
-PCD_F_INNER = os.environ.get("PCD_F_INNER", "amgx")
-PCD_AP_INNER = os.environ.get("PCD_AP_INNER", "amgx")
 if SADDLE_FALLBACK:
     print(f"[T5] saddle_fallback={SADDLE_FALLBACK} "
           f"(F={PCD_F_INNER}, Ap={PCD_AP_INNER})", flush=True)
