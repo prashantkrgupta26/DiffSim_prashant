@@ -1842,10 +1842,15 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
 
         b_dev = wp.array(np.ascontiguousarray(b, np.float64),
                          dtype=wp.float64, device=device)
-        cycles = min(200, max(1, maxiter // 60))
+        # pcd_restart (meta knob, default 60 = byte-identical): flexible
+        # FGMRES stores V+Z = 2*restart*8N bytes — at 10M+ DOF alongside an
+        # AMGX F-hierarchy this is the difference between fitting in HBM and
+        # an AMGX "CUDA kernel launch error" (OOM in disguise; sesc Rung 1).
+        _pcd_restart = int(meta.get("pcd_restart", 60))
+        cycles = min(200, max(1, maxiter // _pcd_restart))
         x_dev, finfo = fgmres_dev(
             op.matvec, b_dev, apply_dev, N, device,
-            tol=tol, atol=1e-13, restart=60, maxiter=cycles)
+            tol=tol, atol=1e-13, restart=_pcd_restart, maxiter=cycles)
 
         if not finfo["converged"]:
             raise ConvergenceError(

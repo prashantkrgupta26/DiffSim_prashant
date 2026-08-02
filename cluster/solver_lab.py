@@ -159,6 +159,11 @@ def run_config(npz_path, config, *, device="cpu", restart=None,
                          inner=inner, ap_inner=ap_inner)
     if restart is not None and config == "bdiag":
         cache[("blocktri_meta", "lab")]["saddle_restart"] = int(restart)
+    elif restart is not None:
+        # pcd path: pcd_restart meta knob (linsolve default 60); smaller
+        # restart shrinks the V+Z Krylov store — the OOM lever alongside
+        # an AMGX F-hierarchy (sesc Rung 1).
+        cache[("pcd_meta", "lab")]["pcd_restart"] = int(restart)
     solver = "fgmres_bdiag" if config == "bdiag" else "fgmres_pcd"
     # F8: treat tol=0.0 as unset (float(0.0 or meta["tol"]) would pick meta
     # tol, but explicit 0.0 from argparse would be falsy — guard explicitly).
