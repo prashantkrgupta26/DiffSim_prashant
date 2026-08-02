@@ -243,11 +243,19 @@ def main(argv=None):
                     choices=("jacobi", "amgx"),
                     help="Override Ap-block inner-solve backend for pcd "
                          "configs (F5: sweep axis; ignored for bdiag)")
+    ap.add_argument("--out", default=None,
+                    help="Append the JSON row to this file directly. Use "
+                         "this instead of piping stdout through tee: AMGX "
+                         "prints its own solver chatter to stdout at the C "
+                         "level, which pollutes a tee'd jsonl (sesc Rung 1).")
     a = ap.parse_args(argv)
     row = run_config(a.snapshot, a.config, device=a.device,
                      restart=a.restart, maxiter=a.maxiter, tol=a.tol,
                      inner=a.inner, ap_inner=a.ap_inner)
     print(json.dumps(row), flush=True)
+    if a.out:
+        with open(a.out, "a") as f:
+            f.write(json.dumps(row) + "\n")
 
 
 if __name__ == "__main__":
