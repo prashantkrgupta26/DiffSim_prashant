@@ -94,7 +94,8 @@ def render(npz_path):
 
 def render_stl_in_domain(stl_path, out_prefix, *, position=(0.0, 0.0, 0.0),
                          scale=1.0,
-                         domain=((0.0, 0.0, 0.0), (1.0, 0.125, 0.125))):
+                         domain=((0.0, 0.0, 0.0), (1.0, 0.125, 0.125)),
+                         window_size=(1920, 1080)):
     """Render the body STL placed inside the channel domain, 3 views.
 
     position/scale mirror the config placement convention: rendered
@@ -112,7 +113,7 @@ def render_stl_in_domain(stl_path, out_prefix, *, position=(0.0, 0.0, 0.0),
                       direction=(0, 1, 0),
                       i_size=hi[0] - lo[0], j_size=hi[2] - lo[2])
     for tag, cam in (("iso", "iso"), ("side", "xy"), ("front", "yz")):
-        p = pv.Plotter(off_screen=True, window_size=(1920, 1080))
+        p = pv.Plotter(off_screen=True, window_size=tuple(window_size))
         p.add_mesh(box, style="wireframe", color="black", line_width=2)
         p.add_mesh(ground, color="tan", opacity=0.4)
         p.add_mesh(body, color="steelblue", show_edges=False)
@@ -139,8 +140,15 @@ if __name__ == "__main__":
             if i >= len(args) or args[i].startswith("--"):
                 sys.exit(f"[render_mesh] ERROR: {flag} requires a value "
                          f"(usage: --stl PATH [--out-prefix P] "
-                         f"[--position x,y,z] [--scale s])")
+                         f"[--position x,y,z] [--scale s] [--res WxH])")
             return args[i]
+        _res_raw = _get("--res", "1920x1080")
+        try:
+            res = tuple(int(x) for x in _res_raw.lower().split("x"))
+            assert len(res) == 2 and res[0] > 0 and res[1] > 0
+        except (ValueError, AssertionError):
+            sys.exit(f"[render_mesh] ERROR: --res must be WxH "
+                     f"(e.g. 7680x4320), got {_res_raw!r}")
         _pos_raw = _get("--position", "0,0,0")
         try:
             pos = tuple(float(x) for x in _pos_raw.split(","))
@@ -153,7 +161,8 @@ if __name__ == "__main__":
         render_stl_in_domain(_get("--stl"),
                              _get("--out-prefix", "results/mesh_renders/body"),
                              position=pos,
-                             scale=float(_get("--scale", "1.0")))
+                             scale=float(_get("--scale", "1.0")),
+                             window_size=res)
     else:
         missing = [f for f in args if not pathlib.Path(f).exists()]
         if missing:
