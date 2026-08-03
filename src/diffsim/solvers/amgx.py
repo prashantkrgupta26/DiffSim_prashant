@@ -164,7 +164,7 @@ def amgx_solve(A, b, sym=False, tol=1e-10, maxiter=2000,
     _ident = (id(A), id(A.data))
     t0 = time.perf_counter()
     if _SETUP_REUSE and state.get("ident") == _ident:
-        pass          # hierarchy AND values already uploaded — nothing to do
+        reuse = True  # hierarchy AND values already uploaded — nothing to do
     else:
         # ---- SETUP-REUSE: fingerprint the sparsity; when unchanged, only
         # push the new coefficient VALUES and reuse the built AMG hierarchy
