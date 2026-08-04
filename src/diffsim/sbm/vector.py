@@ -21,10 +21,21 @@ from .poisson import (make_sbm_dirichlet_Ae, make_sbm_dirichlet_be, _FaceSet,
 
 
 def sbm_vector_dirichlet(dm, sf, geo, g_fn, nu, ndof, alpha=10.0,
-                         a_face=None, beta_backflow=1.0):
+                         a_face=None, beta_backflow=1.0,
+                         return_terms=False):
     """(A_face, b_face) over FULL node-major vector DOFs (unconstrained).
     g_fn(y) -> [Ngp, dim] velocity data at mapped points; a_face optional
-    [Ngp, dim] advecting field at face GPs for backflow."""
+    [Ngp, dim] advecting field at face GPs for backflow.
+
+    return_terms=False (default): returns (A, b) as before (bit-identical).
+    return_terms=True: returns (A, b, terms) where terms is a dict
+    name -> (A_t, b_t) whose sum equals (A, b) at atol 1e-14. Terms:
+      "consistency+adjoint": the fused -Na*gnb - gna*Sb bilinear + adjoint RHS.
+      "penalty":             alpha/h Sa*Sb bilinear + penalty RHS.
+      "backflow":            -(a.n)_- Na*Nb bilinear + zero RHS.
+    The kernel fuses consistency and adjoint into a single expression
+    (kappa*(-Na*gnb - gna*Sb)*dS); isolating them requires a new kernel
+    — the coarser "consistency+adjoint" split is used instead (honest name)."""
     dim = dm.dim
     d = dm.device
     fs = _FaceSet(dm, sf, geo)
@@ -79,13 +90,82 @@ def sbm_vector_dirichlet(dm, sf, geo, g_fn, nu, ndof, alpha=10.0,
     A = sp.coo_matrix((np.concatenate(vals),
                        (np.concatenate(rows), np.concatenate(cols))),
                       shape=(Nn, Nn)).tocsr()
-    return A, brhs
+
+    if not return_terms:
+        return A, brhs
+
+    # --- per-term partition (return_terms=True) ----------------------------
+    # The existing make_sbm_dirichlet_Ae kernel fuses consistency + adjoint
+    # into one expression: nu*(-Na*gnb - gna*Sb)*dS; the penalty term is
+    # nu*(alpha/h*Sa*Sb)*dS. We isolate penalty via make_sbm_penalty_Ae/be
+    # (already present) and derive consistency+adjoint as the residual, giving
+    # an EXACT partition by construction (no floating-point re-evaluation).
+
+    # penalty matrix (alpha/h Sa*Sb, same kernel as sbm_vector_penalty)
+    Ae_pen = wp.zeros((ne_f, nbf, nbf), dtype=wp.float64, device=d)
+    kAp = make_sbm_penalty_Ae(nbf, nqf, dim)
+    wp.launch(kAp, dim=ne_f,
+              inputs=[fs.felem_d, fs.fface_d, b_["h"], fs.Nf_d, fs.dNf_d,
+                      fs.d2Nf_d, fs.wf_d, fs.dvec_d, wp.float64(alpha),
+                      wp.float64(nu), Ae_pen], device=d)
+    Aeh_pen = Ae_pen.numpy()
+
+    # penalty RHS (alpha/h Sa gq)
+    b_pen_comp = []
+    kbp = make_sbm_penalty_be(nbf, nqf, dim)
+    for c in range(dim):
+        gc = wp.array(np.ascontiguousarray(gbar[:, c]), dtype=wp.float64,
+                      device=d)
+        bfull_pen = wp.zeros(dm.n_nodes, dtype=wp.float64, device=d)
+        wp.launch(kbp, dim=ne_f,
+                  inputs=[fs.felem_d, fs.fface_d, b_["conn"], b_["h"],
+                          fs.Nf_d, fs.dNf_d, fs.d2Nf_d, fs.wf_d, fs.dvec_d,
+                          gc, wp.float64(alpha), wp.float64(nu), bfull_pen],
+                  device=d)
+        b_pen_comp.append(bfull_pen.numpy())
+
+    # consistency+adjoint = total - penalty  (exact: no re-evaluation)
+    Aeh_ca = Aeh - Aeh_pen          # [ne_f, nbf, nbf] element matrices
+
+    # scatter each term to CSR (same pattern as main assembly)
+    def _scatter(elem_mat):
+        r2, c2, v2 = [], [], []
+        for c in range(dim):
+            gdof = conn_glob * ndof + c
+            r2.append(np.repeat(gdof, nbf, axis=1).ravel())
+            c2.append(np.tile(gdof, (1, nbf)).ravel())
+            v2.append(elem_mat.ravel())
+        return sp.coo_matrix(
+            (np.concatenate(v2), (np.concatenate(r2), np.concatenate(c2))),
+            shape=(Nn, Nn)).tocsr()
+
+    def _scatter_b(b_comps):
+        bv = np.zeros(Nn)
+        for c in range(dim):
+            bv.reshape(dm.n_nodes, ndof)[:, c] += b_comps[c]
+        return bv
+
+    A_ca = _scatter(Aeh_ca)
+    b_ca = _scatter_b([bc - bp for bc, bp in zip(b_comp, b_pen_comp)])
+
+    A_pen = _scatter(Aeh_pen)
+    b_pen = _scatter_b(b_pen_comp)
+
+    A_bf = _scatter(Ab)
+    b_bf = np.zeros(Nn)
+
+    terms = {
+        "consistency+adjoint": (A_ca, b_ca),
+        "penalty":             (A_pen, b_pen),
+        "backflow":            (A_bf, b_bf),
+    }
+    return A, brhs, terms
 
 
 def sbm_vector_dirichlet_twosided(dm, sf_plus, geo_plus, sf_minus, geo_minus,
                                   g_fn, nu, ndof, alpha=10.0,
                                   a_face_plus=None, a_face_minus=None,
-                                  beta_backflow=1.0):
+                                  beta_backflow=1.0, return_terms=False):
     """Two-sided co-dim-1 shell Nitsche assembly (ThinShell §2.1 convention:
     <a,b>_Gamma~ := <a,b>_Gamma~+ + <a,b>_Gamma~-). The zero-thickness rigid
     shell carries a weak Dirichlet (no-slip, g_fn) on BOTH sides of Gamma; the
@@ -99,14 +179,34 @@ def sbm_vector_dirichlet_twosided(dm, sf_plus, geo_plus, sf_minus, geo_minus,
     Returns (A_face, b_face) over the FULL node-major vector DOFs, the sum of
     the two sides. Either side may be empty (handled by the single-sided
     assembler returning zero blocks). ``a_face_plus`` / ``a_face_minus`` are
-    the optional per-side advecting fields for backflow stabilization."""
-    Ap, bp = sbm_vector_dirichlet(dm, sf_plus, geo_plus, g_fn, nu, ndof,
-                                  alpha=alpha, a_face=a_face_plus,
-                                  beta_backflow=beta_backflow)
-    Am, bm = sbm_vector_dirichlet(dm, sf_minus, geo_minus, g_fn, nu, ndof,
-                                  alpha=alpha, a_face=a_face_minus,
-                                  beta_backflow=beta_backflow)
-    return (Ap + Am).tocsr(), bp + bm
+    the optional per-side advecting fields for backflow stabilization.
+
+    return_terms=False (default): returns (A, b) — bit-identical to before.
+    return_terms=True: returns (A, b, terms) where terms is a dict
+    name->(A_t, b_t) summing to (A, b) at atol 1e-14; terms are the sum of
+    the per-side contributions for each Nitsche term (see sbm_vector_dirichlet
+    for term names and the consistency+adjoint fusion rationale)."""
+    rp = sbm_vector_dirichlet(dm, sf_plus, geo_plus, g_fn, nu, ndof,
+                              alpha=alpha, a_face=a_face_plus,
+                              beta_backflow=beta_backflow,
+                              return_terms=return_terms)
+    rm = sbm_vector_dirichlet(dm, sf_minus, geo_minus, g_fn, nu, ndof,
+                              alpha=alpha, a_face=a_face_minus,
+                              beta_backflow=beta_backflow,
+                              return_terms=return_terms)
+    if not return_terms:
+        Ap, bp = rp
+        Am, bm = rm
+        return (Ap + Am).tocsr(), bp + bm
+    Ap, bp, terms_p = rp
+    Am, bm, terms_m = rm
+    # sum per-term contributions from both sides
+    terms = {
+        name: ((terms_p[name][0] + terms_m[name][0]).tocsr(),
+               terms_p[name][1] + terms_m[name][1])
+        for name in terms_p
+    }
+    return (Ap + Am).tocsr(), bp + bm, terms
 
 
 def sbm_vector_penalty(dm, sf, geo, g_fn, nu, ndof, alpha=10.0):

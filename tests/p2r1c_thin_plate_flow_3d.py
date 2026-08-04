@@ -60,6 +60,13 @@ from diffsim.sbm.vector import (
 from diffsim.api.ns_bricks import assemble_linear_ns
 from diffsim.physics.poisson import gauss_points
 from diffsim.solvers.timestepping import bdf_coeffs
+from diffsim.solvers.linsolve import solve_linear, _LAST_ITERS
+
+# W2b: opt-in per-step timing breakdown (DIFFSIM_ASM_PROFILE=1).
+import os as _os
+_STEP_PROFILE = _os.environ.get("DIFFSIM_ASM_PROFILE", "0").strip() not in ("", "0")
+# W2c: opt-in device-resident CSR handoff — SADDLE_DEVICE_CSR=1 keeps values on
+# device (assemble_handoff) instead of pulling 19 GB/step; read live per step.
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +90,7 @@ def _make_sheet(x_c, y_c, z_c, half_y, half_z):
 
 
 def _build_shell_3d(level, x_c, y_c, z_c, half_y, half_z,
-                    refine_to=None, band_cells=2):
+                    refine_to=None, band_cells=2, device="cpu"):
     """Build dim=3 octree (uniform or adaptive) + two-sided shell surrogate.
 
     refine_to=None  -> uniform octree at ``level`` (current behavior, unchanged).
@@ -110,7 +117,7 @@ def _build_shell_3d(level, x_c, y_c, z_c, half_y, half_z,
         n_excluded = amr["n_excluded"]
         extra = dict(n_nodes=amr["n_nodes"], n_hanging=amr["n_hanging"],
                      build_time=amr["build_time"])
-    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3), "cpu")
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=3), device)
     ftab = face_tables(1, 3)
     (sfp, gp), (sfm, gm) = extract_two_sided_surrogate(ret, sheet, ftab)
     return dict(dm=dm, mesh=mesh, cons=cons, sfp=sfp, gp=gp, sfm=sfm, gm=gm,
@@ -305,6 +312,15 @@ def run_flow_past_3d(
     band_cells=2,
     _two_sided=True,
     _return_fields=False,
+    mono_solver="splu",
+    device="cpu",
+    assembly="host",   # assembly backend: "host" (default, bit-for-bit) | "device"
+    solver_stats=None,  # optional list to append per-step iteration counts (A2 ladder)
+    pcd_inner="jacobi",  # (T4) PCD F-block inner-solve backend: "jacobi" | "amgx"
+    pcd_ap_inner="jacobi",  # (T5) PCD Ap-block inner-solve backend: "jacobi" | "amgx"
+    saddle_restart=None,  # A3 knob A: FGMRES restart length; None => default 60
+    saddle_x0=None,       # A3 knob B: warm-start mode; "extrap" | None (cold)
+    bdiag_block=None,     # W5d knob: "node" => per-node block Jacobi; None => scalar
 ):
     """Run 3-D flow past a finite thin plate with transient BDF2 march.
 
@@ -332,6 +348,23 @@ def run_flow_past_3d(
         Internal flag — False => one-sided (anti-vacuity test).
     _return_fields : bool
         Internal flag — True => also return mesh + node fields dict.
+    mono_solver : str
+        Monolithic solve backend: "splu" (host LU), "cudss" (GPU direct),
+        or "fused" (GPU BiCGStab). Default "splu" preserves legacy behavior.
+    device : str
+        Device for non-splu backends: "cpu" or "cuda"/"hip" for GPU.
+        Default "cpu".
+    assembly : str
+        Assembly backend: "host" (default, bit-for-bit host path) or
+        "device" (DeviceNSAssembler; symbolic pattern once per mesh epoch,
+        numeric fill on device per step, two-sided SBM face system via cached slots).
+        "host" default keeps all existing tests bit-for-bit unchanged.
+    solver_stats : list or None
+        Optional list to which per-step iteration counts are appended when the
+        backend provides them (i.e. when mono_solver is an iterative backend such
+        as "fgmres_bdiag" that writes to ``_LAST_ITERS``).  One integer is
+        appended per step.  Default None => no collection, byte-for-byte identical
+        march (no overhead).  Used by the A2 iteration-ladder harness.
 
     Returns a dict with:
       'cd'         : np.ndarray [nsteps] — drag coefficient (x-direction)
@@ -350,7 +383,7 @@ def run_flow_past_3d(
     # ---- geometry + mesh ----------------------------------------------------
     fx = _build_shell_3d(level, plate_xc, plate_yc, plate_zc,
                          plate_half_y, plate_half_z,
-                         refine_to=refine_to, band_cells=band_cells)
+                         refine_to=refine_to, band_cells=band_cells, device=device)
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
 
     if verbose:
@@ -381,9 +414,103 @@ def run_flow_past_3d(
 
     xq = gauss_points(mesh, dm.tables_by_p)
 
+    # ---- Device assembler setup (once per mesh epoch) -----------------------
+    # Builds symbolic pattern + slot maps; caches SBM face system slots so only
+    # VALUE arrays need refreshing per step (pattern fixed; geometry is static).
+    # The two-sided SBM face system (Af_c/bf_c) is just a host CSR assembled
+    # before the loop — identical slot treatment to the 2-D driver.
+    _dev_asm = None           # DeviceNSAssembler (None => host path)
+    _af_slots_d = None        # device CSR slots for Af_c
+    _af_vals_d = None         # device values array for Af_c (geometry-cached)
+    _bf_dofs_d = None         # device dof indices for bf_c nonzeros
+    _bf_vals_d = None         # device values array for bf_c nonzeros
+    _strong_rows = None       # sorted unique strong rows (set once per epoch)
+    _Af_csr = None            # CSR form of Af_c (cached for value refresh)
+    _Af_csr_nnz = None        # nnz of Af_csr (to assert pattern unchanged)
+
+    if assembly == "device":
+        from diffsim.assembly.device_assembly import DeviceNSAssembler
+        from diffsim.errors import BackendError
+        import warp as wp
+
+        # No pre-emptive gate for adaptive (hanging-node) meshes: the
+        # DeviceNSAssembler's constraint-aware weighted scatter expands
+        # element entries THROUGH the constraint weights, producing the same
+        # free-dof pattern as T^T K T.  The try/except below is the honesty
+        # net: if a future mesh or Af_c variant genuinely exceeds the pattern,
+        # it is reported clearly rather than silently skipped.
+
+        _dev_asm = DeviceNSAssembler(dm)    # symbolic pattern once per epoch
+
+        # --- SBM face system -> fixed-pattern device slots (cached) ----------
+        # Af_c is geometry-cached (assembled once before the loop);
+        # upload slots + values once; no per-step reallocation needed.
+        _Af_csr = Af_c.tocsr()
+        _Af_csr_nnz = _Af_csr.nnz
+        _af_rows, _af_cols = _Af_csr.nonzero()
+        try:
+            _af_slots = _dev_asm.csr_slots(_af_rows, _af_cols)
+        except BackendError as _e:
+            raise ValueError(
+                f"assembly='device': SBM face system (Af_c) contains entries "
+                f"absent from the device assembler's CSR pattern. This is a "
+                f"REAL finding: the constraint-aware face-system entries on this "
+                f"mesh exceed the element-pair graph. Use assembly='host'. "
+                f"Original error: {_e}") from _e
+
+        # Cast slots to the assembler's index dtype (int32 for small meshes)
+        _af_slots_np = _af_slots.astype(_dev_asm._idx_np)
+        _af_slots_d = wp.array(_af_slots_np, dtype=_dev_asm._idx_dtype,
+                               device=dm.device)
+        _af_vals_d = wp.array(
+            np.ascontiguousarray(_Af_csr.data, np.float64),
+            dtype=wp.float64, device=dm.device)
+
+        # bf_c sparse: only nonzero dofs uploaded.
+        # int32 dof indices: _scatter_vec_kernel requires gdof: wp.array(dtype=wp.int32)
+        # (API contract in device_assembly.py).  On meshes where Nfull >= 2^31
+        # the assembler itself refuses at construction, so int32 is always safe here.
+        _bf_nz = np.nonzero(bf_c)[0]
+        _bf_dofs_d = wp.array(_bf_nz.astype(np.int32), dtype=wp.int32,
+                              device=dm.device)
+        _bf_vals_d = wp.array(
+            np.ascontiguousarray(bf_c[_bf_nz], np.float64),
+            dtype=wp.float64, device=dm.device)
+
+        # --- strong rows: BCs + pressure pin (no inflow kick in 3-D) --------
+        # np.unique sorts the rows, giving a canonical order we'll use for
+        # strong_b_vals per step.  set_strong_rows preserves input order, so
+        # the sorted unique array is consistent with the per-step value lookup.
+        # 3-D has NO symmetry-breaking perturbation kick — strong rows are
+        # outer BC rows + pressure pin only.
+        _strong_rows = np.unique(
+            np.concatenate([np.asarray(bc_rows, np.int64),
+                            np.array([int(p_pin)], np.int64)]))
+        _dev_asm.set_strong_rows(_strong_rows)
+
     # ---- Reference force normalization (plate area) -------------------------
     plate_area = 4.0 * plate_half_y * plate_half_z
     ref_force = 0.5 * U_inf ** 2 * plate_area
+
+    # ---- PCD meta cache (fgmres_pcd only) -----------------------------------
+    # build_pcd_meta is called once per BDF order (sigma changes at step 0->1).
+    # The cache dict is passed to solve_linear so make_pcd_apply sees pcd_meta.
+    # fgmres_bdiag also reads ndof from ("blocktri_meta", key); wire it here too
+    # so the 3-D bdiag backend gets ndof=4 (not the default 3).
+    _pcd_cache = {"ndof": ndof}   # carry ndof for fgmres_bdiag (blocktri_meta slot)
+    _pcd_last_order = None        # track when to rebuild pcd_meta (sigma change)
+    if mono_solver in ("fgmres_bdiag", "fused_bdiag"):
+        # both bdiag backends read ndof (and knobs) via ("blocktri_meta", key);
+        # the gate previously covered fgmres_bdiag only, leaving fused_bdiag
+        # with the default ndof=3 (wrong masks on the 3-D saddle).
+        _bdiag_meta = {"ndof": ndof}
+        if saddle_restart is not None:
+            _bdiag_meta["saddle_restart"] = int(saddle_restart)
+        if saddle_x0 is not None:
+            _bdiag_meta["saddle_x0"] = saddle_x0
+        if bdiag_block is not None:
+            _bdiag_meta["bdiag_block"] = bdiag_block
+        _pcd_cache[("blocktri_meta", "ns3d")] = _bdiag_meta
 
     # ---- BDF2 march ---------------------------------------------------------
     x_cur = np.zeros(nfree * ndof)
@@ -394,12 +521,37 @@ def run_flow_past_3d(
     cl_y_hist = np.zeros(nsteps)
     cl_z_hist = np.zeros(nsteps)
 
+    # W2b: header for per-step breakdown table (only when DIFFSIM_ASM_PROFILE=1)
+    if _STEP_PROFILE and assembly == "device":
+        print(
+            f"\n[W2b-profile] step breakdown (assembly=device)"
+            f"\n{'step':>4}  {'host-pre':>9}  {'asm-total':>9}"
+            f"  {'upload':>7}  {'Ae':>7}  {'scatter':>8}"
+            f"  {'extra':>7}  {'strong':>7}  {'pull':>8}"
+            f"  {'chunks':>6}  {'solve':>9}  {'post':>7}  {'step-tot':>9}",
+            flush=True)
+
     for step in range(nsteps):
+        if _STEP_PROFILE and assembly == "device":
+            import time as _time
+            _t_step0 = _time.perf_counter()
+
         order = 1 if step == 0 else 2
         b0, b1, b2 = bdf_coeffs(order, dt)
         sigma = b0 / dt
 
+        # Rebuild pcd_meta when BDF order (and thus sigma) changes.
+        # This is at most 2 builds per run (BDF1 -> BDF2 at step 1).
+        if mono_solver == "fgmres_pcd" and order != _pcd_last_order:
+            from diffsim.solvers.saddle_precond import build_pcd_meta
+            _pcd_cache[("pcd_meta", "ns3d")] = build_pcd_meta(
+                dm, nu, sigma, p_pin=p_pin, inner=pcd_inner,
+                ap_inner=pcd_ap_inner)
+            _pcd_last_order = order
+
         # Advecting velocity at Gauss points
+        if _STEP_PROFILE and assembly == "device":
+            _t_host0 = _time.perf_counter()
         aq, dq = _gp_field_3d(dm, mesh, T, u_pre1, dim)
 
         # History forcing
@@ -413,23 +565,108 @@ def run_flow_past_3d(
         else:
             fq_raw = _gp_history_fq_3d(dm, mesh, T, u_pre1, u_pre2,
                                         b1, b2, dt, dim)
+        if _STEP_PROFILE and assembly == "device":
+            _t_host_ms = (_time.perf_counter() - _t_host0) * 1e3
 
-        # Assemble monolithic NS
-        A, b = assemble_linear_ns(dm, aq, dq, fq_raw, nu, sigma=sigma)
-        A = (A + Af_c).tolil()
-        b = b + bf_c
+        if assembly == "device":
+            # ---- Device assembly path ---------------------------------------
+            # Strong values in _strong_rows ORDER (np.unique-sorted order).
+            # Build a dict from all strong-row values, then index by _strong_rows.
+            _val_of = {}
+            for _r, _v in zip(bc_rows, bc_vals):
+                _val_of[int(_r)] = float(_v)
+            # Pressure pin
+            _val_of[int(p_pin)] = 0.0
+            # Build strong_b_vals in sorted unique row order (_strong_rows)
+            # every strong row is bc_rows or the pin — fail loudly if not
+            _sb = np.array([_val_of[int(_r)] for _r in _strong_rows])
 
-        # Apply strong Dirichlet BCs
-        for r, v in zip(bc_rows, bc_vals):
-            A.rows[r] = [int(r)]; A.data[r] = [1.0]; b[r] = v
+            # Af_c is geometry-cached (assembled once before the loop); its
+            # value array is constant each step.  Use the pre-uploaded
+            # _af_vals_d directly — no per-step reallocation needed.
+            # (The pattern-unchanged assert is a safety guard for future
+            # callers that might pass a per-step Af_c.)
+            assert _Af_csr.nnz == _Af_csr_nnz, (
+                f"Af_c sparsity changed mid-march: {_Af_csr.nnz} vs "
+                f"{_Af_csr_nnz}. Cannot refresh device values safely.")
 
-        # Pressure pin
-        A.rows[p_pin] = [p_pin]; A.data[p_pin] = [1.0]; b[p_pin] = 0.0
+            # assemble: volume fill + extra_matrix(Af) + extra_rhs(bf)
+            # + strong rows — order mirrors host: A_vol + Af_c, b + bf_c,
+            # then LIL surgery.  Oracle: aq/dq/fq as flat pv-keyed dicts.
+            if _STEP_PROFILE:
+                _t_asm0 = _time.perf_counter()
+            # W2c: SADDLE_DEVICE_CSR=1 keeps the assembled values
+            # device-resident (assemble_handoff) instead of pulling the
+            # full CSR to host (assemble); solve_linear's saddle paths
+            # consume the device buffers directly.  Default byte-identical.
+            # Read live (env, not import-time) so parity harnesses can toggle.
+            _dev_csr = _os.environ.get(
+                "SADDLE_DEVICE_CSR", "0").strip() not in ("", "0")
+            _asm_call = (_dev_asm.assemble_handoff if _dev_csr
+                         else _dev_asm.assemble)
+            Acsr, b = _asm_call(
+                aq, dq, fq_raw, nu, sigma,
+                strong_b_vals=_sb,
+                extra_matrix=(_af_slots_d, _af_vals_d),
+                extra_rhs=(_bf_dofs_d, _bf_vals_d))
+            if _STEP_PROFILE:
+                _t_asm_ms = (_time.perf_counter() - _t_asm0) * 1e3
+                _prof = getattr(_dev_asm, "_last_profile", {})
 
-        # Solve
-        x_cur = splu(A.tocsr().tocsc()).solve(b)
+            # Solve (same routing as host path)
+            if _STEP_PROFILE:
+                _t_slv0 = _time.perf_counter()
+            if mono_solver == "splu":
+                x_cur = splu(Acsr.tocsc()).solve(b)
+            else:
+                _LAST_ITERS[0] = None
+                _slv_cache = (_pcd_cache
+                              if mono_solver in ("fgmres_pcd", "fgmres_bdiag")
+                              else None)
+                x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
+                                     device=device,
+                                     cache=_slv_cache, cache_key="ns3d")
+                if solver_stats is not None and _LAST_ITERS[0] is not None:
+                    solver_stats.append(int(_LAST_ITERS[0]))
+            if _STEP_PROFILE:
+                _t_slv_ms = (_time.perf_counter() - _t_slv0) * 1e3
+
+        else:
+            # ---- Host assembly path (default; bit-for-bit unchanged) --------
+            # Assemble monolithic NS
+            A, b = assemble_linear_ns(dm, aq, dq, fq_raw, nu, sigma=sigma)
+            A = (A + Af_c).tolil()
+            b = b + bf_c
+
+            # Apply strong Dirichlet BCs
+            for r, v in zip(bc_rows, bc_vals):
+                A.rows[r] = [int(r)]; A.data[r] = [1.0]; b[r] = v
+
+            # Pressure pin
+            A.rows[p_pin] = [p_pin]; A.data[p_pin] = [1.0]; b[p_pin] = 0.0
+
+            # Solve — routed through solve_linear so MONO_SOLVER/DEVICE select
+            # the backend (splu host | cudss GPU-direct | fused GPU-BiCGStab).
+            # Matrix changes every step (Picard convection).
+            # For fgmres_pcd the pcd_meta is constant per BDF order (mesh ops);
+            # for fgmres_bdiag the blocktri_meta carries ndof=4 for the 3-D case.
+            Acsr = A.tocsr()
+            if mono_solver == "splu":
+                x_cur = splu(Acsr.tocsc()).solve(b)      # legacy path, bit-for-bit
+            else:
+                _LAST_ITERS[0] = None
+                _slv_cache = (_pcd_cache
+                              if mono_solver in ("fgmres_pcd", "fgmres_bdiag")
+                              else None)
+                x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
+                                     device=device,
+                                     cache=_slv_cache, cache_key="ns3d")
+                if solver_stats is not None and _LAST_ITERS[0] is not None:
+                    solver_stats.append(int(_LAST_ITERS[0]))
 
         # Extract velocity for next step
+        if _STEP_PROFILE and assembly == "device":
+            _t_post0 = _time.perf_counter()
         u_new = x_cur.reshape(nfree, ndof)[:, :dim]
 
         # Full node-major vector for traction
@@ -451,6 +688,22 @@ def run_flow_past_3d(
         # Rotate history
         u_pre2 = u_pre1.copy()
         u_pre1 = u_new.copy()
+
+        if _STEP_PROFILE and assembly == "device":
+            _t_post_ms = (_time.perf_counter() - _t_post0) * 1e3
+            _t_step_ms = (_time.perf_counter() - _t_step0) * 1e3
+            _p = _prof if _prof else {}
+            print(
+                f"[W2b] {step:4d}  {_t_host_ms:9.1f}  {_t_asm_ms:9.1f}"
+                f"  {_p.get('upload_ms', 0.0):7.1f}"
+                f"  {_p.get('ae_ms', 0.0):7.1f}"
+                f"  {_p.get('scatter_ms', 0.0):8.1f}"
+                f"  {_p.get('extra_ms', 0.0):7.1f}"
+                f"  {_p.get('strong_ms', 0.0):7.1f}"
+                f"  {_p.get('pull_ms', 0.0):8.1f}"
+                f"  {_p.get('chunks', 0):6d}"
+                f"  {_t_slv_ms:9.1f}  {_t_post_ms:7.1f}  {_t_step_ms:9.1f}",
+                flush=True)
 
         if verbose:
             print(f"[p2r1c-3d] step {step:3d}  Cd={cd_hist[step]:+.4f}  "
@@ -568,6 +821,9 @@ if __name__ == "__main__":
     plate_zc     = float(os.environ.get("PLATE_ZC", "0.5"))
     plate_half_y = float(os.environ.get("PLATE_HALF_Y", "0.125"))
     plate_half_z = float(os.environ.get("PLATE_HALF_Z", "0.125"))
+    mono_solver = os.environ.get("MONO_SOLVER", "splu")
+    device      = os.environ.get("DEVICE", "cpu")
+    assembly    = os.environ.get("ASSEMBLY", "host")
 
     re_approx = int(round(U_inf / nu)) if nu > 0 else 0
     if refine_level:
@@ -582,6 +838,9 @@ if __name__ == "__main__":
         verbose=True,
         refine_to=refine_level,
         _return_fields=True,
+        mono_solver=mono_solver,
+        device=device,
+        assembly=assembly,
     )
     print(f"Cd={res['cd']}")
     print(f"Cl_y={res['cl_y']}")

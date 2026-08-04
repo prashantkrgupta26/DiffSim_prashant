@@ -58,7 +58,7 @@ def test_uniform_mesh_has_no_hanging():
 @pytest.mark.parametrize("dim", [2, 3])
 @pytest.mark.parametrize("p", [1, 2])
 @pytest.mark.parametrize("periodic", [None, "all", "one"])
-@pytest.mark.parametrize("lvl", [2, 3])
+@pytest.mark.parametrize("lvl", [2, 3, 4])
 def test_uniform_fast_equals_general(dim, p, periodic, lvl):
     """Closed-form uniform node/constraint build is bit-for-bit identical to the
     general np.unique path (mesh) and the constraint reference (identity)."""
@@ -91,3 +91,76 @@ def test_uniform_fast_equals_general(dim, p, periodic, lvl):
     assert np.array_equal(c_fast.hanging, c_ref.hanging)
     d = c_fast.T - c_ref.T
     assert d.nnz == 0 or abs(d).max() == 0.0
+
+
+@pytest.mark.parametrize("p", [1, 2])
+@pytest.mark.parametrize("periodic", [None, "all", "one"])
+def test_uniform_fast_2d_L5(p, periodic):
+    """Parity gate: 2-D L5 (32x32 elements) fast == general, all periodicity variants."""
+    import diffsim.mesh.nodes as _N
+    from diffsim.mesh.constraints import (build_constraints,
+                                          _build_constraints_reference)
+    per = (None if periodic is None
+           else (True, True) if periodic == "all"
+           else (True, False))
+    tree = build_uniform(5, dim=2, periodic=per)
+    saved = _N._uniform_complete_level
+    try:
+        _N._uniform_complete_level = lambda t: None
+        m_gen = _N.build_mesh(tree, p=p)
+    finally:
+        _N._uniform_complete_level = saved
+    m_fast = build_mesh(tree, p=p)
+    assert np.array_equal(m_fast.node_icoords, m_gen.node_icoords)
+    assert np.array_equal(m_fast.conn, m_gen.conn)
+    assert np.array_equal(m_fast.boundary_nodes, m_gen.boundary_nodes)
+    c_fast = build_constraints(m_fast)
+    c_ref = _build_constraints_reference(m_fast)
+    assert np.array_equal(c_fast.free_nodes, c_ref.free_nodes)
+    d = c_fast.T - c_ref.T
+    assert d.nnz == 0 or abs(d).max() == 0.0
+
+
+@pytest.mark.parametrize("p", [1, 2])
+@pytest.mark.parametrize("periodic", [None, "all", "one"])
+def test_uniform_fast_3d_L4(p, periodic):
+    """Parity gate: 3-D L4 (16x16x16 elements) fast == general, all periodicity variants."""
+    import diffsim.mesh.nodes as _N
+    from diffsim.mesh.constraints import (build_constraints,
+                                          _build_constraints_reference)
+    per = (None if periodic is None
+           else (True, True, True) if periodic == "all"
+           else (True, False, False))
+    tree = build_uniform(4, dim=3, periodic=per)
+    saved = _N._uniform_complete_level
+    try:
+        _N._uniform_complete_level = lambda t: None
+        m_gen = _N.build_mesh(tree, p=p)
+    finally:
+        _N._uniform_complete_level = saved
+    m_fast = build_mesh(tree, p=p)
+    assert np.array_equal(m_fast.node_icoords, m_gen.node_icoords)
+    assert np.array_equal(m_fast.conn, m_gen.conn)
+    assert np.array_equal(m_fast.boundary_nodes, m_gen.boundary_nodes)
+    c_fast = build_constraints(m_fast)
+    c_ref = _build_constraints_reference(m_fast)
+    assert np.array_equal(c_fast.free_nodes, c_ref.free_nodes)
+    d = c_fast.T - c_ref.T
+    assert d.nnz == 0 or abs(d).max() == 0.0
+
+
+def test_uniform_fast_falls_through_for_adaptive():
+    """Fast path must NOT trigger on non-uniform/adaptive trees (carved or refined).
+    The general path must handle those correctly — fast path must be transparent."""
+    from diffsim.mesh.constraints import build_constraints
+    from diffsim.octree.carve import SphereOracle, carve
+    # carved tree: _uniform_complete_level must return None (fewer elements)
+    import diffsim.mesh.nodes as _N
+    tree_carved, _ = carve(build_uniform(3), SphereOracle((0.5, 0.5, 0.5), 0.4))
+    assert _N._uniform_complete_level(tree_carved) is None, \
+        "Fast path incorrectly detected uniform level on carved tree"
+    m = build_mesh(tree_carved, p=1)
+    c = build_constraints(m)
+    # carved trees have no hanging nodes only if all at same level; partial carve
+    # may or may not — just verify constraints are shape-correct
+    assert c.T.shape == (len(m.node_coords),) * 2

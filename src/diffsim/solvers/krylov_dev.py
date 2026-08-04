@@ -908,7 +908,7 @@ def _bicgstab_fused(op, b, tol, atol, maxiter, diag, check_every,
 def bicgstab_dev(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None,
                  check_every=10, sync_counter=None, max_restarts=50,
                  graph=None, b_dev=None, x_out=None, diag_dev=None,
-                 fixed_iters=None):
+                 fixed_iters=None, apply_dev=None):
     """Single-sync device BiCGStab (Jacobi-preconditioned). Breakdown guards
     live ON DEVICE (scalars[10]) and FREEZE all update kernels, so the state
     at the periodic host check is the last pre-breakdown iterate; the host
@@ -917,13 +917,25 @@ def bicgstab_dev(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None,
     on the L6 cavity monolithic block). Same contract as krylov.bicgstab.
 
     graph: Task-#40 knob (see cg_dev).
-    Task #42 device-resident options (see cg_dev)."""
+    Task #42 device-resident options (see cg_dev).
+
+    apply_dev: optional right-preconditioner hook ``apply_dev(src, dst)``
+        (both wp.array float64 on op.device) that computes dst = M^{-1} src.
+        Applied at the two standard right-preconditioned BiCGStab insertion
+        points: ph = M^{-1} p and sh = M^{-1} s.  The existing diag= fast
+        path (Jacobi hadamard) is UNCHANGED when apply_dev is None.
+        Only valid on the legacy (non-fused) loop; diag=, diag_dev=, and apply_dev are
+        mutually exclusive (diag=/diag_dev= take the fused path, apply_dev does not)."""
     fused, cap = _resolve_path(graph, op.device)
     dev_resident = (b_dev is not None or x_out is not None
                     or diag_dev is not None or fixed_iters is not None)
     if dev_resident and not (fused and _fusable(op)):
         raise ValueError("bicgstab_dev device-resident args require the "
                          "fused CSROperator path")
+    if apply_dev is not None and (diag is not None or diag_dev is not None):
+        raise ValueError("bicgstab_dev: apply_dev and (diag= or diag_dev=) are mutually "
+                         "exclusive; use apply_dev for a general preconditioner "
+                         "or diag=/diag_dev= for the Jacobi fast path")
     if fused and (diag is not None or diag_dev is not None) \
             and _fusable(op):
         return _bicgstab_fused(op, b, tol, atol, maxiter, diag,
@@ -952,7 +964,10 @@ def bicgstab_dev(op, b, tol=1e-10, atol=1e-12, maxiter=2000, diag=None,
                         dtype=wp.float64, device=d)
 
     def precond(dst, src):
-        if minv is not None:
+        # note: precond(dst, src) -> apply_dev(src, dst)
+        if apply_dev is not None:
+            apply_dev(src, dst)          # right-preconditioner hook
+        elif minv is not None:
             wp.launch(_get("hadamard"), dim=n, inputs=[minv, src, dst],
                       device=d)
         else:

@@ -106,6 +106,7 @@ from diffsim.sbm.vector import (
 from diffsim.api.ns_bricks import assemble_linear_ns
 from diffsim.physics.poisson import gauss_points
 from diffsim.solvers.timestepping import bdf_coeffs
+from diffsim.solvers.linsolve import solve_linear, _LAST_ITERS
 from diffsim.steppers.leray_sbm import LeraySBMShellStepper
 
 
@@ -132,7 +133,7 @@ def _make_plate(x_c, y_c, L):
 
 
 def _build_shell(level, x_c, y_c, L, dim=2,
-                 refine_to=None, wake_refine=None, band_cells=2):
+                 refine_to=None, wake_refine=None, band_cells=2, device="cpu"):
     """Build the two-sided shell surrogate for a finite vertical plate.
 
     Uses Segment for classification (finite plate extent) and Plane for
@@ -164,7 +165,7 @@ def _build_shell(level, x_c, y_c, L, dim=2,
         n_excluded = amr["n_excluded"]
         extra = dict(n_nodes=amr["n_nodes"], n_hanging=amr["n_hanging"],
                      build_time=amr["build_time"])
-    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=dim), "cpu")
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=dim), device)
     (sfp, gp), (sfm, gm) = extract_two_sided_surrogate(
         ret, plane, face_tables(1, dim))
     return dict(dm=dm, mesh=mesh, cons=cons, sfp=sfp, gp=gp, sfm=sfm, gm=gm,
@@ -371,6 +372,18 @@ def run_flow_past(
     _return_fields=False,  # internal flag: True => also return mesh + node fields
     pert_eps=None,     # symmetry-breaking kick: fraction of U_inf (None or 0.0 = off)
     pert_t_end=1.0,    # time (physical) at which the kick is switched off
+    mono_solver="splu",  # monolithic solver backend (splu | cudss | fused)
+    device="cpu",      # device for non-splu backends (cpu | cuda | hip)
+    assembly="host",   # assembly backend: "host" (default, bit-for-bit) | "device"
+    on_step=None,      # optional per-step callback: on_step(step, t, u_full, p_full, cd_step)
+    reaction_sets=None,  # list of free-node index arrays for reaction-force arbiter (LD-5)
+    reaction_terms=False,  # (TD-2) if True, also record per-Nitsche-term reaction history
+    solver_stats=None,  # optional list to append per-step iteration counts (A2 ladder)
+    pcd_inner="jacobi",  # (T4) PCD F-block inner-solve backend: "jacobi" | "amgx"
+    pcd_ap_inner="jacobi",  # (T5) PCD Ap-block inner-solve backend: "jacobi" | "amgx"
+    saddle_restart=None,  # A3 knob A: FGMRES restart length; None => default 60
+    saddle_x0=None,       # A3 knob B: warm-start mode; "extrap" | None (cold)
+    bdiag_block=None,     # W5d knob: "node" => per-node block Jacobi; None => scalar
 ):
     """Run flow past a finite thin plate with transient BDF2 march.
 
@@ -392,6 +405,45 @@ def run_flow_past(
     pert_t_end : float
         Physical time at which the kick is switched off (default 1.0).
         After this the inflow reverts to pure streamwise (u_y = 0).
+    mono_solver : str
+        Monolithic solve backend: "splu" (host LU), "cudss" (GPU direct),
+        or "fused" (GPU BiCGStab). Default "splu" preserves legacy behavior.
+    device : str
+        Device for non-splu backends: "cpu" or "cuda"/"hip" for GPU.
+        Default "cpu".
+    assembly : str
+        Assembly backend: "host" (default, bit-for-bit host path) or
+        "device" (DeviceNSAssembler; symbolic pattern once per mesh epoch,
+        numeric fill on device per step, SBM face system via cached slots).
+        "host" default keeps all existing tests bit-for-bit unchanged.
+    on_step : callable or None
+        Optional per-step callback invoked AFTER each step's traction evaluation
+        as ``on_step(step, t_new, u_full, p_full, cd_step)`` where ``u_full``
+        is [n_nodes, 2] velocity, ``p_full`` is [n_nodes] pressure (full-mesh
+        constraint-expanded nodal fields, same construction as ``_return_fields``),
+        and ``cd_step`` is that step's surrogate-traction Cd (float). Default
+        None => bit-for-bit identical march with no overhead.
+    reaction_sets : list of np.ndarray or None
+        Optional list of FREE-NODE index arrays for the variational reaction-force
+        arbiter (LD-5). Each entry ``s_k`` is an array of free-node indices; the
+        arbiter builds ``w_k`` as the u_x-DOF indicator over s_k (1 on u_x DOFs of
+        those nodes, 0 elsewhere) and computes per step:
+            F_x[k] = w_kᵀ (A_vol x_cur − b_vol)
+        using path (b): for the device assembly path, algebraically equivalent to
+            w_kᵀ (A_full x − b_full) − w_kᵀ (Af_c x − bf_c)
+        since A_full = A_vol + Af_c, and w_k has zero weight on every surgery row
+        (strong-BC/kick/pin rows) making the subtraction exact.
+        Sign convention: F_x > 0 is force ON THE FLUID FROM THE PLATE, i.e.
+        opposing the flow. Cd_reaction = F_x / (0.5 * U_inf^2 * L) is POSITIVE
+        for downstream drag (same sign as surrogate-traction Cd).
+        Default None => no reaction evaluation, no 'reaction_hist' key, zero overhead
+        (bit-for-bit identical to the legacy march).
+    solver_stats : list or None
+        Optional list to which per-step iteration counts are appended when the
+        backend provides them (i.e. when mono_solver is an iterative backend such
+        as "fgmres_bdiag" that writes to ``_LAST_ITERS``).  One integer is
+        appended per step.  Default None => no collection, byte-for-byte identical
+        march (no overhead).  Used by the A2 iteration-ladder harness.
 
     Returns a dict with:
       'cd'       : np.ndarray [nsteps] — drag coefficient history
@@ -399,18 +451,42 @@ def run_flow_past(
       'n_excluded': int — number of excluded octree cells (non-zero confirms plate active)
       'nsteps'   : int — number of steps actually taken
 
+    reaction_terms : bool
+        (TD-2) When True, also record per-Nitsche-term reaction force history.
+        Requires reaction_sets to be set; raises ValueError if not.
+        Default False — bit-for-bit identical to legacy march (no overhead).
+
+    When reaction_sets is not None, also returns:
+      'reaction_hist' : np.ndarray [nsteps, nsets] — per-step reaction Cd per set
+                        (Cd_reaction = F_x / (0.5*U_inf^2*L), same sign as cd_surr)
+
+    When reaction_terms=True (requires reaction_sets), also returns:
+      'reaction_terms_hist'  : np.ndarray [nsteps, nterms] — per-step per-term
+                               reaction Cd for set 0 (the first set in reaction_sets).
+                               Terms are the TD-1 Nitsche split: consistency+adjoint,
+                               penalty, backflow (see sbm_vector_dirichlet_twosided).
+      'reaction_terms_names' : list[str] — stable term names (length nterms).
+
     When _return_fields=True, also returns:
       'mesh'     : the DiffSim Mesh object (full octree connectivity)
       'node_fields': dict with 'velocity_magnitude' [Nn] and 'pressure' [Nn]
                      extracted from the final time step's solution
     """
+    # ---- Parameter validation -----------------------------------------------
+    if reaction_terms and (reaction_sets is None or len(reaction_sets) == 0):
+        raise ValueError(
+            "reaction_terms=True requires reaction_sets to be set "
+            "(a non-empty list of free-node index arrays). "
+            "Pass reaction_sets=[...] alongside reaction_terms=True."
+        )
+
     ndof = dim + 1
     t0 = time.time()
 
     # ---- geometry + mesh ----------------------------------------------------
     fx = _build_shell(level, plate_xc, plate_yc, plate_L, dim=dim,
                       refine_to=refine_to, wake_refine=wake_refine,
-                      band_cells=band_cells)
+                      band_cells=band_cells, device=device)
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
 
     if verbose:
@@ -451,7 +527,218 @@ def run_flow_past(
     Af_c = (T_vec.T @ Af_raw @ T_vec).tocsr()
     bf_c = np.asarray(T_vec.T @ bf_raw)
 
+    # ---- Per-term SBM blocks (TD-2; reaction_terms=True only) ---------------
+    # Geometry is static (no advecting-field backflow in this driver's Af build:
+    # sbm_vector_dirichlet_twosided is called WITHOUT a_face_plus/a_face_minus),
+    # so the "backflow" term block is identically zero. We assemble ONCE with
+    # return_terms=True using the same alpha/nu/ndof arguments as above, then
+    # reduce each A_t/b_t through the same T_vec constraint reduction as Af_c.
+    # This is path-independent: A_t/b_t are host CSRs; the per-step computation
+    # only requires w₀ᵀ A_t x and w₀ᵀ b_t — no assembly per step.
+    _rt_active = reaction_terms   # True only when validated above (ValueError if no sets)
+    _term_names = []              # stable ordered list of term names
+    _term_Afc_c = []              # [nterms] list of reduced A_t CSR (host)
+    _term_bfc_c = []              # [nterms] list of reduced b_t vectors (host)
+
+    if _rt_active and _two_sided:
+        # Assemble with return_terms=True (same arguments as the Af_raw call above)
+        _, _, _raw_terms = sbm_vector_dirichlet_twosided(
+            dm, fx["sfp"], fx["gp"], fx["sfm"], fx["gm"],
+            noslip, nu, ndof, alpha=alpha, return_terms=True)
+        # Stable order: iterate dict insertion order (Python 3.7+)
+        for _tname, (_At_raw, _bt_raw) in _raw_terms.items():
+            _term_names.append(_tname)
+            _At_c = (T_vec.T @ _At_raw @ T_vec).tocsr()
+            _bt_c = np.asarray(T_vec.T @ _bt_raw)
+            _term_Afc_c.append(_At_c)
+            _term_bfc_c.append(_bt_c)
+        # Verify backflow term is zero (static geometry: no a_face_plus/a_face_minus).
+        # This is a correctness anchor: if a future caller passes advecting fields
+        # and also uses reaction_terms=True with the monolithic path, escalate.
+        _bf_idx = _term_names.index("backflow") if "backflow" in _term_names else None
+        if _bf_idx is not None:
+            _bf_At = _term_Afc_c[_bf_idx]
+            # The reduced backflow A_t must be identically zero (no advecting field).
+            assert _bf_At.nnz == 0 or abs(_bf_At).max() < 1e-14, (
+                "backflow term is non-zero but no advecting field was passed "
+                "to the driver's Af assembly. Static-geometry invariant violated. "
+                "If per-step backflow is needed, reaction_terms is a design change — "
+                "escalate BLOCKED."
+            )
+    elif _rt_active and not _two_sided:
+        raise ValueError(
+            "reaction_terms=True is only supported with _two_sided=True "
+            "(the standard monolithic driver path)."
+        )
+
     xq = gauss_points(mesh, dm.tables_by_p)
+
+    # ---- Device assembler setup (once per mesh epoch) -----------------------
+    # Builds symbolic pattern + slot maps; caches SBM face system slots so only
+    # VALUE arrays need refreshing per step (pattern fixed; geometry is static).
+    # Gated to uniform meshes: on adaptive (hanging-node) meshes the Af_c
+    # entries may not exist in the device pattern (constraint-aware T^T K T
+    # creates off-diagonal entries not in the element-pair graph) — detected
+    # via csr_slots and reported clearly rather than silently skipped.
+    _dev_asm = None           # DeviceNSAssembler (None => host path)
+    _af_slots_d = None        # device CSR slots for Af_c
+    _af_vals_d = None         # device values array for Af_c (refreshed per step)
+    _bf_dofs_d = None         # device dof indices for bf_c nonzeros
+    _bf_vals_d = None         # device values array for bf_c nonzeros
+    _strong_rows = None       # sorted unique strong rows (set once per epoch)
+    _Af_csr = None            # CSR form of Af_c (cached for value refresh)
+    _Af_csr_nnz = None        # nnz of Af_csr (to assert pattern unchanged)
+
+    if assembly == "device":
+        from diffsim.assembly.device_assembly import DeviceNSAssembler
+        from diffsim.errors import BackendError
+        import warp as wp
+
+        # No pre-emptive gate for adaptive (hanging-node) meshes: the
+        # DeviceNSAssembler's constraint-aware weighted scatter expands
+        # element entries THROUGH the constraint weights (D1 item 3),
+        # producing the same free-dof pattern as T^T K T.  An experiment
+        # on level=4, refine_to=6 (56 hanging nodes, 956 Af_c nnz) confirmed
+        # that ALL Af_c entries are covered by the device pattern (csr_slots
+        # SUCCESS — no BackendError).  The try/except below is the honesty
+        # net: if a future mesh or Af_c variant genuinely exceeds the pattern,
+        # it is reported clearly rather than silently skipped.
+
+        _dev_asm = DeviceNSAssembler(dm)    # symbolic pattern once per epoch
+
+        # --- SBM face system -> fixed-pattern device slots (cached) ----------
+        _Af_csr = Af_c.tocsr()
+        _Af_csr_nnz = _Af_csr.nnz
+        _af_rows, _af_cols = _Af_csr.nonzero()
+        try:
+            _af_slots = _dev_asm.csr_slots(_af_rows, _af_cols)
+        except BackendError as _e:
+            raise ValueError(
+                f"assembly='device': SBM face system (Af_c) contains entries "
+                f"absent from the device assembler's CSR pattern. This is a "
+                f"REAL finding: the constraint-aware face-system entries on this "
+                f"mesh exceed the element-pair graph. Use assembly='host'. "
+                f"Original error: {_e}") from _e
+
+        # Cast slots to the assembler's index dtype (int32 for small meshes)
+        _af_slots_np = _af_slots.astype(_dev_asm._idx_np)
+        _af_slots_d = wp.array(_af_slots_np, dtype=_dev_asm._idx_dtype,
+                               device=dm.device)
+        _af_vals_d = wp.array(
+            np.ascontiguousarray(_Af_csr.data, np.float64),
+            dtype=wp.float64, device=dm.device)
+
+        # bf_c sparse: only nonzero dofs uploaded.
+        # int32 dof indices: _scatter_vec_kernel requires gdof: wp.array(dtype=wp.int32)
+        # (API contract in device_assembly.py).  On meshes where Nfull >= 2^31
+        # the assembler itself refuses at construction, so int32 is always safe here.
+        _bf_nz = np.nonzero(bf_c)[0]
+        _bf_dofs_d = wp.array(_bf_nz.astype(np.int32), dtype=wp.int32,
+                              device=dm.device)
+        _bf_vals_d = wp.array(
+            np.ascontiguousarray(bf_c[_bf_nz], np.float64),
+            dtype=wp.float64, device=dm.device)
+
+        # --- strong rows: BCs + inflow-kick rows + pressure pin (one plan) ---
+        # np.unique sorts the rows, giving a canonical order we'll use for
+        # strong_b_vals per step.  set_strong_rows preserves input order, so
+        # the sorted unique array is consistent with the per-step value lookup.
+        _strong_rows = np.unique(
+            np.concatenate([np.asarray(bc_rows, np.int64),
+                            np.asarray(inflow_vy_rows, np.int64),
+                            np.array([int(p_pin)], np.int64)]))
+        _dev_asm.set_strong_rows(_strong_rows)
+
+    # ---- Full-mesh field expansion helper -----------------------------------
+    # Used by BOTH the per-step on_step callback and the end-of-run _return_fields
+    # export path (one construction, no divergent copies).
+    # x_cur : [nfree*ndof] free-dof interleaved (u_x, u_y, p)
+    # Returns (u_full [n_nodes, dim], p_full [n_nodes]).
+    def _full_fields(x_cur_f):
+        x_all_f = np.asarray(T_vec @ x_cur_f)
+        x_nodes_f = x_all_f.reshape(-1, ndof)
+        return x_nodes_f[:, :dim], x_nodes_f[:, dim]
+
+    # ---- Reaction-force arbiter setup (LD-5; reaction_sets=None => no overhead) -
+    # Variational identity: for a free test function w_k (zero on all surgery rows),
+    # the discrete NS residual gives:
+    #    w_kᵀ R_vol(x) + w_kᵀ R_sbm(x) = 0
+    # => plate x-force = w_kᵀ (A_vol x − b_vol)
+    #
+    # Path (b): avoid a second volume assembly each step by observing
+    #    A_vol = A_full − Af_c,  b_vol = b_full − bf_c
+    # so:
+    #    w_kᵀ (A_vol x − b_vol) = w_kᵀ (A_full x − b_full) − w_kᵀ (Af_c x − bf_c)
+    # This holds EXACTLY provided w_k has zero weight on every surgery row
+    # (strong-BC, kick, and pressure-pin rows) — the assertion below enforces this.
+    # On the HOST path, A_vol and b_vol are available cheaply right after
+    # assemble_linear_ns, so we use them directly rather than the subtraction.
+    # On the DEVICE path (A_full assembled in one shot with extra_matrix), we use
+    # the path-(b) subtraction with the cached host Af_c/bf_c.
+    #
+    # Sign convention: w_kᵀ (A_vol x − b_vol) equals −w_kᵀ(Af_c x − bf_c).
+    # The SBM term Af_c x − bf_c is the Nitsche/SBM PENALTY residual that DECELERATES
+    # the fluid near the plate (force on fluid in −x direction for a bluff body in
+    # forward flow). Hence w_kᵀ (A_vol x − b_vol) is NEGATIVE for forward drag.
+    # To match the surrogate-traction Cd sign convention (positive = drag ON THE PLATE
+    # from the fluid = drag in the +x direction on the plate = fluid force in +x on
+    # the plate = plate reacts in −x on fluid), we NEGATE:
+    #   Cd_reaction = −F_raw / ref_force    where F_raw = w_kᵀ (A_vol x − b_vol)
+    # This yields Cd_reaction > 0 for downstream drag — same sign as Cd_surr.
+    # (Verified on the tiny CPU gate: Cd_surr ~ +4.8, Cd_reaction ~ +2.8; see task-5-report.md.)
+    _rxn_active = reaction_sets is not None and len(reaction_sets) > 0
+    _rxn_nsets = 0
+    _rxn_w = []         # list of dense [nfree*ndof] indicator vectors (one per set)
+    _rxn_Afc_w = []     # list of Af_c.T @ w_k (for device path subtraction)
+    _rxn_bfc_dot = []   # list of bf_c @ w_k (for device path subtraction)
+
+    if _rxn_active:
+        _rxn_nsets = len(reaction_sets)
+        # Collect all surgery rows (strong-BC + kick + pressure-pin) for the assert.
+        _surgery_rows = set(int(r) for r in bc_rows)
+        _surgery_rows.update(int(r) for r in inflow_vy_rows)
+        _surgery_rows.add(int(p_pin))
+
+        for s_k in reaction_sets:
+            # w_k: indicator on the u_x DOF (index 0 in each node's ndof block)
+            # for free-node indices in s_k.  All other DOFs are 0.
+            w_k = np.zeros(nfree * ndof)
+            for ni in np.asarray(s_k, dtype=np.intp):
+                dof_ux = int(ni) * ndof + 0   # u_x DOF
+                w_k[dof_ux] = 1.0
+
+            # Assert: w_k has zero weight on every surgery row.
+            # This makes the variational-identity path (b) algebraically exact.
+            for r in _surgery_rows:
+                assert w_k[r] == 0.0, (
+                    f"reaction_sets: free-node set contains DOF {r} which is a "
+                    f"surgery row (strong-BC / kick / pressure-pin).  The w_k "
+                    f"indicator MUST be zero on all surgery rows for the "
+                    f"variational identity to hold exactly.  "
+                    f"Remove node {r // ndof} from reaction_sets[k]."
+                )
+            _rxn_w.append(w_k)
+
+            # Pre-compute Af_c.T @ w_k and bf_c · w_k for the device path.
+            # (Af_c is symmetric in practice but we use .T for correctness.)
+            _rxn_Afc_w.append(np.asarray(Af_c.T @ w_k))
+            _rxn_bfc_dot.append(float(bf_c @ w_k))
+
+    # ---- PCD / bdiag meta cache ---------------------------------------------
+    # build_pcd_meta is called once per BDF order (sigma changes at step 0->1);
+    # the cache dict is passed to solve_linear so make_pcd_apply sees pcd_meta.
+    # fgmres_bdiag reads ndof and A3 knobs via ("blocktri_meta", cache_key).
+    _pcd_cache = {}           # {("pcd_meta", key): meta, ...}
+    _pcd_last_order = None    # track when to rebuild pcd_meta (sigma change)
+    if mono_solver in ("fgmres_bdiag", "fused_bdiag"):
+        _bdiag_meta = {"ndof": ndof}
+        if saddle_restart is not None:
+            _bdiag_meta["saddle_restart"] = int(saddle_restart)
+        if saddle_x0 is not None:
+            _bdiag_meta["saddle_x0"] = saddle_x0
+        if bdiag_block is not None:
+            _bdiag_meta["bdiag_block"] = bdiag_block
+        _pcd_cache[("blocktri_meta", "ns2d")] = _bdiag_meta
 
     # ---- BDF2 march ---------------------------------------------------------
     # Initialize: u=0 everywhere
@@ -461,6 +748,11 @@ def run_flow_past(
 
     cd_hist = np.zeros(nsteps)
     cl_hist = np.zeros(nsteps)
+    if _rxn_active:
+        _rxn_hist = np.zeros((nsteps, _rxn_nsets))
+    if _rt_active:
+        _nterms = len(_term_names)
+        _rxn_term_hist = np.zeros((nsteps, _nterms))
 
     ref_force = 0.5 * U_inf ** 2 * plate_L    # nondim denominator
 
@@ -469,6 +761,15 @@ def run_flow_past(
         order = 1 if step == 0 else 2
         b0, b1, b2 = bdf_coeffs(order, dt)
         sigma = b0 / dt
+
+        # Rebuild pcd_meta when BDF order (and thus sigma) changes.
+        # This is at most 2 builds per run (BDF1 -> BDF2 at step 1).
+        if mono_solver == "fgmres_pcd" and order != _pcd_last_order:
+            from diffsim.solvers.saddle_precond import build_pcd_meta
+            _pcd_cache[("pcd_meta", "ns2d")] = build_pcd_meta(
+                dm, nu, sigma, p_pin=p_pin, inner=pcd_inner,
+                ap_inner=pcd_ap_inner)
+            _pcd_last_order = order
         t_new = (step + 1) * dt   # time at the END of this step
 
         # Advecting velocity at Gauss points (linearization around u^n)
@@ -486,34 +787,195 @@ def run_flow_past(
         else:
             fq_raw = _gp_history_fq(dm, mesh, T, u_pre1, u_pre2, b1, b2, dt, dim)
 
-        # Assemble monolithic NS
-        A, b = assemble_linear_ns(dm, aq, dq, fq_raw, nu, sigma=sigma)
-        A = (A + Af_c).tolil()
-        b = b + bf_c
+        if assembly == "device":
+            # ---- Device assembly path ---------------------------------------
+            # Strong values in _strong_rows ORDER (np.unique-sorted order).
+            # Build a dict from all strong-row values, then index by _strong_rows.
+            _val_of = {}
+            for _r, _v in zip(bc_rows, bc_vals):
+                _val_of[int(_r)] = float(_v)
+            # Inflow-kick rows: value depends on time
+            if _pert_active and t_new < pert_t_end:
+                _vkick = _pert_vkick
+            else:
+                _vkick = 0.0
+            for _r in inflow_vy_rows:
+                _val_of[int(_r)] = _vkick
+            # Pressure pin
+            _val_of[int(p_pin)] = 0.0
+            # Build strong_b_vals in sorted unique row order (_strong_rows)
+            _sb = np.array([_val_of.get(int(_r), 0.0) for _r in _strong_rows])
 
-        # Apply strong Dirichlet BCs
-        for r, v in zip(bc_rows, bc_vals):
-            A.rows[r] = [int(r)]; A.data[r] = [1.0]; b[r] = v
+            # Af_c is geometry-cached (assembled once before the loop); its
+            # value array is constant each step.  Use the pre-uploaded
+            # _af_vals_d directly — no per-step reallocation needed.
+            # (The pattern-unchanged assert is a safety guard for future
+            # callers that might pass a per-step Af_c.)
+            assert _Af_csr.nnz == _Af_csr_nnz, (
+                f"Af_c sparsity changed mid-march: {_Af_csr.nnz} vs "
+                f"{_Af_csr_nnz}. Cannot refresh device values safely.")
 
-        # Symmetry-breaking perturbation: override inflow u_y for t < pert_t_end.
-        # This mirrors test_cylinder_strouhal.py's kick:
-        #   ``vkick = 0.05 * U_IN if t_new < 0.5 else 0.0``
-        # The kick imposes a small constant transverse velocity at the inflow
-        # for early time, breaking the perfect up-down symmetry so the wake
-        # destabilises to the von Karman / bluff-body shedding branch.
-        # After t >= pert_t_end the inflow reverts to pure streamwise (u_y = 0),
-        # already set by the base bc_rows loop above (no additional action).
-        if _pert_active and t_new < pert_t_end:
-            vkick = _pert_vkick
-            for r in inflow_vy_rows:
-                ri = int(r)
-                A.rows[ri] = [ri]; A.data[ri] = [1.0]; b[ri] = vkick
+            # assemble: volume fill + extra_matrix(Af) + extra_rhs(bf)
+            # + strong rows — order mirrors host: A_vol + Af_c, b + bf_c,
+            # then LIL surgery.  Oracle: aq/dq/fq as flat pv-keyed dicts.
+            # W2c: SADDLE_DEVICE_CSR=1 keeps values device-resident
+            # (assemble_handoff); default byte-identical (assemble).
+            # Read live (env, not import-time) so parity harnesses can toggle.
+            _dev_csr = os.environ.get(
+                "SADDLE_DEVICE_CSR", "0").strip() not in ("", "0")
+            _asm_call = (_dev_asm.assemble_handoff if _dev_csr
+                         else _dev_asm.assemble)
+            Acsr, b = _asm_call(
+                aq, dq, fq_raw, nu, sigma,
+                strong_b_vals=_sb,
+                extra_matrix=(_af_slots_d, _af_vals_d),
+                extra_rhs=(_bf_dofs_d, _bf_vals_d))
 
-        # Pressure pin
-        A.rows[p_pin] = [p_pin]; A.data[p_pin] = [1.0]; b[p_pin] = 0.0
+            # Solve (same routing as host path)
+            if mono_solver == "splu":
+                x_cur = splu(Acsr.tocsc()).solve(b)
+            else:
+                _LAST_ITERS[0] = None
+                _slv_cache = (_pcd_cache
+                              if mono_solver in ("fgmres_pcd", "fgmres_bdiag")
+                              else None)
+                x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
+                                     device=device,
+                                     cache=_slv_cache, cache_key="ns2d")
+                if solver_stats is not None and _LAST_ITERS[0] is not None:
+                    solver_stats.append(int(_LAST_ITERS[0]))
 
-        # Solve
-        x_cur = splu(A.tocsr().tocsc()).solve(b)
+        else:
+            # ---- Host assembly path (default; bit-for-bit unchanged) --------
+            # Assemble monolithic NS — capture A_vol, b_vol BEFORE adding Af_c/bf_c.
+            # The reaction arbiter uses these directly (no subtraction needed on host).
+            A, b = assemble_linear_ns(dm, aq, dq, fq_raw, nu, sigma=sigma)
+
+            # Capture pre-SBM volume system for the reaction arbiter (host path).
+            # Done AFTER assemble_linear_ns and BEFORE adding Af_c/surgery.
+            # w_k has zero weight on surgery rows (asserted at setup), so the
+            # captured A_vol/b_vol yield exact variational reaction forces.
+            if _rxn_active:
+                _A_vol_csr = A.tocsr()     # A_vol: PRE-SBM, PRE-surgery CSR
+                _b_vol = b.copy()          # b_vol: PRE-SBM, PRE-surgery RHS
+
+            A = (A + Af_c).tolil()
+            b = b + bf_c
+
+            # Apply strong Dirichlet BCs
+            for r, v in zip(bc_rows, bc_vals):
+                A.rows[r] = [int(r)]; A.data[r] = [1.0]; b[r] = v
+
+            # Symmetry-breaking perturbation: override inflow u_y for t < pert_t_end.
+            # This mirrors test_cylinder_strouhal.py's kick:
+            #   ``vkick = 0.05 * U_IN if t_new < 0.5 else 0.0``
+            # The kick imposes a small constant transverse velocity at the inflow
+            # for early time, breaking the perfect up-down symmetry so the wake
+            # destabilises to the von Karman / bluff-body shedding branch.
+            # After t >= pert_t_end the inflow reverts to pure streamwise (u_y = 0),
+            # already set by the base bc_rows loop above (no additional action).
+            if _pert_active and t_new < pert_t_end:
+                vkick = _pert_vkick
+                for r in inflow_vy_rows:
+                    ri = int(r)
+                    A.rows[ri] = [ri]; A.data[ri] = [1.0]; b[ri] = vkick
+
+            # Pressure pin
+            A.rows[p_pin] = [p_pin]; A.data[p_pin] = [1.0]; b[p_pin] = 0.0
+
+            # Solve — routed through solve_linear so MONO_SOLVER/DEVICE select
+            # the backend (splu host | cudss GPU-direct | fused GPU-BiCGStab).
+            # Matrix changes every step (Picard convection + kick rows).
+            # For fgmres_pcd the pcd_meta (mesh operators) is constant per BDF
+            # order and lives in _pcd_cache; the fingerprint guard is bypassed
+            # by passing cache_key=None for all other solvers.
+            Acsr = A.tocsr()
+            if mono_solver == "splu":
+                x_cur = splu(Acsr.tocsc()).solve(b)      # legacy path, bit-for-bit
+            else:
+                _LAST_ITERS[0] = None
+                _slv_cache = (_pcd_cache
+                              if mono_solver in ("fgmres_pcd", "fgmres_bdiag")
+                              else None)
+                x_cur = solve_linear(Acsr, b, solver=mono_solver, sym=False,
+                                     device=device,
+                                     cache=_slv_cache, cache_key="ns2d")
+                if solver_stats is not None and _LAST_ITERS[0] is not None:
+                    solver_stats.append(int(_LAST_ITERS[0]))
+
+        # ---- Reaction-force arbiter (LD-5) per step ---------------------------
+        # Computed AFTER the solve so x_cur is the step's solution.
+        # HOST path: F_x[k] = w_kᵀ (A_vol x_cur − b_vol) directly.
+        # DEVICE path (path b): F_x[k] = w_kᵀ (A_full x_cur − b_full)
+        #   − w_kᵀ (Af_c x_cur − bf_c)
+        # where A_full = A_vol + Af_c, b_full = b_vol + bf_c, so the difference
+        # equals w_kᵀ (A_vol x_cur − b_vol) exactly (since w_k ⊥ surgery rows).
+        # Cd_reaction = F_x / ref_force (positive = drag on the plate, same sign as Cd_surr).
+        if _rxn_active:
+            if assembly == "device":
+                # Path (b): F_raw = w_kᵀ A_vol x − w_kᵀ b_vol
+                #                  = w_kᵀ (A_full − Af_c) x − (b_full − bf_c) w_k
+                #                  = (w_kᵀ A_full x − w_kᵀ b_full)
+                #                    − (w_kᵀ Af_c x − w_kᵀ bf_c)
+                # where Acsr/b here are A_full/b_full (device path includes Af_c).
+                # Sign: negate F_raw to get Cd_reaction in the same sign as Cd_surr.
+                _b_numpy = np.asarray(b) if not isinstance(b, np.ndarray) else b
+                for k in range(_rxn_nsets):
+                    w_k = _rxn_w[k]
+                    Afull_T_w = np.asarray(Acsr.T @ w_k)
+                    wT_Afull_x = float(Afull_T_w @ x_cur)
+                    wT_bfull   = float(w_k @ _b_numpy)
+                    wT_Afc_x = float(_rxn_Afc_w[k] @ x_cur)
+                    wT_bfc   = _rxn_bfc_dot[k]
+                    F_raw = (wT_Afull_x - wT_bfull) - (wT_Afc_x - wT_bfc)
+                    # Negate: Cd_reaction > 0 = downstream drag (same sign as Cd_surr)
+                    _rxn_hist[step, k] = -F_raw / ref_force
+            else:
+                # HOST path: use A_vol, b_vol captured before SBM addition.
+                # Sign: negate F_raw to match Cd_surr sign convention.
+                for k in range(_rxn_nsets):
+                    w_k = _rxn_w[k]
+                    Avol_T_w = np.asarray(_A_vol_csr.T @ w_k)
+                    F_raw = float(Avol_T_w @ x_cur) - float(w_k @ _b_vol)
+                    # Negate: Cd_reaction > 0 = downstream drag (same sign as Cd_surr)
+                    _rxn_hist[step, k] = -F_raw / ref_force
+
+        # ---- Per-term reaction history (TD-2; _rt_active only) ---------------
+        # Computed using the pre-reduced host CSR term blocks (path-independent:
+        # A_t/b_t are host matrices; x_cur is always a numpy vector post-solve).
+        # Only set 0 (reaction_sets[0]) is tracked per-term.
+        #
+        # Sign convention: Cd_t = +w₀ᵀ(A_t x_cur - b_t) / ref_force.
+        # By linearity, Σ_t Cd_t = w₀ᵀ(Af_c x - bf_c) / ref_force.
+        # The LD-5 variational identity gives Cd_total = w₀ᵀ(Af_c x - bf_c) / ref_force
+        # (because -w₀ᵀ(A_vol x - b_vol) = w₀ᵀ(Af_c x - bf_c) for surgery-row-
+        # orthogonal w₀). So Σ_t Cd_t == Cd_total (same sign, same value).
+        #
+        # Partition gate: |Σ_t Cd_t - Cd_total| ≤ 1e-12·max(1,|Cd_total|).
+        if _rt_active:
+            w0 = _rxn_w[0]   # w-vector for set 0
+            for ti in range(_nterms):
+                At = _term_Afc_c[ti]   # reduced A_t CSR (host)
+                bt = _term_bfc_c[ti]   # reduced b_t vector (host)
+                # +w₀ᵀ(A_t x - b_t): no negation — Σ_t sums to Af_c contribution
+                F_raw_t = float(np.asarray(At.T @ w0) @ x_cur) - float(w0 @ bt)
+                _rxn_term_hist[step, ti] = F_raw_t / ref_force
+            # Partition gate (inline): Σ_t f_x_t == f_x_total at 1e-12
+            f_x_total = _rxn_hist[step, 0]
+            f_x_term_sum = _rxn_term_hist[step].sum()
+            # 1e-11 relative: SpMV rounding grows with nnz — the r12 leg
+            # measured 1.06e-12 relative (vs 0.9-1.1e-12 at r9-r11), tripping
+            # the old 1e-12 gate at step 167. 10x headroom per the
+            # measured-tail discipline; still ~11 orders below any real
+            # partition break (which would be O(term) ~ 1e0).
+            _part_tol = 1e-11 * max(1.0, abs(f_x_total))
+            assert abs(f_x_term_sum - f_x_total) <= _part_tol, (
+                f"Step {step}: per-term partition error "
+                f"{abs(f_x_term_sum - f_x_total):.3e} > 1e-12·max(1,|total|) "
+                f"({_part_tol:.3e}). total={f_x_total:.8g}, "
+                f"sum_terms={f_x_term_sum:.8g}. "
+                "This is the instrument's trust anchor — partition must hold exactly."
+            )
 
         # Extract velocity for next step
         u_new = x_cur.reshape(nfree, ndof)[:, :dim]
@@ -532,6 +994,11 @@ def run_flow_past(
 
         cd_hist[step] = F[0] / ref_force   # drag (streamwise = x)
         cl_hist[step] = F[1] / ref_force   # lift (transverse = y)
+
+        # Per-step callback (on_step=None => zero overhead)
+        if on_step is not None:
+            u_full_cb, p_full_cb = _full_fields(x_cur)
+            on_step(step, t_new, u_full_cb, p_full_cb, float(cd_hist[step]))
 
         # Rotate history
         u_pre2 = u_pre1.copy()
@@ -553,13 +1020,19 @@ def run_flow_past(
         nsteps=nsteps,
     )
 
+    # Reaction-force arbiter results (LD-5): only present when reaction_sets != None.
+    if _rxn_active:
+        result["reaction_hist"] = _rxn_hist   # [nsteps, nsets] Cd_reaction per set
+
+    # Per-term reaction history (TD-2): only present when reaction_terms=True.
+    if _rt_active:
+        result["reaction_terms_hist"] = _rxn_term_hist   # [nsteps, nterms]
+        result["reaction_terms_names"] = _term_names     # stable ordered list
+
     if _return_fields:
-        # Extract node-level fields from the final step's x_all.
-        # x_all is [Nn * ndof] node-major: node 0 has [u_x, u_y, p],
-        # node 1 has [u_x, u_y, p], etc.
-        x_nodes = np.asarray(x_all).reshape(-1, ndof)   # [Nn, ndof]
-        u_node = x_nodes[:, :dim]                        # [Nn, dim]
-        p_node = x_nodes[:, dim]                         # [Nn]
+        # Extract node-level fields from the final step's solution via the shared
+        # _full_fields helper (same expansion used by the on_step callback).
+        u_node, p_node = _full_fields(x_cur)
         vel_mag = np.linalg.norm(u_node, axis=1)         # [Nn]
         result["mesh"] = mesh
         result["node_fields"] = {
@@ -676,6 +1149,8 @@ def run_flow_past_projection(
     _return_stepper=False,
     pert_eps=None,           # symmetry-breaking kick: fraction of U_inf (None/0 = off)
     pert_t_end=1.0,          # physical time at which the kick is switched off
+    device="cpu",            # device for the DeviceMesh build (cpu | cuda:0)
+    device_assembly=False,   # route K_p (PPE Laplacian) through DeviceScalarPoissonAssembler
 ):
     """Run 2-D flow past a finite thin plate via the PROJECTION stepper.
 
@@ -708,7 +1183,7 @@ def run_flow_past_projection(
     # ---- geometry + two-sided surrogate (SAME two-oracle workaround) --------
     fx = _build_shell(level, plate_xc, plate_yc, plate_L, dim=dim,
                       refine_to=refine_to, wake_refine=wake_refine,
-                      band_cells=band_cells)
+                      band_cells=band_cells, device=device)
     dm, mesh, cons = fx["dm"], fx["mesh"], fx["cons"]
 
     if verbose:
@@ -749,6 +1224,7 @@ def run_flow_past_projection(
         inner_iterate=inner_iterate, inner_max=inner_max,
         inner_relax=inner_relax,
         rotational_pin_wall=rotational_pin_wall,
+        device_assembly=device_assembly,
         verbose=verbose,
     )
     st.set_initial(lambda coords: np.zeros((len(coords), dim)))
@@ -870,12 +1346,23 @@ def compare_solvers(t_start=None, plate_L_physical=None, **cfg):
     L_phys = plate_L if plate_L_physical is None else plate_L_physical
 
     # Which projection knobs to pull out of cfg (leave the rest for both).
+    # device_assembly: routes K_p (PPE Laplacian) through DeviceScalarPoissonAssembler;
+    # projection-only (the monolithic path uses assembly= for its NS system).
     proj_only = {}
     for k in ("ppe_solver", "predictor_solver", "picard_iters", "order",
               "consistent_projection", "inner_iterate", "inner_max",
-              "inner_relax", "rotational_pin_wall"):
+              "inner_relax", "rotational_pin_wall", "device_assembly"):
         if k in cfg:
             proj_only[k] = cfg.pop(k)
+
+    # Which monolithic knobs to pull out of cfg (leave the rest for both).
+    # NOTE: "device" stays in cfg so BOTH legs see it (projection also accepts
+    # device= since Task 3 threads it to its DeviceMesh build).
+    # "assembly" is mono-only: the projection path does not accept it.
+    mono_only = {}
+    for k in ("mono_solver", "assembly"):
+        if k in cfg:
+            mono_only[k] = cfg.pop(k)
 
     t_arr = np.arange(1, nsteps + 1) * dt
     ts = t_arr[len(t_arr) // 2] if t_start is None else t_start
@@ -888,7 +1375,7 @@ def compare_solvers(t_start=None, plate_L_physical=None, **cfg):
             St, freq = float("nan"), float("nan")
         return cd_mean, St, freq
 
-    res_m = run_flow_past(**cfg)
+    res_m = run_flow_past(**cfg, **mono_only)
     cd_m, st_m, f_m = _reduce(res_m)
 
     res_p = run_flow_past_projection(**cfg, **proj_only)
@@ -1047,6 +1534,14 @@ if __name__ == "__main__":
     _pert_eps_env = os.environ.get("PERT_EPS", "")
     pert_eps = float(_pert_eps_env) if _pert_eps_env else None
     pert_t_end = float(os.environ.get("PERT_T_END", "1.0"))
+    mono_solver = os.environ.get("MONO_SOLVER", "splu")
+    pred_solver = os.environ.get("PRED_SOLVER", "splu")
+    device      = os.environ.get("DEVICE", "cpu")
+    assembly    = os.environ.get("ASSEMBLY", "host")
+    # ASSEMBLY=device -> device_assembly=True for the PROJECTION leg (K_p via
+    # DeviceScalarPoissonAssembler; predictor + SBM extra_block remain host).
+    # CASE (c) confirmed: device_assembly only affects K_p, not extra_block.
+    device_assembly = (assembly == "device")
     # Physical plate length: plate_L is the octree-normalized length (divided by
     # domain height H=16).  St = f*L/U uses the PHYSICAL plate length, so we
     # multiply back by 16 to denormalize.  For the default smoke run (plate_L=0.25,
@@ -1078,7 +1573,9 @@ if __name__ == "__main__":
             plate_xc=plate_xc, plate_yc=plate_yc, plate_L=plate_L,
             refine_to=refine_to, wake_refine=wake_refine, band_cells=band_cells,
             pert_eps=pert_eps, pert_t_end=pert_t_end,
-            ppe_solver=ppe_solver,
+            mono_solver=mono_solver, device=device, assembly=assembly,
+            ppe_solver=ppe_solver, predictor_solver=pred_solver,
+            device_assembly=device_assembly,
         )
         print(f"[p2r1a] monolithic: Cd_mean={out['mono']['cd_mean']:.4f}  "
               f"St={out['mono']['St']:.4f}")
@@ -1097,6 +1594,9 @@ if __name__ == "__main__":
         _return_fields=True,
         pert_eps=pert_eps,
         pert_t_end=pert_t_end,
+        mono_solver=mono_solver,
+        device=device,
+        assembly=assembly,
     )
     print(f"Cd={res['cd']}")
     print(f"Cl={res['cl']}")

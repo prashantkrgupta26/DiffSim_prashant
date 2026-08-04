@@ -158,3 +158,14 @@ def test_two_sided_coupling_load_bearing(device):
         f"two-sided coupling not load-bearing: two-sided={cd_two:.4f}, "
         f"one-sided={cd_one:.4f}, rel_diff={rel_diff:.3f} (< 5%) — the "
         "Gamma~+ side is inert")
+
+
+def test_predictor_solver_kwarg_accepted(device):
+    """PRED_SOLVER wire (Task-8 finding): the runner must accept and use
+    predictor_solver; splu explicit == splu default, bit-for-bit."""
+    from p2r1c_thin_plate_flow_3d_projection import run_flow_past_3d_projection
+
+    kw = dict(level=3, nsteps=2, dt=0.01, nu=0.1, verbose=False)
+    r_def = run_flow_past_3d_projection(**kw)
+    r_exp = run_flow_past_3d_projection(predictor_solver="splu", **kw)
+    assert np.allclose(r_def["cd"], r_exp["cd"], rtol=0, atol=1e-12)

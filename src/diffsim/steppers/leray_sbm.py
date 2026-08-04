@@ -580,6 +580,7 @@ class LeraySBMShellStepper:
                  inner_relax=1.0, inner_accel="none", inner_anderson_m=3,
                  consistent_ppe=False, consistent_projection=False,
                  rotational_pin_wall=False,
+                 device_assembly=False,
                  verbose=False):
         # ``rotational_pin_wall`` (FN4, 2026-07-23) — pin the rotational
         # -nu*q correction to 0 on the IMMERSED SHELL (sbm) nodes. At a weak
@@ -624,7 +625,8 @@ class LeraySBMShellStepper:
             inner_accel=inner_accel, inner_anderson_m=inner_anderson_m,
             consistent_ppe=consistent_ppe,
             consistent_projection=consistent_projection,
-            rotational_pin_wall=rotational_pin_wall)
+            rotational_pin_wall=rotational_pin_wall,
+            device_assembly=device_assembly)
         base.dir_nodes = self._strong_nodes
         self.base = base
         self.n_free = base.n_free

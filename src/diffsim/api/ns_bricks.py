@@ -364,6 +364,7 @@ def make_linear_ns_Ae(nbf: int, nqp: int, dim: int):
                   div_aq: wp.array(dtype=wp.float64),
                   gaq: wp.array2d(dtype=wp.float64),
                   nu: wp.float64, sigma: wp.float64, sig2tau: wp.float64,
+                  tau_scale: wp.float64,
                   s_skew: wp.float64, newton: wp.int32,
                   Ae: wp.array3d(dtype=wp.float64)):
         e = wp.tid()
@@ -380,7 +381,11 @@ def make_linear_ns_Ae(nbf: int, nqp: int, dim: int):
             for d in range(dim):
                 amag += aq[gp, d] * aq[gp, d]
             amag = wp.sqrt(amag)
-            tauM = tau_m_metric(amag, fe.he, nu, sig2tau, wp.float64(dim_f))
+            # tauM_scale (C++ NSEquation.h:530 heritage): direct multiplier on
+            # tauM; tauC = 1/(tauM*gg) computed FROM the scaled tauM inherits
+            # the inverse scaling (C++-exact composition).
+            tauM = tau_m_metric(amag, fe.he, nu, sig2tau,
+                                wp.float64(dim_f)) * tau_scale
             tauC = tau_c_metric(tauM, fe.he, wp.float64(dim_f))
             diva = div_aq[gp]
             for a in range(nbf):
@@ -471,6 +476,7 @@ def make_linear_ns_be(nbf: int, nqp: int, dim: int):
                   aq: wp.array2d(dtype=wp.float64),
                   fq: wp.array2d(dtype=wp.float64),
                   nu: wp.float64, sig2tau: wp.float64,
+                  tau_scale: wp.float64,
                   be: wp.array2d(dtype=wp.float64)):
         e = wp.tid()
         fe = FEMElm()
@@ -486,7 +492,8 @@ def make_linear_ns_be(nbf: int, nqp: int, dim: int):
             for d in range(dim):
                 amag += aq[gp, d] * aq[gp, d]
             amag = wp.sqrt(amag)
-            tauM = tau_m_metric(amag, fe.he, nu, sig2tau, wp.float64(dim_f))
+            tauM = tau_m_metric(amag, fe.he, nu, sig2tau,
+                                wp.float64(dim_f)) * tau_scale
             for a in range(nbf):
                 Na = fe_N(Ntab, fe, a)
                 agw = wp.float64(0.0)
@@ -506,7 +513,7 @@ def make_linear_ns_be(nbf: int, nqp: int, dim: int):
 
 def assemble_linear_ns(dm, aq_by_bin, div_aq_by_bin, fq_by_bin, nu,
                        sigma=0.0, sig2tau=None, s_skew=0.5,
-                       gaq_by_bin=None, newton=False):
+                       gaq_by_bin=None, newton=False, tau_scale=1.0):
     """(A, b) constrained, node-major ndof=dim+1. aq/div_aq/fq: per-bin GP
     arrays (host numpy). sig2tau defaults to (2 sigma)^2."""
     dim = dm.dim
@@ -539,12 +546,14 @@ def assemble_linear_ns(dm, aq_by_bin, div_aq_by_bin, fq_by_bin, nu,
                                       b["lapN"],       # G4: complete resu
                                       b["w"], aq, dq, gaq, wp.float64(nu),
                                       wp.float64(sigma), wp.float64(sig2tau),
+                                      wp.float64(tau_scale),
                                       wp.float64(s_skew),
                                       wp.int32(1 if newton else 0), Ae],
                   device=d)
         wp.launch(kb, dim=ne, inputs=[b["conn"], b["h"], b["N"], b["dN"],
                                       b["w"], aq, fq, wp.float64(nu),
-                                      wp.float64(sig2tau), be], device=d)
+                                      wp.float64(sig2tau),
+                                      wp.float64(tau_scale), be], device=d)
         Aeh, beh = Ae.numpy(), be.numpy()
         conn = dm.mesh.conn_of[pv].astype(np.int64)
         gdof = (conn[:, :, None] * ndof

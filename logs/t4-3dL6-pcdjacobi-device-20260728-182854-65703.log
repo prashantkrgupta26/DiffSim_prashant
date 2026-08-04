@@ -1,0 +1,62 @@
+Warp 1.15.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.2
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA RTX 6000 Ada Generation" (48 GiB, sm_89, mempool enabled)
+     "cuda:1"   : "NVIDIA RTX 6000 Ada Generation" (48 GiB, sm_89, mempool enabled)
+   CUDA peer access:
+     Not supported
+   Kernel cache:
+     /home/bglab/.cache/warp/1.15.0
+[saddle-ladder] device=cuda:0  solvers=['fgmres_pcd']  nsteps=5  assembly=device  pcd_inner=None  points=['3d-L6']
+==============================================================================
+
+--- 3d-L6  solver=fgmres_pcd ---
+Module make_sbm_dirichlet_Ae__locals__sbm_dir_Ae_1913307a 1913307 load on device 'cuda:0' took 3.20 ms  (cached)
+Module make_sbm_dirichlet_be__locals__sbm_dir_be_f3d53b05 f3d53b0 load on device 'cuda:0' took 1.46 ms  (cached)
+Module _dof_indices_kernel__locals__dik_8ca85a60 8ca85a6 load on device 'cuda:0' took 10.22 ms  (cached)
+Module _brick_Ae_kernel__locals__brick_Ae_b9377933 b937793 load on device 'cuda:0' took 1.54 ms  (cached)
+Module _brick_Ae_kernel__locals__brick_Ae_71b23e9a 71b23e9 load on device 'cuda:0' took 2.32 ms  (cached)
+Module make_linear_ns_Ae__locals__lin_ns_Ae_23b38efa 23b38ef load on device 'cuda:0' took 1.97 ms  (cached)
+Module make_linear_ns_be__locals__lin_ns_be_fd4cb29b fd4cb29 load on device 'cuda:0' took 163.72 ms  (cached)
+Module _scatter_node_kernel__locals__scn_ce29ae41 ce29ae4 load on device 'cuda:0' took 2.26 ms  (cached)
+Module _scatter_node_vec_kernel__locals__scnv_1045b396 1045b39 load on device 'cuda:0' took 3.65 ms  (cached)
+Module _scatter_kernel__locals__scat_8d5ebe2a 8d5ebe2 load on device 'cuda:0' took 1.52 ms  (cached)
+Module _zero_slots_kernel__locals__zk_3c4a690d 3c4a690 load on device 'cuda:0' took 1.53 ms  (cached)
+Module _diag_one_kernel__locals__dk_4a1e0764 4a1e076 load on device 'cuda:0' took 1.39 ms  (cached)
+Module _make_kernels__locals__dot_partial_73c59ca3 73c59ca load on device 'cuda:0' took 25.93 ms  (cached)
+Module _make_kernels__locals__reduce_to_9929054e 9929054 load on device 'cuda:0' took 0.84 ms  (cached)
+Module _make_kernels__locals__store_normed_7e8b3877 7e8b387 load on device 'cuda:0' took 10.44 ms  (cached)
+Module _make_kernels__locals__zero_g_set0_d53a08ce d53a08c load on device 'cuda:0' took 0.94 ms  (cached)
+Module _make_kernels__locals__copy_from_row_0839d18d 0839d18 load on device 'cuda:0' took 0.77 ms  (cached)
+Module _make_kernels__locals__hadamard_933b2eb8 933b2eb load on device 'cuda:0' took 0.78 ms  (cached)
+Module _make_kernels__locals__dot_partial_16d43218 16d4321 load on device 'cuda:0' took 0.67 ms  (cached)
+Module _make_fused_kernels__locals__freduce_to_6a24acfa 6a24acf load on device 'cuda:0' took 0.71 ms  (cached)
+Module diffsim.assembly.operators 057ea88 load on device 'cuda:0' took 0.61 ms  (cached)
+Module _make_fused_kernels__locals__fcg_red_pap_alpha_9001ac71 9001ac7 load on device 'cuda:0' took 0.79 ms  (cached)
+Module _make_fused_kernels__locals__fcg_update_xr_z_a638cad2 a638cad load on device 'cuda:0' took 0.70 ms  (cached)
+Module _make_fused_kernels__locals__fdot2_0ff90f13 0ff90f1 load on device 'cuda:0' took 0.71 ms  (cached)
+Module _make_fused_kernels__locals__fcg_red_rz_beta_f3f4ad27 f3f4ad2 load on device 'cuda:0' took 0.70 ms  (cached)
+Module _make_kernels__locals__cg_update_p_dc58464d dc58464 load on device 'cuda:0' took 0.63 ms  (cached)
+Module _make_kernels__locals__copy_to_row_65801df7 65801df load on device 'cuda:0' took 0.65 ms  (cached)
+Module _make_kernels__locals__dot_row_773e847e 773e847 load on device 'cuda:0' took 5.83 ms  (cached)
+Module _make_kernels__locals__dot_to_H_bfc9737c bfc9737 load on device 'cuda:0' took 0.94 ms  (cached)
+Module _make_kernels__locals__axpy_row_22ea1b41 22ea1b4 load on device 'cuda:0' took 0.87 ms  (cached)
+Module _make_kernels__locals__hnorm_from_scal_0b18accd 0b18acc load on device 'cuda:0' took 0.91 ms  (cached)
+Module _make_kernels__locals__givens_apply_and_update_cde3ea31 cde3ea3 load on device 'cuda:0' took 1.11 ms  (cached)
+Module _make_kernels__locals__back_solve_c57ff9e4 c57ff9e load on device 'cuda:0' took 1.25 ms  (cached)
+Module _make_combine_kernel__locals__combine_9b752ff3 9b752ff load on device 'cuda:0' took 0.86 ms  (cached)
+  3d-L6         solver=fgmres_pcd        dofs=  1097344  iters_mean=   35.4  s/step= 11.732  converged=True  iters=[35,37,36,35,34]
+    saved -> results/saddle_ladder_3d-L6_fgmres_pcd.npz
+
+==============================================================================
+ SADDLE ITERATION-LADDER SUMMARY
+==============================================================================
+  tag           solver                 dofs  iters_mean   s/step  converged
+------------------------------------------------------------------------------
+  3d-L6         fgmres_pcd          1097344        35.4   11.732       True
+
+[saddle-ladder] KILL-GATE check (<=~2x growth across size rungs):
+  fgmres_pcd: insufficient valid points for kill-gate check
+
+SADDLE-LADDER-OK

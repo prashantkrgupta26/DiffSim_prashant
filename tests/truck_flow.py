@@ -1,0 +1,50 @@
+"""Compatibility shim — truck driver moved to diffsim.cases.truck.
+
+The implementation has been split into four modules under
+src/diffsim/cases/truck/:
+  truck_mesh.py   — mesh construction (slab carve, refine, truck carve)
+  truck_bc.py     — boundary conditions and reaction-set helpers
+  truck_ckpt.py   — mesh-sequenced checkpoint interpolation
+  truck_march.py  — BDF2 transient march (run_truck, make_nu_schedule)
+
+This shim re-exports the full public API so that old references (ledger
+snippets, results scripts, cluster scripts not yet updated) continue to work.
+New code should import from diffsim.cases.truck directly.
+"""
+from diffsim.cases.truck import (
+    _channel_box,
+    slab_carve,
+    refine_region_boxes,
+    refine_truck_band,
+    refine_walls,
+    refine_ground,
+    _face_components,
+    flood_fill_retain,
+    build_truck_mesh,
+    truck_bc_masks,
+    truck_strong_bc,
+    _pressure_pin,
+    soft_start_amp,
+    truck_reaction_set,
+    interpolate_checkpoint,
+    _gp_field,
+    _gp_history_fq,
+    run_truck,
+    make_nu_schedule,
+)
+
+
+if __name__ == "__main__":
+    import os
+    from diffsim.cases.truck_config import load_truck_config
+    cfgp = os.environ.get("TRUCK_CONFIG", os.path.join(
+        os.path.dirname(__file__), "..", "local_code_old",
+        "truck_4case_fresh_inputs", "NewRun-no-shell-slope0p25", "config.txt"))
+    cfg = load_truck_config(cfgp)
+    base_level = int(os.environ.get("BASE_LEVEL", "6"))
+    nsteps = int(os.environ.get("NSTEPS", "3"))
+    res = run_truck(cfg, nsteps=nsteps, base_level=base_level,
+                    truck_band_to=int(os.environ.get("BAND_TO", str(base_level + 2))),
+                    verbose=True)
+    print("Cd_react", res["cd"])
+    print("Cd_surr", res["cd_surr"])

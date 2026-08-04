@@ -170,3 +170,151 @@ def test_perturbation_breaks_symmetry():
     assert ratio > 10.0, (
         f"ON/OFF std ratio={ratio:.1f} < 10 — kick not clearly breaking symmetry"
     )
+
+
+def test_mono_solver_routing_parity():
+    """Routing the monolithic solve through solve_linear(solver="splu")
+    must reproduce the legacy inline-splu march exactly (same host LU)."""
+    from p2r1a_thin_plate_flow import run_flow_past
+    kw = dict(level=4, nsteps=3, dt=0.01, nu=0.1, U_inf=1.0, verbose=False)
+    res_legacy = run_flow_past(**kw)                       # default path
+    res_routed = run_flow_past(mono_solver="splu", device="cpu", **kw)
+    assert np.allclose(res_legacy["cd"], res_routed["cd"], rtol=0, atol=1e-12), (
+        f"routed splu diverged from legacy: {res_legacy['cd']} vs {res_routed['cd']}")
+
+
+def test_compare_solvers_accepts_mono_knobs():
+    """compare_solvers must route mono_solver/device/assembly to the monolithic
+    leg ONLY — the projection leg does not accept them (reviewer-found TypeError).
+    Passes assembly="device" so the mono_only routing of assembly is exercised."""
+    from p2r1a_thin_plate_flow import compare_solvers
+    out = compare_solvers(level=4, nsteps=3, dt=0.01, nu=0.1, U_inf=1.0,
+                          mono_solver="splu", device="cpu", assembly="device",
+                          predictor_solver="splu")
+    assert np.isfinite(out["mono"]["cd_mean"])
+    assert np.isfinite(out["proj"]["cd_mean"])
+
+
+def test_device_assembly_parity_cpu(device):
+    """assembly="device" on the CPU Warp device must match assembly="host"
+    to distribution tolerance (host-device assembly parity; on cpu the
+    scatter is deterministic so the tolerance is tight)."""
+    from p2r1a_thin_plate_flow import run_flow_past
+    kw = dict(level=4, nsteps=3, dt=0.01, nu=0.1, U_inf=1.0, verbose=False)
+    res_h = run_flow_past(assembly="host", **kw)
+    res_d = run_flow_past(assembly="device", **kw)
+    assert np.allclose(res_h["cd"], res_d["cd"], rtol=1e-9, atol=1e-11), (
+        f"device-assembly Cd diverged: {res_h['cd']} vs {res_d['cd']}")
+
+
+def test_device_assembly_parity_cpu_adaptive(device):
+    """assembly="device" works on the adaptive (hanging-node) mesh and matches
+    assembly="host" to distribution tolerance.
+
+    Evidence-based gate (C1 review finding): the csr_slots coverage experiment
+    on level=4, refine_to=6 (56 hanging nodes, 956 Af_c nnz) returned SUCCESS —
+    all Af_c entries are present in the constraint-aware device pattern.  The
+    preemptive ValueError was removed; this test documents the verified outcome.
+
+    Uses level=4, refine_to=6, nsteps=3 (fast; ~seconds on Mac CPU).
+    """
+    from p2r1a_thin_plate_flow import run_flow_past
+    kw = dict(level=4, refine_to=6, nsteps=3, dt=0.01, nu=0.1, U_inf=1.0,
+              verbose=False)
+    res_h = run_flow_past(assembly="host", **kw)
+    res_d = run_flow_past(assembly="device", **kw)
+    assert np.allclose(res_h["cd"], res_d["cd"], rtol=1e-9, atol=1e-11), (
+        f"device-assembly adaptive Cd diverged: {res_h['cd']} vs {res_d['cd']}")
+
+
+def test_on_step_default_parity():
+    """on_step=None must be bit-for-bit identical to the legacy march."""
+    from p2r1a_thin_plate_flow import run_flow_past
+    kw = dict(level=4, nsteps=3, dt=0.01, nu=0.1, U_inf=1.0, verbose=False)
+    res_a = run_flow_past(**kw)
+    res_b = run_flow_past(on_step=None, **kw)
+    assert np.allclose(res_a["cd"], res_b["cd"], rtol=0, atol=1e-14)
+
+def test_on_step_callback_contract():
+    """Callback fires once per step with full-mesh fields + that step's Cd."""
+    from p2r1a_thin_plate_flow import run_flow_past
+    calls = []
+    def spy(step, t, u_full, p_full, cd_step):
+        calls.append((step, t, u_full.shape, p_full.shape, cd_step))
+    res = run_flow_past(level=4, nsteps=3, dt=0.01, nu=0.1, U_inf=1.0,
+                        verbose=False, on_step=spy)
+    assert len(calls) == 3
+    n = calls[0][2][0]
+    assert calls[0][2] == (n, 2) and calls[0][3] == (n,)
+    # cd passed to the callback matches the returned history per step
+    for k, (step, t, _, _, cd_step) in enumerate(calls):
+        assert step == k and np.isclose(cd_step, res["cd"][k], rtol=0, atol=1e-14)
+
+
+def test_reaction_sets_default_parity():
+    """reaction_sets=None must be bit-for-bit identical to legacy march (atol=1e-14)."""
+    from p2r1a_thin_plate_flow import run_flow_past
+    kw = dict(level=4, nsteps=3, dt=0.01, nu=0.1, U_inf=1.0, verbose=False)
+    res_a = run_flow_past(**kw)
+    res_b = run_flow_past(reaction_sets=None, **kw)
+    assert np.allclose(res_a["cd"], res_b["cd"], rtol=0, atol=1e-14), (
+        f"reaction_sets=None changed cd: {res_a['cd']} vs {res_b['cd']}"
+    )
+    # reaction_hist must NOT be in the result when reaction_sets is None
+    assert "reaction_hist" not in res_b, \
+        "reaction_hist key present in result when reaction_sets=None"
+
+
+def _make_reaction_sets(level=4, L=0.25, x_c=0.375, y_c=0.5, U_inf=1.0):
+    """Build two plate-enclosing free-node index sets, minus strong-BC nodes.
+
+    Sets are within 1.5L and 2.5L of plate centre respectively; outer-boundary
+    nodes (inflow, walls) are excluded so the w_k indicator is zero on all
+    surgery rows.  This mirrors the GPU discriminator's set construction and is
+    the helper that makes the variational identity exact.
+    """
+    from diffsim.octree.build import build_uniform
+    from diffsim.mesh.nodes import build_mesh
+    from diffsim.mesh.constraints import build_constraints
+    from diffsim.sbm.surrogate import classify_shell_intercepted
+    from diffsim.geometry.csg import Segment
+    seg = Segment((x_c, y_c - L / 2), (x_c, y_c + L / 2))
+    tree = build_uniform(level, dim=2)
+    ret, _ = classify_shell_intercepted(tree, seg)
+    mesh = build_mesh(ret, p=1)
+    cons = build_constraints(mesh)
+    free_coords = mesh.node_coords[cons.free_nodes]
+    # Outer-boundary mask (inflow + top + bottom walls)
+    x_min, x_max = free_coords[:, 0].min(), free_coords[:, 0].max()
+    y_min, y_max = free_coords[:, 1].min(), free_coords[:, 1].max()
+    bc_mask = (
+        (np.abs(free_coords[:, 0] - x_min) < 1e-10) |
+        (np.abs(free_coords[:, 1] - y_min) < 1e-10) |
+        (np.abs(free_coords[:, 1] - y_max) < 1e-10)
+    )
+    # Outflow pressure-pin: x=x_max corner (pressure DOF — u_x DOF at that node
+    # is NOT forced, but to be safe exclude x_max nodes too since the u_y=0 is
+    # NOT imposed there but the pressure pin IS on one of them; exclude x_max
+    # conservatively to avoid the pin).
+    # Actually: the pressure pin is on a pressure DOF (ndof*i + dim), not u_x.
+    # The u_x DOF of outflow nodes is free. But bc_rows only contains inflow/walls.
+    # Still, be conservative and exclude outflow nodes to avoid edge effects.
+    bc_mask |= (np.abs(free_coords[:, 0] - x_max) < 1e-10)
+    # Build two sets: within 1.5L and 2.5L of plate center, minus BC nodes
+    dist = np.sqrt((free_coords[:, 0] - x_c)**2 + (free_coords[:, 1] - y_c)**2)
+    set1 = np.where((dist <= 1.5 * L) & ~bc_mask)[0]
+    set2 = np.where((dist <= 2.5 * L) & ~bc_mask)[0]
+    return set1, set2
+
+
+def test_reaction_sets_returns_hist_shape():
+    """reaction_sets=[s1, s2] => reaction_hist has shape [nsteps, 2], all finite."""
+    from p2r1a_thin_plate_flow import run_flow_past
+    set1, set2 = _make_reaction_sets(level=4)
+    nsteps = 3
+    res = run_flow_past(level=4, nsteps=nsteps, dt=0.01, nu=0.1, U_inf=1.0,
+                        verbose=False, reaction_sets=[set1, set2])
+    assert "reaction_hist" in res, "reaction_hist missing from result"
+    rh = res["reaction_hist"]
+    assert rh.shape == (nsteps, 2), f"reaction_hist shape {rh.shape} != ({nsteps}, 2)"
+    assert np.all(np.isfinite(rh)), f"reaction_hist has non-finite values: {rh}"

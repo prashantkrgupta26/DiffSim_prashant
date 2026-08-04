@@ -23,7 +23,7 @@ if [ -e "$GPUBOX_LOCK" ]; then
 fi
 : > "$GPUBOX_LOCK"
 if ! tmux new-session -d -s "$sess" \
-  "trap 'rm -f \"$GPUBOX_LOCK\"' EXIT; cd '$GPUBOX_REPO_ABS' && { $cmd ; } 2>&1 | tee '$log'"; then
+  "trap 'rm -f \"$GPUBOX_LOCK\"' EXIT; cd '$GPUBOX_REPO_ABS' && { env $GPUBOX_GPU_ENV $cmd ; } 2>&1 | tee '$log'"; then
   rm -f "$GPUBOX_LOCK"
   echo "tmux failed to launch — cleared lock." >&2
   exit 5

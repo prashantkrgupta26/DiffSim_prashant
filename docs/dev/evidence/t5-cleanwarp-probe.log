@@ -1,0 +1,50 @@
+[clean-probe] 2026-07-30T10:05:47Z start cache=/work/mech-ai/baskarg/DiffSim/.warp-cache-clean (NO graft, fresh cache) log=cluster/results/t5-cleanwarp-probe-20260730T100547Z.log
+
+[] WARP 1.15.0
+/work/mech-ai/baskarg/DiffSim/cluster/t5_probe.py:10: UserWarning: load_truck_config: ignoring unrecognized top-level keys: AverageOutput, AverageOutputInterval, Cb_e, Cb_f_bulk, CheckpointInterval, CheckpointNumbackup, Ci_e, G_dir, Gr_V, Gr_ramping, HeatSolverType, HeatTimestepper, NavierStokesSolverType, OutputStartTime, Pe_V, Pe_ramping, PostProcessingInterval, ReSolverRampMaxEffort, ReSolverRampOutput, ReSolverRampReduceOnStruggle, ReSolverRampReduction, ReSolverRampStableSteps, RemoveInterceptedForShell_CompleteOctree, SolveHT, SolveNS, blockTolerance, ifInter, initial_condition, iterMaxBlock, solver_options_ht, solver_options_ns, tauM_scale, thetaTimeStepping
+  cfg=load_truck_config(CONF); scale=cfg.domain_scale; dt=0.01*scale
+Warp 1.15.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "aarch64"
+     "cuda:0"   : "NVIDIA GH200 480GB" (95 GiB, sm_90, mempool enabled)
+   Kernel cache:
+     /work/mech-ai/baskarg/DiffSim/.warp-cache-clean/1.15.0
+cuda True NVIDIA GH200 480GB
+Module _make_query_kernel__locals__trimesh_query_7504a757 7504a75 load on device 'cuda:0' took 381.99 ms  (compiled)
+[truck] cells=1950196 carved=439052 slab_cut=0 sf=91908 nsteps=3 dt=0.000625 nu=0.01 alpha=20.0
+Module make_sbm_dirichlet_Ae__locals__sbm_dir_Ae_1913307a 1913307 load on device 'cuda:0' took 757.07 ms  (compiled)
+Module make_sbm_dirichlet_be__locals__sbm_dir_be_f3d53b05 f3d53b0 load on device 'cuda:0' took 134.94 ms  (compiled)
+Module make_linear_ns_Ae__locals__lin_ns_Ae_23b38efa 23b38ef load on device 'cuda:0' took 111.14 ms  (compiled)
+Module _scatter_weighted_kernel_chunked__locals__scwc_5494f6ff 5494f6f load on device 'cuda:0' took 99.11 ms  (compiled)
+Module make_linear_ns_be__locals__lin_ns_be_fd4cb29b fd4cb29 load on device 'cuda:0' took 317.91 ms  (compiled)
+Module _scatter_vec_weighted_kernel__locals__scvw_58216abb 58216ab load on device 'cuda:0' took 80.84 ms  (compiled)
+Module _scatter_kernel_chunked__locals__scat_18c49925 18c4992 load on device 'cuda:0' took 85.43 ms  (compiled)
+Module _zero_slots_kernel_chunked__locals__zk_5a9c7c9a 5a9c7c9 load on device 'cuda:0' took 82.70 ms  (compiled)
+Module _diag_one_kernel_chunked__locals__dk_1783be85 1783be8 load on device 'cuda:0' took 89.18 ms  (compiled)
+Module _gather_kernel_chunked__locals__gat_58889783 5888978 load on device 'cuda:0' took 97.37 ms  (compiled)
+Module _make_kernels__locals__dot_partial_73c59ca3 73c59ca load on device 'cuda:0' took 82.99 ms  (compiled)
+Module _make_kernels__locals__reduce_to_9929054e 9929054 load on device 'cuda:0' took 75.56 ms  (compiled)
+Module _make_kernels__locals__store_normed_7e8b3877 7e8b387 load on device 'cuda:0' took 77.84 ms  (compiled)
+Module _make_kernels__locals__zero_g_set0_d53a08ce d53a08c load on device 'cuda:0' took 73.90 ms  (compiled)
+Module _make_kernels__locals__copy_from_row_0839d18d 0839d18 load on device 'cuda:0' took 75.81 ms  (compiled)
+Module _bdiag_kernel__locals__bdiag_apply_1ee3faa0 1ee3faa load on device 'cuda:0' took 74.50 ms  (compiled)
+Module _make_kernels__locals__copy_to_row_65801df7 65801df load on device 'cuda:0' took 75.09 ms  (compiled)
+Module make_csr_spmv_chunked__locals__spmv_ch_35afa75b 35afa75 load on device 'cuda:0' took 92.65 ms  (compiled)
+Module _make_kernels__locals__dot_row_773e847e 773e847 load on device 'cuda:0' took 95.02 ms  (compiled)
+Module _make_kernels__locals__dot_to_H_bfc9737c bfc9737 load on device 'cuda:0' took 74.45 ms  (compiled)
+Module _make_kernels__locals__axpy_row_22ea1b41 22ea1b4 load on device 'cuda:0' took 76.94 ms  (compiled)
+Module _make_kernels__locals__hnorm_from_scal_0b18accd 0b18acc load on device 'cuda:0' took 74.61 ms  (compiled)
+Module _make_kernels__locals__givens_apply_and_update_cde3ea31 cde3ea3 load on device 'cuda:0' took 84.38 ms  (compiled)
+Module _make_kernels__locals__back_solve_c57ff9e4 c57ff9e load on device 'cuda:0' took 79.98 ms  (compiled)
+Module _make_combine_kernel__locals__combine_9b752ff3 9b752ff load on device 'cuda:0' took 79.09 ms  (compiled)
+[truck] step   0  Cd_react=-0.0000  Cd_surr=-1008.8049
+  step0 cd=-0.00000 cd_surr=-1008.8 t=572.2
+Module _sub__locals__vsub_889c699d 889c699 load on device 'cuda:0' took 102.50 ms  (compiled)
+[truck] step   1  Cd_react=-0.0000  Cd_surr=-2343.2760
+  step1 cd=-0.00000 cd_surr=-2343.3 t=600.1
+[truck] step   2  Cd_react=-0.0000  Cd_surr=-4547.4717
+  step2 cd=-0.00000 cd_surr=-4547.5 t=607.1
+[truck] done in 607.1s
+GPU-DEVICE-PATH OK cells= 1950196 cd= [np.float64(-0.0), np.float64(-0.0), np.float64(-0.0)]
+[clean-probe] 2026-07-30T10:16:01Z done rc=0

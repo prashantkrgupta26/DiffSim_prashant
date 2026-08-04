@@ -133,6 +133,12 @@ def amgx_solve(A, b, sym=False, tol=1e-10, maxiter=2000,
     # settings gets a matching solver instead of silently inheriting the
     # first call's (evaluation solver-review item, CONFIRMED). Resources
     # remain shared per the lifetime rule via the first-created state.
+    # CAVEAT (T2 review): callers sharing a key share the singleton matrix
+    # object — two DIFFERENT simultaneously-live matrices with identical
+    # (sym, tol, maxiter) would thrash the fingerprint check (results stay
+    # correct, but every alternation forces a full re-setup). Keep
+    # tol/maxiter distinct per live matrix (PCD F-inner: 1e-4/50;
+    # direct "amgx" solves: typically 1e-10/2000).
     key = ("singleton", bool(sym), float(tol), int(maxiter))
     state = _ctx.get(key)
     if state is None:
@@ -147,21 +153,34 @@ def amgx_solve(A, b, sym=False, tol=1e-10, maxiter=2000,
         _ctx[key] = state
 
     M, X, B, slv = state["M"], state["X"], state["B"], state["slv"]
-    # ---- SETUP-REUSE: fingerprint the sparsity; when unchanged, only push
-    # the new coefficient VALUES and reuse the built AMG hierarchy (skip the
-    # expensive setup). Otherwise re-upload the pattern and re-setup. ----
-    fp = _sparsity_fingerprint(A)
-    reuse = _SETUP_REUSE and state["fp"] is not None and state["fp"] == fp
+    # ---- IDENTITY FAST PATH (sesc Rung 1): within one outer solve the
+    # F-inner passes the SAME csr object with the SAME data buffer on every
+    # apply.  At 0.6B nnz the sparsity fingerprint alone costs a 2.5 GB
+    # tobytes copy per call and the values re-upload another ~5 GB — pure
+    # waste when literally nothing changed.  Key on (id(A), id(A.data)):
+    # any new object or rebound data buffer falls through to the fingerprint
+    # path; in-place mutation of the SAME data buffer is outside this
+    # module's contract (callers construct fresh CSRs per assembly).
+    _ident = (id(A), id(A.data))
     t0 = time.perf_counter()
-    if reuse:
-        # Same pattern: only the values changed. AMGX expects the CSR VALUES
-        # array in the same (sorted) order that was uploaded originally.
-        M.replace_coefficients(np.ascontiguousarray(A.data, np.float64))
-        # No slv.setup(): the coarse hierarchy from the first setup is reused.
+    if _SETUP_REUSE and state.get("ident") == _ident:
+        reuse = True  # hierarchy AND values already uploaded — nothing to do
     else:
-        M.upload_CSR(A)
-        slv.setup(M)
-        state["fp"] = fp
+        # ---- SETUP-REUSE: fingerprint the sparsity; when unchanged, only
+        # push the new coefficient VALUES and reuse the built AMG hierarchy
+        # (skip the expensive setup). Otherwise re-upload + re-setup. ----
+        fp = _sparsity_fingerprint(A)
+        reuse = _SETUP_REUSE and state["fp"] is not None and state["fp"] == fp
+        if reuse:
+            # Same pattern: only the values changed. AMGX expects the CSR
+            # VALUES array in the same (sorted) order originally uploaded.
+            M.replace_coefficients(np.ascontiguousarray(A.data, np.float64))
+            # No slv.setup(): the hierarchy from the first setup is reused.
+        else:
+            M.upload_CSR(A)
+            slv.setup(M)
+            state["fp"] = fp
+        state["ident"] = _ident
     t_setup = time.perf_counter() - t0
     B.upload(np.ascontiguousarray(b, np.float64))
     x = np.zeros_like(b)
@@ -169,7 +188,12 @@ def amgx_solve(A, b, sym=False, tol=1e-10, maxiter=2000,
     t1 = time.perf_counter()
     slv.solve(B, X)
     t_solve = time.perf_counter() - t1
-    if slv.status not in ("success",):
+    # "not_converged" means maxiter was hit — accept the truncated iterate
+    # (it is used as a smoother in the PCD F-inner; the outer FGMRES carries
+    # the remaining residual, same as the Jacobi-CG cap_hits convention).
+    # Any other non-success status (e.g. "numerical_issues", "crashed") still
+    # raises so genuine AMGX failures surface.
+    if slv.status not in ("success", "not_converged"):
         raise RuntimeError(f"AMGX solve status: {slv.status}")
     X.download(x)
     # telemetry for the scaling harness (best-effort; ignore if unavailable)

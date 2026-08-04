@@ -35,6 +35,18 @@ from ..errors import BackendError, ConvergenceError
 
 _CUDSS_OPTS = ...          # lazily built by cudss_options()
 
+# Iteration-count sentinel written by backends that track iteration counts and
+# read by the return_result wrapper (allows cacheless callers to get iters).
+# Single-element list so it is mutable from nested call frames.
+_LAST_ITERS = [None]
+
+# Inner-stats sentinel written by fgmres_pcd after each solve and read by the
+# return_result wrapper.  Schema: {"F": {...}, "Ap": {...}, "Mp": {...}} where
+# each dict has keys applies/iters_total/cap_hits/max_exit_relres.
+# None when the last solve was not fgmres_pcd or stats were not collected.
+_LAST_INNER_STATS = [None]
+
+
 
 def cudss_options():
     """DirectSolverOptions with multithreaded host planning
@@ -1057,19 +1069,34 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
     device = default_device() if device is None else device
     if return_result:
         from .result import LinearSolveResult
+        _LAST_ITERS[0] = None          # cleared before every call
+        _LAST_INNER_STATS[0] = None    # cleared before every call
         x = solve_linear(A, b, solver=solver, sym=sym, tol=tol,
                          maxiter=maxiter, device=device, cache=cache,
                          cache_key=cache_key)
-        iters = None
-        if cache is not None and cache_key is not None:
+        iters = _LAST_ITERS[0]         # written by backends that track iters
+        if iters is None and cache is not None and cache_key is not None:
             rec = cache.get(("blockch_iters", cache_key))
             if rec is not None:
                 iters = rec[0]
+        inner_stats = _LAST_INNER_STATS[0]   # written by fgmres_pcd
         return LinearSolveResult(x=x, converged=True, iterations=iters,
-                                 backend=solver, reason="converged")
-    A = A.tocsr()
+                                 backend=solver, reason="converged",
+                                 inner_stats=inner_stats)
+    # W2c: device-resident CSR handoff.  A DeviceSaddleCSR keeps the assembled
+    # values on device; the saddle iterative backends (fgmres_bdiag /
+    # fused_bdiag) consume them via a Warp SpMV + device-gathered diagonal, so
+    # we must NOT call A.tocsr() (the 19 GB pull we are eliminating).  Any other
+    # solver still gets the host CSR through .tocsr() (transparent fallback).
+    from ..assembly.device_assembly import DeviceSaddleCSR
+    _dev_handoff = A if isinstance(A, DeviceSaddleCSR) else None
+    if _dev_handoff is None:
+        A = A.tocsr()
+    elif solver not in ("fgmres_bdiag", "fused_bdiag"):
+        A = A.tocsr()          # unsupported solver: fall back to host pull
     if cache is not None and cache_key is not None \
-            and solver not in ("blockch", "blockamgx"):
+            and solver not in ("blockch", "blockamgx",
+                               "fgmres_bdiag", "fgmres_pcd", "fused_bdiag"):
         # cheap staleness guard (evaluation solver-review item): cached
         # factorizations are for CONSTANT matrices — catch reuse of a key
         # after the matrix changed shape/pattern (values are the caller's
@@ -1077,6 +1104,10 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         # blockch is EXEMPT: it caches meta/iteration records only and
         # rebuilds its factors per call — the host T^T K T pattern
         # legitimately flaps under multiphase noise (the S2 finding).
+        # fgmres_bdiag / fgmres_pcd are EXEMPT: the cache carries only
+        # preconditioner META (pcd_meta, ndof) assembled from the mesh
+        # once per BDF order — NOT matrix factorizations; the A changes
+        # every step (Picard convection) and that is expected.
         fp = (A.shape, A.nnz, str(A.dtype))
         old = cache.get(("fingerprint", cache_key))
         if old is None:
@@ -1113,6 +1144,72 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
                          diag=diag, check_every=100)
         if not info.get("converged"):
             raise ConvergenceError(f"fused solve failed: {info}")
+        return x
+
+    if solver == "fused_bdiag":
+        # W5a: block-diagonal preconditioned BiCGStab for the (u, p) saddle.
+        # CSROperator + make_bdiag_apply feed bicgstab_dev via the apply_dev
+        # hook (general right-preconditioner, legacy loop — no Krylov basis).
+        # ndof recovered from blocktri_meta (same convention as fgmres_bdiag).
+        from ..assembly.operators import CSROperator
+        from .krylov_dev import bicgstab_dev
+        from .saddle_precond import make_bdiag_apply
+
+        meta = (cache or {}).get(("blocktri_meta", cache_key), {})
+        ndof = meta.get("ndof", 3)
+
+        # T4b equilibration knob (same semantics as fgmres_bdiag).
+        _equilibrate = bool(meta.get("saddle_equilibrate", False))
+
+        _bdiag_block = meta.get("bdiag_block", "scalar")
+        _diag_host = None
+        if _dev_handoff is not None and _bdiag_block == "scalar":
+            # W2c device-resident fast path (see fgmres_bdiag for rationale).
+            from .saddle_precond import make_bdiag_apply_from_diag
+            op = _dev_handoff.device_operator()
+            _diag_dev = _dev_handoff.diagonal_device()
+            apply_bdiag = make_bdiag_apply_from_diag(_diag_dev, ndof, device)
+            if _equilibrate:
+                _diag_host = (_diag_dev.numpy() if hasattr(_diag_dev, "numpy")
+                              else np.asarray(_diag_dev))
+        else:
+            if _dev_handoff is not None:
+                A = _dev_handoff.tocsr()   # node-block: needs host CSR blocks
+            op = CSROperator(A, device)
+            # W5d knob (same convention as fgmres_bdiag): opt-in node-block Jacobi.
+            apply_bdiag = make_bdiag_apply(A, ndof, device, block=_bdiag_block)
+            if _equilibrate:
+                _diag_host = np.asarray(A.diagonal()).copy()
+
+        if _equilibrate:
+            # T4b: run BiCGStab on the equilibrated system A_hat = D^{-1/2} A
+            # D^{-1/2}.  The wrapped operator carries the scaled matvec; the
+            # apply is built from the scaled diagonal (~identity) — the same
+            # algebra as fgmres_bdiag.  The wrapper is not a CSROperator so
+            # this takes the legacy (apply_dev) loop, which is correct here.
+            import warp as wp
+            from .saddle_precond import make_equilibrated_solve
+            N = op.n_free
+            _mvh, _bhat, _recover, apply_bdiag = make_equilibrated_solve(
+                op.matvec, b, _diag_host, N, device, ndof)
+
+            class _EqOp:
+                device = op.device
+                n_free = N
+                def matvec(self, x, y):
+                    _mvh(x, y)
+            x_hat, info = bicgstab_dev(_EqOp(), _bhat.numpy(), tol=tol,
+                                       atol=1e-13, maxiter=maxiter,
+                                       check_every=100, apply_dev=apply_bdiag)
+            x = _recover(x_hat)
+        else:
+            x, info = bicgstab_dev(op, b, tol=tol, atol=1e-13, maxiter=maxiter,
+                                   check_every=100, apply_dev=apply_bdiag)
+        _LAST_ITERS[0] = info.get("iters")
+        if not info.get("converged"):
+            raise ConvergenceError(
+                f"fused_bdiag: not converged after {info.get('iters')} "
+                f"iterations; relres={info.get('relres', float('inf')):.3e}")
         return x
 
     if solver == "gpu_cg":
@@ -1476,6 +1573,294 @@ def solve_linear(A, b, solver="splu", sym=False, tol=1e-10, maxiter=40000,
         if cache is not None and cache_key is not None:
             cache[("blockamgx_iters", cache_key)] = (iters,)
         return x
+
+    if solver == "fgmres_bdiag":
+        # Task A1: block-diagonal (Jacobi-by-block) preconditioned FGMRES for
+        # the monolithic (u, p) saddle system.  The preconditioner applies
+        # independent Jacobi scaling to the velocity block and the
+        # PSPG-stabilized pressure block (with a 1e-12 relative floor on |d_p|
+        # so near-zero pressure pivots do not amplify noise).
+        # CSR construction mirrors the "fused" backend pattern; the outer
+        # Krylov is fgmres_dev (device-resident flexible GMRES, restart configurable via saddle_restart meta (default 60)).
+        #
+        # A3 knob A — restart: opt-in via meta["saddle_restart"] (set by the
+        # driver from SADDLE_RESTART env) or the "saddle_restart" cache entry.
+        # Default 60 is bit-for-bit identical to the prior hardcoded value.
+        # cycles divisor always equals restart so the total-iteration cap is
+        # consistent regardless of restart length.
+        #
+        # A3 knob B — warm-start x0: opt-in via meta["saddle_x0"] = "extrap".
+        # The driver stores the last two solution vectors in the cache under
+        # ("bdiag_x_prev", cache_key) and ("bdiag_x_prev2", cache_key).
+        # x0 = 2*x^n - x^{n-1} (linear extrapolation); first two steps fall
+        # back to x^n or zero.  Default None = cold start, byte-identical.
+        from ..assembly.operators import CSROperator
+        from .fgmres_dev import fgmres_dev
+        from .saddle_precond import make_bdiag_apply
+        import warp as wp
+
+        # ndof: caller's contract for the monolithic saddle is ndof = dim+1.
+        # We recover ndof from the blocktri_meta cache slot when available
+        # (same convention used by "blocktri"), otherwise default to 3 (2-D).
+        meta = (cache or {}).get(("blocktri_meta", cache_key), {})
+        ndof = meta.get("ndof", 3)
+
+        # A3 knob A: restart length (opt-in, default 60)
+        _restart = int(meta.get("saddle_restart", 60))
+
+        # Krylov restart advisor: when running on a CUDA device, estimate the
+        # flexible-FGMRES V+Z storage (2·restart·8·N bytes) and warn once per
+        # cache key if it exceeds 50% of free VRAM.  LOG-ONLY: never changes
+        # _restart.  No-op on CPU paths (guarded by is_cuda) and safe against
+        # API mismatches (free_memory query wrapped in try/except).
+        _advisor_key = ("_bdiag_restart_advised", cache_key)
+        if (cache is not None and cache_key is not None
+                and not cache.get(_advisor_key)):
+            try:
+                _wd = wp.get_device(device)
+                if _wd.is_cuda:
+                    _N_adv = len(b)
+                    _krylov_bytes = 2 * _restart * 8 * _N_adv
+                    _free_vram = _wd.free_memory
+                    if _free_vram > 0 and _krylov_bytes > 0.5 * _free_vram:
+                        _suggested = max(
+                            1, int(0.4 * _free_vram / (8 * _N_adv)))
+                        print(
+                            f"[saddle] RESTART-ADVISOR: restart={_restart} "
+                            f"needs V+Z≈{_krylov_bytes/2**30:.2f} GiB "
+                            f"(>50% of {_free_vram/2**30:.2f} GiB free VRAM "
+                            f"at N={_N_adv}); "
+                            f"suggested restart≤{_suggested}",
+                            flush=True)
+            except Exception:
+                pass   # API mismatch or non-CUDA build — skip silently
+            cache[_advisor_key] = True
+
+        # T4b knob — symmetric diagonal EQUILIBRATION (opt-in via
+        # meta["saddle_equilibrate"], set by the driver from SADDLE_EQUILIBRATE).
+        # Solve (D^{-1/2} A D^{-1/2}) y = D^{-1/2} b, x = D^{-1/2} y with
+        # D = |diag(A)| (floored).  This collapses a many-order diagonal span
+        # (Cb_f Nitsche penalties on fine surrogate faces vs coarse bulk) to
+        # O(1), changing the metric the unpreconditioned-residual FGMRES
+        # minimizes and breaking the scalar-Jacobi relres floor.  After scaling
+        # diag(A_hat) = +-1, so the bdiag apply on the scaled system is
+        # ~identity — equilibration REPLACES the Jacobi preconditioner (the
+        # apply is built from the scaled diagonal, which keeps the pressure
+        # floor exact).  Default off = byte-identical.
+        _equilibrate = bool(meta.get("saddle_equilibrate", False))
+
+        _bdiag_block = meta.get("bdiag_block", "scalar")
+        _diag_host = None                 # populated for the equilibrate path
+        if _dev_handoff is not None and _bdiag_block == "scalar":
+            # W2c device-resident fast path: SpMV over the resident CSR values
+            # (no re-upload) + preconditioner diagonal from a device gather
+            # (73 MB download vs the 19 GB values pull).  Only the scalar
+            # bdiag needs the diagonal alone; node-block Jacobi needs full CSR
+            # sub-blocks and takes the host fallback below.
+            from .saddle_precond import make_bdiag_apply_from_diag
+            op = _dev_handoff.device_operator()
+            _diag_dev = _dev_handoff.diagonal_device()
+            apply_dev = make_bdiag_apply_from_diag(_diag_dev, ndof, device)
+            N = _dev_handoff.shape[0]
+            if _equilibrate:
+                _diag_host = (_diag_dev.numpy() if hasattr(_diag_dev, "numpy")
+                              else np.asarray(_diag_dev))
+        else:
+            if _dev_handoff is not None:
+                A = _dev_handoff.tocsr()   # node-block: needs host CSR blocks
+            op = CSROperator(A, device)
+            # W5d knob: bdiag_block="node" upgrades scalar Jacobi to per-node
+            # ndof x ndof block Jacobi (opt-in via blocktri_meta; default scalar).
+            apply_dev = make_bdiag_apply(A, ndof, device, block=_bdiag_block)
+            N = A.shape[0]
+            if _equilibrate:
+                _diag_host = np.asarray(A.diagonal()).copy()
+
+        # T4b: replace op.matvec/rhs/apply with the equilibrated forms (the
+        # solution is recovered after fgmres via `recover`).
+        _matvec = op.matvec
+        _recover = None
+        if _equilibrate:
+            from .saddle_precond import make_equilibrated_solve
+            _matvec, b_dev_eq, _recover, apply_dev = make_equilibrated_solve(
+                op.matvec, b, _diag_host, N, device, ndof)
+
+        b_dev = wp.array(np.ascontiguousarray(b, np.float64),
+                         dtype=wp.float64, device=device)
+        if _equilibrate:
+            b_dev = b_dev_eq
+        # cycles × restart bounds total inner iterations; divisor == restart
+        cycles = min(200, max(1, maxiter // _restart))
+
+        # A3 knob B: warm-start initial guess (opt-in via saddle_x0="extrap")
+        _x0_mode = meta.get("saddle_x0")
+        x0_dev = None
+        if _x0_mode == "extrap" and cache is not None and cache_key is not None:
+            _xn = cache.get(("bdiag_x_prev", cache_key))   # x^n (last step)
+            _xn1 = cache.get(("bdiag_x_prev2", cache_key)) # x^{n-1}
+            if _xn is not None and _xn1 is not None:
+                # linear extrapolation: x0 = 2*x^n - x^{n-1}
+                x0_np = 2.0 * _xn - _xn1
+                x0_dev = wp.array(np.ascontiguousarray(x0_np, np.float64),
+                                  dtype=wp.float64, device=device)
+            elif _xn is not None:
+                # only one prior step: use x^n as initial guess
+                x0_dev = wp.array(np.ascontiguousarray(_xn, np.float64),
+                                  dtype=wp.float64, device=device)
+            # else: first step — cold start (x0_dev stays None)
+
+        # T4b: under equilibration the outer solve is in the SCALED space
+        # (y = D^{1/2} x); the warm-start guess must be pre-scaled the same
+        # way: y0 = x0 / s  (s = D^{-1/2}).  We recover x = s .* y after.
+        if _equilibrate and x0_dev is not None:
+            _x0h = x0_dev.numpy() / _recover(np.ones(N))  # = x0 * D^{1/2}
+            x0_dev = wp.array(np.ascontiguousarray(_x0h, np.float64),
+                              dtype=wp.float64, device=device)
+
+        x_dev, finfo = fgmres_dev(
+            _matvec, b_dev, apply_dev, N, device,
+            tol=tol, atol=1e-13, restart=_restart, maxiter=cycles,
+            x0_dev=x0_dev)
+
+        # min-work drift-guard (truck five-leg forensics; meta knob
+        # saddle_min_work like its siblings): under a
+        # loose tol + warm start, entry residuals below tol get accepted
+        # with ZERO iterations, and the unsolved drift compounds across
+        # steps until the march collapses (the tol=1e-3 failure mode).
+        # When enabled, an iters==0 acceptance is followed by ONE polishing
+        # restart cycle targeting a 4x residual reduction; its result is
+        # accepted regardless of the convergence flag (it is a polish, not
+        # a gate).  Default off = byte-identical.
+        if (meta.get("saddle_min_work")
+                and finfo.get("converged") and finfo.get("inner", 0) == 0):
+            _r0 = float(finfo.get("relres", 0.0))
+            if _r0 > 0.0:
+                x_dev, _finfo2 = fgmres_dev(
+                    _matvec, b_dev, apply_dev, N, device,
+                    tol=0.25 * _r0, atol=1e-13, restart=_restart,
+                    maxiter=1, x0_dev=x_dev)
+                finfo = dict(finfo)
+                finfo["inner"] = int(_finfo2.get("inner", 0))
+                finfo["relres"] = _finfo2.get("relres", _r0)
+                finfo["converged"] = True   # polish never gates
+
+        # Per-solve miss telemetry for the driver, via the same meta side
+        # channel as the accept-miss flag: True iff this solve ended
+        # non-converged (the driver clears it if a fallback then converges).
+        meta["last_solve_miss"] = not bool(finfo["converged"])
+
+        if not finfo["converged"]:
+            # Baskar directive (T5): solve misses during the initial
+            # transient are acceptable — accept the truncated iterate, LOG
+            # the achieved relres, and march on (the caller's blow-up
+            # sentinel guards against drift masquerading as progress).
+            # Windowing is the caller's job: it sets/clears the meta flag
+            # per step.  Default (flag absent) = strict raise, byte-
+            # identical.
+            if meta.get("saddle_accept_miss"):
+                print(f"[saddle] ACCEPT-MISS: relres={finfo['relres']:.3e} "
+                      f"after {finfo['inner']} inner ({finfo['outer']} "
+                      f"restarts) vs tol={tol:.1e}", flush=True)
+            else:
+                print(f"[saddle] BUDGET-EXHAUSTED fgmres_bdiag: "
+                      f"relres={finfo['relres']:.3e} after {finfo['inner']} "
+                      f"inner ({finfo['outer']} restarts) — primary budget "
+                      f"exhausted, raising for caller fallback", flush=True)
+                raise ConvergenceError(
+                    f"fgmres_bdiag: not converged after {finfo['inner']} inner "
+                    f"iterations ({finfo['outer']} restarts); "
+                    f"relres={finfo['relres']:.3e}")
+
+        # T4b: recover x = D^{-1/2} y from the scaled solution.
+        if _equilibrate:
+            _x_np = _recover(x_dev)
+            x_dev = wp.array(np.ascontiguousarray(_x_np, np.float64),
+                             dtype=wp.float64, device=device)
+
+        # Publish iteration count to the module sentinel so the return_result
+        # wrapper (which calls us without return_result=True) can surface it.
+        _LAST_ITERS[0] = finfo["inner"]
+
+        # A3 knob B: store solution for next-step warm start (no-op when
+        # saddle_x0 is not "extrap" — cache keys unused in that case).
+        if _x0_mode == "extrap" and cache is not None and cache_key is not None:
+            _xn_cur = x_dev.numpy()
+            _xn_old = cache.get(("bdiag_x_prev", cache_key))
+            if _xn_old is not None:
+                cache[("bdiag_x_prev2", cache_key)] = _xn_old
+            cache[("bdiag_x_prev", cache_key)] = _xn_cur
+
+        return x_dev.numpy()
+
+    if solver == "fgmres_pcd":
+        # Task A3: PCD (pressure convection-diffusion) Schur-complement
+        # preconditioned FGMRES for the monolithic (u, p) saddle.  The
+        # preconditioner is upper-block-triangular:
+        #     z_p = S^{-1} r_p,  S^{-1} ~ sigma Ap^{-1} + nu Mp^{-1}
+        #     z_u = F^{-1} (r_u - G z_p)
+        # with F the velocity block extracted from A, G the pressure-gradient
+        # block, and Ap/Mp the pressure-space stiffness/mass assembled ONCE per
+        # mesh from dm (build_pcd_meta) and passed via the cache under
+        # ("pcd_meta", cache_key) — the backend cannot see dm.  Inner solves are
+        # loose Jacobi-CG (preconditioner strength; the outer FGMRES gates).
+        # Mirrors the fgmres_bdiag branch (same fgmres_dev, restart, cycles,
+        # iteration-sentinel plumbing).
+        from ..assembly.operators import CSROperator
+        from .fgmres_dev import fgmres_dev
+        from .saddle_precond import make_pcd_apply
+        import warp as wp
+
+        meta = (cache or {}).get(("pcd_meta", cache_key))
+        if meta is None:
+            raise ValueError(
+                "fgmres_pcd requires ('pcd_meta', cache_key) in cache — build "
+                "it once per mesh via saddle_precond.build_pcd_meta(dm, nu, "
+                "sigma) and pass cache=/cache_key=")
+
+        # Truck-fallback memory fix: when A is a DeviceSaddleCSR (device-
+        # resident handoff), reuse its resident SpMV for the outer matvec
+        # instead of uploading a SECOND full device CSR (the ~19 GB duplicate
+        # that OOMed the truck fallback at 77 GB committed).  The
+        # preconditioner blocks (F/G/Ap/Mp extraction) still need one host
+        # pull — only F is re-uploaded to device (~half the saddle nnz).
+        if hasattr(A, "device_operator"):
+            op = A.device_operator()          # resident CSR, no re-upload
+            A_pc = A.tocsr()                  # host pull for block extraction
+        else:
+            op = CSROperator(A, device)
+            A_pc = A
+        # T1: per-block inner-solve telemetry — create the accumulator dict
+        # and pass it to make_pcd_apply; after the solve, publish it to the
+        # module sentinel so return_result=True can copy it to inner_stats.
+        _inner_stats: dict = {
+            blk: {"applies": 0, "iters_total": 0,
+                  "cap_hits": 0, "max_exit_relres": 0.0}
+            for blk in ("F", "Ap", "Mp")
+        }
+        apply_dev = make_pcd_apply(A_pc, meta, device, stats=_inner_stats)
+        N = A.shape[0]
+
+        b_dev = wp.array(np.ascontiguousarray(b, np.float64),
+                         dtype=wp.float64, device=device)
+        # pcd_restart (meta knob, default 60 = byte-identical): flexible
+        # FGMRES stores V+Z = 2*restart*8N bytes — at 10M+ DOF alongside an
+        # AMGX F-hierarchy this is the difference between fitting in HBM and
+        # an AMGX "CUDA kernel launch error" (OOM in disguise; sesc Rung 1).
+        _pcd_restart = int(meta.get("pcd_restart", 60))
+        cycles = min(200, max(1, maxiter // _pcd_restart))
+        x_dev, finfo = fgmres_dev(
+            op.matvec, b_dev, apply_dev, N, device,
+            tol=tol, atol=1e-13, restart=_pcd_restart, maxiter=cycles)
+
+        if not finfo["converged"]:
+            raise ConvergenceError(
+                f"fgmres_pcd: not converged after {finfo['inner']} inner "
+                f"iterations ({finfo['outer']} restarts); "
+                f"relres={finfo['relres']:.3e}")
+
+        _LAST_ITERS[0] = finfo["inner"]
+        _LAST_INNER_STATS[0] = _inner_stats   # T1: publish for return_result
+        return x_dev.numpy()
 
     from ..errors import ConfigError
     raise ConfigError(f"unknown solver '{solver}'")

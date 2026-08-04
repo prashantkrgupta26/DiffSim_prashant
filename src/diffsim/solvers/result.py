@@ -48,6 +48,15 @@ class LinearSolveResult:
     backend: str = ""
     reason: str = "converged"
     info: dict = field(default_factory=dict)
+    inner_stats: Optional[dict] = None
+    """Per-block inner-solve telemetry; currently populated by the
+    ``fgmres_pcd`` backend.  Schema::
+
+        {"F":  {"applies": int, "iters_total": int,
+                "cap_hits": int, "max_exit_relres": float},
+         "Ap": {...}, "Mp": {...}}
+
+    ``None`` for solvers that do not instrument inner solves."""
 
     def __iter__(self):
         # tuple back-compat: ``x, info = result``

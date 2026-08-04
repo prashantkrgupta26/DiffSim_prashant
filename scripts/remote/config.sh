@@ -15,6 +15,11 @@ export GPUBOX_LOGDIR="${GPUBOX_LOGDIR:-$GPUBOX_REPO_ABS/logs}"
 export GPUBOX_GIT_REMOTE="${GPUBOX_GIT_REMOTE:-gpubox}"             # name of ssh git remote on the Mac
 export GPUBOX_GIT_URL="${GPUBOX_GIT_URL:-$GPUBOX_HOST:$GPUBOX_REPO}"
 
+# gpubox is WSL2: the native libcuda stub shadows the WSL GPU-passthrough
+# driver. EVERY GPU process must see /usr/lib/wsl/lib first or Warp/torch
+# report "no CUDA-capable device" while nvidia-smi works fine.
+export GPUBOX_GPU_ENV="LD_LIBRARY_PATH=/usr/lib/wsl/lib"
+
 # Absolute path to the box's Claude CLI — referenced directly so dispatch does
 # not depend on a login shell sourcing PATH (and to keep remote quoting shallow).
 export CLAUDE_BIN="${CLAUDE_BIN:-/home/bglab/.local/bin/claude}"

@@ -107,3 +107,66 @@ def test_3d_thin_plate_two_sided_loadbearing():
         f"|Cd_twosided|={abs(cd_2s):.4f}  |Cd_onesided|={abs(cd_1s):.4f}"
     )
     print(f"\n[3d-loadbearing] Cd_2s={cd_2s:+.4f}  Cd_1s={cd_1s:+.4f}")
+
+
+def test_mono3d_solver_routing_parity():
+    kw = dict(level=3, nsteps=2, dt=0.01, nu=0.1, U_inf=1.0, verbose=False)
+    res_legacy = run_flow_past_3d(**kw)
+    res_routed = run_flow_past_3d(mono_solver="splu", device="cpu", **kw)
+    assert np.allclose(res_legacy["cd"], res_routed["cd"], rtol=0, atol=1e-12)
+
+
+def test_device_assembly_parity_cpu_3d():
+    """assembly="device" matches assembly="host" on the 3-D monolithic march.
+
+    DeviceNSAssembler volume fill + two-sided SBM face system (Af_c) via
+    extra_matrix/extra_rhs device slots + strong rows on device must produce
+    bit-for-bit identical Cd to the host LIL-surgery path.
+    """
+    from p2r1c_thin_plate_flow_3d import run_flow_past_3d
+    kw = dict(level=3, nsteps=2, dt=0.01, nu=0.1, verbose=False)
+    res_h = run_flow_past_3d(assembly="host", **kw)
+    res_d = run_flow_past_3d(assembly="device", **kw)
+    assert np.allclose(res_h["cd"], res_d["cd"], rtol=1e-9, atol=1e-11), (
+        f"device-assembly 3-D Cd diverged: {res_h['cd']} vs {res_d['cd']}")
+
+
+def test_device_assembly_parity_cpu_3d_adaptive():
+    """assembly="device" works on the adaptive 3-D mesh and matches assembly="host".
+
+    Mirrors test_device_assembly_parity_cpu_adaptive (2-D): confirms the
+    constraint-aware device pattern covers all Af_c entries on a hanging-node
+    mesh.  Uses level=3, refine_to=4, nsteps=2 — runs in ~2s on Mac CPU.
+    """
+    from p2r1c_thin_plate_flow_3d import run_flow_past_3d
+    kw = dict(level=3, refine_to=4, nsteps=2, dt=0.01, nu=0.1, verbose=False)
+    res_h = run_flow_past_3d(assembly="host", **kw)
+    res_d = run_flow_past_3d(assembly="device", **kw)
+    assert np.allclose(res_h["cd"], res_d["cd"], rtol=1e-9, atol=1e-11), (
+        f"device-assembly 3-D adaptive Cd diverged: {res_h['cd']} vs {res_d['cd']}")
+
+
+def test_device_csr_handoff_parity_3d():
+    """W2c: SADDLE_DEVICE_CSR=1 (device-resident CSR handoff) is bit-for-bit
+    identical to the default host-CSR pull on the 3-D device-assembly
+    fgmres_bdiag path.  The 3-D driver is the path that ships to the GH200; the
+    handoff only relocates WHERE vals_d lives (device vs host round-trip), so
+    the drag trajectory must match to 1e-14.
+    """
+    from p2r1c_thin_plate_flow_3d import run_flow_past_3d
+    kw = dict(level=3, nsteps=2, dt=0.01, nu=0.1, verbose=False,
+              mono_solver="fgmres_bdiag", device="cpu", assembly="device")
+    _prev = os.environ.get("SADDLE_DEVICE_CSR")
+    try:
+        os.environ["SADDLE_DEVICE_CSR"] = "0"
+        res_ref = run_flow_past_3d(**kw)
+        os.environ["SADDLE_DEVICE_CSR"] = "1"
+        res_dev = run_flow_past_3d(**kw)
+    finally:
+        if _prev is None:
+            os.environ.pop("SADDLE_DEVICE_CSR", None)
+        else:
+            os.environ["SADDLE_DEVICE_CSR"] = _prev
+    assert np.allclose(res_ref["cd"], res_dev["cd"], rtol=0, atol=1e-14), (
+        f"SADDLE_DEVICE_CSR changed 3-D cd trajectory: "
+        f"{res_ref['cd']} (host) vs {res_dev['cd']} (device)")

@@ -3,6 +3,12 @@
 The Mac thinks and orchestrates; a headless Claude on gpubox executes GPU work.
 The Mac is the sole GitHub gatekeeper. Spec: `docs/dev/specs/2026-07-17-remote-deploy-workflow-design.md`.
 
+**Source of truth:** the office Mac (this Dropbox-synced checkout) is the BRAIN and
+its DiffSim repo is the canonical MASTER. gpubox and Nova are compute workers:
+code flows Mac→worker, results+commits flow worker→Mac and are reconciled into
+master. Never treat a worker's tree as authority; if a worker is ahead/uncommitted,
+fetch and reconcile it back here rather than developing against the worker copy.
+
 ## One-time
 - `bash scripts/remote/remote-doctor.sh --fix` — verifies the box and adds the `gpubox` git remote.
 - Nova: `ssh nova true` once to establish the Duo `ControlMaster` (reused 7 days).
