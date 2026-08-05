@@ -286,3 +286,76 @@ Level 6 (p1-uniform box) was attempted directly and the process was killed by th
 (`n_elems=2968`, `n_dofs=3791`, total wall `0.27s`.)
 
 **Interpretation:** this does NOT match what the explore prompt hints at ("the m0.5 findings say constraints") — here `build_constraints` is only 5% of the time; `solve` and `classify` dominate. Checked the referenced finding directly: m1a finding 6 measured `build_constraints` at `48s` for a 4D p2 mesh, but that was the OLD, unvectorized host-probe-loop implementation (one `LeafLookup.find` call per node per probe). The current `build_constraints` (vectorized campaign, 2026-07-05) batches all probes into one call and was already confirmed elsewhere (P1 tutorial) to drop from `222s` to `0.71s` at 66k 2-D DOFs. At this sphere mesh's tiny scale (3,791 DOFs), that fix means constraints is no longer the bottleneck — the old finding describes code that no longer exists in this form. Re-measuring beats trusting a stale reference.
+
+## Task A6 - Complex Geometry (CSG Carves)
+**Date:** August 4, 2026  
+**Script:** `tutorials/A_foundations/A6_complex_geometry.py`  
+**Run source:** User-provided terminal output.
+
+### Observed Results
+
+- **channel (inside a box):** errors `[2.522e-04, 1.373e-04]`, order `0.88`.
+- **plate minus disk (outside):** errors `[1.024e-03, 2.493e-04]`, order `2.04`.
+- **icosphere STL-path (outside, 3-D):** errors `[1.961e-02, 4.138e-03]`, order `2.25`.
+
+Matches the docstring's EXPECTED RESULTS closely (`0.88` / `2.04` / `2.25`) — no bug.
+
+### Interpretation
+
+The two smooth-boundary carves (disk, icosphere) recover the expected order-2 SBM accuracy. The channel is the outlier at order `0.88`: a box has corners, where the SDF is not differentiable and the closest-point projection is ambiguous (multiple equally-close points), breaking the smoothness assumption the Taylor shift relies on. The corner elements locally degrade accuracy and drag down the global rate, even though most of the channel's boundary (the flat sides) is perfectly smooth.
+
+### Explore (a) — Compose channel MINUS disk
+
+Built `Intersection(Box(channel), Complement(Sphere(r=0.1)))`, domain=`"inside"` — flow-past-a-cylinder-in-a-pipe geometry. Control check: running plain `Box` alone through the same harness reproduced the base script's `0.88` exactly, confirming the implementation is correct.
+
+**Result:** errors `[3.182e-04, 1.387e-04]` (levels 5/6), order `1.20`.
+
+**Interpretation:** the prompt says "verify order 2" — measured order is `1.20`, not 2. The disk removal doesn't touch the box's four corners, so the same corner degradation from the base channel case persists (the disk only improves the constant: `1.20` vs the plain channel's `0.88`). The explore prompt's expectation doesn't hold here.
+
+### Explore (b) — Corner-effect diagnosis (mask near-corner elements)
+
+Re-solved the plain channel and measured L2 error excluding all quadrature points within `k*h` of any of the box's 4 corners, for `k = 1, 2, 3, 5, 10`.
+
+| exclusion | order (levels 5/6) |
+|---|---:|
+| none (full domain) | 0.88 |
+| 1h | 0.88 |
+| 2h | 0.87 |
+| 3h | 0.86 |
+| 5h | 0.82 |
+| 10h | 0.49 |
+| 20h | degenerate — mask empties most of the small channel domain |
+
+**Interpretation:** contrary to what the prompt expects ("smooth order should reappear"), masking away from the corners does NOT recover order 2 — order barely moves out to 5h, and gets *worse* at 10h. This means the corner's damage isn't just a local contribution to the error norm that can be filtered out after the fact: through the coupled linear system, a badly-conditioned corner region pollutes the discrete solution field more globally (elliptic PDEs don't guarantee numerical defects stay local). The corner is still the right root cause (the smooth-only cases converge cleanly), but the fix has to attack the corner itself, not the error measurement — e.g. round the corner (blend the Box SDF with a small-radius fillet via `Union`/smooth-min), or add local h-refinement concentrated at the corners to better resolve the ambiguous closest-point region there.
+
+### Explore (c) — Stanford bunny (real STL-path test)
+
+Downloaded the real `bun_zipper.ply` from the Stanford 3D Scanning Repository (`graphics.stanford.edu/pub/3Dscanrep/bunny.tar.gz`; 35,947 verts, 69,451 tris), scaled to fit `[0,1]^3` (max extent `0.6`, centered at `0.5`), wrapped in `TriMeshOracle`, and ran the same `domain="outside"` case-3 pipeline.
+
+| level | DOFs | error | wall |
+|---:|---:|---:|---:|
+| 3 | 707 | 1.499e-02 | — |
+| 4 | 4,744 | 3.053e-03 | — |
+| 5 | 34,546 | 7.498e-04 | 9.1s |
+| 6 | 263,518 | 1.781e-04 | 785s |
+
+Orders: `2.30` (3→4), `2.03` (4→5), `2.07` (5→6) — no plateau yet.
+
+Mean/max triangle edge length after scaling: `0.0057` / `0.0189`. Sagitta estimate `s²/(8R)`: `~4e-5` for smooth body regions (`R~0.1`) up to `~2.2e-3` for thin/curved features like the ears (`R~0.02`, max edge).
+
+**Interpretation:** no error floor observed through level 6 — order stays clean at ~2.0-2.3 throughout, because octree `h` at level 6 (`0.0156`) is still larger than the mesh's own mean facet size (`0.0057`); the octree hasn't yet out-resolved the geometry. The level-6 error (`1.78e-4`) already falls inside the broad sagitta estimate range, hinting the ears/thin features may already be facet-limited even while the smooth body is still octree-limited — but confirming a true global floor needs level 7-8, which was not attempted: level 6 alone cost 785s, and the level 5→6 solve-time growth was already steep enough that level 7 risked the same OOM/impractical-runtime outcome as A5's level 6.
+
+### Explore (d) — Performance corner: `GeometryData.evaluate` timing vs level
+
+Isolated `GeometryData.evaluate` (icosphere case), timed with repeated calls (median/min of 7-9 reps) per level to reduce noise.
+
+| level | n surrogate faces | median | min |
+|---:|---:|---:|---:|
+| 3 | 192 | 0.001s | 0.001s |
+| 4 | 528 | 0.009s | 0.006s |
+| 5 | 1,992 | 0.014s | 0.009s |
+| 6 | 7,320 | 0.075s | 0.070s |
+| 7 | 28,512 | 0.148s | 0.102s |
+| 8 | 112,344 | 2.506s | 2.009s |
+
+**Interpretation:** expected exponent is ~1 — each Gauss point is one independent BVH query against a fixed-size triangle mesh, so cost should scale linearly with the number of query points. Small-level measurements (levels 3-6) are launch-floor-dominated and noisy — repeated runs of the *same* level transition gave wildly different exponents (`0.18` to `2.3`) run-to-run on this shared machine, so they're not trustworthy. At the largest, most reliable scale (level 7→8, min times): faces grew `3.94x` but time grew `~19.7x` — exponent `~2.17`, clearly super-linear, not the ~1 the "independent per-point query" model predicts. Something in `GeometryData.evaluate` (likely the FP64 torch closest-point/region-masking machinery, or host-device sync overhead) stops scaling cleanly once the query count gets large — worth a closer look if this geometry path is ever pushed to production mesh sizes.
