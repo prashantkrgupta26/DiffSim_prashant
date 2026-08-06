@@ -359,3 +359,51 @@ Isolated `GeometryData.evaluate` (icosphere case), timed with repeated calls (me
 | 8 | 112,344 | 2.506s | 2.009s |
 
 **Interpretation:** expected exponent is ~1 — each Gauss point is one independent BVH query against a fixed-size triangle mesh, so cost should scale linearly with the number of query points. Small-level measurements (levels 3-6) are launch-floor-dominated and noisy — repeated runs of the *same* level transition gave wildly different exponents (`0.18` to `2.3`) run-to-run on this shared machine, so they're not trustworthy. At the largest, most reliable scale (level 7→8, min times): faces grew `3.94x` but time grew `~19.7x` — exponent `~2.17`, clearly super-linear, not the ~1 the "independent per-point query" model predicts. Something in `GeometryData.evaluate` (likely the FP64 torch closest-point/region-masking machinery, or host-device sync overhead) stops scaling cleanly once the query count gets large — worth a closer look if this geometry path is ever pushed to production mesh sizes.
+
+## Task B1 - Bratu Newton
+**Date:** August 6, 2026  
+**Script:** `tutorials/B_nonlinear/B1_bratu_newton.py`
+
+### Observed Results
+
+- **Newton residuals** (level 5, p1, lam=3): `1.42e-02, 1.66e-03, 3.08e-05, 8.04e-09, 1.17e-15` — 5 steps, clearly quadratic.
+- **Spatial orders:** p1 `[2.353e-03, 5.898e-04, 1.476e-04]` -> orders `2.00, 2.00`; p2 `[2.056e-04, 2.574e-05, 3.219e-06]` -> orders `3.00, 3.00`.
+
+Matches the docstring's EXPECTED RESULTS exactly — no bug.
+
+### Explore (a)+(b) — Modified Newton vs. Picard vs. full Newton
+
+Iteration counts to `tol=1e-12` (level 5, p1, lam=3):
+
+| variant | iterations | convergence |
+|---|---:|---|
+| full Newton | 5 | quadratic (residual ~squares each step) |
+| modified Newton (Jacobian frozen at 1st iterate) | 16 | linear, rate ~0.20/step |
+| Picard (drop `-M_jac` entirely, `J=K`) | 22 | linear, rate ~0.32/step |
+
+**Interpretation:** all three converge (the problem is well-posed at lam=3, far from the fold), but only full Newton is quadratic. Modified Newton still uses a real (if stale) linearization of the exponential term, giving a consistent linear rate; Picard uses none at all (just lags the whole nonlinear term one step behind), giving a slower linear rate. This is the textbook Newton/chord/Picard hierarchy, reproduced numerically: exact Jacobian -> quadratic, frozen Jacobian -> linear (fast), no Jacobian -> linear (slower).
+
+### Explore (c) — Continuation toward lam* (physical Bratu, f=0, g=0)
+
+Warm-started continuation from lam=0.5 up to lam=6.82 (level 5, p1), tracking the lower branch, reusing each converged solution as the next initial guess:
+
+| lam | iterations | converged | max\|u\| |
+|---:|---:|---|---:|
+| 0.5 - 6.6 | 3-4 | yes | 0.038 -> 1.066 |
+| 6.7 - 6.813 | 4-5 | yes | 1.150 -> 1.379 |
+| 6.814 | 60 (capped) | **no** | diverges |
+| 6.82 | 60 (capped) | **no** | diverges (max\|u\| spikes to 27+) |
+
+**Interpretation:** the discrete critical point sits between `lam=6.813` (converges cleanly, 5 iterations) and `lam=6.814` (fails outright, never converges) — pinning the level-5 discrete lam*_h to about `6.813-6.814`, within ~0.1% of the literature continuum value `lam* ~ 6.808124` for the 2-D square. Contrary to a "gradually rising iteration count" expectation, the observed behavior is a sharp cliff, not a slow slide: iteration count stays flat (3-5) essentially all the way to the fold, then Newton fails completely one step later. This matches fold-bifurcation theory — the Jacobian only becomes singular exactly at lam*, so degradation is confined to a narrow neighborhood our lam-steps (0.001-1.0) mostly stepped over.
+
+### Explore (d) — Host-assembly vs. solve timing (level 7), and a kernel sketch
+
+| level 7 (n_free=16,641) | per-step time |
+|---|---|
+| host assembly (`gp_values` + `weighted_integrals`, numpy) | 0.055, 0.040, 0.037, 0.056, 0.013 s |
+| splu solve | 0.049, 0.047, 0.043, 0.043 s |
+| **totals** | assembly `0.201s`, solve `0.182s` (ratio `1.03x`) |
+
+**Interpretation:** at level 7 the two costs are roughly tied, with host assembly a hair ahead. Checked the source directly: `BratuWorkspace.gp_values`/`weighted_integrals` are pure NumPy (`np.einsum`, `np.add.at`) — no `warp` import in this file at all, unlike the linear stiffness `K`, which *is* GPU-assembled once via `assemble_csr`. So the nonlinear term is the one piece of this pipeline never ported to GPU, and it's re-run from scratch on the host every single Newton step.
+
+**Kernel sketch (not implemented, per the prompt):** the codebase already has the right template — `make_poisson_element_matrices_var` (`assembly/operators.py`) is a "closure-hook" stiffness kernel weighted by a per-Gauss-point scalar `kq[e*nqp+q]`, used elsewhere for spatially-varying coefficients. A `make_bratu_mass_var(nbf, nqp, dim)` kernel would follow the exact same shape but with a MASS-like integrand (`N_a * N_b` instead of `dN_a . dN_b`), fused with an on-device evaluation of `u_h` at each Gauss point (interpolate nodal `u` via the basis-value table `Ntab`, already resident on device from `DeviceMesh`) and `lam * exp(u_h)` as the weight. That eliminates the host round-trip entirely for the nonlinear term: nodal `u` goes GPU -> device kernel produces `Me[e,a,b]` -> only the small triplet arrays return to host for the existing COO->CSR step (or skip even that via the device-resident scatter path `DeviceScalarPoissonAssembler` already used elsewhere for the linear case).
