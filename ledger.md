@@ -407,3 +407,49 @@ Warm-started continuation from lam=0.5 up to lam=6.82 (level 5, p1), tracking th
 **Interpretation:** at level 7 the two costs are roughly tied, with host assembly a hair ahead. Checked the source directly: `BratuWorkspace.gp_values`/`weighted_integrals` are pure NumPy (`np.einsum`, `np.add.at`) — no `warp` import in this file at all, unlike the linear stiffness `K`, which *is* GPU-assembled once via `assemble_csr`. So the nonlinear term is the one piece of this pipeline never ported to GPU, and it's re-run from scratch on the host every single Newton step.
 
 **Kernel sketch (not implemented, per the prompt):** the codebase already has the right template — `make_poisson_element_matrices_var` (`assembly/operators.py`) is a "closure-hook" stiffness kernel weighted by a per-Gauss-point scalar `kq[e*nqp+q]`, used elsewhere for spatially-varying coefficients. A `make_bratu_mass_var(nbf, nqp, dim)` kernel would follow the exact same shape but with a MASS-like integrand (`N_a * N_b` instead of `dN_a . dN_b`), fused with an on-device evaluation of `u_h` at each Gauss point (interpolate nodal `u` via the basis-value table `Ntab`, already resident on device from `DeviceMesh`) and `lam * exp(u_h)` as the weight. That eliminates the host round-trip entirely for the nonlinear term: nodal `u` goes GPU -> device kernel produces `Me[e,a,b]` -> only the small triplet arrays return to host for the existing COO->CSR step (or skip even that via the device-resident scatter path `DeviceScalarPoissonAssembler` already used elsewhere for the linear case).
+
+## Task B2 - Bratu in 3-D + Continuation
+
+**Date:** August 6, 2026
+**Script:** `tutorials/B_nonlinear/B2_bratu_3d.py`
+
+### Observed Results
+
+- **3-D MMS (p1, lam=2):** errors `[2.057e-02, 5.189e-03, 1.301e-03]` (levels 2/3/4), orders `1.99, 2.00`.
+- **Continuation (level 3, physical Bratu):** Newton iteration counts creep `2 -> 3 -> 3 -> 3 -> 3 -> 4 -> 4 -> 6` as `lam` goes `1 -> 3 -> 5 -> 7 -> 8 -> 9 -> 9.5 -> 10`; fails outright at `lam=11`.
+
+Matches the docstring's EXPECTED RESULTS — no bug.
+
+### Explore (a) — Bisect the fold across levels 2/3/4
+
+Coarse continuation to bracket the fold, then bisected to `+-0.01` in `lam` (had to make the Newton call exception-safe first: a diverging step causes `exp` overflow and an exactly-singular `splu` factorization, which crashes rather than fails cleanly on the stock `Bratu3D.newton` — wrapped it to catch both and blow-up (`max|u|>1e4`) as a clean failure).
+
+| level | n_free | discrete lam*_h bracket | midpoint |
+|---:|---:|---|---:|
+| 2 | 125 | [10.3594, 10.3672] | 10.363 |
+| 3 | 729 | [10.0156, 10.0234] | 10.020 |
+| 4 | 4,913 | [9.9219, 9.9297] | 9.926 |
+
+**Interpretation:** the discrete fold converges monotonically toward the literature value `lam* ~ 9.9` as the mesh refines (10.363 -> 10.020 -> 9.926), landing within `~0.3%` of literature at level 4. Coarse meshes systematically *overestimate* the critical lam — makes sense: an under-resolved mesh can't fully represent the solution's blow-up curvature, so the discrete problem tolerates a slightly higher forcing before its Jacobian goes singular.
+
+### Explore (b) — Pseudo-arclength augmented system (derivation only, per the prompt)
+
+Full derivation is in the companion report. Summary: treat `z=(u,lam)` jointly, parametrize the solution curve by arclength `s` instead of `lam` directly, and add one scalar constraint `N(u,lam,s) = u_dot0.(u-u0) + lam_dot0*(lam-lam0) - ds = 0` to the residual `F(u,lam)=0`. The resulting bordered `(n+1)x(n+1)` Newton system stays nonsingular exactly at the fold (where the plain `dF/du` alone is singular), because the extra tangent row/column removes the rank deficiency — this is what lets continuation walk smoothly through and past a fold that defeats simple lam-stepping.
+
+### Explore (c) — Performance: weighted-integrals vs solve at level 4, FLOP estimate
+
+Measured mid-continuation at `lam=8`, level 4 (`n_free=4913`, `nbf=8`, `nqp=8`, `4096` elements):
+
+| stage | per-iteration time |
+|---|---:|
+| `gp_values` | ~0.0005s |
+| `weighted_integrals` (both calls combined) | ~0.028s |
+| `splu` solve | ~0.09s |
+
+**Finding 1 (corrects the prompt's premise):** at level 4, `splu` solve (~0.09s) is ~3x *more* expensive than the weighted-integrals host assembly (~0.028s), not the other way around — the prompt's "weighted-integrals is now the bottleneck" claim doesn't hold at this level. (It may hold at smaller levels where Python/einsum call overhead is proportionally larger relative to an already-tiny factorization; not measured here since the prompt specified level 4.)
+
+**Finding 2 (redundant work, independent of #1):** confirmed directly — for the physical continuation path (`f_fn=None`), `w_rhs == w_exp`, so `Bratu3D.newton`'s two `weighted_integrals(...)` calls per iteration compute *bit-for-bit identical* `(Fv, M)` pairs (`np.allclose` true, sparse-difference `nnz=0`) and each throws away half the result. An easy 2x win on this specific (very common) code path.
+
+**FLOP estimate for the `Me` einsum `"qa,qb,eq,q,e->eab"`:** counting 3 multiplies + 1 add per `(e,a,b,q)` term plus one final per-element scale gives `n_elems*nbf^2*nqp*4 + n_elems*nbf^2 = 8,650,752` FLOPs per call at level 4. Measured time per call (`0.0143s`) implies **~0.61 GFLOP/s** achieved. A practical peak on this machine (measured via a `2000x2000` BLAS `dgemm`) is **~77 GFLOP/s** — so the einsum runs at **~0.78% of practical peak**, over 100x off.
+
+**Interpretation:** this is a textbook memory-bound kernel. The computation is a *batch* of 4,096 tiny (`8x8`) independent matrices, not one large matmul — numpy's einsum engine can't lower a batched contraction with a non-reduced batch index (`e`) onto a single efficient BLAS GEMM call, so it falls back to a generic, unblocked, poorly-cache-reused loop. Arithmetic intensity is low (~1 FLOP per byte moved: reads `w_gp[e,q]`, writes `Me[e,a,b]`, both streamed from/to memory with almost no data reuse across elements), which is exactly the regime where a CPU is bottlenecked on memory bandwidth, not FLOPs — matching the `<1%`-of-peak result.
