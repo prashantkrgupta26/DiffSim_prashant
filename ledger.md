@@ -63,6 +63,19 @@ Measured exponents:
 
 The Warp element, load, and error kernels were loaded on `cuda:0`. The `splu` sparse solve remains CPU-based, so the solve timings are not GPU solve timings. At level 8, the solve remains the largest measured stage (`0.2433 s`), followed by assembly (`0.1501 s`).
 
+### Explore (b) — Break the MMS: keep `f`, set `g=0`
+
+Ran two variants (no ledger entry existed previously for this task):
+
+- **`u*=sin(pi x)sin(pi y)`** (f correct, g=0 everywhere): errors `[1.606e-03, 4.015e-04, 1.004e-04]`, orders `2.00, 2.00` — **identical** to the correct-g control, because this particular `u*` is already exactly zero on the whole boundary, so `g=0` happens to be exactly right. Nothing was actually broken.
+- **`u*=x^2+y^2`** (the file's current default, nonzero on the boundary; f correct, g=0 everywhere): errors `[9.045e-01, 9.051e-01, 9.052e-01]`, orders `-0.001, -0.000` — error plateaus around `0.905` and does not shrink under refinement at all.
+
+**Interpretation:** boundary-data errors don't average out under mesh refinement — they set a hard floor on accuracy, exactly like A2's Explore (a) finding for a Neumann-side flux error. The `sin*sin` case is a cautionary tale of its own: it shows a manufactured solution can accidentally be immune to a "broken" boundary condition if it happens to vanish there, which would make the experiment falsely look like a non-issue — the choice of `u*` matters for what a test can actually detect.
+
+## Task A1 Addendum — Note on the file's own EXPECTED RESULTS vs. what's recorded
+
+The docstring's EXPECTED RESULTS block (`p=1: ~1.61e-3/... order 2.00`; `p=2: ~2.05e-4/... order 2.99/3.00`) describes the original `u*=sin(pi x)sin(pi y)` MMS case. The file's module-level `u_star`/`f_star` currently implement `u*=x^2+y^2` instead (Explore (a)'s patch-test case) — so the "Observed Convergence Rates" recorded above are actually Explore (a)'s result, not a run of the docstring's own stated baseline. Both are legitimate MMS choices; flagging only so the numbers above are read in the right context.
+
 ## Task A2 - Boundary Conditions: Explore (a)
 **Date:** July 27, 2026  
 **Experiment:** Changed the manufactured solution to $u^*(x,y)=\sin(\pi x)\sin(\pi y)$ while leaving the x-only case unchanged.
@@ -183,6 +196,24 @@ level 5 -> 6: 2.63
 | 6 | 0.0156 | 6.401e-04 |
 
 Observed orders were `1.30` and `2.57`. These are very close to the earlier exact-circle `lambda=1.0` results (`1.31`, `2.63`) at these levels, but the sampled geometry introduces projection failures and a small error change. The temporary code changes were restored after testing; this is a diagnostic result, not a permanent change to the A3 tutorial.
+
+### Performance Corner — `classify_lambda` timing vs. level (untitled task at the end of the file, no prior ledger entry)
+
+The claim to test: cost should track the number of **intercepted** (narrow-band) elements, `O(2^level)`, not the total element count, `O(4^level)` — because of the two-pass design (a cheap center-distance check resolves most elements immediately; only the narrow band around the true boundary pays the expensive dense per-element quadrature).
+
+Direct element-count check (recomputing the same narrow-band criterion `classify_lambda` uses internally: `|psi(center)| <= lipschitz_bound*(sqrt(dim)/2)*h`), levels 4-8:
+
+| level | total elements | narrow-band elements | band growth |
+|---:|---:|---:|---:|
+| 4 | 256 | 88 | — |
+| 5 | 1,024 | 176 | 2.00x |
+| 6 | 4,096 | 336 | 1.91x |
+| 7 | 16,384 | 688 | 2.05x |
+| 8 | 65,536 | 1,368 | 1.99x |
+
+Wall-clock timing (median/min of 11 reps, after warming all levels first) was too noisy to extract a reliable exponent at this scale — all runs are under 5ms, deep in Python-dispatch/launch-floor-dominated territory on this shared machine (e.g. level 7 median `5.07ms` vs. min `1.18ms`, a 4x spread from run to run).
+
+**Interpretation:** the element-count check is a clean, direct, noise-free confirmation of the claim — the narrow band grows almost exactly `2.00x` per level (total elements always grow exactly `4.00x`), matching `O(2^level)` to within measurement precision. Wall-clock timing at these small absolute run times isn't trustworthy evidence either way; the algorithmic claim itself is nonetheless solidly confirmed by directly counting what the two-pass logic actually does, independent of timer noise. A real timing measurement of this claim would need levels large enough that the narrow-band work (tens of thousands of elements, not hundreds) dominates fixed per-call overhead.
 
 ## Task A4 - Mixed p1/p2 Elements and Minimum Rule
 **Date:** August 1, 2026  
