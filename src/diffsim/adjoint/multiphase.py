@@ -313,19 +313,18 @@ class MultiCHDiscrete:
                 # phi-dependent mobility: extra Jacobian term dRphi_i/dphi_i
                 # = Int gradN . ((dM_ii/dphi_i) * grad(mu_i))
                 # For const closure dM/dphi = 0; for phi_diag dM_ii/dphi_i != 0
-                if mobility.name != "const":
-                    # dM_ii/dphi_i (scalar field [ne, nqp])
-                    dMii_dphii = mobility._dmatrix_dphi_diag(phi_gp, i)
-                    if dMii_dphii is not None:
-                        # flux contribution: dM_ii/dphi_i * grad(mu_i)
-                        dflux = dMii_dphii[:, :, None] * gmu[i]
-                        # integrate: Int gradN . dflux * N_a  (N_a is phi_i test fn)
-                        # = einsum over (e, q, a=phi-row, b=phi-col)
-                        # result shape (e, nbf_a, nbf_b) -> scatter to Ae[2i,2i]
-                        dM_term = np.einsum(
-                            "eq,eqd,qad,e,qb->eab",
-                            dJxW, dflux, dN, dscale, N)
-                        Ae[:, 2 * i::blk, 2 * i::blk] += dM_term
+                # dM_ii/dphi_i (scalar field [ne, nqp])
+                dMii_dphii = mobility._dmatrix_dphi_diag(phi_gp, i)
+                if dMii_dphii is not None:
+                    # flux contribution: dM_ii/dphi_i * grad(mu_i)
+                    dflux = dMii_dphii[:, :, None] * gmu[i]
+                    # integrate: Int gradN . dflux * N_a  (N_a is phi_i test fn)
+                    # = einsum over (e, q, a=phi-row, b=phi-col)
+                    # result shape (e, nbf_a, nbf_b) -> scatter to Ae[2i,2i]
+                    dM_term = np.einsum(
+                        "eq,eqd,qad,e,qb->eab",
+                        dJxW, dflux, dN, dscale, N)
+                    Ae[:, 2 * i::blk, 2 * i::blk] += dM_term
                 Ae[:, 2 * i + 1::blk, 2 * i::blk] += -kap[i] * LL   # +kap term
                 Ae[:, 2 * i + 1::blk, 2 * i + 1::blk] += NN         # dRmu/dmu
             if want_jac:
