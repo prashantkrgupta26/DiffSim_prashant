@@ -109,7 +109,7 @@ validation numbers, and what gradients are available:
 - **[Poisson / Shifted-Boundary](docs/projects/poisson-sbm.md)** — the immersed-diffusion foundation; asymptotic 2nd order and the dyadic-halo rule.
 - **[Navier–Stokes](docs/projects/navier-stokes.md)** — incompressible flow around immersed bodies, p1 & p2; cavity vs Ghia, cylinder C_d 1.334.
 - **[Heat & mass transfer](docs/projects/heat-mass.md)** — buoyant/thermal transport; de Vahl Davis Nusselt to 0.05 %.
-- **[Phase field](docs/projects/phase-field.md)** — Cahn–Hilliard / Allen–Cahn / evaporating films; the Wodo replication and the first learned free energy.
+- **[Phase field](docs/projects/phase-field.md)** — Cahn–Hilliard / Allen–Cahn / evaporating films; the Wodo replication and the first learned free energy. Extended to the M-component (OrgElMorph) blend: a differentiable multi-Cahn–Hilliard morphology stack with gradients w.r.t. the blend design parameters (χ-matrix, N, mobility, κ, mean composition), GPU-resident via cuDSS, and a learnable multi-component free energy fit by trajectory-matching.
 - **[Differentiable design](docs/projects/differentiable.md)** — end-to-end adjoints; recovering a hidden INR shape from flow probes (bunny headline 1.23e-3).
 - **[Adaptivity](docs/projects/adaptivity.md)** — spatial octree re-mesh with exact state transfer + BDF1/2 temporal LTE control.
 
@@ -201,8 +201,20 @@ Milestones **M0 through M4 are complete** — gated and committed. That spans th
 octree/SBM foundations, incompressible Navier–Stokes at p1 and p2, coupled
 heat/mass transfer, end-to-end adjoints with neural-SDF geometry, the full device
 migration, differentiable adaptivity, and the phase-field stack with its learned
-free energy. See the [roadmap](docs/dev/roadmap.md) for the measured evidence
-behind each, and the milestone reports in `docs/dev/` for the full stories.
+free energy.
+
+**M5 (OrgElMorph)** adds the M-component morphology stack and makes it
+differentiable end-to-end: a discrete implicit-function-theorem adjoint through
+the multi-Cahn–Hilliard march yields exact gradients of a morphology objective
+w.r.t. the blend design parameters (χ-matrix, N, Onsager mobility, gradient
+energy κ, and the mean composition) — three-way verified (hand adjoint = autograd
+twin = finite differences), CPU reference-grade *and* GPU-resident through a cuDSS
+backend validated at 256×128. **M6** makes the physics learnable: a
+gauge-anchored multi-component free energy and a named mobility closure fit by
+trajectory-matching through the same verified adjoint (φ-only / K=0 to date;
+crystallization-coupled learning is in progress). See the
+[roadmap](docs/dev/roadmap.md) for the measured evidence behind each, and the
+milestone reports in `docs/dev/` for the full stories.
 
 ## Citation & license
 
