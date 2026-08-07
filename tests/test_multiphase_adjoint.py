@@ -414,3 +414,27 @@ def test_scipy_backend_solve_and_transpose():
     assert np.allclose(A @ x, b, atol=1e-12)
     xt = be.solve_T(A, b)
     assert np.allclose(A.T @ xt, b, atol=1e-12)
+
+
+# ==========================================================================
+# Task 2 (Rung 2): Route engine solves through LinearBackend
+# ==========================================================================
+def test_forward_accepts_backend_and_defaults_scipy():
+    from diffsim.adjoint import ScipyBackend
+    from diffsim.adjoint.multiphase import MultiCHForward, FHMultiEnergy
+    import numpy as np
+    # Build a ternary dm inline (same as test_forward_parity_ternary)
+    dm, mesh = _dm(3)
+    M = 2
+    chi = np.zeros((M + 1, M + 1))
+    chi[0, 1] = chi[1, 0] = 2.5
+    chi[0, 2] = chi[2, 0] = 1.0
+    chi[1, 2] = chi[2, 1] = 0.8
+    N = np.ones(M + 1)
+    en = FHMultiEnergy(chi, N)
+    fwd = MultiCHForward(dm, en, onsager=np.eye(2), kappa=[1e-3, 1e-3], dt=1e-3)
+    assert isinstance(fwd.backend, ScipyBackend)
+    be = ScipyBackend()
+    fwd2 = MultiCHForward(dm, en, onsager=np.eye(2), kappa=[1e-3, 1e-3],
+                          dt=1e-3, backend=be)
+    assert fwd2.backend is be

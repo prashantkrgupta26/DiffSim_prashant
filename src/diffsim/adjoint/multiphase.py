@@ -26,7 +26,6 @@ Gate scope: uniform mesh (constraints.T == identity), natural no-flux BCs, BDF1
 and variable-coefficient BDF2."""
 import numpy as np
 import scipy.sparse as sp
-from scipy.sparse.linalg import splu
 
 
 # --------------------------------------------------------------------------
@@ -341,7 +340,8 @@ class MultiCHForward:
     sibling of phasefield.CHForward."""
 
     def __init__(self, dm, energy, onsager, kappa, dt=1e-2, order=1,
-                 newton_tol=1e-12, newton_max=30):
+                 newton_tol=1e-12, newton_max=30, backend=None):
+        from .linsolve_backend import ScipyBackend
         self.op = MultiCHDiscrete(dm, energy.M)
         self.M = energy.M
         self.energy = energy
@@ -350,6 +350,7 @@ class MultiCHForward:
         self.dt = float(dt)
         self.order = order
         self.newton_tol, self.newton_max = newton_tol, newton_max
+        self.backend = backend or ScipyBackend()
         self.t = 0.0
         self.dt_prev = None
         self.steps = []
@@ -399,7 +400,7 @@ class MultiCHForward:
         mus = [m.copy() for m in self.mus]
         for it in range(self.newton_max):
             R, J = self.op.assemble(phis, mus, hist_gp, params, want_jac=True)
-            dx = splu(J.tocsc()).solve(-R)
+            dx = self.backend.solve(J, -R)
             for i in range(self.M):
                 phis[i] = phis[i] + dx[2 * i::blk]
                 mus[i] = mus[i] + dx[2 * i + 1::blk]
@@ -455,7 +456,7 @@ class MultiCHAdjoint:
             _, J = op.assemble(rec["phis"], rec["mus"], zero_hist,
                                rec["params"], want_jac=True)
             rhs = np.asarray(dJdx_list[n], np.float64) + pending[n]
-            lam = splu(J.T.tocsc()).solve(rhs)
+            lam = self.fwd.backend.solve_T(J, rhs)
             for nm in param_names:
                 dRdp = op.dR_dparam(rec["phis"], rec["mus"], rec["params"], nm)
                 grads[nm] -= float(lam @ dRdp)
