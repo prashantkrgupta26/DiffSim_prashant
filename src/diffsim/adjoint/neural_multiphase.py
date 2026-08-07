@@ -27,6 +27,79 @@ from .multiphase import MultiEnergy, FHMultiEnergy
 
 
 # ---------------------------------------------------------------------------
+# MobilityClosure — named learnable mobility M(phi; a)
+# ---------------------------------------------------------------------------
+class MobilityClosure:
+    """NAMED mobility M(phi;a).  'const' = the given Onsager matrix (existing
+    behavior); 'phi_diag' = M_ii = m0*(1 + c*phi_i), off-diag 0 (learnable
+    m0, c).
+
+    ``.matrix(phi_gp)``      — M×M list-of-lists of [ne, nqp] arrays
+    ``.dmatrix_dparam(phi_gp, name)`` — M×M list-of-lists of [ne, nqp] arrays
+    ``.param_names``         — tuple of learnable parameter names
+
+    Preserves complex dtype so complex-step verification flows through.
+    """
+
+    def __init__(self, name="const", M=2, onsager=None, coeffs=None):
+        self.name = name
+        self.M = int(M)
+        self.onsager = None if onsager is None else np.asarray(onsager)
+        self.coeffs = dict(coeffs or {})
+        if name == "const":
+            self.param_names = ()
+        elif name == "phi_diag":
+            self.coeffs.setdefault("mob_m0", 1.0)
+            self.coeffs.setdefault("mob_c", 0.0)
+            self.param_names = ("mob_m0", "mob_c")
+        else:
+            raise ValueError(f"unknown mobility closure {name!r}")
+
+    def matrix(self, phi_gp):
+        """Returns M×M list-of-lists of [ne, nqp] arrays at Gauss points."""
+        M = self.M
+        if self.name == "const":
+            return [[self.onsager[i, j] * np.ones_like(phi_gp[0])
+                     for j in range(M)] for i in range(M)]
+        # phi_diag: M_ii = m0*(1 + c*phi_i), off-diagonal 0
+        m0 = self.coeffs["mob_m0"]
+        c = self.coeffs["mob_c"]
+        out = [[np.zeros_like(phi_gp[0]) for _ in range(M)] for _ in range(M)]
+        for i in range(M):
+            out[i][i] = m0 * (1.0 + c * phi_gp[i])
+        return out
+
+    def dmatrix_dparam(self, phi_gp, name):
+        """Returns M×M list-of-lists of [ne, nqp] arrays, dM/d(param name)."""
+        M = self.M
+        out = [[np.zeros_like(phi_gp[0]) for _ in range(M)] for _ in range(M)]
+        if self.name == "phi_diag":
+            if name == "mob_m0":
+                c = self.coeffs["mob_c"]
+                for i in range(M):
+                    out[i][i] = (1.0 + c * phi_gp[i])
+            elif name == "mob_c":
+                m0 = self.coeffs["mob_m0"]
+                for i in range(M):
+                    out[i][i] = m0 * phi_gp[i]
+        return out
+
+    def _dmatrix_dphi_diag(self, phi_gp, i):
+        """dM_ii/dphi_i at Gauss points: [ne, nqp] array, or None if zero.
+        Used by assemble() to add the phi-dependent-mobility Jacobian term.
+        For 'const': returns None (dM/dphi = 0, term absent).
+        For 'phi_diag': dM_ii/dphi_i = m0 * c."""
+        if self.name == "const":
+            return None
+        if self.name == "phi_diag":
+            m0 = self.coeffs["mob_m0"]
+            c = self.coeffs["mob_c"]
+            # m0*c is a scalar; broadcast to [ne, nqp] matching phi_gp[i] shape
+            return m0 * c * np.ones_like(phi_gp[i])
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Numpy port of neural_energy._legendre — preserves complex dtype
 # ---------------------------------------------------------------------------
 def _legendre_np(u, k):

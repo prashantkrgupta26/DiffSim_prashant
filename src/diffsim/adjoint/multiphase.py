@@ -229,22 +229,40 @@ class MultiCHDiscrete:
     def assemble(self, phis, mus, hist_gp, params, want_jac=True):
         """R (len ndof) and, if want_jac, J = dR/dx (csr ndof x ndof).
         phis/mus are length-M lists of length-nn arrays; hist_gp[i][bi] is the
-        [ne, nqp] BDF history load for species i (sum_k (ch_k/dt) interp)."""
+        [ne, nqp] BDF history load for species i (sum_k (ch_k/dt) interp).
+
+        params["mobility"] must be a MobilityClosure (or legacy "onsager" key
+        for back-compat).  The transport flux for species i is:
+            flux_i = sum_j M_ij(phi) * grad(mu_j)
+        For phi-dependent closures the Jacobian gains an extra term
+            dRphi_i/dphi_i += int gradN . ((dM_ii/dphi_i) * grad(mu_i))
+        (diagonal only for the phi_diag closure; off-diagonal M==0 there)."""
         M, blk = self.M, self.blk
-        Lam = np.asarray(params["onsager"])   # dtype preserved (complex-step)
+        # --- mobility: prefer closure; fall back to legacy onsager key -------
+        mobility = params.get("mobility")
+        if mobility is None:
+            # legacy path: params["onsager"] is a plain matrix
+            from .neural_multiphase import MobilityClosure as _MC
+            mobility = _MC("const", M=M,
+                           onsager=np.asarray(params["onsager"]))
         kap = params["kappa"]
         energy = params["energy"]
         sigma = params["sigma"]
         pi = [self.interp(phis[i]) for i in range(M)]
         mi = [self.interp(mus[i]) for i in range(M)]
         # promote R dtype so complex-step verification (imag perturbations in
-        # phi/mu, chi/N, onsager/kappa) flows through the scatter unclipped.
+        # phi/mu, chi/N, mobility/kappa) flows through the scatter unclipped.
         dsrc = [np.asarray(phis[i]).dtype for i in range(M)]
         dsrc += [np.asarray(mus[i]).dtype for i in range(M)]
-        dsrc += [np.asarray(Lam).dtype, np.asarray(kap).dtype]
+        dsrc += [np.asarray(kap).dtype]
+        if mobility.name == "const" and mobility.onsager is not None:
+            dsrc.append(np.asarray(mobility.onsager).dtype)
         for attr in ("chi", "N"):
             if hasattr(energy, attr):
                 dsrc.append(np.asarray(getattr(energy, attr)).dtype)
+        # also pick up complex dtype from closure coefficients (phi_diag)
+        for v in mobility.coeffs.values():
+            dsrc.append(np.asarray(v).dtype)
         R = np.zeros(self.ndof, dtype=np.result_type(*dsrc, np.float64))
         rows, cols, vals = [], [], []
         for bi, B in enumerate(self.bins):
@@ -260,11 +278,14 @@ class MultiCHDiscrete:
             ne, nbf = B["ne"], B["nbf"]
             Ae = np.zeros((ne, blk * nbf, blk * nbf)) if want_jac else None
             H = energy.dmu_dphi(phi_gp) if want_jac else None
+            # evaluate mobility matrix at Gauss points: M×M list-of-lists of
+            # [ne, nqp] arrays
+            Lam = mobility.matrix(phi_gp)
             for i in range(M):
                 # R_phi_i = Int N(sigma phi_i - hist_i) + Int gradN . flux_i
                 flux = np.zeros_like(gmu[0])
                 for j in range(M):
-                    flux = flux + Lam[i, j] * gmu[j]
+                    flux = flux + Lam[i][j][:, :, None] * gmu[j]
                 gN_flux = np.einsum("qad,e,eqd->eqa", dN, dscale, flux)
                 Rphi = (np.einsum("eq,qa->ea",
                                   dJxW * (sigma * phi_gp[i] - hist_gp[i][bi]),
@@ -280,9 +301,31 @@ class MultiCHDiscrete:
                     continue
                 Ae[:, 2 * i::blk, 2 * i::blk] += sigma * NN         # dRphi/dphi
                 for j in range(M):
-                    Ae[:, 2 * i::blk, 2 * j + 1::blk] += Lam[i, j] * LL
+                    # dRphi_i/dmu_j: Int gradN_a . (M_ij(phi) grad N_b_mu_j) dOmega
+                    # M_ij is [ne,nqp]: must weight BEFORE integrating over q.
+                    # Lij_LL[e,a,b] = Sum_q dJxW[e,q]*dscale[e]^2 * Lam_ij[e,q]
+                    #                  * Sum_d dN[q,a,d]*dN[q,b,d]
+                    Lij_LL = np.einsum("eq,e,qad,qbd->eab",
+                                       dJxW * Lam[i][j], dscale ** 2, dN, dN)
+                    Ae[:, 2 * i::blk, 2 * j + 1::blk] += Lij_LL
                     FPP = np.einsum("eq,qa,qb->eab", dJxW * H[i][j], N, N)
                     Ae[:, 2 * i + 1::blk, 2 * j::blk] += -FPP       # dRmu/dphi
+                # phi-dependent mobility: extra Jacobian term dRphi_i/dphi_i
+                # = Int gradN . ((dM_ii/dphi_i) * grad(mu_i))
+                # For const closure dM/dphi = 0; for phi_diag dM_ii/dphi_i != 0
+                if mobility.name != "const":
+                    # dM_ii/dphi_i (scalar field [ne, nqp])
+                    dMii_dphii = mobility._dmatrix_dphi_diag(phi_gp, i)
+                    if dMii_dphii is not None:
+                        # flux contribution: dM_ii/dphi_i * grad(mu_i)
+                        dflux = dMii_dphii[:, :, None] * gmu[i]
+                        # integrate: Int gradN . dflux * N_a  (N_a is phi_i test fn)
+                        # = einsum over (e, q, a=phi-row, b=phi-col)
+                        # result shape (e, nbf_a, nbf_b) -> scatter to Ae[2i,2i]
+                        dM_term = np.einsum(
+                            "eq,eqd,qad,e,qb->eab",
+                            dJxW, dflux, dN, dscale, N)
+                        Ae[:, 2 * i::blk, 2 * i::blk] += dM_term
                 Ae[:, 2 * i + 1::blk, 2 * i::blk] += -kap[i] * LL   # +kap term
                 Ae[:, 2 * i + 1::blk, 2 * i + 1::blk] += NN         # dRmu/dmu
             if want_jac:
@@ -300,9 +343,22 @@ class MultiCHDiscrete:
 
     def dR_dparam(self, phis, mus, params, name):
         """Explicit dR/dp as a length-ndof vector at a committed state.  Bulk
-        params route through the energy object; onsager/kappa are engine-level."""
+        params route through the energy object; mobility/kappa are engine-level.
+
+        Handles:
+          onsager_a_b   — legacy constant onsager entry (const closure)
+          mob_*         — mobility closure parameter (phi_diag or other closures)
+          kappa_i       — interface energy coefficient
+          others        — delegated to energy.dmu_dparam
+        """
         M, blk = self.M, self.blk
         energy = params["energy"]
+        # retrieve mobility closure (prefer params["mobility"]; fall back to legacy)
+        mobility = params.get("mobility")
+        if mobility is None and "onsager" in params:
+            from .neural_multiphase import MobilityClosure as _MC
+            mobility = _MC("const", M=M,
+                           onsager=np.asarray(params["onsager"]))
         pi = [self.interp(phis[i]) for i in range(M)]
         mi = [self.interp(mus[i]) for i in range(M)]
         out = np.zeros(self.ndof)
@@ -310,12 +366,27 @@ class MultiCHDiscrete:
             dJxW, N, dN, dscale = B["dJxW"], B["N"], B["dN"], B["dscale"]
             phi_gp = [pi[i][bi][0] for i in range(M)]
             if name.startswith("onsager_"):
+                # legacy: const closure, Lam[a,b] is a scalar that multiplies
+                # grad(mu_b) in flux for species a -> dR_phi_a / d(onsager_a_b)
                 _, a, b = name.split("_")
                 a, b = int(a), int(b)
                 gmu_b = mi[b][bi][1]
                 gN = np.einsum("qad,e,eqd->eqa", dN, dscale, gmu_b)
                 Rphi = np.einsum("eq,eqa->ea", dJxW, gN)
                 np.add.at(out, B["gdof"][:, 2 * a::blk].ravel(), Rphi.ravel())
+            elif name.startswith("mob_"):
+                # mobility closure parameter: dR_phi_i/d(param) =
+                # Int gradN . ((dM_ij/d(param)) * grad(mu_j)) for each i,j
+                dLam = mobility.dmatrix_dparam(phi_gp, name)  # M×M list-of-lists
+                for i in range(M):
+                    contrib = np.zeros_like(mi[0][bi][1])  # [ne, nqp, dim]
+                    for j in range(M):
+                        dLij = dLam[i][j]  # [ne, nqp]
+                        contrib = contrib + dLij[:, :, None] * mi[j][bi][1]
+                    gN = np.einsum("qad,e,eqd->eqa", dN, dscale, contrib)
+                    Rphi = np.einsum("eq,eqa->ea", dJxW, gN)
+                    np.add.at(out, B["gdof"][:, 2 * i::blk].ravel(),
+                              Rphi.ravel())
             elif name.startswith("kappa_"):
                 i = int(name.split("_")[1])
                 gN = np.einsum("qad,e,eqd->eqa", dN, dscale, pi[i][bi][1])
@@ -339,14 +410,37 @@ class MultiCHForward:
     the converged state and BDF coefficients the adjoint replays.  M-generic
     sibling of phasefield.CHForward."""
 
-    def __init__(self, dm, energy, onsager, kappa, dt=1e-2, order=1,
-                 newton_tol=1e-12, newton_max=30, backend=None):
+    def __init__(self, dm, energy, onsager=None, kappa=None, dt=1e-2, order=1,
+                 newton_tol=1e-12, newton_max=30, backend=None,
+                 mobility=None):
+        """Newton BDF march.  ``mobility`` may be a MobilityClosure or a plain
+        matrix/array (auto-wrapped as const closure).  ``onsager`` is the legacy
+        keyword; if both are provided, ``mobility`` takes precedence."""
         from .linsolve_backend import ScipyBackend
+        from .neural_multiphase import MobilityClosure
         self.op = MultiCHDiscrete(dm, energy.M)
         self.M = energy.M
         self.energy = energy
-        self.onsager = np.asarray(onsager, np.float64)
-        self.kappa = [float(k) for k in kappa]
+        # --- resolve mobility ---
+        # Precedence: explicit mobility= > onsager= keyword
+        if mobility is not None:
+            if isinstance(mobility, MobilityClosure):
+                self.mobility = mobility
+            else:
+                # plain matrix / array
+                self.mobility = MobilityClosure(
+                    "const", M=self.M,
+                    onsager=np.asarray(mobility, np.float64))
+        elif onsager is not None:
+            self.mobility = MobilityClosure(
+                "const", M=self.M,
+                onsager=np.asarray(onsager, np.float64))
+        else:
+            raise ValueError("MultiCHForward: supply mobility= or onsager=")
+        # legacy attribute (backward-compat for callers that read fwd.onsager)
+        if self.mobility.name == "const":
+            self.onsager = self.mobility.onsager
+        self.kappa = [float(k) for k in (kappa or [])]
         self.dt = float(dt)
         self.order = order
         self.newton_tol, self.newton_max = newton_tol, newton_max
@@ -387,7 +481,7 @@ class MultiCHForward:
         return hist_gp
 
     def _params(self, sigma):
-        return dict(onsager=self.onsager, kappa=self.kappa,
+        return dict(mobility=self.mobility, kappa=self.kappa,
                     energy=self.energy, sigma=sigma)
 
     def step(self, record=True):
