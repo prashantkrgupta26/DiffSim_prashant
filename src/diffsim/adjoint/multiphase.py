@@ -475,11 +475,12 @@ class MultiCHAdjoint:
             ch, dt = rec["ch"], rec["dt"]
             for k, cc in enumerate(ch):
                 kn = n - (k + 1)
+                if kn < 0 and phi0_cot is None:
+                    continue          # residual-only caller: exact old fast path
                 for i in range(M):
                     hc = (cc / dt) * (Mass @ lam[2 * i::blk])
                     if kn < 0:
-                        if phi0_cot is not None:
-                            phi0_cot[i] += hc
+                        phi0_cot[i] += hc
                     else:
                         pending[kn][2 * i::blk] += hc
         # dJ/dphi_mean_i = sum_nodes (dJ/dx0)_{phi_i}, since a uniform mean
