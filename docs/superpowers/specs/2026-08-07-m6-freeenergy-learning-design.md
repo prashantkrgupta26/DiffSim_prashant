@@ -75,6 +75,17 @@ energy object, a mobility closure, a twin extension, and the MD data/loss layer.
   downstream (like the BO campaign, DAISY/analysis-side), not part of the engine
   deliverable.
 
+## Plan-level refinements (ratified 2026-08-07 at plan handoff)
+
+- **v1 energy correction = gauge-anchored POLYNOMIAL BASIS** (`BasisMultiEnergy`,
+  the M-generalization of `neural_energy.BasisCorrEnergy`), not the MLP head.
+  Exact simplex gauge, analytic `mu`/Hessian, coefficient-Gramian identifiability.
+  The MLP `NeuralMultiEnergy` is a drop-in follow-on (same `MultiEnergy` contract).
+- **Split into Plan A (engine) + Plan B (MD-learning layer).** Plan A =
+  energy + mobility closure + twin + three-way gate + synthetic recovery
+  (CPU, no MD). Plan B = MD ingest + hybrid CG/descriptor loss + Gramian
+  pre-check + real-MD demo. See `docs/superpowers/plans/2026-08-07-m6-freeenergy-planA-engine.md`.
+
 ## Architecture
 
 A differentiable trajectory-matching loop:
