@@ -96,3 +96,94 @@ def test_energy_derivs_complex_step(M):
                 fd = (FHMultiEnergy(chi, n1).mu(phis)[i]
                       - FHMultiEnergy(chi, n2).mu(phis)[i]) / (2 * eps)
             assert np.allclose(an[i], fd, atol=1e-6, rtol=1e-5), (name, i)
+
+
+# ==========================================================================
+# Task 2: MultiCHDiscrete
+# ==========================================================================
+def _rand_state(op, seed):
+    r = np.random.default_rng(seed)
+    M, nn = op.M, op.nn
+    phis = [0.20 + 0.06 * r.random(nn) for _ in range(M)]
+    mus = [0.05 * r.random(nn) for _ in range(M)]
+    return phis, mus
+
+
+def _rand_energy(M, seed):
+    from diffsim.adjoint.multiphase import FHMultiEnergy
+    r = np.random.default_rng(seed)
+    chi = 0.3 + 0.4 * r.random((M + 1, M + 1))
+    chi = 0.5 * (chi + chi.T)
+    np.fill_diagonal(chi, 0.0)
+    return FHMultiEnergy(chi, 1.0 + 0.5 * r.random(M + 1)), chi
+
+
+def test_discrete_jacobian_complex_step():
+    """J = dR/dx column-by-column vs complex-step of the residual (M=2)."""
+    from diffsim.adjoint.multiphase import MultiCHDiscrete
+    M = 2
+    dm, mesh = _dm(2)
+    op = MultiCHDiscrete(dm, M)
+    en, _ = _rand_energy(M, 7)
+    phis, mus = _rand_state(op, 8)
+    onsager = np.array([[1.0, 0.2], [0.2, 0.8]])
+    params = dict(onsager=onsager, kappa=[0.01, 0.02], energy=en, sigma=13.7)
+    hist = [[np.zeros_like(B["dJxW"]) for B in op.bins] for _ in range(M)]
+    R, J = op.assemble(phis, mus, hist, params, want_jac=True)
+    blk = 2 * M
+
+    def col(k):
+        h = 1e-30
+        pf = [x.astype(complex) for x in phis]
+        mf = [x.astype(complex) for x in mus]
+        node, fld = divmod(k, blk)
+        (pf if fld % 2 == 0 else mf)[fld // 2][node] += 1j * h
+        Rc, _ = op.assemble(pf, mf, hist, params, want_jac=False)
+        return Rc.imag / h
+
+    r = np.random.default_rng(9)
+    for k in r.integers(0, op.ndof, size=16):
+        got = np.asarray(J[:, int(k)].todense()).ravel()
+        assert np.allclose(got, col(int(k)), atol=1e-8, rtol=1e-6), int(k)
+
+
+def test_dR_dparam_complex_step():
+    """dR/dp vs complex-step of the residual, all rung-1 parameter kinds."""
+    from diffsim.adjoint.multiphase import MultiCHDiscrete
+    M = 2
+    dm, mesh = _dm(2)
+    op = MultiCHDiscrete(dm, M)
+    en, chi = _rand_energy(M, 11)
+    phis, mus = _rand_state(op, 12)
+    onsager = np.array([[1.0, 0.2], [0.2, 0.8]])
+    kappa = [0.01, 0.02]
+    params = dict(onsager=onsager, kappa=kappa, energy=en, sigma=9.0)
+    hist = [[np.zeros_like(B["dJxW"]) for B in op.bins] for _ in range(M)]
+
+    def resid(pp):
+        R, _ = op.assemble(phis, mus, hist, pp, want_jac=False)
+        return R
+
+    names = ["chi_0_1", "chi_0_2", "N_0", "N_2", "onsager_0_1", "kappa_0"]
+    from diffsim.adjoint.multiphase import FHMultiEnergy
+    for name in names:
+        an = op.dR_dparam(phis, mus, params, name)
+        h = 1e-30
+        if name.startswith("chi_"):
+            _, a, b = name.split("_"); a, b = int(a), int(b)
+            cc = chi.astype(complex); cc[a, b] += 1j * h; cc[b, a] += 1j * h
+            pp = dict(params, energy=FHMultiEnergy(cc, en.N))
+        elif name.startswith("N_"):
+            j = int(name.split("_")[1])
+            NN = en.N.astype(complex); NN[j] += 1j * h
+            pp = dict(params, energy=FHMultiEnergy(chi, NN))
+        elif name.startswith("onsager_"):
+            _, a, b = name.split("_"); a, b = int(a), int(b)
+            oo = onsager.astype(complex); oo[a, b] += 1j * h
+            pp = dict(params, onsager=oo)
+        else:
+            i = int(name.split("_")[1])
+            kk = [complex(v) for v in kappa]; kk[i] += 1j * h
+            pp = dict(params, kappa=kk)
+        cs = resid(pp).imag / h
+        assert np.allclose(an, cs, atol=1e-8, rtol=1e-6), name
