@@ -454,3 +454,37 @@ def test_scipy_to_torch_csr_roundtrip_and_transpose():
     ATt = scipy_to_torch_csr(A.T.tocsr(), torch.device("cpu"), torch)
     assert np.allclose(ATt.to_dense().cpu().numpy(), A.toarray().T)
     assert At.dtype == torch.float64
+
+
+def test_cudss_backend_importable_on_cpu():
+    # construction must not require CUDA (torch imported lazily); this lets the
+    # engine + daisy-morph wiring be unit-tested on the Mac.
+    from diffsim.adjoint import CudssBackend
+    be = CudssBackend(device="cuda:0")
+    assert be.device_str == "cuda:0"
+
+
+def _gpu_available():
+    try:
+        import warp as wp
+        return wp.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _gpu_available(), reason="no CUDA GPU (rung-2 gate runs on gpubox)")
+def test_cudss_backend_matches_scipy_on_gpu():
+    import numpy as np
+    import scipy.sparse as sp
+    from diffsim.adjoint import ScipyBackend, CudssBackend
+    rng = np.random.default_rng(0)
+    n = 200
+    A = sp.random(n, n, density=0.02, format="csr", random_state=0)
+    A = A + sp.eye(n) * 5.0            # well-conditioned, nonsymmetric
+    b = rng.standard_normal(n)
+    xs = ScipyBackend().solve(A, b)
+    xg = CudssBackend("cuda:0").solve(A, b)
+    assert np.allclose(xs, xg, rtol=1e-9, atol=1e-11)
+    xts = ScipyBackend().solve_T(A, b)
+    xtg = CudssBackend("cuda:0").solve_T(A, b)
+    assert np.allclose(xts, xtg, rtol=1e-9, atol=1e-11)
