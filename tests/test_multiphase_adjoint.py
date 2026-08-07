@@ -259,3 +259,34 @@ def test_forward_parity_quaternary():
     for i in range(M):
         assert np.allclose(fwd.steps[-1]["phis"][i], ref[i],
                            atol=1e-9, rtol=1e-7), i
+
+
+# ==========================================================================
+# Task 4: MultiCHAdjoint — interface smoke (three-way gate is Task 5)
+# ==========================================================================
+def test_adjoint_interface():
+    from diffsim.adjoint.multiphase import (MultiCHForward, MultiCHAdjoint,
+                                            FHMultiEnergy)
+    M = 2
+    dm, mesh = _dm(3)
+    coords = mesh.node_coords
+    chi = np.zeros((M + 1, M + 1))
+    chi[0, 1] = chi[1, 0] = 2.5
+    chi[0, 2] = chi[2, 0] = 1.0
+    chi[1, 2] = chi[2, 1] = 0.8
+    N = np.ones(M + 1)
+    fwd = MultiCHForward(dm, FHMultiEnergy(chi, N), onsager=np.eye(M),
+                         kappa=[1e-2, 1e-2], dt=1e-2, order=1)
+    cc = np.cos(np.pi * coords[:, 0]) * np.cos(np.pi * coords[:, 1])
+    fwd.set_initial([0.30 + 0.05 * cc, 0.30 + 0.05 * cc])
+    fwd.run(3)
+    blk = 2 * M
+    nn = dm.n_nodes
+    dJdx = [np.zeros(blk * nn) for _ in range(3)]
+    for i in range(M):
+        dJdx[-1][2 * i::blk] = fwd.steps[-1]["phis"][i] - 0.30
+    names = ["chi_0_1", "N_0", "onsager_0_0", "kappa_0"]
+    g = MultiCHAdjoint(fwd).gradient(dJdx, names)
+    assert set(g) == set(names)
+    for k, v in g.items():
+        assert np.isfinite(v), k

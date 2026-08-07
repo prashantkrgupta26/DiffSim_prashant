@@ -404,3 +404,52 @@ class MultiCHForward:
 
     def run(self, n_steps):
         return [self.step() for _ in range(n_steps)]
+
+
+# --------------------------------------------------------------------------
+# IFT reverse-sweep adjoint
+# --------------------------------------------------------------------------
+class MultiCHAdjoint:
+    """Reverse-sweep dJ/d{chi, N, onsager, kappa} for J = sum_n j(x_n).
+    M-generic sibling of phasefield.CHAdjoint: the BDF history cotangent
+    couples ALL M conserved phi-fields."""
+
+    def __init__(self, fwd: MultiCHForward):
+        self.fwd = fwd
+        self.op = fwd.op
+
+    def gradient(self, dJdx_list, param_names):
+        """dJdx_list[n] = dj/dx_n as a length-ndof node-major vector.
+        Returns {name: dJ/dname}."""
+        op = self.op
+        blk, M = op.blk, op.M
+        steps = self.fwd.steps
+        Ns = len(steps)
+        Mass = op.mass_matrix()
+        grads = {nm: 0.0 for nm in param_names}
+        pending = [np.zeros(op.ndof) for _ in range(Ns)]
+        # J = dR/dx is independent of the BDF history load, so zero history
+        # rebuilds the Jacobian at the converged iterate.
+        zero_hist = [[np.zeros_like(B["dJxW"]) for B in op.bins]
+                     for _ in range(M)]
+        for n in range(Ns - 1, -1, -1):
+            rec = steps[n]
+            _, J = op.assemble(rec["phis"], rec["mus"], zero_hist,
+                               rec["params"], want_jac=True)
+            rhs = np.asarray(dJdx_list[n], np.float64) + pending[n]
+            lam = splu(J.T.tocsc()).solve(rhs)
+            for nm in param_names:
+                dRdp = op.dR_dparam(rec["phis"], rec["mus"], rec["params"], nm)
+                grads[nm] -= float(lam @ dRdp)
+            # history cotangent: R_n depends on phi_i,{n-k} only through
+            # -(ch_k/dt) Mass on the phi_i-block -> +(ch_k/dt) Mass lam_phi_i
+            # onto the phi_i-columns of the earlier step.
+            ch, dt = rec["ch"], rec["dt"]
+            for k, cc in enumerate(ch):
+                kn = n - (k + 1)
+                if kn < 0:
+                    continue
+                for i in range(M):
+                    hc = (cc / dt) * (Mass @ lam[2 * i::blk])
+                    pending[kn][2 * i::blk] += hc
+        return grads
