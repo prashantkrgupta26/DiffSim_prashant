@@ -478,7 +478,14 @@ class MultiCHTwin:
         ons0 = np.asarray(onsager, np.float64)
         kap0 = [float(k) for k in kappa]
         leaves = {}
+        phi0_off = {}
         for nm in names:
+            if nm.startswith("phi0_"):
+                i = int(nm.split("_")[1])
+                leaves[nm] = torch.tensor(0.0, dtype=torch.float64,
+                                          device=self.dev, requires_grad=True)
+                phi0_off[i] = leaves[nm]
+                continue
             base = (chi0 if nm.startswith("chi_") else
                     N0 if nm.startswith("N_") else
                     ons0 if nm.startswith("onsager_") else kap0)
@@ -495,7 +502,9 @@ class MultiCHTwin:
         kap = [torch.tensor(k, dtype=torch.float64, device=self.dev)
                for k in kap0]
         for nm, leaf in leaves.items():
-            if nm.startswith("chi_"):
+            if nm.startswith("phi0_"):
+                pass  # handled below via phi0_off
+            elif nm.startswith("chi_"):
                 _, a, b = nm.split("_"); a, b = int(a), int(b)
                 E = torch.zeros(M + 1, M + 1, dtype=torch.float64,
                                 device=self.dev)
@@ -513,8 +522,13 @@ class MultiCHTwin:
                 Lam = Lam - Lam * E + leaf * E
             else:
                 kap[int(nm.split("_")[1])] = leaf
-        phis = [torch.tensor(np.asarray(p), dtype=torch.float64,
-                             device=self.dev) for p in phi0_list]
+        phis = []
+        for i in range(M):
+            p = torch.tensor(np.asarray(phi0_list[i]), dtype=torch.float64,
+                             device=self.dev)
+            if i in phi0_off:
+                p = p + phi0_off[i]
+            phis.append(p)
         out = self.march(phis, chi_t, N_t, Lam, kap, n_steps)
         xN = out[-1]
         blk = self.blk

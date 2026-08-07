@@ -399,6 +399,48 @@ def test_three_way_quaternary_bdf1(device):
 
 
 # ==========================================================================
+# Task 6: MultiCHTwin mean-phi offset leaf (twin == FD for phi0 group)
+# ==========================================================================
+def test_meanphi_twin_vs_fd_ternary_bdf1():
+    from diffsim.adjoint.torch_twin import MultiCHTwin
+    import numpy as np
+    dm, mesh = _dm(3)
+    coords = mesh.node_coords
+    M, order, n_steps, dt = 2, 1, 3, 0.01
+    chi0 = np.zeros((M + 1, M + 1))
+    chi0[0, 1] = chi0[1, 0] = 2.5
+    chi0[0, 2] = chi0[2, 0] = 1.0
+    chi0[1, 2] = chi0[2, 1] = 1.0
+    N0 = 1.0 + 0.3 * np.arange(M + 1)
+    ons0 = np.eye(M)
+    kap0 = [0.01, 0.02]
+    cc = np.cos(np.pi * coords[:, 0]) * np.cos(np.pi * coords[:, 1])
+    base = [0.28 + 0.05 * cc for _ in range(M)]
+    tgt = 0.28
+    names = [f"phi0_{i}" for i in range(M)]
+    twin = MultiCHTwin(dm, M, dt=dt, order=order, device="cpu")
+    g_tw = twin.grads(base, chi0, N0, ons0, kap0, n_steps, names, tgt)
+
+    import torch
+    def loss_of(phi0):
+        out = twin.march(
+            [torch.tensor(np.asarray(p)) for p in phi0],
+            torch.tensor(chi0), torch.tensor(N0), torch.tensor(ons0),
+            [torch.tensor(k) for k in kap0], n_steps)
+        xN = out[-1]
+        return 0.5 * float(sum(((xN[2 * i::2 * M] - tgt) ** 2).sum()
+                               for i in range(M)))
+    eps = 1e-6
+    for i in range(M):
+        hi = [base[j] + (eps if j == i else 0.0) for j in range(M)]
+        lo = [base[j] - (eps if j == i else 0.0) for j in range(M)]
+        fd = (loss_of(hi) - loss_of(lo)) / (2 * eps)
+        rel = abs(g_tw[f"phi0_{i}"] - fd) / max(abs(fd), 1e-14)
+        print(f"phi0_{i}: twin={g_tw[f'phi0_{i}']:+.6e} fd={fd:+.6e} rel={rel:.2e}")
+        assert rel < 1e-6, (i, g_tw[f"phi0_{i}"], fd, rel)
+
+
+# ==========================================================================
 # Task 1 (Rung 2): LinearBackend protocol + ScipyBackend
 # ==========================================================================
 def test_scipy_backend_solve_and_transpose():
