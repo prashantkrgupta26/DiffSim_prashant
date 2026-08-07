@@ -209,6 +209,24 @@ class MultiCHDiscrete:
             shape=(self.nn, self.nn)).tocsr()
         return self._mass
 
+    def stiffness_matrix(self):
+        """Global scalar stiffness (Laplacian) K, K[a,b] = Int gradN_a.gradN_b.
+        Used by objectives like the interfacial (gradient) energy
+        J = sum_i (kappa_i/2) phi_i^T K phi_i, whose cotangent is kappa_i K phi_i."""
+        rows, cols, vals = [], [], []
+        for B in self.bins:
+            LL = np.einsum("eq,qad,qbd->eab",
+                           B["dJxW"] * B["dscale"][:, None] ** 2,
+                           B["dN"], B["dN"])
+            conn, nbf = B["conn"], B["nbf"]
+            rows.append(np.repeat(conn, nbf, axis=1).ravel())
+            cols.append(np.tile(conn, (1, nbf)).ravel())
+            vals.append(LL.ravel())
+        return sp.coo_matrix(
+            (np.concatenate(vals),
+             (np.concatenate(rows), np.concatenate(cols))),
+            shape=(self.nn, self.nn)).tocsr()
+
     def assemble(self, phis, mus, hist_gp, params, want_jac=True):
         """R (len ndof) and, if want_jac, J = dR/dx (csr ndof x ndof).
         phis/mus are length-M lists of length-nn arrays; hist_gp[i][bi] is the

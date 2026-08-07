@@ -264,6 +264,21 @@ def test_forward_parity_quaternary():
 # ==========================================================================
 # Task 4: MultiCHAdjoint — interface smoke (three-way gate is Task 5)
 # ==========================================================================
+def test_stiffness_matrix():
+    """K symmetric; K @ const == 0 (gradient energy of a constant is zero);
+    phi^T K phi > 0 for a non-constant field (used by the interfacial-energy
+    objective in the daisy-morph gradients path)."""
+    from diffsim.adjoint.multiphase import MultiCHDiscrete
+    dm, mesh = _dm(3)
+    op = MultiCHDiscrete(dm, 2)
+    K = op.stiffness_matrix()
+    assert (abs(K - K.T)).nnz == 0 or np.allclose((K - K.T).data, 0.0)
+    const = np.ones(op.nn)
+    assert np.allclose(K @ const, 0.0, atol=1e-10)
+    cc = np.cos(np.pi * mesh.node_coords[:, 0])
+    assert float(cc @ (K @ cc)) > 1e-6
+
+
 def test_adjoint_interface():
     from diffsim.adjoint.multiphase import (MultiCHForward, MultiCHAdjoint,
                                             FHMultiEnergy)
