@@ -11,6 +11,8 @@ so no non-differentiable clamp is ever needed."""
 import numpy as np
 import torch
 
+from .neural_energy import _legendre as _legendre_torch
+
 torch.set_default_dtype(torch.float64)
 
 
@@ -363,7 +365,16 @@ class MultiCHTwin:
         g = torch.einsum("qad,ea,e->eqd", B["dN"], vals, B["dscale"])
         return v, g
 
-    def _mu_and_H(self, phi_gp, chi_t, Ninv):
+    def _mu_and_H(self, phi_gp, chi_t, Ninv,
+                  basis_leaves=None, basis_meta=None):
+        """Compute FH exchange potentials and their Hessian at Gauss points.
+
+        Optional energy correction (Task 3, M6):
+          basis_leaves : dict  {(i, k): leaf_tensor}  — only the requested ones
+          basis_meta   : dict  {mid, half, degrees}
+        Adds sum_k gamma_{i,k} * P_k(u_i) to mus[i]
+        and  sum_k gamma_{i,k} * P'_k(u_i)/half to H[i][i].
+        """
         M = self.M
         ps = 1.0 - sum(phi_gp)
         phi_of = lambda l: phi_gp[l] if l < M else ps
@@ -378,12 +389,40 @@ class MultiCHTwin:
               - chi_t[i, M] - chi_t[M, j] + (Ninv[i] / phi_gp[i]
                                              if i == j else 0.0)
               for j in range(M)] for i in range(M)]
+        # --- energy correction ------------------------------------------------
+        if basis_leaves and basis_meta:
+            mid = basis_meta["mid"]
+            half = basis_meta["half"]
+            degrees = basis_meta["degrees"]
+            for i in range(M):
+                u = (phi_gp[i] - mid) / half
+                for k in degrees:
+                    key = (i, k)
+                    if key not in basis_leaves:
+                        continue
+                    gamma_ik = basis_leaves[key]
+                    pk, dpk = _legendre_torch(u, k)
+                    mus[i] = mus[i] + gamma_ik * pk
+                    H[i][i] = H[i][i] + gamma_ik * dpk / half
         return mus, H
 
-    def _assemble(self, x, hist_gp, chi_t, Ninv, Lam, kap, sigma):
+    def _assemble(self, x, hist_gp, chi_t, Ninv, Lam, kap, sigma,
+                  basis_leaves=None, basis_meta=None, mob_leaves=None):
+        """Assemble residual R and Jacobian J.
+
+        Optional extensions (Task 3, M6):
+          basis_leaves / basis_meta — energy correction fed to _mu_and_H.
+          mob_leaves  : dict {'mob_m0': tensor, 'mob_c': tensor} or None.
+            When present, replaces constant Lam[i,j] with phi_diag closure
+            M_ii = mob_m0*(1 + mob_c*phi_i), off-diagonal 0.
+            The Jacobian includes the analytic dM_ii/dphi_i block so Newton
+            converges robustly; gradient correctness comes from the exact
+            residual + autograd-through-convergence.
+        """
         M, blk = self.M, self.blk
         R = torch.zeros(self.ndof, device=self.dev)
         J = torch.zeros(self.ndof * self.ndof, device=self.dev)
+        use_mob_leaves = mob_leaves is not None
         for bi, B in enumerate(self.bins):
             dJxW, N, dN, ds = B["dJxW"], B["N"], B["dN"], B["dscale"]
             phi_gp, gphi, mu_gp, gmu = [], [], [], []
@@ -392,7 +431,9 @@ class MultiCHTwin:
                 phi_gp.append(v); gphi.append(g)
                 v2, g2 = self._ip(x[2 * i + 1::blk], B)
                 mu_gp.append(v2); gmu.append(g2)
-            muref, H = self._mu_and_H(phi_gp, chi_t, Ninv)
+            muref, H = self._mu_and_H(phi_gp, chi_t, Ninv,
+                                      basis_leaves=basis_leaves,
+                                      basis_meta=basis_meta)
             NN = torch.einsum("eq,qa,qb->eab", dJxW, N, N)
             LL = torch.einsum("eq,qad,qbd->eab", dJxW * ds[:, None] ** 2,
                               dN, dN)
@@ -400,8 +441,17 @@ class MultiCHTwin:
             nbf = B["nbf"]
             Ae = torch.zeros((B["ne"], blk * nbf, blk * nbf), device=self.dev)
             for i in range(M):
-                flux = sum(Lam[i, j] * gmu[j] for j in range(M))
-                gN_flux = torch.einsum("qad,e,eqd->eqa", dN, ds, flux)
+                if use_mob_leaves:
+                    # phi_diag: M_ii = mob_m0*(1 + mob_c*phi_i), off-diag 0
+                    mob_m0 = mob_leaves["mob_m0"]
+                    mob_c = mob_leaves["mob_c"]
+                    Mii = mob_m0 * (1.0 + mob_c * phi_gp[i])  # [ne, nqp]
+                    # Rphi flux: ∫ M_ii ∇mu_i · ∇v dΩ  (only diagonal species)
+                    flux_vec = Mii[:, :, None] * gmu[i]   # [ne, nqp, dim]
+                    gN_flux = torch.einsum("qad,e,eqd->eqa", dN, ds, flux_vec)
+                else:
+                    flux = sum(Lam[i, j] * gmu[j] for j in range(M))
+                    gN_flux = torch.einsum("qad,e,eqd->eqa", dN, ds, flux)
                 Rphi = torch.einsum("eq,qa->ea",
                                     dJxW * (sigma * phi_gp[i] - hist_gp[i][bi]),
                                     N) + torch.einsum("eq,eqa->ea", dJxW,
@@ -413,8 +463,26 @@ class MultiCHTwin:
                 R = R.index_add(0, B["gd"][2 * i], Rphi.reshape(-1))
                 R = R.index_add(0, B["gd"][2 * i + 1], Rmu.reshape(-1))
                 Ae[:, 2 * i::blk, 2 * i::blk] = sigma * NN
+                if use_mob_leaves:
+                    # phi_i column → Mii-weighted Laplacian for mu_i dofs
+                    Ae[:, 2 * i::blk, 2 * i + 1::blk] = torch.einsum(
+                        "eq,qad,qbd->eab",
+                        dJxW * Mii * ds[:, None] ** 2, dN, dN)
+                    # phi_i column → extra dM_ii/dphi_i * ∇mu_i·∇N_b term
+                    # dM_ii/dphi_i = mob_m0 * mob_c (scalar expression)
+                    dMii_dphi = mob_m0 * mob_c
+                    # ∫ dJxW * dM/dphi_i * (∇mu_i · ∇N_b) * N_a dΩ
+                    # gmu_i: [ne, nqp, dim]; dN: [nqp, nbf, dim]; ds: [ne]
+                    gmu_dot_dN = torch.einsum(
+                        "eqd,qbd,e->eqb", gmu[i], dN, ds)  # [ne, nqp, nbf]
+                    Ae[:, 2 * i::blk, 2 * i::blk] = (
+                        Ae[:, 2 * i::blk, 2 * i::blk]
+                        + dMii_dphi * torch.einsum(
+                            "eq,qa,eqb->eab", dJxW, N, gmu_dot_dN))
+                else:
+                    for j in range(M):
+                        Ae[:, 2 * i::blk, 2 * j + 1::blk] = Lam[i, j] * LL
                 for j in range(M):
-                    Ae[:, 2 * i::blk, 2 * j + 1::blk] = Lam[i, j] * LL
                     Ae[:, 2 * i + 1::blk, 2 * j::blk] = -WM(H[i][j])
                 Ae[:, 2 * i + 1::blk, 2 * i::blk] = \
                     Ae[:, 2 * i + 1::blk, 2 * i::blk] - kap[i] * LL
@@ -423,7 +491,15 @@ class MultiCHTwin:
         return R, J.reshape(self.ndof, self.ndof)
 
     def march(self, phi0_list, chi_t, N_t, Lam, kap, n_steps,
-              newton_max=40, newton_tol=1e-12):
+              newton_max=40, newton_tol=1e-12,
+              tau=None, basis_leaves=None, basis_meta=None, mob_leaves=None):
+        """March n_steps of BDF1/BDF2 with optional:
+          tau           : time-scale leaf; dt_eff = tau * self.dt
+          basis_leaves  : {(i,k): tensor} energy correction coefficients
+          basis_meta    : {mid, half, degrees} for the shifted-Legendre basis
+          mob_leaves    : {'mob_m0': tensor, 'mob_c': tensor} phi_diag closure
+        When tau/basis_leaves/mob_leaves are None the march is identical to
+        the original (backward-compatible, no-op for existing tests)."""
         M, blk = self.M, self.blk
         Ninv = 1.0 / N_t
         x = torch.zeros(self.ndof, device=self.dev)
@@ -431,11 +507,13 @@ class MultiCHTwin:
             x[2 * i::blk] = phi0_list[i]
         snap = [phi0_list[i].clone() for i in range(M)]
         hist = [snap, [p.clone() for p in snap]]
-        dt = self.dt
+        dt_base = self.dt
         t, dt_prev = 0.0, None
         out = []
         for _ in range(n_steps):
-            if self.order == 1 or dt_prev is None or t < dt / 2:
+            # effective time step (tau leaf scales physical dt)
+            dt = tau * dt_base if tau is not None else dt_base
+            if self.order == 1 or dt_prev is None or t < float(dt_base) / 2:
                 c0_, ch = 1.0, [1.0]
             else:
                 rr = dt / dt_prev
@@ -456,7 +534,9 @@ class MultiCHTwin:
             xk = x.clone()
             for it in range(newton_max):
                 R, Jm = self._assemble(xk, hist_gp, chi_t, Ninv, Lam, kap,
-                                       sigma)
+                                       sigma, basis_leaves=basis_leaves,
+                                       basis_meta=basis_meta,
+                                       mob_leaves=mob_leaves)
                 dx = torch.linalg.solve(Jm, -R)
                 xk = xk + dx
                 if float(dx.detach().abs().max()) < newton_tol:
@@ -464,14 +544,29 @@ class MultiCHTwin:
             x = xk
             out.append(x)
             hist = [[x[2 * i::blk] for i in range(M)], hist[0]]
-            t += dt
+            t += float(dt_base)
             dt_prev = dt
         return out
 
     def grads(self, phi0_list, chi, N, onsager, kappa, n_steps, names,
-              target):
+              target, basis_energy=None, mob_closure=None):
         """Build leaf tensors for the requested params, march, backprop
-        loss = 0.5 sum_i ||phi_i,N - target||^2, return {name: leaf.grad}."""
+        loss = 0.5 sum_i ||phi_i,N - target||^2, return {name: leaf.grad}.
+
+        Extended (Task 3, M6) to support three new name families:
+
+        ``basis_{i}_{k}`` (energy correction)
+          Requires ``basis_energy`` — a BasisMultiEnergy (or object with .gamma,
+          .mid, .half, .degrees).  Initial values taken from energy.gamma[(i,k)]
+          (0.0 if absent).
+
+        ``mob_{j}`` (mobility closure)
+          Requires ``mob_closure`` — a MobilityClosure('phi_diag', ...) with
+          .coeffs dict.  Initial values from closure.coeffs.
+
+        ``tau`` (time-scale)
+          No extra object needed; initialised to 1.0 (multiplicative identity).
+        """
         M = self.M
         chi0 = np.asarray(chi, np.float64)
         N0 = np.asarray(N, np.float64)
@@ -479,37 +574,76 @@ class MultiCHTwin:
         kap0 = [float(k) for k in kappa]
         leaves = {}
         phi0_off = {}
+        # ---- build leaves for all requested names --------------------------
         for nm in names:
             if nm.startswith("phi0_"):
                 i = int(nm.split("_")[1])
                 leaves[nm] = torch.tensor(0.0, dtype=torch.float64,
                                           device=self.dev, requires_grad=True)
                 phi0_off[i] = leaves[nm]
-                continue
-            base = (chi0 if nm.startswith("chi_") else
-                    N0 if nm.startswith("N_") else
-                    ons0 if nm.startswith("onsager_") else kap0)
-            if nm.startswith("chi_") or nm.startswith("onsager_"):
-                _, a, b = nm.split("_"); v = float(base[int(a), int(b)])
+            elif nm.startswith("basis_"):
+                # basis_{i}_{k}: init from energy.gamma[(i,k)] or 0.0
+                _, si, sk = nm.split("_")
+                i_sp, k_deg = int(si), int(sk)
+                v = 0.0
+                if basis_energy is not None:
+                    v = float(basis_energy.gamma.get((i_sp, k_deg), 0.0))
+                leaves[nm] = torch.tensor(v, dtype=torch.float64,
+                                          device=self.dev, requires_grad=True)
+            elif nm.startswith("mob_"):
+                # mob_m0 or mob_c: init from closure.coeffs
+                v = 0.0
+                if mob_closure is not None:
+                    v = float(mob_closure.coeffs.get(nm, 0.0))
+                leaves[nm] = torch.tensor(v, dtype=torch.float64,
+                                          device=self.dev, requires_grad=True)
+            elif nm == "tau":
+                leaves[nm] = torch.tensor(1.0, dtype=torch.float64,
+                                          device=self.dev, requires_grad=True)
+            elif nm.startswith("chi_") or nm.startswith("onsager_"):
+                base = chi0 if nm.startswith("chi_") else ons0
+                _, a, b = nm.split("_")
+                v = float(base[int(a), int(b)])
+                leaves[nm] = torch.tensor(v, dtype=torch.float64,
+                                          device=self.dev, requires_grad=True)
+            elif nm.startswith("N_"):
+                v = float(N0[int(nm.split("_")[1])])
+                leaves[nm] = torch.tensor(v, dtype=torch.float64,
+                                          device=self.dev, requires_grad=True)
             else:
-                v = float(base[int(nm.split("_")[1])])
-            leaves[nm] = torch.tensor(v, dtype=torch.float64,
-                                      device=self.dev, requires_grad=True)
-        # assemble differentiable parameter tensors from constants + leaves
+                # kappa_{i}
+                v = float(kap0[int(nm.split("_")[1])])
+                leaves[nm] = torch.tensor(v, dtype=torch.float64,
+                                          device=self.dev, requires_grad=True)
+        # ---- assemble differentiable parameter tensors ---------------------
         chi_t = torch.tensor(chi0, dtype=torch.float64, device=self.dev)
         N_t = torch.tensor(N0, dtype=torch.float64, device=self.dev)
         Lam = torch.tensor(ons0, dtype=torch.float64, device=self.dev)
         kap = [torch.tensor(k, dtype=torch.float64, device=self.dev)
                for k in kap0]
+        # basis leaves dict keyed by (i, k)
+        b_leaves = {}   # {(i, k): leaf_tensor}
+        b_meta = None
+        mob_lvs = None  # {'mob_m0': tensor, 'mob_c': tensor}
+        tau_leaf = None
         for nm, leaf in leaves.items():
             if nm.startswith("phi0_"):
-                pass  # handled below via phi0_off
+                pass
+            elif nm.startswith("basis_"):
+                _, si, sk = nm.split("_")
+                b_leaves[(int(si), int(sk))] = leaf
+            elif nm.startswith("mob_"):
+                if mob_lvs is None:
+                    mob_lvs = {}
+                mob_lvs[nm] = leaf
+            elif nm == "tau":
+                tau_leaf = leaf
             elif nm.startswith("chi_"):
                 _, a, b = nm.split("_"); a, b = int(a), int(b)
                 E = torch.zeros(M + 1, M + 1, dtype=torch.float64,
                                 device=self.dev)
                 E[a, b] = 1.0; E[b, a] = 1.0
-                chi_t = chi_t - chi_t * E + leaf * E   # replace entry by leaf
+                chi_t = chi_t - chi_t * E + leaf * E
             elif nm.startswith("N_"):
                 i = int(nm.split("_")[1])
                 e = torch.zeros(M + 1, dtype=torch.float64, device=self.dev)
@@ -522,6 +656,29 @@ class MultiCHTwin:
                 Lam = Lam - Lam * E + leaf * E
             else:
                 kap[int(nm.split("_")[1])] = leaf
+        # ---- fill in constant basis coefficients not requested as leaves ---
+        if b_leaves and basis_energy is not None:
+            for (i, k), v in basis_energy.gamma.items():
+                if (i, k) not in b_leaves:
+                    b_leaves[(i, k)] = torch.tensor(
+                        float(v), dtype=torch.float64, device=self.dev)
+            b_meta = dict(mid=basis_energy.mid, half=basis_energy.half,
+                          degrees=basis_energy.degrees)
+        elif b_leaves:
+            # no basis_energy supplied — infer meta from names with dom=(0.05,0.95)
+            mid, half = 0.5, 0.45
+            degrees = tuple(sorted({k for (_, k) in b_leaves}))
+            b_meta = dict(mid=mid, half=half, degrees=degrees)
+        # ---- if mob_closure provided, fill non-leaf mob coeffs -------------
+        if mob_closure is not None and mob_lvs is None:
+            mob_lvs = {}
+        if mob_closure is not None:
+            for pname in ("mob_m0", "mob_c"):
+                if pname not in mob_lvs:
+                    mob_lvs[pname] = torch.tensor(
+                        float(mob_closure.coeffs.get(pname, 0.0)),
+                        dtype=torch.float64, device=self.dev)
+        # ---- initial conditions -------------------------------------------
         phis = []
         for i in range(M):
             p = torch.tensor(np.asarray(phi0_list[i]), dtype=torch.float64,
@@ -529,7 +686,12 @@ class MultiCHTwin:
             if i in phi0_off:
                 p = p + phi0_off[i]
             phis.append(p)
-        out = self.march(phis, chi_t, N_t, Lam, kap, n_steps)
+        # ---- march and loss -----------------------------------------------
+        out = self.march(phis, chi_t, N_t, Lam, kap, n_steps,
+                         tau=tau_leaf,
+                         basis_leaves=b_leaves if b_leaves else None,
+                         basis_meta=b_meta,
+                         mob_leaves=mob_lvs)
         xN = out[-1]
         blk = self.blk
         tgt = torch.tensor(float(target), dtype=torch.float64,

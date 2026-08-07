@@ -219,3 +219,107 @@ def test_phi_diag_jacobian_complex_step():
     for k in rng2.integers(0, op.ndof, size=20):
         got = np.asarray(J[:, int(k)].todense()).ravel()
         assert np.allclose(got, col(int(k)), atol=1e-8, rtol=1e-6), int(k)
+
+
+# ==========================================================================
+# Task 3 (M6): MultiCHTwin — basis/mob/tau grads vs central FD
+# ==========================================================================
+def test_twin_basis_mob_tau_vs_fd():
+    """MultiCHTwin.grads for basis_0_2 / mob_m0 / tau vs central FD.
+
+    Ternary (M=2), BDF1, 3 steps.  BasisMultiEnergy(degrees=(2,3)) + phi_diag
+    MobilityClosure.  Compare each twin grad against central FD of the same
+    loss = 0.5 * sum_i || phi_i,N - tgt ||^2.  Rel error < 1e-6.
+    """
+    import torch
+    from diffsim.adjoint import BasisMultiEnergy, MobilityClosure
+    from diffsim.adjoint.torch_twin import MultiCHTwin
+
+    M = 2
+    dm, mesh = _dm(3)
+    coords = mesh.node_coords
+    cc = np.cos(np.pi * coords[:, 0]) * np.cos(np.pi * coords[:, 1])
+
+    # ---- base parameters --------------------------------------------------
+    chi0 = np.zeros((M + 1, M + 1))
+    chi0[0, 1] = chi0[1, 0] = 2.5
+    chi0[0, 2] = chi0[2, 0] = 1.0
+    chi0[1, 2] = chi0[2, 1] = 0.8
+    N0 = np.ones(M + 1)
+    ons0 = np.eye(M)   # used only as placeholder (overridden by mob_closure)
+    kap0 = [0.01, 0.02]
+    dt = 0.01
+    n_steps = 3
+    tgt = 0.28
+    phi0 = [0.28 + 0.05 * cc, 0.28 + 0.05 * cc]
+
+    # non-zero basis coefficients so the gradient is non-trivial
+    basis_coeffs = {"basis_0_2": 0.15, "basis_0_3": -0.10,
+                    "basis_1_2": 0.08, "basis_1_3": 0.05}
+    basis_en = BasisMultiEnergy(chi0, N0, degrees=(2, 3), coeffs=basis_coeffs)
+
+    mob_coeffs = {"mob_m0": 1.2, "mob_c": 0.4}
+    mob_cl = MobilityClosure("phi_diag", M=M, coeffs=mob_coeffs)
+
+    twin = MultiCHTwin(dm, M, dt=dt, order=1, device="cpu")
+
+    names = ["basis_0_2", "mob_m0", "tau"]
+    g_tw = twin.grads(phi0, chi0, N0, ons0, kap0, n_steps, names, tgt,
+                      basis_energy=basis_en, mob_closure=mob_cl)
+
+    # ---- central FD reference using the SAME loss via twin.march ----------
+    def loss_of(basis_coeffs_d, mob_coeffs_d, tau_val):
+        """Re-run twin march with perturbed params; return scalar loss."""
+        mid, half = 0.5, 0.45
+        degrees = (2, 3)
+        # build basis_leaves (constant tensors, no grad)
+        bl = {}
+        for i in range(M):
+            for k in degrees:
+                nm = f"basis_{i}_{k}"
+                bl[(i, k)] = torch.tensor(
+                    float(basis_coeffs_d.get(nm, 0.0)), dtype=torch.float64)
+        bmeta = dict(mid=mid, half=half, degrees=degrees)
+        mob_lvs = {pn: torch.tensor(float(mob_coeffs_d[pn]), dtype=torch.float64)
+                   for pn in ("mob_m0", "mob_c")}
+        tau_t = torch.tensor(float(tau_val), dtype=torch.float64)
+        chi_t = torch.tensor(chi0, dtype=torch.float64)
+        N_t = torch.tensor(N0, dtype=torch.float64)
+        phis_t = [torch.tensor(np.asarray(phi0[i]), dtype=torch.float64)
+                  for i in range(M)]
+        kap_t = [torch.tensor(k, dtype=torch.float64) for k in kap0]
+        out = twin.march(phis_t, chi_t, N_t, None, kap_t, n_steps,
+                         tau=tau_t, basis_leaves=bl, basis_meta=bmeta,
+                         mob_leaves=mob_lvs)
+        xN = out[-1]
+        blk = 2 * M
+        tgt_t = torch.tensor(float(tgt), dtype=torch.float64)
+        return float(0.5 * sum(((xN[2 * i::blk] - tgt_t) ** 2).sum()
+                               for i in range(M)))
+
+    eps = 1e-5  # central FD step (tau/mob are order-1 params; 1e-5 is safe)
+
+    # FD for basis_0_2
+    bc_hi = dict(basis_coeffs); bc_hi["basis_0_2"] += eps
+    bc_lo = dict(basis_coeffs); bc_lo["basis_0_2"] -= eps
+    fd_basis02 = (loss_of(bc_hi, mob_coeffs, 1.0)
+                  - loss_of(bc_lo, mob_coeffs, 1.0)) / (2 * eps)
+
+    # FD for mob_m0
+    mc_hi = dict(mob_coeffs); mc_hi["mob_m0"] += eps
+    mc_lo = dict(mob_coeffs); mc_lo["mob_m0"] -= eps
+    fd_mob_m0 = (loss_of(basis_coeffs, mc_hi, 1.0)
+                 - loss_of(basis_coeffs, mc_lo, 1.0)) / (2 * eps)
+
+    # FD for tau
+    fd_tau = (loss_of(basis_coeffs, mob_coeffs, 1.0 + eps)
+              - loss_of(basis_coeffs, mob_coeffs, 1.0 - eps)) / (2 * eps)
+
+    fd = {"basis_0_2": fd_basis02, "mob_m0": fd_mob_m0, "tau": fd_tau}
+
+    for nm in names:
+        tw_val = g_tw[nm]
+        fd_val = fd[nm]
+        rel = abs(tw_val - fd_val) / max(abs(fd_val), 1e-14)
+        print(f"{nm}: twin={tw_val:+.6e}  fd={fd_val:+.6e}  rel={rel:.2e}")
+        assert rel < 1e-6, (nm, tw_val, fd_val, rel)
