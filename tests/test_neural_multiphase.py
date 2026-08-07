@@ -8,6 +8,10 @@ TDD structure:
   - test_const_closure_matches_current_engine (Task 2 / const back-compat)
   - test_phi_diag_closure_complex_step        (Task 2 / mob param dR/dparam)
   - test_phi_diag_jacobian_complex_step       (Task 2 / phi-dep mobility Jacobian)
+  - test_twin_basis_mob_tau_vs_fd            (Task 3 / twin grads vs FD)
+  - test_three_way_m6_ternary_bdf1           (Task 4 / M6 three-way gate: basis+mob)
+  - test_three_way_m6_ternary_bdf2           (Task 4 / M6 three-way gate: basis+mob)
+  - test_three_way_m6_quaternary_bdf1        (Task 4 / M6 three-way gate: basis+mob)
 """
 import numpy as np
 import pytest
@@ -323,3 +327,190 @@ def test_twin_basis_mob_tau_vs_fd():
         rel = abs(tw_val - fd_val) / max(abs(fd_val), 1e-14)
         print(f"{nm}: twin={tw_val:+.6e}  fd={fd_val:+.6e}  rel={rel:.2e}")
         assert rel < 1e-6, (nm, tw_val, fd_val, rel)
+
+
+# ==========================================================================
+# Task 4 (M6): three-way gate — BasisMultiEnergy + phi_diag closure
+# hand IFT adjoint == torch twin == central FD
+# for basis_*/mob_* params; tau deferred (twin-vs-FD only, no hand-adjoint leg)
+# ==========================================================================
+
+def _three_way_m6(dm, coords, M, order, n_steps, dt=0.01):
+    """Three-way verification gate for the M6 engine:
+    BasisMultiEnergy (gauge-anchored polynomial correction) + phi_diag
+    MobilityClosure.
+
+    Returns {name: (adj, twin, fd)} for basis_*/mob_* and
+    {name: (None, twin, fd)} for tau (hand adjoint deferred — see comment).
+
+    Tolerances: adj/twin < 1e-10, adj/fd < 1e-6 for basis_*/mob_*.
+    tau is twin-vs-FD only (< 1e-6), hand-adjoint leg omitted with comment.
+
+    NOTE on tau hand-adjoint deferral:
+      dJ/dtau in the hand adjoint requires recording the per-step time-term
+      cotangent (the sigma-weighted mass residual scaled by -1/tau) through the
+      reverse sweep — analogous to the mean-phi history cotangent added in the
+      rung-2 gate.  This is a targeted follow-up; the IFT adjoint engine is
+      verified for tau via the twin (which uses torch autograd-through-convergence
+      with tau as a leaf) and FD.  The basis_*/mob_* full three-way is the
+      non-negotiable scientific acceptance criterion for this rung.
+    """
+    from diffsim.adjoint import BasisMultiEnergy, MobilityClosure
+    from diffsim.adjoint.multiphase import (MultiCHForward, MultiCHAdjoint)
+    from diffsim.adjoint.torch_twin import MultiCHTwin
+    import torch
+
+    nn = dm.n_nodes
+    blk = 2 * M
+
+    # ---- base parameters ---------------------------------------------------
+    chi0 = np.zeros((M + 1, M + 1))
+    for a in range(M + 1):
+        for b in range(a + 1, M + 1):
+            chi0[a, b] = chi0[b, a] = 2.5 if (a, b) == (0, 1) else 1.0
+    N0 = np.ones(M + 1)
+    kap0 = [0.01 * (i + 1) for i in range(M)]
+    cc = np.cos(np.pi * coords[:, 0]) * np.cos(np.pi * coords[:, 1])
+    phi0 = [0.28 + 0.05 * cc for _ in range(M)]
+    tgt = 0.28
+
+    # non-trivial basis/mob coefficients so all gradients are non-trivially large
+    # (mob_c=2.0 ensures the mob_c gradient exceeds ~1e-5, keeping adj/twin<1e-10
+    #  even for BDF2 where the small-gradient amplification issue is worst)
+    basis_coeffs = {"basis_0_2": 0.12, "basis_0_3": -0.08}
+    if M >= 2:
+        basis_coeffs["basis_1_2"] = 0.06
+    if M >= 3:
+        basis_coeffs["basis_2_2"] = 0.05
+    mob_coeffs = {"mob_m0": 1.5, "mob_c": 2.0}
+
+    basis_en = BasisMultiEnergy(chi0, N0, degrees=(2, 3), coeffs=basis_coeffs)
+    mob_cl = MobilityClosure("phi_diag", M=M, coeffs=dict(mob_coeffs))
+
+    # parameter names: full three-way for basis_*/mob_*; tau twin-vs-FD only
+    names_full = ["basis_0_2", "basis_0_3", "mob_m0", "mob_c"]
+    names_tau = ["tau"]
+    all_names = names_full + names_tau
+
+    # ---- hand adjoint (IFT, basis_*/mob_* only) ----------------------------
+    def run_fwd(bc, mc, record=False):
+        """Build and run forward with given basis/mob coefficients."""
+        be = BasisMultiEnergy(chi0, N0, degrees=(2, 3),
+                              coeffs={k: float(v) for k, v in bc.items()})
+        mb = MobilityClosure("phi_diag", M=M,
+                             coeffs={k: float(v) for k, v in mc.items()})
+        fwd = MultiCHForward(dm, be, mobility=mb, kappa=list(kap0),
+                             dt=dt, order=order)
+        fwd.set_initial(phi0)
+        fwd.run(n_steps)
+        xs = [fwd.steps[-1]["phis"][i] for i in range(M)]
+        J = 0.5 * float(sum(((x - tgt) ** 2).sum() for x in xs))
+        return (fwd, J) if record else J
+
+    fwd, _ = run_fwd(basis_coeffs, mob_coeffs, record=True)
+    adj = MultiCHAdjoint(fwd)
+    dJdx = [np.zeros(blk * nn) for _ in range(n_steps)]
+    for i in range(M):
+        dJdx[-1][2 * i::blk] = fwd.steps[-1]["phis"][i] - tgt
+    g_adj = adj.gradient(dJdx, names_full)
+
+    # ---- central FD --------------------------------------------------------
+    eps = 1e-6
+
+    def fd_basis(name):
+        _, si, sk = name.split("_")
+        bc_hi = dict(basis_coeffs); bc_hi[name] += eps
+        bc_lo = dict(basis_coeffs); bc_lo[name] -= eps
+        return (run_fwd(bc_hi, mob_coeffs) - run_fwd(bc_lo, mob_coeffs)) / (2 * eps)
+
+    def fd_mob(name):
+        mc_hi = dict(mob_coeffs); mc_hi[name] += eps
+        mc_lo = dict(mob_coeffs); mc_lo[name] -= eps
+        return (run_fwd(basis_coeffs, mc_hi) - run_fwd(basis_coeffs, mc_lo)) / (2 * eps)
+
+    def fd_tau():
+        """FD for tau: scale dt by (1+eps) / (1-eps)."""
+        def run_tau(tau_val):
+            be = BasisMultiEnergy(chi0, N0, degrees=(2, 3),
+                                  coeffs={k: float(v) for k, v in basis_coeffs.items()})
+            mb = MobilityClosure("phi_diag", M=M,
+                                 coeffs={k: float(v) for k, v in mob_coeffs.items()})
+            fwd_t = MultiCHForward(dm, be, mobility=mb, kappa=list(kap0),
+                                   dt=dt * tau_val, order=order)
+            fwd_t.set_initial(phi0)
+            fwd_t.run(n_steps)
+            xs = [fwd_t.steps[-1]["phis"][i] for i in range(M)]
+            return 0.5 * float(sum(((x - tgt) ** 2).sum() for x in xs))
+        return (run_tau(1.0 + eps) - run_tau(1.0 - eps)) / (2 * eps)
+
+    g_fd = {}
+    for nm in names_full:
+        if nm.startswith("basis_"):
+            g_fd[nm] = fd_basis(nm)
+        else:
+            g_fd[nm] = fd_mob(nm)
+    g_fd["tau"] = fd_tau()
+
+    # ---- torch twin (all params including tau) -----------------------------
+    twin = MultiCHTwin(dm, M, dt=dt, order=order, device="cpu")
+    g_tw = twin.grads(phi0, chi0, N0, np.eye(M), kap0, n_steps, all_names, tgt,
+                      basis_energy=basis_en, mob_closure=mob_cl)
+
+    # ---- assemble result ---------------------------------------------------
+    result = {}
+    for nm in names_full:
+        result[nm] = (g_adj[nm], g_tw[nm], g_fd[nm])
+    # tau: hand adjoint deferred — store None as sentinel
+    result["tau"] = (None, g_tw["tau"], g_fd["tau"])
+    return result
+
+
+def _check_three_way_m6(res, tag):
+    """Check three-way tolerances for M6 gate.
+    For basis_*/mob_*: full three-way (adj/twin < 1e-10, adj/fd < 1e-6).
+    For tau: twin-vs-FD only (< 1e-6); hand adjoint leg deferred.
+    """
+    for p, (a, t, f) in res.items():
+        if a is None:
+            # tau: twin-vs-FD only
+            r_tf = abs(t - f) / max(abs(f), 1e-14)
+            print(f"{tag} {p:12s} [tau-deferred] twin={t:+.6e} fd={f:+.6e} "
+                  f"twin/fd={r_tf:.2e}")
+            assert r_tf < 1e-6, (p, t, f)
+        else:
+            r_t = abs(a - t) / max(abs(t), 1e-14)
+            r_f = abs(a - f) / max(abs(f), 1e-14)
+            print(f"{tag} {p:12s} adj={a:+.6e} twin={t:+.6e} fd={f:+.6e} "
+                  f"adj/twin={r_t:.2e} adj/fd={r_f:.2e}")
+            assert r_t < 1e-10, (p, a, t)
+            assert r_f < 1e-6, (p, a, f)
+
+
+def test_three_way_m6_ternary_bdf1():
+    """M6 three-way gate: BasisMultiEnergy + phi_diag closure, ternary BDF1.
+    basis_0_2, basis_0_3, mob_m0, mob_c: full three-way (adj==twin==FD).
+    tau: twin-vs-FD only (hand-adjoint deferred).
+    """
+    dm, mesh = _dm(3)
+    res = _three_way_m6(dm, mesh.node_coords, M=2, order=1, n_steps=3)
+    _check_three_way_m6(res, "M6-T-bdf1")
+
+
+def test_three_way_m6_ternary_bdf2():
+    """M6 three-way gate: BasisMultiEnergy + phi_diag closure, ternary BDF2.
+    basis_0_2, basis_0_3, mob_m0, mob_c: full three-way (adj==twin==FD).
+    tau: twin-vs-FD only (hand-adjoint deferred).
+    """
+    dm, mesh = _dm(3)
+    res = _three_way_m6(dm, mesh.node_coords, M=2, order=2, n_steps=4)
+    _check_three_way_m6(res, "M6-T-bdf2")
+
+
+def test_three_way_m6_quaternary_bdf1():
+    """M6 three-way gate: BasisMultiEnergy + phi_diag closure, quaternary BDF1.
+    basis_0_2, basis_0_3, mob_m0, mob_c: full three-way (adj==twin==FD).
+    tau: twin-vs-FD only (hand-adjoint deferred).
+    """
+    dm, mesh = _dm(2)
+    res = _three_way_m6(dm, mesh.node_coords, M=3, order=1, n_steps=2)
+    _check_three_way_m6(res, "M6-Q-bdf1")
