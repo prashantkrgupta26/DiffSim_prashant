@@ -439,14 +439,22 @@ class MultiCHAdjoint:
 
     def gradient(self, dJdx_list, param_names):
         """dJdx_list[n] = dj/dx_n as a length-ndof node-major vector.
-        Returns {name: dJ/dname}."""
+        Returns {name: dJ/dname}.  Residual params (chi/N/onsager/kappa) use
+        the reverse-sweep dR/dp; names of the form 'phi0_i' return the
+        mean-composition (initial-condition) gradient dJ/dphi_mean_i, formed
+        from the history cotangent that lands on the initial state x0."""
         op = self.op
         blk, M = op.blk, op.M
         steps = self.fwd.steps
         Ns = len(steps)
         Mass = op.mass_matrix()
+        res_names = [nm for nm in param_names if not nm.startswith("phi0_")]
+        phi0_names = [nm for nm in param_names if nm.startswith("phi0_")]
         grads = {nm: 0.0 for nm in param_names}
         pending = [np.zeros(op.ndof) for _ in range(Ns)]
+        # cotangent that accumulates onto the initial condition x0 (the history
+        # terms whose target step index kn < 0). Per retained phi-species.
+        phi0_cot = [np.zeros(op.nn) for _ in range(M)] if phi0_names else None
         # J = dR/dx is independent of the BDF history load, so zero history
         # rebuilds the Jacobian at the converged iterate.
         zero_hist = [[np.zeros_like(B["dJxW"]) for B in op.bins]
@@ -457,18 +465,26 @@ class MultiCHAdjoint:
                                rec["params"], want_jac=True)
             rhs = np.asarray(dJdx_list[n], np.float64) + pending[n]
             lam = self.fwd.backend.solve_T(J, rhs)
-            for nm in param_names:
+            for nm in res_names:
                 dRdp = op.dR_dparam(rec["phis"], rec["mus"], rec["params"], nm)
                 grads[nm] -= float(lam @ dRdp)
             # history cotangent: R_n depends on phi_i,{n-k} only through
             # -(ch_k/dt) Mass on the phi_i-block -> +(ch_k/dt) Mass lam_phi_i
-            # onto the phi_i-columns of the earlier step.
+            # onto the phi_i-columns of the earlier step (kn>=0), or onto the
+            # initial-condition accumulator (kn<0 -> x0).
             ch, dt = rec["ch"], rec["dt"]
             for k, cc in enumerate(ch):
                 kn = n - (k + 1)
-                if kn < 0:
-                    continue
                 for i in range(M):
                     hc = (cc / dt) * (Mass @ lam[2 * i::blk])
-                    pending[kn][2 * i::blk] += hc
+                    if kn < 0:
+                        if phi0_cot is not None:
+                            phi0_cot[i] += hc
+                    else:
+                        pending[kn][2 * i::blk] += hc
+        # dJ/dphi_mean_i = sum_nodes (dJ/dx0)_{phi_i}, since a uniform mean
+        # shift adds 1 to every nodal value of the initial phi_i field.
+        for nm in phi0_names:
+            i = int(nm.split("_")[1])
+            grads[nm] = float(phi0_cot[i].sum())
         return grads

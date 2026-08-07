@@ -456,6 +456,68 @@ def test_scipy_to_torch_csr_roundtrip_and_transpose():
     assert At.dtype == torch.float64
 
 
+# ==========================================================================
+# Task 1 (mean-phi / x0 cotangent): adj vs FD for initial-condition gradient
+# ==========================================================================
+def _meanphi_adj_vs_fd(dm, coords, M, order, n_steps, dt=0.01):
+    from diffsim.adjoint.multiphase import (MultiCHForward, MultiCHAdjoint,
+                                            FHMultiEnergy)
+    nn = dm.n_nodes
+    blk = 2 * M
+    chi0 = np.zeros((M + 1, M + 1))
+    for a in range(M + 1):
+        for b in range(a + 1, M + 1):
+            chi0[a, b] = chi0[b, a] = 2.5 if (a, b) == (0, 1) else 1.0
+    N0 = 1.0 + 0.3 * np.arange(M + 1)
+    ons0 = np.eye(M) + 0.1 * (np.ones((M, M)) - np.eye(M))
+    kap0 = [0.01 * (i + 1) for i in range(M)]
+    cc = np.cos(np.pi * coords[:, 0]) * np.cos(np.pi * coords[:, 1])
+    base = [0.28 + 0.05 * cc for _ in range(M)]
+    tgt = 0.28
+    names = [f"phi0_{i}" for i in range(M)]
+
+    def run(phi0, record=False):
+        fwd = MultiCHForward(dm, FHMultiEnergy(chi0, N0), onsager=ons0,
+                             kappa=list(kap0), dt=dt, order=order)
+        fwd.set_initial(phi0)
+        fwd.run(n_steps)
+        xs = [fwd.steps[-1]["phis"][i] for i in range(M)]
+        J = 0.5 * float(sum(((x - tgt) ** 2).sum() for x in xs))
+        return (fwd, J) if record else J
+
+    fwd, _ = run(base, record=True)
+    dJdx = [np.zeros(blk * nn) for _ in range(n_steps)]
+    for i in range(M):
+        dJdx[-1][2 * i::blk] = fwd.steps[-1]["phis"][i] - tgt
+    g_adj = MultiCHAdjoint(fwd).gradient(dJdx, names)
+
+    eps = 1e-6
+    g_fd = {}
+    for i in range(M):
+        hi = [base[j] + (eps if j == i else 0.0) for j in range(M)]
+        lo = [base[j] - (eps if j == i else 0.0) for j in range(M)]
+        g_fd[f"phi0_{i}"] = (run(hi) - run(lo)) / (2 * eps)
+    return {nm: (g_adj[nm], g_fd[nm]) for nm in names}
+
+
+def test_meanphi_adj_vs_fd_ternary_bdf1():
+    dm, mesh = _dm(3)
+    res = _meanphi_adj_vs_fd(dm, mesh.node_coords, M=2, order=1, n_steps=3)
+    for p, (a, f) in res.items():
+        rel = abs(a - f) / max(abs(f), 1e-14)
+        print(f"meanphi-bdf1 {p} adj={a:+.6e} fd={f:+.6e} rel={rel:.2e}")
+        assert rel < 1e-6, (p, a, f)
+
+
+def test_meanphi_adj_vs_fd_ternary_bdf2():
+    dm, mesh = _dm(3)
+    res = _meanphi_adj_vs_fd(dm, mesh.node_coords, M=2, order=2, n_steps=4)
+    for p, (a, f) in res.items():
+        rel = abs(a - f) / max(abs(f), 1e-14)
+        print(f"meanphi-bdf2 {p} adj={a:+.6e} fd={f:+.6e} rel={rel:.2e}")
+        assert rel < 1e-6, (p, a, f)
+
+
 def test_cudss_backend_importable_on_cpu():
     # construction must not require CUDA (torch imported lazily); this lets the
     # engine + daisy-morph wiring be unit-tested on the Mac.
