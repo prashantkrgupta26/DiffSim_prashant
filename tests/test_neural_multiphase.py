@@ -418,7 +418,6 @@ def _three_way_m6(dm, coords, M, order, n_steps, dt=0.01):
     eps = 1e-6
 
     def fd_basis(name):
-        _, si, sk = name.split("_")
         bc_hi = dict(basis_coeffs); bc_hi[name] += eps
         bc_lo = dict(basis_coeffs); bc_lo[name] -= eps
         return (run_fwd(bc_hi, mob_coeffs) - run_fwd(bc_lo, mob_coeffs)) / (2 * eps)
@@ -514,3 +513,101 @@ def test_three_way_m6_quaternary_bdf1():
     dm, mesh = _dm(2)
     res = _three_way_m6(dm, mesh.node_coords, M=3, order=1, n_steps=2)
     _check_three_way_m6(res, "M6-Q-bdf1")
+
+
+def test_basis_energy_correction_applied_without_basis_names():
+    """Regression test for Fix 1: basis energy correction is applied even when
+    no basis_* names are requested in the grads() call.
+
+    This test verifies that when basis_energy is provided but names=["mob_m0"]
+    (i.e., no basis names requested), the full basis energy correction is still
+    applied during the forward march, and the mob_m0 gradient computed via
+    autograd matches central-FD of the loss computed with the SAME full energy.
+
+    Before Fix 1, the basis correction would silently drop when b_leaves was
+    empty, resulting in a wrong forward trajectory and wrong mob_m0 gradient.
+    After Fix 1, the correction is always applied when basis_energy is given,
+    regardless of which basis names are requested in names.
+    """
+    import torch
+    from diffsim.adjoint import BasisMultiEnergy, MobilityClosure
+    from diffsim.adjoint.torch_twin import MultiCHTwin
+
+    M = 2
+    dm, mesh = _dm(3)
+    coords = mesh.node_coords
+    cc = np.cos(np.pi * coords[:, 0]) * np.cos(np.pi * coords[:, 1])
+
+    # Base parameters
+    chi0 = np.zeros((M + 1, M + 1))
+    chi0[0, 1] = chi0[1, 0] = 2.5
+    chi0[0, 2] = chi0[2, 0] = 1.0
+    chi0[1, 2] = chi0[2, 1] = 0.8
+    N0 = np.ones(M + 1)
+    ons0 = np.eye(M)  # placeholder (overridden by mob_closure)
+    kap0 = [0.01, 0.02]
+    dt = 0.01
+    n_steps = 2
+    tgt = 0.28
+    phi0 = [0.28 + 0.05 * cc, 0.28 + 0.05 * cc]
+
+    # Non-zero basis coefficients — these must be applied in the march
+    basis_coeffs = {"basis_0_2": 0.15, "basis_0_3": -0.10,
+                    "basis_1_2": 0.08, "basis_1_3": 0.05}
+    basis_en = BasisMultiEnergy(chi0, N0, degrees=(2, 3), coeffs=basis_coeffs)
+
+    # Mobility closure coefficients
+    mob_coeffs = {"mob_m0": 1.2, "mob_c": 0.4}
+    mob_cl = MobilityClosure("phi_diag", M=M, coeffs=mob_coeffs)
+
+    twin = MultiCHTwin(dm, M, dt=dt, order=1, device="cpu")
+
+    # Request ONLY mob_m0 gradient (NO basis_* names) — the basis correction
+    # should still be applied to the forward march.
+    names = ["mob_m0"]
+    g_tw = twin.grads(phi0, chi0, N0, ons0, kap0, n_steps, names, tgt,
+                      basis_energy=basis_en, mob_closure=mob_cl)
+
+    # Compute central-FD gradient of the same loss with the SAME full energy.
+    def loss_with_energy(mob_m0_val):
+        """Run twin march with perturbed mob_m0, same basis_energy always applied."""
+        mid, half = 0.5, 0.45
+        degrees = (2, 3)
+        # basis_leaves: ALL coefficients from basis_energy, no grads
+        bl = {}
+        for i in range(M):
+            for k in degrees:
+                nm = f"basis_{i}_{k}"
+                bl[(i, k)] = torch.tensor(
+                    float(basis_en.gamma.get((i, k), 0.0)), dtype=torch.float64)
+        bmeta = dict(mid=mid, half=half, degrees=degrees)
+        # mob_leaves: perturbed mob_m0, constant mob_c
+        mob_lvs = {
+            "mob_m0": torch.tensor(float(mob_m0_val), dtype=torch.float64),
+            "mob_c": torch.tensor(float(mob_coeffs["mob_c"]), dtype=torch.float64),
+        }
+        chi_t = torch.tensor(chi0, dtype=torch.float64)
+        N_t = torch.tensor(N0, dtype=torch.float64)
+        phis_t = [torch.tensor(np.asarray(phi0[i]), dtype=torch.float64)
+                  for i in range(M)]
+        kap_t = [torch.tensor(k, dtype=torch.float64) for k in kap0]
+        out = twin.march(phis_t, chi_t, N_t, None, kap_t, n_steps,
+                         basis_leaves=bl, basis_meta=bmeta,
+                         mob_leaves=mob_lvs)
+        xN = out[-1]
+        blk = 2 * M
+        tgt_t = torch.tensor(float(tgt), dtype=torch.float64)
+        return float(0.5 * sum(((xN[2 * i::blk] - tgt_t) ** 2).sum()
+                               for i in range(M)))
+
+    eps = 1e-5
+    mob_m0_base = mob_coeffs["mob_m0"]
+    fd_mob_m0 = (loss_with_energy(mob_m0_base + eps)
+                 - loss_with_energy(mob_m0_base - eps)) / (2 * eps)
+
+    # Compare twin gradient with central-FD.
+    tw_val = g_tw["mob_m0"]
+    rel = abs(tw_val - fd_mob_m0) / max(abs(fd_mob_m0), 1e-14)
+    print(f"basis_energy_applied_without_basis_names: "
+          f"twin={tw_val:+.6e}  fd={fd_mob_m0:+.6e}  rel={rel:.2e}")
+    assert rel < 1e-6, ("mob_m0", tw_val, fd_mob_m0, rel)

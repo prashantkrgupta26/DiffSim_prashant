@@ -568,6 +568,10 @@ class MultiCHTwin:
 
         ``tau`` (time-scale)
           No extra object needed; initialised to 1.0 (multiplicative identity).
+
+        Note: when ``basis_energy`` or ``mob_closure`` are provided, their full
+        correction is always applied to the march regardless of which basis/mob
+        names are requested in ``names``; only the requested names receive gradients.
         """
         M = self.M
         chi0 = np.asarray(chi, np.float64)
@@ -659,7 +663,7 @@ class MultiCHTwin:
             else:
                 kap[int(nm.split("_")[1])] = leaf
         # ---- fill in constant basis coefficients not requested as leaves ---
-        if b_leaves and basis_energy is not None:
+        if basis_energy is not None:
             for (i, k), v in basis_energy.gamma.items():
                 if (i, k) not in b_leaves:
                     b_leaves[(i, k)] = torch.tensor(
