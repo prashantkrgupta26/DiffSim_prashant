@@ -500,6 +500,8 @@ class MultiCHTwin:
           mob_leaves    : {'mob_m0': tensor, 'mob_c': tensor} phi_diag closure
         When tau/basis_leaves/mob_leaves are None the march is identical to
         the original (backward-compatible, no-op for existing tests)."""
+        if Lam is None and mob_leaves is None:
+            raise ValueError("march needs either a constant Lam (mobility matrix) or mob_leaves (closure)")
         M, blk = self.M, self.blk
         Ninv = 1.0 / N_t
         x = torch.zeros(self.ndof, device=self.dev)
@@ -670,9 +672,9 @@ class MultiCHTwin:
             degrees = tuple(sorted({k for (_, k) in b_leaves}))
             b_meta = dict(mid=mid, half=half, degrees=degrees)
         # ---- if mob_closure provided, fill non-leaf mob coeffs -------------
-        if mob_closure is not None and mob_lvs is None:
-            mob_lvs = {}
         if mob_closure is not None:
+            if mob_lvs is None:
+                mob_lvs = {}
             for pname in ("mob_m0", "mob_c"):
                 if pname not in mob_lvs:
                     mob_lvs[pname] = torch.tensor(
