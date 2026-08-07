@@ -49,12 +49,12 @@ def scipy_to_torch_csr(A, device, torch):
 class CudssBackend(LinearBackend):
     """Factor+solve on a CUDA device via nvmath cuDSS DirectSolver.
 
-    Mirrors physics/multiphase.MultiPhaseStepper._solve (linsolver='cudss'):
-    plan once per sparsity pattern, refactorize per call, rebuild the plan if
-    nnz flaps (with an explicit .free() before rebuilding to avoid double-free
-    of device buffers under nnz-flapping runs — measured 2026-07-10).
-    Uses DirectSolverOptions(blocking=True) to suppress the mt-planning layer
-    thread-team leak (measured 2026-07-10: 18.6k threads -> libgomp failure).
+    Plans + factorizes a fresh DirectSolver on every solve (freeing the prior
+    one): the host-numpy assembly hands a new device CSR buffer each call, and
+    one instance solves both the forward Jacobian and its transpose, so cuDSS
+    operand-reuse (reset_operands) does not apply — see _solve_csr.  Uses
+    DirectSolverOptions(blocking=True) to suppress the mt-planning layer thread-
+    team leak (measured 2026-07-10: 18.6k threads -> libgomp failure).
     Assembly stays host-numpy; only the solve is on device.
 
     Construction is host-safe (torch imported lazily) so the engine + daisy-morph
@@ -65,8 +65,7 @@ class CudssBackend(LinearBackend):
         self.device_str = str(device)
         self._torch = None
         self._device = None
-        self._solver = None      # cuDSS DirectSolver, planned once per pattern
-        self._nnz = None
+        self._solver = None      # cuDSS DirectSolver (rebuilt per solve)
 
     def _lazy(self):
         if self._torch is None:
@@ -80,27 +79,30 @@ class CudssBackend(LinearBackend):
         from nvmath.sparse.advanced import DirectSolver, DirectSolverOptions
         At = scipy_to_torch_csr(A, self._device, torch)
         bt = torch.as_tensor(b.astype("float64"), device=self._device)
-        # plan once per pattern; rebuild if nnz changes.
-        # Mirror production nnz-guard: explicitly .free() the old plan before
-        # rebuilding to avoid double-free of device buffers under nnz-flapping
-        # noise runs (physics/multiphase.py:1945-1956, measured 2026-07-10).
-        if self._solver is not None and A.nnz != self._nnz:
+        # Plan + factorize FRESH every solve.  Two reasons cuDSS operand-reuse
+        # (reset_operands) is invalid for this backend:
+        #  (1) scipy_to_torch_csr allocates a NEW device buffer each call, but
+        #      reset_operands assumes the operand values are updated IN PLACE in
+        #      the planned buffers -- passing new buffers invalidates the plan
+        #      ("different buffers ... requires calling plan() and factorize()
+        #      again", measured on gpubox 2026-08-07).
+        #  (2) one backend instance solves BOTH the forward Jacobian J (solve)
+        #      and the adjoint J^T (solve_T) during a single gradient: same nnz
+        #      but DIFFERENT sparsity pattern, so an nnz-only reuse guard would
+        #      reuse a plan across incompatible patterns.
+        # Free the prior solver first to avoid leaking device buffers.  Options:
+        # DirectSolverOptions(blocking=True) mirrors production and suppresses
+        # the mt-planning gomp thread-team leak (physics/multiphase.py:1966-1968,
+        # measured 2026-07-10).
+        if self._solver is not None:
             try:
                 self._solver.free()
             except Exception:
                 pass
             self._solver = None
-        if self._solver is None:
-            # PLAIN options (no libcudss_mtlayer_gomp): the mt planning layer
-            # leaks one gomp thread team per solver call (measured 2026-07-10).
-            # Mirror production: DirectSolverOptions(blocking=True).
-            # (physics/multiphase.py:1966-1968)
-            self._solver = DirectSolver(
-                At, bt, options=DirectSolverOptions(blocking=True))
-            self._solver.plan()
-            self._nnz = A.nnz
-        else:
-            self._solver.reset_operands(a=At, b=bt)
+        self._solver = DirectSolver(
+            At, bt, options=DirectSolverOptions(blocking=True))
+        self._solver.plan()
         self._solver.factorize()
         return np.asarray(self._solver.solve().cpu())
 

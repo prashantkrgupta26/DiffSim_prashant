@@ -666,3 +666,18 @@ def test_cudss_backend_matches_scipy_on_gpu():
     assert A2.nnz != A1.nnz
     x2 = be2.solve(A2, b)
     assert np.allclose(x2, ScipyBackend().solve(A2, b), rtol=1e-9, atol=1e-11)
+
+    # reuse ONE instance across REPEATED same-pattern solves AND a solve_T after
+    # a solve -- the real gradient-march access pattern (forward J then adjoint
+    # J^T, same nnz, different sparsity).  cuDSS operand-reuse across freshly
+    # allocated buffers / a transposed pattern raised "Factorization cannot be
+    # performed before plan()" on gpubox 2026-08-07; this pins the fix.
+    be3 = CudssBackend("cuda:0")
+    b2 = rng.standard_normal(n)
+    for rhs in (b, b2, b):                                  # repeated same-A solves
+        assert np.allclose(be3.solve(A, rhs),
+                           ScipyBackend().solve(A, rhs), rtol=1e-9, atol=1e-11)
+    assert np.allclose(be3.solve_T(A, b),                  # J^T on the same instance
+                       ScipyBackend().solve_T(A, b), rtol=1e-9, atol=1e-11)
+    assert np.allclose(be3.solve(A, b),                    # back to J: no plan carryover
+                       ScipyBackend().solve(A, b), rtol=1e-9, atol=1e-11)
