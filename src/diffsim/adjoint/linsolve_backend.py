@@ -32,3 +32,14 @@ class ScipyBackend(LinearBackend):
 
     def solve_T(self, A, b):
         return splu(A.T.tocsc()).solve(b)
+
+
+def scipy_to_torch_csr(A, device, torch):
+    """scipy sparse -> torch.sparse_csr_tensor (int64 indices, float64 vals) on
+    ``device``.  Mirrors the CSR handoff production uses for cuDSS zero-copy
+    (physics/multiphase.MultiPhaseStepper.device_csr)."""
+    A = A.tocsr()
+    crow = torch.as_tensor(A.indptr.astype("int64"), device=device)
+    col = torch.as_tensor(A.indices.astype("int64"), device=device)
+    val = torch.as_tensor(A.data.astype("float64"), device=device)
+    return torch.sparse_csr_tensor(crow, col, val, size=A.shape, device=device)

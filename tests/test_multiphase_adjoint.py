@@ -438,3 +438,19 @@ def test_forward_accepts_backend_and_defaults_scipy():
     fwd2 = MultiCHForward(dm, en, onsager=np.eye(2), kappa=[1e-3, 1e-3],
                           dt=1e-3, backend=be)
     assert fwd2.backend is be
+
+
+def test_scipy_to_torch_csr_roundtrip_and_transpose():
+    import scipy.sparse as sp
+    torch = pytest.importorskip("torch")
+    from diffsim.adjoint.linsolve_backend import scipy_to_torch_csr
+    A = sp.csr_matrix(np.array([[3.0, 1.0, 0.0],
+                                [0.0, 2.0, 1.0],
+                                [1.0, 0.0, 4.0]]))
+    At = scipy_to_torch_csr(A, torch.device("cpu"), torch)
+    # dense round-trip matches scipy
+    assert np.allclose(At.to_dense().cpu().numpy(), A.toarray())
+    # transpose path (what solve_T feeds cuDSS) matches scipy A.T
+    ATt = scipy_to_torch_csr(A.T.tocsr(), torch.device("cpu"), torch)
+    assert np.allclose(ATt.to_dense().cpu().numpy(), A.toarray().T)
+    assert At.dtype == torch.float64
