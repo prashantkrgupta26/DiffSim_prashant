@@ -187,3 +187,75 @@ def test_dR_dparam_complex_step():
             pp = dict(params, kappa=kk)
         cs = resid(pp).imag / h
         assert np.allclose(an, cs, atol=1e-8, rtol=1e-6), name
+
+
+# ==========================================================================
+# Task 3: MultiCHForward — forward parity vs production MultiPhaseStepper (K=0)
+# ==========================================================================
+def test_forward_parity_ternary():
+    from diffsim.adjoint.multiphase import MultiCHForward, FHMultiEnergy
+    from diffsim.physics.multiphase import MultiPhaseStepper
+    M = 2
+    dm, mesh = _dm(3)
+    coords = mesh.node_coords
+    chi = np.zeros((M + 1, M + 1))
+    chi[0, 1] = chi[1, 0] = 2.5
+    chi[0, 2] = chi[2, 0] = 1.0
+    chi[1, 2] = chi[2, 1] = 0.8
+    N = np.ones(M + 1)
+    onsager = np.eye(M)
+    kappa = [1e-2, 1e-2]
+    dt = 1e-2
+    cc = np.cos(np.pi * coords[:, 0]) * np.cos(np.pi * coords[:, 1])
+    phi0 = [0.30 + 0.05 * cc, 0.30 + 0.05 * cc]
+    st = MultiPhaseStepper(dm, M=M, K=0, chi_aa=chi, N=N.tolist(),
+                           onsager=onsager.tolist(), kappa=kappa, dt=dt,
+                           bulk="p1", newton_tol=1e-12, newton_max=40,
+                           linsolver="splu", tstep="bdf1")
+    st.set_initial([(lambda x, v=p: v) for p in phi0])
+    for _ in range(3):
+        st.step()
+    ref = [np.asarray(st.phi(i)) for i in range(M)]
+    fwd = MultiCHForward(dm, FHMultiEnergy(chi, N), onsager=onsager,
+                         kappa=kappa, dt=dt, order=1)
+    fwd.set_initial(phi0)
+    fwd.run(3)
+    for i in range(M):
+        rel = (np.abs(fwd.steps[-1]["phis"][i] - ref[i]).max()
+               / max(np.abs(ref[i]).max(), 1e-12))
+        print(f"parity ternary phi{i}: max rel {rel:.2e}")
+        assert np.allclose(fwd.steps[-1]["phis"][i], ref[i],
+                           atol=1e-9, rtol=1e-7), i
+
+
+def test_forward_parity_quaternary():
+    from diffsim.adjoint.multiphase import MultiCHForward, FHMultiEnergy
+    from diffsim.physics.multiphase import MultiPhaseStepper
+    M = 3
+    dm, mesh = _dm(2)
+    coords = mesh.node_coords
+    chi = np.zeros((M + 1, M + 1))
+    for a in range(M + 1):
+        for b in range(a + 1, M + 1):
+            chi[a, b] = chi[b, a] = 1.5 if b == M else 2.0
+    N = np.ones(M + 1)
+    onsager = np.eye(M)
+    kappa = [1e-2] * M
+    dt = 1e-2
+    cc = np.cos(np.pi * coords[:, 0]) * np.cos(np.pi * coords[:, 1])
+    phi0 = [0.22 + 0.04 * cc for _ in range(M)]
+    st = MultiPhaseStepper(dm, M=M, K=0, chi_aa=chi, N=N.tolist(),
+                           onsager=onsager.tolist(), kappa=kappa, dt=dt,
+                           bulk="p1", newton_tol=1e-12, newton_max=40,
+                           linsolver="splu", tstep="bdf1")
+    st.set_initial([(lambda x, v=p: v) for p in phi0])
+    for _ in range(2):
+        st.step()
+    ref = [np.asarray(st.phi(i)) for i in range(M)]
+    fwd = MultiCHForward(dm, FHMultiEnergy(chi, N), onsager=onsager,
+                         kappa=kappa, dt=dt, order=1)
+    fwd.set_initial(phi0)
+    fwd.run(2)
+    for i in range(M):
+        assert np.allclose(fwd.steps[-1]["phis"][i], ref[i],
+                           atol=1e-9, rtol=1e-7), i

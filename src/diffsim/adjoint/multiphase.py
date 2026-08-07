@@ -312,3 +312,95 @@ class MultiCHDiscrete:
                     np.add.at(out, B["gdof"][:, 2 * i + 1::blk].ravel(),
                               Rmu.ravel())
         return out
+
+
+# --------------------------------------------------------------------------
+# forward march (numpy) + per-step recorder for the adjoint
+# --------------------------------------------------------------------------
+class MultiCHForward:
+    """Newton BDF march of the discrete multi-CH operator, recording per-step
+    the converged state and BDF coefficients the adjoint replays.  M-generic
+    sibling of phasefield.CHForward."""
+
+    def __init__(self, dm, energy, onsager, kappa, dt=1e-2, order=1,
+                 newton_tol=1e-12, newton_max=30):
+        self.op = MultiCHDiscrete(dm, energy.M)
+        self.M = energy.M
+        self.energy = energy
+        self.onsager = np.asarray(onsager, np.float64)
+        self.kappa = [float(k) for k in kappa]
+        self.dt = float(dt)
+        self.order = order
+        self.newton_tol, self.newton_max = newton_tol, newton_max
+        self.t = 0.0
+        self.dt_prev = None
+        self.steps = []
+
+    def set_initial(self, phi0_list):
+        self.phis = [np.asarray(p, np.float64).copy() for p in phi0_list]
+        self.mus = [np.zeros_like(self.phis[0]) for _ in range(self.M)]
+        snap = [p.copy() for p in self.phis]
+        self.hist = [snap, [p.copy() for p in snap]]
+        self.t = 0.0
+        self.dt_prev = None
+        self.steps = []
+
+    def _bdf(self):
+        if self.order == 1 or self.dt_prev is None or self.t < self.dt / 2:
+            return 1.0, [1.0]
+        rr = self.dt / self.dt_prev
+        return ((1.0 + 2.0 * rr) / (1.0 + rr),
+                [1.0 + rr, -rr * rr / (1.0 + rr)])
+
+    def _hist_gp(self, ch):
+        hist_gp = [None] * self.M
+        for i in range(self.M):
+            acc = None
+            for k, cc in enumerate(ch):
+                hi = self.op.interp(self.hist[k][i])
+                contrib = [(cc / self.dt) * hi[bi][0]
+                           for bi in range(len(hi))]
+                if acc is None:
+                    acc = contrib
+                else:
+                    acc = [acc[bi] + contrib[bi] for bi in range(len(hi))]
+            hist_gp[i] = acc
+        return hist_gp
+
+    def _params(self, sigma):
+        return dict(onsager=self.onsager, kappa=self.kappa,
+                    energy=self.energy, sigma=sigma)
+
+    def step(self, record=True):
+        c0_, ch = self._bdf()
+        sigma = c0_ / self.dt
+        hist_gp = self._hist_gp(ch)
+        params = self._params(sigma)
+        blk = self.op.blk
+        phis = [p.copy() for p in self.phis]
+        mus = [m.copy() for m in self.mus]
+        for it in range(self.newton_max):
+            R, J = self.op.assemble(phis, mus, hist_gp, params, want_jac=True)
+            dx = splu(J.tocsc()).solve(-R)
+            for i in range(self.M):
+                phis[i] = phis[i] + dx[2 * i::blk]
+                mus[i] = mus[i] + dx[2 * i + 1::blk]
+            if np.abs(dx).max() < self.newton_tol:
+                break
+        self.phis, self.mus = phis, mus
+        if record:
+            x = np.zeros(self.op.ndof)
+            for i in range(self.M):
+                x[2 * i::blk] = phis[i]
+                x[2 * i + 1::blk] = mus[i]
+            self.steps.append(dict(
+                phis=[p.copy() for p in phis], mus=[m.copy() for m in mus],
+                x=x, sigma=sigma, ch=list(ch), dt=self.dt,
+                params=self._params(sigma)))
+        self.hist = [[p.copy() for p in phis], self.hist[0]]
+        self.t += self.dt
+        self.dt_prev = self.dt
+        return [p.copy() for p in phis], [m.copy() for m in mus]
+
+    def run(self, n_steps):
+        return [self.step() for _ in range(n_steps)]
