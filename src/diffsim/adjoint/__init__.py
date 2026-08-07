@@ -3,6 +3,10 @@ adjoint through the Cahn-Hilliard / Allen-Cahn / multiphase stack)."""
 from .phasefield import (CHDiscrete, CHForward, CHAdjoint, PolyEnergy,
                          FHEnergy, PolyBasisEnergy)
 from .crystallization import CACHDiscrete, CACHForward, CACHAdjoint
+from .multiphase import (MultiEnergy, FHMultiEnergy, MultiCHDiscrete,
+                         MultiCHForward, MultiCHAdjoint)
 
 __all__ = ["CHDiscrete", "CHForward", "CHAdjoint", "PolyEnergy", "FHEnergy",
-           "PolyBasisEnergy", "CACHDiscrete", "CACHForward", "CACHAdjoint"]
+           "PolyBasisEnergy", "CACHDiscrete", "CACHForward", "CACHAdjoint",
+           "MultiEnergy", "FHMultiEnergy", "MultiCHDiscrete",
+           "MultiCHForward", "MultiCHAdjoint"]

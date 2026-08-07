@@ -290,3 +290,94 @@ def test_adjoint_interface():
     assert set(g) == set(names)
     for k, v in g.items():
         assert np.isfinite(v), k
+
+
+# ==========================================================================
+# Task 5: MultiCHTwin + the THREE-WAY gate (hand adjoint == twin == FD)
+# ==========================================================================
+def _three_way_multi(dm, coords, M, order, n_steps, dt=0.01):
+    from diffsim.adjoint.multiphase import (MultiCHForward, MultiCHAdjoint,
+                                            FHMultiEnergy)
+    from diffsim.adjoint.torch_twin import MultiCHTwin
+    nn = dm.n_nodes
+    blk = 2 * M
+    chi0 = np.zeros((M + 1, M + 1))
+    for a in range(M + 1):
+        for b in range(a + 1, M + 1):
+            chi0[a, b] = chi0[b, a] = 2.5 if (a, b) == (0, 1) else 1.0
+    N0 = 1.0 + 0.3 * np.arange(M + 1)          # non-trivial N to exercise N grads
+    ons0 = np.eye(M) + 0.1 * (np.ones((M, M)) - np.eye(M))
+    kap0 = [0.01 * (i + 1) for i in range(M)]
+    cc = np.cos(np.pi * coords[:, 0]) * np.cos(np.pi * coords[:, 1])
+    phi0 = [0.28 + 0.05 * cc for _ in range(M)]
+    tgt = 0.28
+    names = (["chi_0_1", f"chi_0_{M}"] + [f"N_{i}" for i in range(M + 1)]
+             + ["onsager_0_0", "onsager_0_1"] + ["kappa_0"])
+
+    def run(chi, N, ons, kap, record=False):
+        fwd = MultiCHForward(dm, FHMultiEnergy(chi, N), onsager=ons,
+                             kappa=list(kap), dt=dt, order=order)
+        fwd.set_initial(phi0)
+        fwd.run(n_steps)
+        xs = [fwd.steps[-1]["phis"][i] for i in range(M)]
+        J = 0.5 * float(sum(((x - tgt) ** 2).sum() for x in xs))
+        return (fwd, J) if record else J
+
+    fwd, _ = run(chi0, N0, ons0, kap0, record=True)
+    adj = MultiCHAdjoint(fwd)
+    dJdx = [np.zeros(blk * nn) for _ in range(n_steps)]
+    for i in range(M):
+        dJdx[-1][2 * i::blk] = fwd.steps[-1]["phis"][i] - tgt
+    g_adj = adj.gradient(dJdx, names)
+
+    def fd(name):
+        eps = 1e-6
+
+        def bump(sign):
+            c_, N_, o_, k_ = (chi0.copy(), N0.copy(), ons0.copy(),
+                              list(kap0))
+            if name.startswith("chi_"):
+                _, a, b = name.split("_"); a, b = int(a), int(b)
+                c_[a, b] += sign * eps; c_[b, a] += sign * eps
+            elif name.startswith("N_"):
+                N_[int(name.split("_")[1])] += sign * eps
+            elif name.startswith("onsager_"):
+                _, a, b = name.split("_"); a, b = int(a), int(b)
+                o_[a, b] += sign * eps
+            else:
+                k_[int(name.split("_")[1])] += sign * eps
+            return run(c_, N_, o_, k_)
+        return (bump(+1) - bump(-1)) / (2 * eps)
+    g_fd = {nm: fd(nm) for nm in names}
+
+    twin = MultiCHTwin(dm, M, dt=dt, order=order, device="cpu")
+    g_tw = twin.grads(phi0, chi0, N0, ons0, kap0, n_steps, names, tgt)
+    return {nm: (g_adj[nm], g_tw[nm], g_fd[nm]) for nm in names}
+
+
+def _check_three_way(res, tag):
+    for p, (a, t, f) in res.items():
+        r_t = abs(a - t) / max(abs(t), 1e-14)
+        r_f = abs(a - f) / max(abs(f), 1e-14)
+        print(f"{tag} {p:12s} adj={a:+.6e} twin={t:+.6e} fd={f:+.6e} "
+              f"adj/twin={r_t:.2e} adj/fd={r_f:.2e}")
+        assert r_t < 1e-10, (p, a, t)
+        assert r_f < 1e-6, (p, a, f)
+
+
+def test_three_way_ternary_bdf1(device):
+    dm, mesh = _dm(3)
+    res = _three_way_multi(dm, mesh.node_coords, M=2, order=1, n_steps=3)
+    _check_three_way(res, "T-bdf1")
+
+
+def test_three_way_ternary_bdf2(device):
+    dm, mesh = _dm(3)
+    res = _three_way_multi(dm, mesh.node_coords, M=2, order=2, n_steps=4)
+    _check_three_way(res, "T-bdf2")
+
+
+def test_three_way_quaternary_bdf1(device):
+    dm, mesh = _dm(2)
+    res = _three_way_multi(dm, mesh.node_coords, M=3, order=1, n_steps=2)
+    _check_three_way(res, "Q-bdf1")
