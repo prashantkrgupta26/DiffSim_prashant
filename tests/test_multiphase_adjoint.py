@@ -474,7 +474,6 @@ def _gpu_available():
 
 @pytest.mark.skipif(not _gpu_available(), reason="no CUDA GPU (rung-2 gate runs on gpubox)")
 def test_cudss_backend_matches_scipy_on_gpu():
-    import numpy as np
     import scipy.sparse as sp
     from diffsim.adjoint import ScipyBackend, CudssBackend
     rng = np.random.default_rng(0)
@@ -488,3 +487,15 @@ def test_cudss_backend_matches_scipy_on_gpu():
     xts = ScipyBackend().solve_T(A, b)
     xtg = CudssBackend("cuda:0").solve_T(A, b)
     assert np.allclose(xts, xtg, rtol=1e-9, atol=1e-11)
+
+    # nnz-flap: reuse ONE backend instance across two different-nnz matrices so
+    # the plan-rebuild/.free() branch is exercised on hardware (production saw
+    # the CSR pattern grow mid-march; that branch is otherwise untested).
+    be2 = CudssBackend("cuda:0")
+    A1 = sp.random(n, n, density=0.02, format="csr", random_state=1) + sp.eye(n) * 5.0
+    x1 = be2.solve(A1, b)
+    assert np.allclose(x1, ScipyBackend().solve(A1, b), rtol=1e-9, atol=1e-11)
+    A2 = A1.tolil(); A2[0, n - 1] += 1.0; A2 = A2.tocsr()   # adds one entry -> different nnz
+    assert A2.nnz != A1.nnz
+    x2 = be2.solve(A2, b)
+    assert np.allclose(x2, ScipyBackend().solve(A2, b), rtol=1e-9, atol=1e-11)
