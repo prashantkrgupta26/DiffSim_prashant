@@ -396,3 +396,21 @@ def test_three_way_quaternary_bdf1(device):
     dm, mesh = _dm(2)
     res = _three_way_multi(dm, mesh.node_coords, M=3, order=1, n_steps=2)
     _check_three_way(res, "Q-bdf1")
+
+
+# ==========================================================================
+# Task 1 (Rung 2): LinearBackend protocol + ScipyBackend
+# ==========================================================================
+def test_scipy_backend_solve_and_transpose():
+    import numpy as np
+    import scipy.sparse as sp
+    from diffsim.adjoint import ScipyBackend
+    A = sp.csr_matrix(np.array([[3.0, 1.0, 0.0],
+                                [0.0, 2.0, 1.0],
+                                [1.0, 0.0, 4.0]]))
+    b = np.array([1.0, -2.0, 3.0])
+    be = ScipyBackend()
+    x = be.solve(A, b)
+    assert np.allclose(A @ x, b, atol=1e-12)
+    xt = be.solve_T(A, b)
+    assert np.allclose(A.T @ xt, b, atol=1e-12)
