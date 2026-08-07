@@ -462,7 +462,7 @@ def test_three_way_quaternary_bdf1(device):
 
 
 # ==========================================================================
-# Task 6: MultiCHTwin mean-phi offset leaf (twin == FD for phi0 group)
+# MultiCHTwin mean-phi offset leaf (twin == FD)
 # ==========================================================================
 def test_meanphi_twin_vs_fd_ternary_bdf1():
     from diffsim.adjoint.torch_twin import MultiCHTwin
