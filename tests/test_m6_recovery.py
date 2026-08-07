@@ -66,8 +66,8 @@ def _run_recovery(dm, mesh, n_steps=5, n_opt=30, lr=2e-2, dt=5e-3, M=2):
 
     Returns
     -------
-    loss_hist  : list[float]   length n_opt+1 (step 0 = initial, step k = after k updates)
-    theta_hist : list[dict]    parameter dicts at each opt step
+    loss_hist  : list[float]   length n_opt+2 (step 0 = initial, steps 1..n_opt = after updates, final re-eval)
+    theta_hist : list[dict]    parameter dicts at each opt step (same length as loss_hist)
     truth      : dict          ground truth parameter values
     param_names: list[str]     ordered list of all learnable parameter names
     """
@@ -173,6 +173,13 @@ def _run_recovery(dm, mesh, n_steps=5, n_opt=30, lr=2e-2, dt=5e-3, M=2):
                 a_cur[k] = a_cur[k] - delta
         loss_hist.append(J)
         theta_hist.append({**gamma_cur, **a_cur})
+
+    # ------------------------------------------------------------------
+    # final re-evaluation at final parameters to align loss_hist[-1] with theta_hist[-1]
+    # ------------------------------------------------------------------
+    J_final, _ = _forward_loss_and_grads(gamma_cur, a_cur)
+    loss_hist.append(J_final)
+    theta_hist.append({**gamma_cur, **a_cur})
 
     truth = {**gamma_star, **a_star}
     return loss_hist, theta_hist, truth, param_names
