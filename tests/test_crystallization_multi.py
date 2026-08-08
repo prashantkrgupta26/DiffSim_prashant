@@ -59,6 +59,42 @@ def test_crystal_energy_derivs_complex_step():
     en.dsig[0] = en.dsig[0].real
     assert np.allclose(cs2, en.dfdphi_dparam(phis, psis, "dsig_0")[0], atol=1e-9)
 
+    # d(dfdphi)/d(dh_k) complex-step tests
+    for k in K:
+        en.dh[k] = complex(en.dh[k]) + 1j * h
+        cs_dh = (en.dfdphi(phis, psis)[k].imag) / h
+        en.dh[k] = en.dh[k].real
+        an_dh = en.dfdphi_dparam(phis, psis, f"dh_{k}")[k]
+        assert np.allclose(cs_dh, an_dh, atol=1e-9), \
+            f"dfdphi_dparam(dh_{k}) mismatch: cs={cs_dh}, an={an_dh}"
+
+    # d(dfdpsi)/d(dh_k) complex-step tests
+    for j, k in enumerate(K):
+        en.dh[k] = complex(en.dh[k]) + 1j * h
+        cs_dh_psi = (en.dfdpsi(phis, psis)[j].imag) / h
+        en.dh[k] = en.dh[k].real
+        an_dh_psi = en.dfdpsi_dparam(phis, psis, f"dh_{k}")[j]
+        assert np.allclose(cs_dh_psi, an_dh_psi, atol=1e-9), \
+            f"dfdpsi_dparam(dh_{k}) mismatch: cs={cs_dh_psi}, an={an_dh_psi}"
+
+    # d(dfdphi)/d(Tm_k) complex-step tests
+    for k in K:
+        en.Tm[k] = complex(en.Tm[k]) + 1j * h
+        cs_Tm = (en.dfdphi(phis, psis)[k].imag) / h
+        en.Tm[k] = en.Tm[k].real
+        an_Tm = en.dfdphi_dparam(phis, psis, f"Tm_{k}")[k]
+        assert np.allclose(cs_Tm, an_Tm, atol=1e-9), \
+            f"dfdphi_dparam(Tm_{k}) mismatch: cs={cs_Tm}, an={an_Tm}"
+
+    # d(dfdpsi)/d(Tm_k) complex-step tests
+    for j, k in enumerate(K):
+        en.Tm[k] = complex(en.Tm[k]) + 1j * h
+        cs_Tm_psi = (en.dfdpsi(phis, psis)[j].imag) / h
+        en.Tm[k] = en.Tm[k].real
+        an_Tm_psi = en.dfdpsi_dparam(phis, psis, f"Tm_{k}")[j]
+        assert np.allclose(cs_Tm_psi, an_Tm_psi, atol=1e-9), \
+            f"dfdpsi_dparam(Tm_{k}) mismatch: cs={cs_Tm_psi}, an={an_Tm_psi}"
+
 
 def test_crystal_energy_cross_hessian_d2fdphidpsi():
     """Perturb psi_k imaginary, check d(dfdphi_k)/dpsi_k == d2fdphidpsi[k][j].

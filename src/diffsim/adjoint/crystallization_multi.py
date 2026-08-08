@@ -69,8 +69,11 @@ class AdditiveCrystalEnergy(CrystalEnergy):
                    for b in ("dsig", "dh", "Tm"))
         self.param_names = self.fh.param_names + cp
 
+    def _Tfactor(self, k):
+        return self.T / self.Tm[k] - 1.0
+
     def _drive(self, k):
-        return self.dh[k] * (self.T / self.Tm[k] - 1.0)
+        return self.dh[k] * self._Tfactor(k)
 
     def _kpsi(self, psis, k):          # psi array for crystallizable species k
         return psis[self.crystallizable.index(k)]
@@ -119,7 +122,7 @@ class AdditiveCrystalEnergy(CrystalEnergy):
             if b == "dsig":
                 z[k] = _q(ps)
             elif b == "dh":
-                z[k] = _p(ps) * (self.T / self.Tm[k] - 1.0)
+                z[k] = _p(ps) * self._Tfactor(k)
             else:   # Tm
                 z[k] = _p(ps) * (-self.dh[k] * self.T / self.Tm[k] ** 2)
             return z
@@ -136,7 +139,7 @@ class AdditiveCrystalEnergy(CrystalEnergy):
             if b == "dsig":
                 z[j] = phis[k] * _qp(ps)
             elif b == "dh":
-                z[j] = phis[k] * _pp(ps) * (self.T / self.Tm[k] - 1.0)
+                z[j] = phis[k] * _pp(ps) * self._Tfactor(k)
             else:   # Tm
                 z[j] = phis[k] * _pp(ps) * (-self.dh[k] * self.T / self.Tm[k] ** 2)
         return z
