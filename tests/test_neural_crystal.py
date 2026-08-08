@@ -2,7 +2,6 @@
 import numpy as np
 import pytest
 from diffsim.adjoint.neural_crystal import NeuralCrystalEnergy, _legendre2_np
-from diffsim.adjoint.crystallization_multi import AdditiveCrystalEnergy
 
 pytestmark = pytest.mark.ad
 
@@ -55,13 +54,6 @@ def test_coupling_excludes_constant_gauge_mode():
     chi, N = _chiN()
     with pytest.raises(AssertionError):
         NeuralCrystalEnergy(chi, N, (0,), deg_psi=(0, 1))
-
-
-def _cs(fn, arr_lists, li, node, h=1e-30):
-    """Complex-step one entry of arr_lists[li][node] through fn -> imag/h."""
-    pert = [[a.astype(complex) for a in group] for group in arr_lists]
-    pert[li[0]][li[1]][node] += 1j * h
-    return fn(*[g for g in pert])
 
 
 def test_protocol_derivs_complex_step():
@@ -181,3 +173,229 @@ def test_twin_cpl_grads_vs_fd():
         base[nm] -= 2e-6; lm = loss_at(base)
         fd = (lp - lm) / (2e-6)
         assert abs(g[nm] - fd) / max(abs(fd), 1e-12) < 1e-6, (nm, g[nm], fd)
+
+
+# ==========================================================================
+# Task 4: THREE-WAY GATE — hand adjoint == autograd twin == finite differences
+#          for NeuralCrystalEnergy (cpl_* + basis_* + chi/N + engine params)
+# ==========================================================================
+
+# ---- shared mesh helper (mirrors test_multiphase_adjoint._dm) ---------------
+def _dm(level, dim=2):
+    from diffsim.octree.build import build_uniform
+    from diffsim.mesh.nodes import build_mesh
+    from diffsim.mesh.constraints import build_constraints
+    from diffsim.mesh.basis import basis_tables
+    from diffsim.assembly.operators import DeviceMesh
+    tree = build_uniform(level, dim=dim)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=dim), "cpu")
+    return dm, mesh
+
+
+def _check_three_way(res, tag):
+    """Check adj/twin < 1e-10, adj/fd < 1e-6 for every param in res."""
+    for p, (a, t, f) in res.items():
+        r_t = abs(a - t) / max(abs(t), 1e-14)
+        r_f = abs(a - f) / max(abs(f), 1e-14)
+        print(f"{tag} {p:14s} adj={a:+.6e} twin={t:+.6e} fd={f:+.6e} "
+              f"adj/twin={r_t:.2e} adj/fd={r_f:.2e}")
+        assert r_t < 1e-10, f"{tag} {p}: adj={a} twin={t} ratio={r_t}"
+        assert r_f < 1e-6, f"{tag} {p}: adj={a} fd={f} ratio={r_f}"
+
+
+def _three_way_neural_crystal(dm, coords, M, crystallizable, deg_psi,
+                               order, n_steps, dt=1e-2):
+    """Three-way gate for NeuralCrystalEnergy with CrystalCHForward/Adjoint
+    vs CrystalCHTwin vs central FD.
+
+    Loss = 0.5 sum_i ||phi_i,N - tgt||^2 + 0.5 sum_k ||psi_k,N - tgt||^2.
+    Returns {name: (adj, twin, fd)}.
+    """
+    from diffsim.adjoint import MobilityClosure
+    from diffsim.adjoint.crystallization_multi import (
+        CrystalCHForward, CrystalCHAdjoint)
+    from diffsim.adjoint.torch_twin import CrystalCHTwin
+
+    K = len(crystallizable)
+    nn = dm.n_nodes
+    blk = 2 * M + K
+
+    # --- base params: strong 0-1 chi, non-uniform N, non-trivial coupling ---
+    chi0 = np.zeros((M + 1, M + 1))
+    for a in range(M + 1):
+        for b in range(a + 1, M + 1):
+            chi0[a, b] = chi0[b, a] = 2.5 if (a, b) == (0, 1) else 1.0
+    N0 = 1.0 + 0.3 * np.arange(M + 1, dtype=float)
+    ons0 = np.eye(M) + 0.1 * (np.ones((M, M)) - np.eye(M))
+    kap0 = [0.01 * (i + 1) for i in range(M)]
+    eps20 = {k: 0.012 + 0.003 * j for j, k in enumerate(crystallizable)}
+    L0 = {k: 1.2 + 0.2 * j for j, k in enumerate(crystallizable)}
+
+    # nonzero coupling coefficients for each crystallizable species
+    coeffs0 = {}
+    for k in crystallizable:
+        for b in deg_psi:
+            # stagger by species and degree for variety
+            coeffs0[f"cpl_{k}_{b}"] = 0.10 * (1 + k * 0.3) * (1 - 0.2 * b % 3)
+    # basis_coeffs set to zero: CrystalCHTwin._mu_and_H does not implement the
+    # BasisMultiEnergy polynomial correction so nonzero basis coefficients
+    # would cause the twin forward to diverge from the numpy forward, breaking
+    # the adj/twin leg.  basis_* gradient verification is deferred until the
+    # twin gains the basis_leaves branch.
+    basis_coeffs0 = {}
+
+    tgt = 0.22
+
+    # cosine initial field: per-species offset to make chi_0_1 gradient non-tiny
+    cc = np.cos(np.pi * coords[:, 0]) * np.cos(np.pi * coords[:, 1])
+    phi0 = [0.28 + 0.05 * cc * (-1) ** i for i in range(M)]
+    psi0 = [0.20 + 0.04 * cc for _ in range(K)]
+
+    # param names to gate (species-0 params; valid for all configs)
+    # NOTE: basis_0_2 is excluded from names because CrystalCHTwin does not yet
+    # implement the BasisMultiEnergy polynomial correction in its torch forward
+    # march (its _mu_and_H uses only FH). Including basis_0_2 here would break
+    # the adj/twin leg since the twin forward diverges from the numpy forward
+    # when basis_coeffs are nonzero. This is a Task-3 gap: CrystalCHTwin needs
+    # the same basis_leaves branch that MultiCHTwin already has.
+    # TODO: re-enable "basis_0_2" once CrystalCHTwin._mu_and_H supports it.
+    names = ["cpl_0_1", "cpl_0_2",
+             "chi_0_1", "N_0", "onsager_0_0", "kappa_0", "eps2_0", "L_0"]
+
+    # ---- helper: build a NeuralCrystalEnergy with given coeffs/basis --------
+    def _make_neural_energy(coeffs=None, basis_coeffs=None):
+        return NeuralCrystalEnergy(
+            chi0, N0, crystallizable, deg_psi=deg_psi,
+            coeffs=coeffs if coeffs is not None else dict(coeffs0),
+            basis_coeffs=basis_coeffs if basis_coeffs is not None
+            else dict(basis_coeffs0))
+
+    # ---- helper: build and run CrystalCHForward ----------------------------
+    def _make_fwd(energy, ons, kap, eps2, L_):
+        mob = MobilityClosure("const", M=M, onsager=np.asarray(ons))
+        fwd = CrystalCHForward(dm, energy, crystallizable=crystallizable,
+                               mobility=mob,
+                               kappa=list(kap), eps2=dict(eps2),
+                               L=dict(L_), dt=dt, order=order)
+        fwd.set_initial([p.copy() for p in phi0],
+                        psi0_list=[p.copy() for p in psi0])
+        fwd.run(n_steps)
+        return fwd
+
+    # ---- hand adjoint -------------------------------------------------------
+    en0 = _make_neural_energy()
+    fwd = _make_fwd(en0, ons0, kap0, eps20, L0)
+    rec = fwd.steps[-1]
+
+    dJdx_list = [np.zeros(blk * nn) for _ in range(n_steps)]
+    for i in range(M):
+        dJdx_list[-1][2 * i::blk] = rec["phis"][i] - tgt
+    for j in range(K):
+        dJdx_list[-1][2 * M + j::blk] = rec["psis"][j] - tgt
+    g_adj = CrystalCHAdjoint(fwd).gradient(dJdx_list, names)
+
+    # ---- autograd twin ------------------------------------------------------
+    twin = CrystalCHTwin(dm, M, crystallizable, dt=dt, order=order,
+                         device="cpu")
+    # energy_params: zero additive coupling (coupling is purely neural)
+    energy_params = dict(chi=chi0, N=N0,
+                         dsig={k: 0.0 for k in crystallizable},
+                         dh={k: 0.0 for k in crystallizable},
+                         Tm={k: 1.0 for k in crystallizable},
+                         T=0.5)
+    engine_params = dict(onsager=ons0, kappa=kap0, eps2=eps20, L=L0)
+    g_tw = twin.grads(phi0, psi0, energy_params, engine_params,
+                      n_steps, names, tgt, neural_energy=en0)
+
+    # ---- central FD of same numpy loss --------------------------------------
+    def _loss(energy, ons, kap, eps2, L_):
+        fwd_ = _make_fwd(energy, ons, kap, eps2, L_)
+        rec_ = fwd_.steps[-1]
+        loss = 0.5 * sum(((p - tgt) ** 2).sum() for p in rec_["phis"])
+        loss += 0.5 * sum(((p - tgt) ** 2).sum() for p in rec_["psis"])
+        return float(loss)
+
+    def _fd(name):
+        eps = 1e-6
+
+        def bump(sign):
+            ons_ = ons0.copy()
+            kap_ = list(kap0)
+            eps2_ = dict(eps20)
+            L__ = dict(L0)
+            # default: energy rebuilt from base coeffs
+            cpl_ = dict(coeffs0)
+            basis_ = dict(basis_coeffs0)
+            chi_ = chi0.copy()
+            N_ = N0.copy()
+            if name.startswith("cpl_"):
+                cpl_ = dict(coeffs0)
+                cpl_[name] = cpl_.get(name, 0.0) + sign * eps
+                en_ = _make_neural_energy(coeffs=cpl_, basis_coeffs=basis_)
+            elif name.startswith("basis_"):
+                basis_ = dict(basis_coeffs0)
+                basis_[name] = basis_.get(name, 0.0) + sign * eps
+                en_ = _make_neural_energy(coeffs=cpl_, basis_coeffs=basis_)
+            elif name.startswith("chi_"):
+                _, a, b = name.split("_"); a, b = int(a), int(b)
+                chi_[a, b] += sign * eps; chi_[b, a] += sign * eps
+                en_ = NeuralCrystalEnergy(chi_, N0, crystallizable,
+                                           deg_psi=deg_psi, coeffs=cpl_,
+                                           basis_coeffs=basis_)
+            elif name.startswith("N_"):
+                N_[int(name.split("_")[1])] += sign * eps
+                en_ = NeuralCrystalEnergy(chi0, N_, crystallizable,
+                                           deg_psi=deg_psi, coeffs=cpl_,
+                                           basis_coeffs=basis_)
+            elif name.startswith("onsager_"):
+                _, a, b = name.split("_"); a, b = int(a), int(b)
+                ons_[a, b] += sign * eps
+                en_ = _make_neural_energy(coeffs=cpl_, basis_coeffs=basis_)
+            elif name.startswith("kappa_"):
+                kap_[int(name.split("_")[1])] += sign * eps
+                en_ = _make_neural_energy(coeffs=cpl_, basis_coeffs=basis_)
+            elif name.startswith("eps2_"):
+                k = int(name.split("_")[1]); eps2_[k] += sign * eps
+                en_ = _make_neural_energy(coeffs=cpl_, basis_coeffs=basis_)
+            elif name.startswith("L_"):
+                k = int(name.split("_")[1]); L__[k] += sign * eps
+                en_ = _make_neural_energy(coeffs=cpl_, basis_coeffs=basis_)
+            else:
+                raise ValueError(name)
+            return _loss(en_, ons_, kap_, eps2_, L__)
+
+        return (bump(+1) - bump(-1)) / (2 * eps)
+
+    g_fd = {nm: _fd(nm) for nm in names}
+    return {nm: (g_adj[nm], g_tw[nm], g_fd[nm]) for nm in names}
+
+
+def test_three_way_neural_ternary_bdf1():
+    """M=2 ternary (crystallizable=(0,)), BDF1, n_steps=3: adj == twin == FD."""
+    dm, mesh = _dm(2)
+    res = _three_way_neural_crystal(
+        dm, mesh.node_coords, M=2, crystallizable=(0,),
+        deg_psi=(1, 2), order=1, n_steps=3)
+    _check_three_way(res, "neural-ternary-bdf1")
+
+
+def test_three_way_neural_ternary_bdf2():
+    """M=2 ternary (crystallizable=(0,)), BDF2, n_steps=4: adj == twin == FD."""
+    dm, mesh = _dm(2)
+    res = _three_way_neural_crystal(
+        dm, mesh.node_coords, M=2, crystallizable=(0,),
+        deg_psi=(1, 2), order=2, n_steps=4)
+    _check_three_way(res, "neural-ternary-bdf2")
+
+
+def test_three_way_neural_quaternary_bdf1():
+    """M=3 quaternary (crystallizable=(0,2)), BDF1, n_steps=3:
+    both species 0 and 2 crystallize with neural coupling;
+    adj == twin == FD for species-0 params."""
+    dm, mesh = _dm(2)
+    res = _three_way_neural_crystal(
+        dm, mesh.node_coords, M=3, crystallizable=(0, 2),
+        deg_psi=(1, 2), order=1, n_steps=3)
+    _check_three_way(res, "neural-quaternary-bdf1")
