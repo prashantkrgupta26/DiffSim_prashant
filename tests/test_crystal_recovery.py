@@ -9,6 +9,23 @@ from diffsim.adjoint.crystal_recovery import (
     structure_factor, structure_factor_grad, nodal_to_grid)
 
 
+# ---------------------------------------------------------------------------
+# Shared mesh helper for multi-snapshot tests (copied from test_crystallization_multi)
+# ---------------------------------------------------------------------------
+
+def _dm(level, dim=2):
+    from diffsim.octree.build import build_uniform
+    from diffsim.mesh.nodes import build_mesh
+    from diffsim.mesh.constraints import build_constraints
+    from diffsim.mesh.basis import basis_tables
+    from diffsim.assembly.operators import DeviceMesh
+    tree = build_uniform(level, dim=dim)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=dim), "cpu")
+    return dm, mesh
+
+
 def test_structure_factor_output_shape():
     """S(k) should return a 1-D array of length nbins (default min(shape)//2)."""
     f = np.ones((8, 12))
@@ -105,3 +122,45 @@ def test_nodal_to_grid_values():
     assert np.allclose(grid, expected), (
         f"Max error: {np.abs(grid - expected).max()}"
     )
+
+
+# ===========================================================================
+# Task 3: Multi-snapshot recovery — identifiability lift
+# ===========================================================================
+
+def test_multisnapshot_recovers_higher_mode():
+    """Multi-snapshot recovery lifts identifiability of cpl_0_2 (higher ψ-mode).
+
+    Plants {"cpl_0_1": 0.15, "cpl_0_2": -0.12}, recovers with snapshots at
+    steps (2, 4, 6).  Asserts:
+      - loss drop ≥ 20×  (convergence)
+      - cpl_0_2 within 30% of planted (higher mode identifiable from multi-snapshot)
+    """
+    from diffsim.adjoint.crystal_recovery import recover_multisnapshot
+    dm, mesh = _dm(2)
+    planted = {"cpl_0_1": 0.15, "cpl_0_2": -0.12}
+    names = ["cpl_0_1", "cpl_0_2"]
+    # multi-snapshot: observe several times -> higher mode cpl_0_2 identifiable
+    lh, th, tt = recover_multisnapshot(
+        dm, mesh, planted, names, n_steps=6, snapshots=(2, 4, 6),
+        order=1, n_iter=60, lr=0.5)
+    assert lh[-1] <= lh[0] / 20.0, (
+        f"Loss drop {lh[0]:.4e} → {lh[-1]:.4e} is < 20× (ratio {lh[0]/lh[-1]:.1f}×)")
+    # the higher mode cpl_0_2 recovers where single-snapshot (② Task 5) fails
+    assert abs(th["cpl_0_2"] - tt["cpl_0_2"]) <= 0.30 * abs(tt["cpl_0_2"]), (
+        f"cpl_0_2: planted={tt['cpl_0_2']:.4f}, recovered={th['cpl_0_2']:.4f}, "
+        f"relerr={abs(th['cpl_0_2']-tt['cpl_0_2'])/abs(tt['cpl_0_2']):.3f}")
+
+
+def test_multisnapshot_descriptor_smoke():
+    """descriptor=True path runs and still reduces the loss (no crash, no diverge)."""
+    from diffsim.adjoint.crystal_recovery import recover_multisnapshot
+    dm, mesh = _dm(2)
+    planted = {"cpl_0_1": 0.15, "cpl_0_2": -0.12}
+    names = ["cpl_0_1", "cpl_0_2"]
+    lh, th, tt = recover_multisnapshot(
+        dm, mesh, planted, names, n_steps=6, snapshots=(2, 4, 6),
+        order=1, n_iter=20, lr=0.5, descriptor=True, lam_desc=1e-3)
+    # descriptor term must not cause divergence: final loss < initial loss
+    assert lh[-1] < lh[0], (
+        f"Descriptor-on smoke: loss did not decrease ({lh[0]:.4e} → {lh[-1]:.4e})")
