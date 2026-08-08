@@ -472,3 +472,104 @@ def test_crystal_adjoint_returns_finite_grads():
         f"Missing keys: {set(param_names) - set(grads.keys())}"
     for nm, val in grads.items():
         assert np.isfinite(val), f"grad[{nm!r}] = {val} is not finite"
+
+
+# ==========================================================================
+# Task 4: CrystalCHTwin — autograd twin, checked vs central-FD of same loss
+# ==========================================================================
+def test_crystal_twin_grads_vs_fd():
+    """CrystalCHTwin (M-generic CACHTwin + generic CrystalEnergy).  Ternary
+    M=2, crystallizable=(0,), BDF1, n_steps=3.  Twin autograd grads of
+
+        loss = 0.5 sum_i ||phi_i,N - tgt||^2 + 0.5 sum_k ||psi_k,N - tgt||^2
+
+    are checked against central finite differences of the SAME loss computed
+    with a fresh numpy CrystalCHForward march (independent forward).  Relative
+    error < 1e-6 for each param."""
+    from diffsim.adjoint import MobilityClosure
+    from diffsim.adjoint.crystallization_multi import CrystalCHForward
+    from diffsim.adjoint.torch_twin import CrystalCHTwin
+
+    M = 2
+    crystallizable = (0,)
+    chi, N = _chiN(M=M)
+    ons = np.array([[1.0, 0.15], [0.15, 0.9]])
+    kap = [0.01, 0.02]
+    eps2 = {0: 0.015}
+    L = {0: 1.5}
+    dsig = {0: 1.2}
+    dh = {0: -1.0}
+    Tm = {0: 1.0}
+    T = 0.5
+    dt = 1e-2
+    n_steps = 3
+    target = 0.2
+
+    dm, _mesh = _dm(2)
+    nn = dm.n_nodes
+    rng = np.random.default_rng(321)
+    phi0 = [0.15 + 0.05 * rng.random(nn) for _ in range(M)]
+    psi0 = [0.1 + 0.05 * rng.random(nn)]
+
+    energy_params = dict(chi=chi, N=N, dsig=dsig, dh=dh, Tm=Tm, T=T)
+    engine_params = dict(onsager=ons, kappa=kap, eps2=eps2, L=L)
+
+    names = ["dsig_0", "dh_0", "L_0", "eps2_0", "chi_0_1", "kappa_0"]
+
+    # --- twin autograd grads ---
+    twin = CrystalCHTwin(dm, M, crystallizable, dt=dt, order=1)
+    tw = twin.grads(phi0, psi0, energy_params, engine_params, n_steps,
+                    names, target)
+
+    # --- central-FD reference of the SAME loss via numpy forward ---
+    def loss_of(ep, gp):
+        en = AdditiveCrystalEnergy(
+            ep["chi"], ep["N"], crystallizable=crystallizable,
+            dsig=ep["dsig"], dh=ep["dh"], Tm=ep["Tm"], T=ep["T"])
+        fwd = CrystalCHForward(
+            dm, en, crystallizable=crystallizable,
+            mobility=MobilityClosure("const", M=M,
+                                     onsager=np.asarray(gp["onsager"])),
+            kappa=gp["kappa"], eps2=gp["eps2"], L=gp["L"], dt=dt, order=1)
+        fwd.set_initial([p.copy() for p in phi0],
+                        psi0_list=[p.copy() for p in psi0])
+        fwd.run(n_steps)
+        rec = fwd.steps[-1]
+        loss = 0.5 * sum(((p - target) ** 2).sum() for p in rec["phis"])
+        loss += 0.5 * sum(((p - target) ** 2).sum() for p in rec["psis"])
+        return loss
+
+    def perturbed(name, delta):
+        ep = dict(chi=np.array(chi, float), N=np.array(N, float),
+                  dsig=dict(dsig), dh=dict(dh), Tm=dict(Tm), T=T)
+        gp = dict(onsager=np.array(ons, float), kappa=list(kap),
+                  eps2=dict(eps2), L=dict(L))
+        if name.startswith("dsig_"):
+            k = int(name.split("_")[1]); ep["dsig"][k] += delta
+        elif name.startswith("dh_"):
+            k = int(name.split("_")[1]); ep["dh"][k] += delta
+        elif name.startswith("Tm_"):
+            k = int(name.split("_")[1]); ep["Tm"][k] += delta
+        elif name.startswith("L_"):
+            k = int(name.split("_")[1]); gp["L"][k] += delta
+        elif name.startswith("eps2_"):
+            k = int(name.split("_")[1]); gp["eps2"][k] += delta
+        elif name.startswith("kappa_"):
+            i = int(name.split("_")[1]); gp["kappa"][i] += delta
+        elif name.startswith("chi_"):
+            _, a, b = name.split("_"); a, b = int(a), int(b)
+            ep["chi"][a, b] += delta; ep["chi"][b, a] += delta
+        else:
+            raise ValueError(name)
+        return ep, gp
+
+    step = 1e-6
+    print()
+    for nm in names:
+        epp, gpp = perturbed(nm, step)
+        epm, gpm = perturbed(nm, -step)
+        fd = (loss_of(epp, gpp) - loss_of(epm, gpm)) / (2 * step)
+        relerr = abs(tw[nm] - fd) / max(abs(fd), 1e-30)
+        print(f"  {nm:10s} twin={tw[nm]:+.10e} fd={fd:+.10e} "
+              f"relerr={relerr:.2e}")
+        assert relerr < 1e-6, f"{nm}: twin={tw[nm]} fd={fd} relerr={relerr}"

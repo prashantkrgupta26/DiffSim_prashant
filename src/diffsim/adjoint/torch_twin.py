@@ -165,8 +165,24 @@ def _q_t(psi):
     return psi ** 2 * (1.0 - psi) ** 2
 
 
+def _qp_t(psi):
+    return 2.0 * psi - 6.0 * psi ** 2 + 4.0 * psi ** 3
+
+
+def _qpp_t(psi):
+    return 2.0 - 12.0 * psi + 12.0 * psi ** 2
+
+
 def _p_t(psi):
     return 3.0 * psi ** 2 - 2.0 * psi ** 3
+
+
+def _pp_t(psi):
+    return 6.0 * psi - 6.0 * psi ** 2
+
+
+def _ppp_t(psi):
+    return 6.0 - 12.0 * psi
 
 
 class CACHTwin:
@@ -704,5 +720,346 @@ class MultiCHTwin:
                            device=self.dev)
         loss = 0.5 * sum(((xN[2 * i::blk] - tgt) ** 2).sum()
                          for i in range(M))
+        loss.backward()
+        return {nm: float(leaves[nm].grad) for nm in names}
+
+
+# --------------------------------------------------------------------------
+# M-generic coupled multi-CH x multi-Allen-Cahn crystallization twin (K>=0)
+# — reference for adjoint/crystallization_multi.CrystalCHAdjoint (three-way gate)
+# --------------------------------------------------------------------------
+class CrystalCHTwin:
+    """Autograd twin of adjoint/crystallization_multi.CrystalCHDiscrete: the
+    M-generic Cahn-Hilliard 2M block (a la MultiCHTwin) coupled to a K-species
+    Allen-Cahn psi block (a la CACHTwin), for the AdditiveCrystalEnergy bulk
+
+        f = f_FH(phi; chi, N)
+          + sum_k phi_k [ q(psi_k) dsig_k + p(psi_k) drive_k ],
+        drive_k = dh_k (T / Tm_k - 1),   k in crystallizable.
+
+    Node-major block ``blk = 2*M + K``:
+      f = 2*i     -> phi_i   (i = 0 .. M-1)
+      f = 2*i + 1 -> mu_i    (i = 0 .. M-1)
+      f = 2*M + j -> psi_{crystallizable[j]}   (j = 0 .. K-1)
+
+    chi/N/onsager/kappa and the crystal params (dsig/dh/Tm/eps2/L per species)
+    enter as leaf tensors so autograd-through-convergence returns the IFT
+    gradient the hand adjoint (CrystalCHAdjoint) must reproduce.  Weak form,
+    BDF history and Newton match CrystalCHDiscrete exactly."""
+
+    def __init__(self, dm, M, crystallizable, dt=1e-2, order=1, device="cpu"):
+        assert order in (1, 2)
+        self.M = int(M)
+        self.crystallizable = tuple(int(k) for k in crystallizable)
+        self.K = len(self.crystallizable)
+        self.blk = 2 * self.M + self.K
+        self.dt = float(dt)
+        self.order = order
+        self.dev = device
+        self.dim, self.nn = dm.dim, dm.n_nodes
+        self.ndof = self.blk * self.nn
+        t = lambda a, d=torch.float64: torch.tensor(np.asarray(a), dtype=d,
+                                                    device=device)
+        blk = self.blk
+        self.bins = []
+        for pv, b in dm.bins.items():
+            tb = dm.tables_by_p[pv]
+            conn = dm.mesh.conn_of[pv].astype(np.int64)
+            h = np.asarray(dm.mesh.tree.h()[dm.mesh.bins[pv]], np.float64)
+            ne, nbf = conn.shape
+            jac = (h / 2.0) ** self.dim
+            dJxW = np.asarray(tb.w)[None, :] * jac[:, None]
+            gdof = (conn[:, :, None] * blk
+                    + np.arange(blk)[None, None, :]).reshape(ne, blk * nbf)
+            r = np.repeat(gdof, blk * nbf, axis=1).ravel()
+            c = np.tile(gdof, (1, blk * nbf)).ravel()
+            self.bins.append(dict(
+                conn=t(conn, torch.int64), N=t(tb.N), dN=t(tb.dN),
+                dJxW=t(dJxW), dscale=t(2.0 / h), ne=ne, nbf=nbf,
+                gd=[t(gdof[:, f::blk].ravel(), torch.int64)
+                    for f in range(blk)],
+                lin=t(r * self.ndof + c, torch.int64)))
+
+    def _ip(self, field, B):
+        vals = field[B["conn"]]
+        v = torch.einsum("qa,ea->eq", B["N"], vals)
+        g = torch.einsum("qad,ea,e->eqd", B["dN"], vals, B["dscale"])
+        return v, g
+
+    def _mu_and_H(self, phi_gp, chi_t, Ninv):
+        """FH exchange potentials and their phi-Hessian at Gauss points
+        (identical to MultiCHTwin._mu_and_H, no energy-correction branch)."""
+        M = self.M
+        ps = 1.0 - sum(phi_gp)
+        phi_of = lambda l: phi_gp[l] if l < M else ps
+
+        def S(m):
+            return sum(phi_of(l) * chi_t[m, l]
+                       for l in range(M + 1) if l != m)
+        mus = [Ninv[i] * (torch.log(phi_gp[i]) + 1.0)
+               - Ninv[M] * (torch.log(ps) + 1.0) + S(i) - S(M)
+               for i in range(M)]
+        H = [[Ninv[M] / ps + (chi_t[i, j] if i != j else 0.0)
+              - chi_t[i, M] - chi_t[M, j] + (Ninv[i] / phi_gp[i]
+                                             if i == j else 0.0)
+              for j in range(M)] for i in range(M)]
+        return mus, H
+
+    def _assemble(self, x, hpg, hsg, chi_t, Ninv, Lam, kap, eps2, L,
+                  dsig, drive, sigma):
+        """Residual R and Jacobian J.  chi_t/Ninv are (M+1)-shaped tensors,
+        Lam is M x M mobility, kap is length-M list, eps2/L/dsig/drive are
+        length-K lists (per crystallizable species, in cryst order)."""
+        M, K, blk = self.M, self.K, self.blk
+        R = torch.zeros(self.ndof, device=self.dev)
+        J = torch.zeros(self.ndof * self.ndof, device=self.dev)
+        for bi, B in enumerate(self.bins):
+            dJxW, N, dN, ds = B["dJxW"], B["N"], B["dN"], B["dscale"]
+            phi_gp, gphi, mu_gp, gmu = [], [], [], []
+            for i in range(M):
+                v, g = self._ip(x[2 * i::blk], B)
+                phi_gp.append(v); gphi.append(g)
+                v2, g2 = self._ip(x[2 * i + 1::blk], B)
+                mu_gp.append(v2); gmu.append(g2)
+            psi_gp, gpsi = [], []
+            for j in range(K):
+                v, g = self._ip(x[2 * M + j::blk], B)
+                psi_gp.append(v); gpsi.append(g)
+            muref, H = self._mu_and_H(phi_gp, chi_t, Ninv)
+            # crystal coupling: dfdphi_k += q dsig + p drive; assemble the
+            # per-crystallizable-species scalar quantities keyed by cryst idx j
+            q = [_q_t(psi_gp[j]) for j in range(K)]
+            p = [_p_t(psi_gp[j]) for j in range(K)]
+            qp = [_qp_t(psi_gp[j]) for j in range(K)]
+            pp = [_pp_t(psi_gp[j]) for j in range(K)]
+            qpp = [_qpp_t(psi_gp[j]) for j in range(K)]
+            ppp = [_ppp_t(psi_gp[j]) for j in range(K)]
+            # coup_j = d(dfdphi_k)/dpsi_k = d(dfdpsi_k)/dphi_k
+            coup = [qp[j] * dsig[j] + pp[j] * drive[j] for j in range(K)]
+            dfdphi_add = {}       # species k -> q dsig + p drive
+            dfdpsi = {}           # cryst idx j -> phi_k (q' dsig + p' drive)
+            for j, k in enumerate(self.crystallizable):
+                dfdphi_add[k] = q[j] * dsig[j] + p[j] * drive[j]
+                dfdpsi[j] = phi_gp[k] * coup[j]
+            NN = torch.einsum("eq,qa,qb->eab", dJxW, N, N)
+            LL = torch.einsum("eq,qad,qbd->eab", dJxW * ds[:, None] ** 2,
+                              dN, dN)
+            WM = lambda w: torch.einsum("eq,qa,qb->eab", dJxW * w, N, N)
+            nbf = B["nbf"]
+            Ae = torch.zeros((B["ne"], blk * nbf, blk * nbf), device=self.dev)
+            # --- phi/mu rows (M-CH block, plus psi coupling on mu rows) ---
+            for i in range(M):
+                flux = sum(Lam[i, j] * gmu[j] for j in range(M))
+                gN_flux = torch.einsum("qad,e,eqd->eqa", dN, ds, flux)
+                Rphi = torch.einsum(
+                    "eq,qa->ea", dJxW * (sigma * phi_gp[i] - hpg[i][bi]),
+                    N) + torch.einsum("eq,eqa->ea", dJxW, gN_flux)
+                dfdphi_i = muref[i]
+                if i in dfdphi_add:
+                    dfdphi_i = dfdphi_i + dfdphi_add[i]
+                gN_gphi = torch.einsum("qad,e,eqd->eqa", dN, ds, gphi[i])
+                Rmu = torch.einsum("eq,qa->ea", dJxW * (mu_gp[i] - dfdphi_i),
+                                   N) - kap[i] * torch.einsum(
+                    "eq,eqa->ea", dJxW, gN_gphi)
+                R = R.index_add(0, B["gd"][2 * i], Rphi.reshape(-1))
+                R = R.index_add(0, B["gd"][2 * i + 1], Rmu.reshape(-1))
+                Ae[:, 2 * i::blk, 2 * i::blk] = sigma * NN
+                for j in range(M):
+                    Ae[:, 2 * i::blk, 2 * j + 1::blk] = Lam[i, j] * LL
+                    Ae[:, 2 * i + 1::blk, 2 * j::blk] = -WM(H[i][j])
+                Ae[:, 2 * i + 1::blk, 2 * i::blk] = \
+                    Ae[:, 2 * i + 1::blk, 2 * i::blk] - kap[i] * LL
+                Ae[:, 2 * i + 1::blk, 2 * i + 1::blk] = NN
+                # dR_mu_i / dpsi_j : nonzero only when i is crystallizable k
+                if i in self.crystallizable:
+                    j = self.crystallizable.index(i)
+                    Ae[:, 2 * i + 1::blk, 2 * M + j::blk] = -WM(coup[j])
+            # --- psi rows (multi-Allen-Cahn block) ---
+            for j, k in enumerate(self.crystallizable):
+                prow = 2 * M + j
+                gN_gpsi = torch.einsum("qad,e,eqd->eqa", dN, ds, gpsi[j])
+                Rpsi = torch.einsum(
+                    "eq,qa->ea", dJxW * (sigma * psi_gp[j] - hsg[j][bi]),
+                    N) + L[j] * (
+                    torch.einsum("eq,qa->ea", dJxW * dfdpsi[j], N)
+                    + eps2[j] * torch.einsum("eq,eqa->ea", dJxW, gN_gpsi))
+                R = R.index_add(0, B["gd"][prow], Rpsi.reshape(-1))
+                # dR_psi_k / dphi_k = L_k WM(coup_j)
+                Ae[:, prow::blk, 2 * k::blk] = L[j] * WM(coup[j])
+                # dR_psi_k / dpsi_k = sigma NN + L_k (WM(phi_k(q'' dsig +
+                #   p''' drive)) + eps2_k LL)
+                Ae[:, prow::blk, prow::blk] = sigma * NN + L[j] * (
+                    WM(phi_gp[k] * (qpp[j] * dsig[j] + ppp[j] * drive[j]))
+                    + eps2[j] * LL)
+            J = J.index_add(0, B["lin"], Ae.reshape(-1))
+        return R, J.reshape(self.ndof, self.ndof)
+
+    def march(self, phi0_list, psi0_list, chi_t, N_t, Lam, kap, eps2, L,
+              dsig, drive, n_steps, newton_max=40, newton_tol=1e-12):
+        M, K, blk = self.M, self.K, self.blk
+        Ninv = 1.0 / N_t
+        x = torch.zeros(self.ndof, device=self.dev)
+        for i in range(M):
+            x[2 * i::blk] = phi0_list[i]
+        for j in range(K):
+            x[2 * M + j::blk] = psi0_list[j]
+        phi_snap = [phi0_list[i].clone() for i in range(M)]
+        psi_snap = [psi0_list[j].clone() for j in range(K)]
+        hist_phi = [phi_snap, [p.clone() for p in phi_snap]]
+        hist_psi = [psi_snap, [p.clone() for p in psi_snap]]
+        dt = self.dt
+        t, dt_prev = 0.0, None
+        out = []
+
+        def hgp(hist, nf):
+            acc_all = []
+            for i in range(nf):
+                acc = None
+                for kk, cc in enumerate(ch):
+                    hi = [self._ip(hist[kk][i], B)[0] for B in self.bins]
+                    if acc is None:
+                        acc = [(cc / dt) * hi[bi] for bi in range(len(hi))]
+                    else:
+                        for bi in range(len(hi)):
+                            acc[bi] = acc[bi] + (cc / dt) * hi[bi]
+                acc_all.append(acc)
+            return acc_all
+
+        for _ in range(n_steps):
+            if self.order == 1 or dt_prev is None or t < dt / 2:
+                c0_, ch = 1.0, [1.0]
+            else:
+                rr = dt / dt_prev
+                c0_ = (1.0 + 2.0 * rr) / (1.0 + rr)
+                ch = [1.0 + rr, -rr * rr / (1.0 + rr)]
+            sigma = c0_ / dt
+            hpg = hgp(hist_phi, M)
+            hsg = hgp(hist_psi, K)
+            xk = x.clone()
+            for it in range(newton_max):
+                R, Jm = self._assemble(xk, hpg, hsg, chi_t, Ninv, Lam, kap,
+                                       eps2, L, dsig, drive, sigma)
+                dx = torch.linalg.solve(Jm, -R)
+                xk = xk + dx
+                if float(dx.detach().abs().max()) < newton_tol:
+                    break
+            x = xk
+            out.append(x)
+            hist_phi = [[x[2 * i::blk] for i in range(M)], hist_phi[0]]
+            hist_psi = [[x[2 * M + j::blk] for j in range(K)], hist_psi[0]]
+            t += dt
+            dt_prev = dt
+        return out
+
+    def grads(self, phi0_list, psi0_list, energy_params, engine_params,
+              n_steps, names, target):
+        """Build leaf tensors for requested params, march, backprop
+        loss = 0.5 sum_i ||phi_i,N - tgt||^2 + 0.5 sum_k ||psi_k,N - tgt||^2,
+        return {name: leaf.grad}.
+
+        energy_params: chi (MxM+1 sym), N (len M+1), dsig/dh/Tm (dict k->float),
+        T (float).  engine_params: onsager (MxM), kappa (len M), eps2/L
+        (dict k->float).  Recognised names:
+          dsig_k, dh_k, Tm_k, eps2_k, L_k  (per crystallizable species k)
+          chi_a_b (symmetric), N_i, onsager_a_b, kappa_i
+        """
+        M, K = self.M, self.K
+        cryst = self.crystallizable
+        chi0 = np.asarray(energy_params["chi"], np.float64)
+        N0 = np.asarray(energy_params["N"], np.float64)
+        ons0 = np.asarray(engine_params["onsager"], np.float64)
+        kap0 = [float(k) for k in engine_params["kappa"]]
+        dsig0 = {int(k): float(v) for k, v in energy_params["dsig"].items()}
+        dh0 = {int(k): float(v) for k, v in energy_params["dh"].items()}
+        Tm0 = {int(k): float(v) for k, v in energy_params["Tm"].items()}
+        eps20 = {int(k): float(v) for k, v in engine_params["eps2"].items()}
+        L0 = {int(k): float(v) for k, v in engine_params["L"].items()}
+        T = float(energy_params["T"])
+
+        leaves = {}
+        for nm in names:
+            if nm.startswith("chi_") or nm.startswith("onsager_"):
+                base = chi0 if nm.startswith("chi_") else ons0
+                _, a, b = nm.split("_")
+                v = float(base[int(a), int(b)])
+            elif nm.startswith("N_"):
+                v = float(N0[int(nm.split("_")[1])])
+            elif nm.startswith("kappa_"):
+                v = float(kap0[int(nm.split("_")[1])])
+            elif nm.startswith("dsig_"):
+                v = dsig0[int(nm.split("_")[1])]
+            elif nm.startswith("dh_"):
+                v = dh0[int(nm.split("_")[1])]
+            elif nm.startswith("Tm_"):
+                v = Tm0[int(nm.split("_")[1])]
+            elif nm.startswith("eps2_"):
+                v = eps20[int(nm.split("_")[1])]
+            elif nm.startswith("L_"):
+                v = L0[int(nm.split("_")[1])]
+            else:
+                raise ValueError(f"unknown param name {nm!r}")
+            leaves[nm] = torch.tensor(v, dtype=torch.float64,
+                                      device=self.dev, requires_grad=True)
+
+        tt = lambda a: torch.tensor(np.asarray(a), dtype=torch.float64,
+                                    device=self.dev)
+        # ---- differentiable param tensors (splice leaves in) ----
+        chi_t = tt(chi0)
+        N_t = tt(N0)
+        Lam = tt(ons0)
+        kap = [tt(k) for k in kap0]
+        dsig_d = {k: tt(v) for k, v in dsig0.items()}
+        dh_d = {k: tt(v) for k, v in dh0.items()}
+        Tm_d = {k: tt(v) for k, v in Tm0.items()}
+        eps2_d = {k: tt(v) for k, v in eps20.items()}
+        L_d = {k: tt(v) for k, v in L0.items()}
+        for nm, leaf in leaves.items():
+            if nm.startswith("chi_"):
+                _, a, b = nm.split("_"); a, b = int(a), int(b)
+                E = torch.zeros(M + 1, M + 1, dtype=torch.float64,
+                                device=self.dev)
+                E[a, b] = 1.0; E[b, a] = 1.0
+                chi_t = chi_t - chi_t * E + leaf * E
+            elif nm.startswith("onsager_"):
+                _, a, b = nm.split("_"); a, b = int(a), int(b)
+                E = torch.zeros(M, M, dtype=torch.float64, device=self.dev)
+                E[a, b] = 1.0
+                Lam = Lam - Lam * E + leaf * E
+            elif nm.startswith("N_"):
+                i = int(nm.split("_")[1])
+                e = torch.zeros(M + 1, dtype=torch.float64, device=self.dev)
+                e[i] = 1.0
+                N_t = N_t - N_t * e + leaf * e
+            elif nm.startswith("kappa_"):
+                kap[int(nm.split("_")[1])] = leaf
+            elif nm.startswith("dsig_"):
+                dsig_d[int(nm.split("_")[1])] = leaf
+            elif nm.startswith("dh_"):
+                dh_d[int(nm.split("_")[1])] = leaf
+            elif nm.startswith("Tm_"):
+                Tm_d[int(nm.split("_")[1])] = leaf
+            elif nm.startswith("eps2_"):
+                eps2_d[int(nm.split("_")[1])] = leaf
+            elif nm.startswith("L_"):
+                L_d[int(nm.split("_")[1])] = leaf
+        # ---- per-crystallizable-species lists (in cryst order) ----
+        Tt = tt(T)
+        dsig = [dsig_d[k] for k in cryst]
+        drive = [dh_d[k] * (Tt / Tm_d[k] - 1.0) for k in cryst]
+        eps2 = [eps2_d[k] for k in cryst]
+        L = [L_d[k] for k in cryst]
+        # ---- initial conditions ----
+        phis = [tt(phi0_list[i]) for i in range(M)]
+        psis = [tt(psi0_list[j]) for j in range(K)]
+        # ---- march + loss ----
+        out = self.march(phis, psis, chi_t, N_t, Lam, kap, eps2, L,
+                         dsig, drive, n_steps)
+        xN = out[-1]
+        blk = self.blk
+        tgt = torch.tensor(float(target), dtype=torch.float64,
+                           device=self.dev)
+        loss = 0.5 * sum(((xN[2 * i::blk] - tgt) ** 2).sum() for i in range(M))
+        loss = loss + 0.5 * sum(
+            ((xN[2 * M + j::blk] - tgt) ** 2).sum() for j in range(K))
         loss.backward()
         return {nm: float(leaves[nm].grad) for nm in names}
