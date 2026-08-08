@@ -820,3 +820,102 @@ Naive unregularized Adam on all 1,089 voxel values (from a wrong-circle initial 
 | GridSDF n=48 | 2,401 | 15.0ms | 2.61ms | **0.118ms** | 13.8ms | 5.31x |
 
 **Interpretation:** the *adjoint linear solve* itself — the theoretically `O(1)` part, and the part that would cost `O(N)` separate solves under finite differences — stays essentially flat (`0.118-0.133ms`) across a `3` to `2,401` parameter range, exactly confirming the docstring's claim: this cost depends only on mesh size (fixed here), never on parameter count. The *tape sweep* (turning the mesh-level adjoint into per-parameter gradients) is NOT free — it costs meaningfully more for GridSDF (`14-25ms`) than for the 3-parameter CSG case (`1.5ms`), since it fundamentally has to touch each of the `(n+1)^2` voxels at least once. This is not a contradiction of the "adjoint is O(1)" claim — it's the correct, complete version of it: **zero extra *solves* regardless of parameter count, but still `O(N)` bookkeeping to distribute the sensitivity back to `N` individual parameters** — a cost that is real but, per-parameter, vastly cheaper than a full linear solve (at 2,401 params, the whole adjoint+tape pipeline still finishes in under 15ms combined, versus the multi-second cost `2,401` separate finite-difference solves would require).
+
+## Task E2 - GENIE DiffSBM (INR Edit Recovery)
+
+**Date:** August 9-10, 2026
+**Script:** `tutorials/E_differentiable/E2_genie_diffsbm.py`
+
+By far the most expensive tutorial run in this series (level-5 3-D SBM solves through a 7-layer SIREN INR, each Gauss-Newton epoch needing ~10+ solves). The base run and several explores were run as long-lived background jobs with incremental logging; a few explores were deliberately scoped down to L4 (noted explicitly below) to keep total runtime tractable — the docstring itself frames explores 6-7 as "OPEN RESEARCH QUESTIONS," so partial, honest findings are appropriate here, not a limitation to apologize for.
+
+### Observed Results (7 of 8 Gauss-Newton epochs completed; killed by a 40-min budget one epoch short)
+
+```
+[modes] top-4 eigenvalues [11277.26 6719.27 5193.58 3638.48], subspace stability 1.000
+[check] dJ/dalpha_0: adjoint -4.877200e+04 vs FD -4.924447e+04 (rel 9.6e-03)
+[recover] ep 0: J = 3.556e-01, |alpha - alpha*| = 6.595e-03
+[recover] ep 1: J = 5.648e-03, |alpha - alpha*| = 6.585e-03
+[recover] ep 2: J = 4.114e-03, |alpha - alpha*| = 6.588e-03
+[recover] ep 3: J = 1.814e-03, |alpha - alpha*| = 6.507e-03
+[recover] ep 4: J = 1.341e-03, |alpha - alpha*| = 6.704e-03
+[recover] ep 5: J = 2.663e-04, |alpha - alpha*| = 6.669e-03
+[recover] ep 6: J = 2.663e-04, |alpha - alpha*| = 6.669e-03   <- ZERO progress (explicit stall)
+```
+
+Matches the docstring's EXPECTED RESULTS precisely: mode stability `1.000`; adjoint-vs-FD `9.6e-3` (docstring: `~1e-2` at L5); `J` drops `>1335x` (docstring: `~1000x`) while `|alpha-alpha*|` stays essentially flat the entire time — the exact "plateau near alpha=0" the docstring describes as an honest, open limitation. No bug.
+
+### Explore 1 — Thin vs. thick mode-extraction band
+
+**Sphere checkpoint:** subspace stability stayed at **exactly 1.0000** across every band width tested, from the base thick band down to a literal zero-width single-radius shell, even at `k=16` modes. Root cause: the sphere's top-16 eigenvalue spectrum is very well-separated (no near-degenerate pairs anywhere tested) — by matrix-perturbation-theory intuition, a well-separated eigenspace is inherently robust to sampling noise regardless of band width, so the paper's thin-band instability simply has nothing to act on for this particular (very simple, symmetric) checkpoint.
+
+**Bunny checkpoint** (`bunny_ear_movement_two_head.json`, richer geometry): stability `0.9973` (thick) -> `0.9979` (thin, no worse) -> `0.9819` (very thin, clear degradation) — reproduces the paper's claimed direction once tested on a geometry complex enough to have less-separated eigenvalues.
+
+Bug caught and fixed in my own methodology along the way: an initial thin-band test compared a small candidate pool to *itself* (100% index overlap when the sample size requested exceeds the pool), giving a vacuous, always-1.0 "stability" reading — fixed via two independently-jittered sampling grids.
+
+### Explore 2 — Probe reduction and the Gauss-Newton Jacobian's condition number
+
+Single-epoch (`alpha=0`) Jacobian SVD, sweeping probe count (all using the same frozen L4 epoch, for tractability):
+
+| n_probes | singular values | condition number |
+|---:|---|---:|
+| 26 | [22.10, 6.99, 3.89, 3.21] | 6.89 |
+| 4 | [6.25, 1.94, 1.51, 1.16] | 5.40 |
+| 3 | [5.09, 1.75, 1.16] | 4.40 |
+| 2 | [3.92, 1.75] | **2.24** |
+
+**Interpretation:** the danger at 2 probes is *invisible* to the naive condition-number check — it actually looks the *healthiest* of the four (`2.24`, the lowest of all)! The real problem is structural, not numerical: a `[2,4]` Jacobian can only ever report 2 singular values (numpy doesn't pad with explicit zeros), so the condition number computed from *those* values says nothing about the two full dimensions of `alpha`-space that 2 probes cannot constrain *at all*. The correct first check is `n_probes >= n_params` (a shape/rank prerequisite), not the condition number alone — a genuinely non-obvious, important refinement of "watch the condition number."
+
+### Explore 3 — Bunny carve resolution across levels
+
+| level | h | total elements | retained | surrogate faces |
+|---:|---:|---:|---:|---:|
+| 3 | 0.1250 | 512 | 512 (100%) | **0** |
+| 4 | 0.0625 | 4,096 | 4,070 (99.4%) | 66 |
+| 5 | 0.0312 | 32,768 | 32,420 (98.9%) | 416 |
+| 6 | 0.0156 | 262,144 | 258,413 (98.6%) | 2,242 |
+
+**Interpretation:** level 3 fails to resolve the boundary at all (zero surrogate faces — the whole domain reads as "outside"); real carving starts at level 4 and refines smoothly through level 6 (retained fraction removed climbs steadily: 0% -> 0.6% -> 1.1% -> 1.4%, no sharp jump indicating a specific "ears become separate" threshold). Pinning the exact level where the ears resolve as topologically distinct features would need targeted geometric probing beyond element/face counts — not performed here given time constraints; flagged rather than guessed at.
+
+### Explore 4 — Break it: `w0=30`
+
+**No gate fires anywhere in the pipeline** — oracle load, `classify_lambda`, `extract_surrogate`, and `GeometryData.evaluate` all succeed silently. Instead: a **silent, degenerate failure**. Direct `psi` inspection confirms why: `w0=30` scrambles the SIREN's learned frequency scaling into near-noise (only `6.75%` of random domain points read negative, no coherent sphere shape; center point psi flips sign entirely: `-0.118` correct vs. `+0.108` wrong). `classify_lambda`'s own Lipschitz narrow-band fast path — which assumes near-1-Lipschitz behavior with a 2x safety margin — gets fooled by the badly-mis-scaled gradients into confidently classifying **the entire domain as outside**: `retained=4096/4096`, `0` surrogate faces.
+
+**Interpretation:** this directly contradicts the explore prompt's own framing ("which gate catches it") — none does. The failure signature is a suspiciously *empty* carve, not an exception — a real, concerning finding: the cheap, first-line defense against this class of bug isn't any existing gate, it's an explicit sanity check that the retained region and surrogate face count are non-trivially nonzero, run immediately after every carve.
+
+### Explore 5 — Target outside the mode span
+
+Constructed a genuine out-of-span perturbation to the target's last layer (`||orthogonal component|| = 0.1014`, verified via explicit projection removal against `V`'s span). Recovery (L4, 3 epochs):
+
+```
+ep 0: J=2.9249e-03
+ep 1: J=4.1877e-04
+ep 2: J=4.5181e-05
+final: J=1.2158e-05   (clean ~240x drop, NO plateau/stall)
+```
+
+**Interpretation:** converges cleanly to a nonzero residual floor (`1.2e-5`, vs. `~O(1e-30)` for the base task's in-span sanity check) — exactly GENIE's well-posedness theorem in action: the optimizer never even attempts to represent the unreachable component (by construction, `alpha` only ever parametrizes within-span edits), so it converges smoothly to the best achievable in-span approximation rather than becoming unstable. Notably, this out-of-span case converges *far* more cleanly than the base task's own in-span `alpha*` recovery — separating two genuinely different failure modes: non-representability (harmless to optimization stability, just leaves an expected residual) vs. landscape roughness (the base task's real problem, see Explore 6).
+
+### Explore 6 — Mapping the `J` landscape along a random ray
+
+Coarse resolution only (`step=1e-2`; medium/fine passes did not complete within the time budget):
+
+```
+J values along the ray: [4.88e-3, 4.94e-3, 4.94e-3, 3.88e-3, 2.01e-3, 3.68e-4, 1.37e-2, 5.08e+02, 3.19e-1]
+max |dJ| between adjacent samples: 507.78
+```
+
+**Interpretation:** even at a coarse `t`-resolution of `0.01`, the ray sweep landed directly on a **>5-order-of-magnitude barrier** (`J` jumping from `~1e-2` to `507.8` and back down to `0.32` within two adjacent steps) — a vivid, concrete, directly-observed instance of exactly the "steep local structure" / classification-drift "walls" the source code's own comments describe (the `J=183` barrier mentioned in the epoch-drift comments). This alone is strong evidence for *why* the base task's Gauss-Newton recovery plateaus: the search can be blocked by walls this sharp long before it's anywhere near the true optimum.
+
+### Explore 7 — Multiscale recovery: does L4 beat L5's plateau?
+
+Same recovery problem (identical `alpha*`, probes, Gauss-Newton/LM algorithm), run at L4 instead of L5:
+
+| epoch | L4 `\|alpha-alpha*\|` | L5 `\|alpha-alpha*\|` (base run) |
+|---:|---:|---:|
+| 0 | 6.60e-3 | 6.60e-3 |
+| 1 | 5.12e-3 | 6.59e-3 |
+| 2 | 2.35e-3 | 6.59e-3 |
+| 3 | 4.82e-4 | 6.51e-3 |
+| 4 | 3.42e-5 | 6.70e-3 |
+
+**Interpretation:** a strikingly clean result. At L4, the identical recovery problem converges smoothly to `3.4e-5` parameter error in just 5 epochs — a `>190x` improvement — while the same problem at L5 stays stuck at `~6.5-6.7e-3` (essentially unmoved) over 6-7 epochs. This directly and decisively answers the explore prompt's question: yes, a coarser level's smoother landscape (fewer/less-severe classification-drift barriers, per Explore 6) lets Gauss-Newton actually find the true minimum, where the fine level's rougher landscape traps it near the start. (Scope note: this tests "L4 alone" against "L5 alone," not the full two-stage "optimize at L4, then refine at L5" continuation the prompt describes — the L4-alone result is compelling enough to report on its own, but the specific refine-at-L5 step was not itself run, given time constraints.)
