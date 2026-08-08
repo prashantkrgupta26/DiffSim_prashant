@@ -685,3 +685,71 @@ relative error      = 2.72e-09
 (First attempt gave a 99.6% mismatch — traced to the same missing `dscale` bug as Explore (a); the full Jacobian itself was verified independently against a directly-FD'd residual, `~1e-10` agreement per column, before trusting the adjoint result above.)
 
 **Interpretation:** the IFT/adjoint argument holds completely unchanged in form — `(dR/du)^T lambda = dJ/du`, solved once at the *converged* state, same as the linear case and same as E0b's own Newton-loop principle (§3(B)) — the only change is that `dR/du` now contains a genuine extra term (the residual is truly nonlinear in `u` once `kappa` depends on `u`), and the forward solve needs actual iteration (Picard here; Newton would work identically, since only the *converged* `u*` and the *relation* `R(u,m)=0` matter to the adjoint, not which algorithm reached it — the same "differentiate the relation, not the algorithm" principle from E0a/E0b §3, demonstrated concretely by using Picard, a different algorithm, and it not mattering at all).
+
+## Task E0c - The Recipe for a New PDE
+
+**Date:** August 9, 2026
+**Script:** `tutorials/E_differentiable/E0c_recipe_new_pde.py`
+
+### Observed Results
+
+All base-task checks passed, matching the docstring's EXPECTED RESULTS exactly (no bug): heat-chain adjoint vs FD `6.41e-07` (<1e-5); store vs recompute agreement `0.00e+00` (<1e-10); backward/forward wall ratio `1.17x` (<2.5x); logsumexp/max jump ratio `0.128` (<0.5); signal/FD-floor ratio `4.63e8` (>1e3); flat-J contrast `98.8x` (>10x); Allen-Cahn three-way `8.01e-09` (<1e-6).
+
+### Explore (a) — Scale to level 4 / 60 steps; sweep checkpoint budget
+
+| level/steps | full-store | backward ratio | recompute (10 ckpt) | recompute (4 ckpt) | recompute (2 ckpt) |
+|---|---|---:|---:|---:|---:|
+| L3/30 steps | 19.6 KiB, 0.57x | — | 1.60x fwd | 2.42x fwd | 4.72x fwd |
+| L4/60 steps | 137.7 KiB, 0.74x | — | 2.34x fwd | 4.47x fwd | 7.67x fwd |
+
+**Interpretation:** the memory-vs-compute trade-off is exactly monotonic and matches the checklist's prediction: fewer checkpoints -> less memory, more recompute cost, cleanly. At this toy scale (level 4, 137.7 KiB) nothing is remotely "uncomfortable" yet — the docstring's own scaling note (8 GB at `1e6` dofs x `1e3` steps) is the regime where this actually bites; this explore just confirms the trend direction and rate are correct in miniature.
+
+### Explore (b) — Time-integrated `J`, re-derived seed injection
+
+Re-derived the adjoint seed recurrence for `J = (dt/2) sum_n ||W u^n - u_obs^n||^2`: every step now injects its own direct `dJ/du^n` term (`seed^n = P^T lam^{n+1} + dJ/du^n`), not just the final step.
+
+```
+correctly re-derived seed logic: adjoint vs FD rel err = 5.99e-07  (matches base task's 6.41e-07 precision)
+WRONG (reusing final-time-only seed logic on this new J): rel err vs FD = 1.000e+00
+```
+
+**Interpretation:** the correct re-derivation matches FD as precisely as the original final-time-only case. Reusing the *old* seed logic unmodified on the *new* J gives a completely uncorrelated (100% relative error) gradient — a stark, unambiguous demonstration that the seed-injection logic must be re-derived per choice of `J`, not just structurally copied.
+
+### Explore (c) — Sweep beta in the logsumexp relaxation
+
+| beta | jump ratio (lse/max) | bias (mean abs error vs true max) |
+|---:|---:|---:|
+| 1 | 0.026 | 0.958 |
+| 20 | 0.062 | 0.012 |
+| 40 (tutorial's default) | 0.128 | 0.004 |
+| 100 | 0.322 | 0.001 |
+| 500 | 0.814 | 0.0001 |
+
+**Interpretation:** bias drops steeply from beta=1 to ~20-40 (0.96 -> 0.004), while the jump ratio only creeps up slowly over that same range (0.026 -> 0.128) — most of the smoothness-preserving benefit is obtained cheaply by beta~20-40; beyond that, bias improvement diminishes sharply while the jump ratio climbs steeply back toward the nonsmooth limit. The tutorial's own default (`beta=40`) sits right at this practical knee.
+
+### Explore (d) — Fully implicit (Newton) Allen-Cahn, IFT adjoint at the converged state
+
+Rebuilt the AC march as fully-implicit BDF1 (Newton-solved each step, not the semi-implicit split), and built the adjoint using the CONVERGED Newton Jacobian at each step (never unrolling the Newton iterations themselves).
+
+```
+dJ/dM      adjoint=5.427483e-05  FD=5.427483e-05  rel_err=5.06e-09
+dJ/dkappa  adjoint=1.280978e-02  FD=1.280978e-02  rel_err=5.97e-10
+worst rel err: 5.06e-09  (compare to the semi-implicit scheme's own 8.01e-09 three-way check)
+```
+
+**Interpretation:** matches FD to the same precision class as the base task's semi-implicit three-way check, confirming the do-not-differentiate-Newton-loops principle (E0b §3B) generalizes cleanly to this genuinely nonlinear, fully-implicit scheme — exactly the pattern the docstring says M4 uses for learned phase-field thermodynamics.
+
+### Explore (e) — Adam fit with Tikhonov, and a genuine (not quoted) conditioning measurement
+
+```
+Adam, single IC, no Tikhonov:      M=-0.975 kappa=0.0190   (TRUE M=1.0 kappa=0.01) -- unstable, wrong sign
+Adam, single IC, WITH Tikhonov:    M=0.9999 kappa=0.0138   -- pulled to a near-correct, stable answer
+Adam, THREE diverse ICs, no Tikhonov: M=1.684 kappa=0.0142  -- better than unregularized single-IC, imperfect (untuned Adam LR for the joint 3-IC objective)
+
+Observation-Jacobian conditioning (own from-scratch computation, 2 parameters):
+  single IC:   singular values [0.988, 1.28e-12]   cond = 7.69e+11  (essentially singular)
+  diverse ICs: singular values [2.87, 0.00787]     cond = 3.65e+02
+  improvement: 2.1 BILLION x
+```
+
+**Interpretation:** the single-IC unregularized fit genuinely diverges to an unstable, wrong-sign answer, directly reproducing (at this project's own small, tractable scale) the qualitative failure mode the base task's beyond-FH story describes — Tikhonov regularization pulls it to a stable, near-correct answer instead of letting it wander, exactly as advertised ("Tikhonov as science, not hack"). The conditioning result is the strongest, cleanest finding: with only one initial condition, `(M, kappa)` are almost perfectly *aliased* (second singular value `~1e-12`, i.e. two directions in parameter space are nearly indistinguishable from the data) — adding two more, differently-shaped initial conditions collapses that near-singularity by 9 orders of magnitude (`cond` `7.69e11 -> 3.65e2`). Notably, this from-scratch `3.65e2` lands right inside the range the quoted beyond-FH literature figures report for *their* diverse-protocol conditioning (`2e2-5e2`) — a satisfying, independent quantitative echo of the same mechanism in a different (much smaller) physical system.
