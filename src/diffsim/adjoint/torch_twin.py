@@ -185,6 +185,23 @@ def _ppp_t(psi):
     return 6.0 - 12.0 * psi
 
 
+def _legendre2_t(u, k):
+    """Second derivative d^2 P_k / du^2 of shifted-Legendre on u in [-1, 1],
+    in torch (autograd not needed — used analytically in the Jacobian).
+    Mirrors neural_crystal._legendre2_np. k in 0..5."""
+    if k == 0 or k == 1:
+        return torch.zeros_like(u)
+    if k == 2:
+        return 3.0 * torch.ones_like(u)
+    if k == 3:
+        return 15.0 * u
+    if k == 4:
+        return (105.0 * u * u - 15.0) / 2.0
+    if k == 5:
+        return (315.0 * u ** 3 - 105.0 * u) / 2.0
+    raise ValueError(f"basis degree {k} not in 0..5")
+
+
 class CACHTwin:
     """Autograd twin of adjoint/crystallization.CACHDiscrete. Node block
     (phi, mu, psi); FH bulk energy for phi.  Crystallisation params
@@ -806,13 +823,23 @@ class CrystalCHTwin:
         return mus, H
 
     def _assemble(self, x, hpg, hsg, chi_t, Ninv, Lam, kap, eps2, L,
-                  dsig, drive, sigma):
+                  dsig, drive, sigma, cpl_leaves=None, cpl_meta=None):
         """Residual R and Jacobian J.  chi_t/Ninv are (M+1)-shaped tensors,
         Lam is M x M mobility, kap is length-M list, eps2/L/dsig/drive are
-        length-K lists (per crystallizable species, in cryst order)."""
+        length-K lists (per crystallizable species, in cryst order).
+
+        Optional neural coupling extension:
+          cpl_leaves : dict {(k, b): leaf_tensor}  — coupling coefficients c_{k,b}
+          cpl_meta   : dict {deg_psi: tuple}        — degrees b included
+        When present, ADDS to the coupling residual:
+          dfdphi_k += sum_b c_{k,b} L_b(2*psi_k - 1)
+          dfdpsi_k += phi_k * 2 * sum_b c_{k,b} L_b'(2*psi_k - 1)
+        and the corresponding Jacobian blocks (both additive and neural coexist).
+        """
         M, K, blk = self.M, self.K, self.blk
         R = torch.zeros(self.ndof, device=self.dev)
         J = torch.zeros(self.ndof * self.ndof, device=self.dev)
+        use_cpl = cpl_leaves is not None and cpl_meta is not None
         for bi, B in enumerate(self.bins):
             dJxW, N, dN, ds = B["dJxW"], B["N"], B["dN"], B["dscale"]
             phi_gp, gphi, mu_gp, gmu = [], [], [], []
@@ -834,13 +861,46 @@ class CrystalCHTwin:
             pp = [_pp_t(psi_gp[j]) for j in range(K)]
             qpp = [_qpp_t(psi_gp[j]) for j in range(K)]
             ppp = [_ppp_t(psi_gp[j]) for j in range(K)]
-            # coup_j = d(dfdphi_k)/dpsi_k = d(dfdpsi_k)/dphi_k
+            # coup_j = d(dfdphi_k)/dpsi_k = d(dfdpsi_k)/dphi_k  (additive)
             coup = [qp[j] * dsig[j] + pp[j] * drive[j] for j in range(K)]
             dfdphi_add = {}       # species k -> q dsig + p drive
             dfdpsi = {}           # cryst idx j -> phi_k (q' dsig + p' drive)
             for j, k in enumerate(self.crystallizable):
                 dfdphi_add[k] = q[j] * dsig[j] + p[j] * drive[j]
                 dfdpsi[j] = phi_gp[k] * coup[j]
+            # --- neural coupling correction (optional, additive on top) ------
+            # h_k(psi) = sum_b c_{k,b} L_b(u), u=2*psi-1
+            # h_k'(psi) = 2 * sum_b c_{k,b} L_b'(u)
+            # h_k''(psi) = 4 * sum_b c_{k,b} L_b''(u)
+            cpl_hk = {}           # j-idx -> h_k at Gauss pts
+            cpl_hkp = {}          # j-idx -> h_k' at Gauss pts
+            cpl_hkpp = {}         # j-idx -> h_k'' at Gauss pts
+            if use_cpl:
+                deg_psi = cpl_meta["deg_psi"]
+                for j, k in enumerate(self.crystallizable):
+                    u = 2.0 * psi_gp[j] - 1.0
+                    hk = torch.zeros_like(psi_gp[j])
+                    hkp = torch.zeros_like(psi_gp[j])
+                    hkpp = torch.zeros_like(psi_gp[j])
+                    for b in deg_psi:
+                        c_kb = cpl_leaves.get((k, b))
+                        if c_kb is None:
+                            continue
+                        pk, dpk = _legendre_torch(u, b)
+                        d2pk = _legendre2_t(u, b)
+                        hk = hk + c_kb * pk
+                        hkp = hkp + c_kb * dpk * 2.0
+                        hkpp = hkpp + c_kb * d2pk * 4.0
+                    cpl_hk[j] = hk
+                    cpl_hkp[j] = hkp
+                    cpl_hkpp[j] = hkpp
+                    # add to dfdphi_k: += h_k(psi_k)
+                    if k in dfdphi_add:
+                        dfdphi_add[k] = dfdphi_add[k] + hk
+                    else:
+                        dfdphi_add[k] = hk
+                    # add to dfdpsi_j: += phi_k * h_k'(psi_k)
+                    dfdpsi[j] = dfdpsi[j] + phi_gp[k] * hkp
             NN = torch.einsum("eq,qa,qb->eab", dJxW, N, N)
             LL = torch.einsum("eq,qad,qbd->eab", dJxW * ds[:, None] ** 2,
                               dN, dN)
@@ -871,9 +931,13 @@ class CrystalCHTwin:
                     Ae[:, 2 * i + 1::blk, 2 * i::blk] - kap[i] * LL
                 Ae[:, 2 * i + 1::blk, 2 * i + 1::blk] = NN
                 # dR_mu_i / dpsi_j : nonzero only when i is crystallizable k
+                # total coupling = additive coup[j] + neural h_k'(psi_k)
                 if i in self.crystallizable:
                     j = self.crystallizable.index(i)
-                    Ae[:, 2 * i + 1::blk, 2 * M + j::blk] = -WM(coup[j])
+                    total_coup_j = coup[j]
+                    if use_cpl and j in cpl_hkp:
+                        total_coup_j = total_coup_j + cpl_hkp[j]
+                    Ae[:, 2 * i + 1::blk, 2 * M + j::blk] = -WM(total_coup_j)
             # --- psi rows (multi-Allen-Cahn block) ---
             for j, k in enumerate(self.crystallizable):
                 prow = 2 * M + j
@@ -884,18 +948,30 @@ class CrystalCHTwin:
                     torch.einsum("eq,qa->ea", dJxW * dfdpsi[j], N)
                     + eps2[j] * torch.einsum("eq,eqa->ea", dJxW, gN_gpsi))
                 R = R.index_add(0, B["gd"][prow], Rpsi.reshape(-1))
-                # dR_psi_k / dphi_k = L_k WM(coup_j)
-                Ae[:, prow::blk, 2 * k::blk] = L[j] * WM(coup[j])
-                # dR_psi_k / dpsi_k = sigma NN + L_k (WM(phi_k(q'' dsig +
-                #   p''' drive)) + eps2_k LL)
+                # dR_psi_k / dphi_k = L_k WM(total_coup_j)  (h_k'(psi_k))
+                total_coup_j = coup[j]
+                if use_cpl and j in cpl_hkp:
+                    total_coup_j = total_coup_j + cpl_hkp[j]
+                Ae[:, prow::blk, 2 * k::blk] = L[j] * WM(total_coup_j)
+                # dR_psi_k / dpsi_k = sigma NN + L_k (WM(phi_k*(q'' dsig +
+                #   p''' drive + h_k''(psi_k))) + eps2_k LL)
+                psi_d2 = phi_gp[k] * (qpp[j] * dsig[j] + ppp[j] * drive[j])
+                if use_cpl and j in cpl_hkpp:
+                    psi_d2 = psi_d2 + phi_gp[k] * cpl_hkpp[j]
                 Ae[:, prow::blk, prow::blk] = sigma * NN + L[j] * (
-                    WM(phi_gp[k] * (qpp[j] * dsig[j] + ppp[j] * drive[j]))
-                    + eps2[j] * LL)
+                    WM(psi_d2) + eps2[j] * LL)
             J = J.index_add(0, B["lin"], Ae.reshape(-1))
         return R, J.reshape(self.ndof, self.ndof)
 
     def march(self, phi0_list, psi0_list, chi_t, N_t, Lam, kap, eps2, L,
-              dsig, drive, n_steps, newton_max=40, newton_tol=1e-12):
+              dsig, drive, n_steps, newton_max=40, newton_tol=1e-12,
+              cpl_leaves=None, cpl_meta=None):
+        """March n_steps of BDF1/BDF2.  Optional neural coupling:
+          cpl_leaves : dict {(k, b): tensor}   coupling coefficients c_{k,b}
+          cpl_meta   : dict {deg_psi: tuple}   degrees b
+        When provided, the full neural coupling is applied every step (not
+        just for requested-gradient names); the additive coupling path (dsig/
+        drive) coexists and is always applied from the supplied values."""
         M, K, blk = self.M, self.K, self.blk
         Ninv = 1.0 / N_t
         x = torch.zeros(self.ndof, device=self.dev)
@@ -938,7 +1014,9 @@ class CrystalCHTwin:
             xk = x.clone()
             for it in range(newton_max):
                 R, Jm = self._assemble(xk, hpg, hsg, chi_t, Ninv, Lam, kap,
-                                       eps2, L, dsig, drive, sigma)
+                                       eps2, L, dsig, drive, sigma,
+                                       cpl_leaves=cpl_leaves,
+                                       cpl_meta=cpl_meta)
                 dx = torch.linalg.solve(Jm, -R)
                 xk = xk + dx
                 if float(dx.detach().abs().max()) < newton_tol:
@@ -952,7 +1030,7 @@ class CrystalCHTwin:
         return out
 
     def grads(self, phi0_list, psi0_list, energy_params, engine_params,
-              n_steps, names, target):
+              n_steps, names, target, neural_energy=None):
         """Build leaf tensors for requested params, march, backprop
         loss = 0.5 sum_i ||phi_i,N - tgt||^2 + 0.5 sum_k ||psi_k,N - tgt||^2,
         return {name: leaf.grad}.
@@ -962,6 +1040,13 @@ class CrystalCHTwin:
         (dict k->float).  Recognised names:
           dsig_k, dh_k, Tm_k, eps2_k, L_k  (per crystallizable species k)
           chi_a_b (symmetric), N_i, onsager_a_b, kappa_i
+          cpl_{k}_{b}  (neural coupling coefficients; requires neural_energy)
+
+        neural_energy : NeuralCrystalEnergy or None.
+          When provided, its FULL coupling (all c[(k,b)]) is applied to every
+          march step regardless of which cpl_* names are requested; only the
+          requested names receive gradients (the non-requested c[(k,b)] are
+          treated as fixed constants).
         """
         M, K = self.M, self.K
         cryst = self.crystallizable
@@ -978,7 +1063,14 @@ class CrystalCHTwin:
 
         leaves = {}
         for nm in names:
-            if nm.startswith("chi_") or nm.startswith("onsager_"):
+            if nm.startswith("cpl_"):
+                # cpl_{k}_{b}: init from neural_energy.c[(k,b)] or 0.0
+                _, sk, sb = nm.split("_")
+                k_sp, b_deg = int(sk), int(sb)
+                v = 0.0
+                if neural_energy is not None:
+                    v = float(neural_energy.c.get((k_sp, b_deg), 0.0))
+            elif nm.startswith("chi_") or nm.startswith("onsager_"):
                 base = chi0 if nm.startswith("chi_") else ons0
                 _, a, b = nm.split("_")
                 v = float(base[int(a), int(b)])
@@ -1013,8 +1105,14 @@ class CrystalCHTwin:
         Tm_d = {k: tt(v) for k, v in Tm0.items()}
         eps2_d = {k: tt(v) for k, v in eps20.items()}
         L_d = {k: tt(v) for k, v in L0.items()}
+        # ---- coupling leaf dict {(k,b): tensor} for march ------------------
+        c_leaves = {}   # {(k, b): leaf or constant tensor}
+        c_meta = None
         for nm, leaf in leaves.items():
-            if nm.startswith("chi_"):
+            if nm.startswith("cpl_"):
+                _, sk, sb = nm.split("_")
+                c_leaves[(int(sk), int(sb))] = leaf
+            elif nm.startswith("chi_"):
                 _, a, b = nm.split("_"); a, b = int(a), int(b)
                 E = torch.zeros(M + 1, M + 1, dtype=torch.float64,
                                 device=self.dev)
@@ -1042,6 +1140,18 @@ class CrystalCHTwin:
                 eps2_d[int(nm.split("_")[1])] = leaf
             elif nm.startswith("L_"):
                 L_d[int(nm.split("_")[1])] = leaf
+        # ---- fill in constant coupling coefficients from neural_energy ------
+        # (always apply full correction when neural_energy is provided; only
+        # the requested cpl_* names get gradients — non-requested are constants)
+        if neural_energy is not None:
+            for (k, b), v in neural_energy.c.items():
+                if (k, b) not in c_leaves:
+                    c_leaves[(k, b)] = tt(float(v))
+            c_meta = dict(deg_psi=neural_energy.deg_psi)
+        elif c_leaves:
+            # neural_energy not supplied but cpl_* names requested — infer meta
+            deg_psi = tuple(sorted({b for (_, b) in c_leaves}))
+            c_meta = dict(deg_psi=deg_psi)
         # ---- per-crystallizable-species lists (in cryst order) ----
         Tt = tt(T)
         dsig = [dsig_d[k] for k in cryst]
@@ -1053,7 +1163,9 @@ class CrystalCHTwin:
         psis = [tt(psi0_list[j]) for j in range(K)]
         # ---- march + loss ----
         out = self.march(phis, psis, chi_t, N_t, Lam, kap, eps2, L,
-                         dsig, drive, n_steps)
+                         dsig, drive, n_steps,
+                         cpl_leaves=c_leaves if c_leaves else None,
+                         cpl_meta=c_meta)
         xN = out[-1]
         blk = self.blk
         tgt = torch.tensor(float(target), dtype=torch.float64,
@@ -1063,3 +1175,60 @@ class CrystalCHTwin:
             ((xN[2 * M + j::blk] - tgt) ** 2).sum() for j in range(K))
         loss.backward()
         return {nm: float(leaves[nm].grad) for nm in names}
+
+    def loss_only(self, phi0_list, psi0_list, energy_params, engine_params,
+                  n_steps, target, neural_energy=None):
+        """Detached forward pass returning scalar phi+psi loss (no autograd).
+
+        Uses torch.no_grad() so all operations are free of gradient tracking.
+        Intended for FD gradient verification: call at slightly perturbed
+        coefficients without building any leaf tensors.
+
+        energy_params / engine_params : same dicts as grads().
+        neural_energy : NeuralCrystalEnergy (or None).  When provided, its
+          full coupling is applied to the march.
+        """
+        M, K = self.M, self.K
+        cryst = self.crystallizable
+        chi0 = np.asarray(energy_params["chi"], np.float64)
+        N0 = np.asarray(energy_params["N"], np.float64)
+        ons0 = np.asarray(engine_params["onsager"], np.float64)
+        kap0 = [float(k) for k in engine_params["kappa"]]
+        dsig0 = {int(k): float(v) for k, v in energy_params["dsig"].items()}
+        dh0 = {int(k): float(v) for k, v in energy_params["dh"].items()}
+        Tm0 = {int(k): float(v) for k, v in energy_params["Tm"].items()}
+        eps20 = {int(k): float(v) for k, v in engine_params["eps2"].items()}
+        L0 = {int(k): float(v) for k, v in engine_params["L"].items()}
+        T = float(energy_params["T"])
+        tt = lambda a: torch.tensor(np.asarray(a), dtype=torch.float64,
+                                    device=self.dev)
+        with torch.no_grad():
+            chi_t = tt(chi0)
+            N_t = tt(N0)
+            Lam = tt(ons0)
+            kap = [tt(k) for k in kap0]
+            Tt = tt(T)
+            dsig = [tt(dsig0[k]) for k in cryst]
+            drive = [tt(dh0[k]) * (Tt / tt(Tm0[k]) - 1.0) for k in cryst]
+            eps2 = [tt(eps20[k]) for k in cryst]
+            L = [tt(L0[k]) for k in cryst]
+            phis = [tt(phi0_list[i]) for i in range(M)]
+            psis = [tt(psi0_list[j]) for j in range(K)]
+            c_leaves = None
+            c_meta = None
+            if neural_energy is not None:
+                c_leaves = {(k, b): tt(float(v))
+                            for (k, b), v in neural_energy.c.items()}
+                c_meta = dict(deg_psi=neural_energy.deg_psi)
+            out = self.march(phis, psis, chi_t, N_t, Lam, kap, eps2, L,
+                             dsig, drive, n_steps,
+                             cpl_leaves=c_leaves, cpl_meta=c_meta)
+            xN = out[-1]
+            blk = self.blk
+            tgt = torch.tensor(float(target), dtype=torch.float64,
+                               device=self.dev)
+            loss = 0.5 * sum(
+                ((xN[2 * i::blk] - tgt) ** 2).sum() for i in range(M))
+            loss = loss + 0.5 * sum(
+                ((xN[2 * M + j::blk] - tgt) ** 2).sum() for j in range(K))
+            return float(loss)

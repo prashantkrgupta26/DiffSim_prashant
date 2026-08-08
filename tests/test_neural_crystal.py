@@ -144,3 +144,40 @@ def test_reduction_matches_additive_up_to_gauge():
     dadd = add.dfdphi(phis, psis)[0]
     diff = dneu - dadd
     assert np.allclose(diff - diff.mean(), 0.0, atol=1e-9)  # only a constant differs
+
+
+def test_twin_cpl_grads_vs_fd():
+    import torch
+    from diffsim.adjoint.torch_twin import CrystalCHTwin
+    from diffsim.octree.build import build_uniform
+    from diffsim.mesh.nodes import build_mesh
+    from diffsim.mesh.constraints import build_constraints
+    from diffsim.mesh.basis import basis_tables
+    from diffsim.assembly.operators import DeviceMesh
+    tree = build_uniform(2, dim=2)
+    mesh = build_mesh(tree, p=1)
+    dm = DeviceMesh.from_mesh(mesh, build_constraints(mesh),
+                              basis_tables(1, dim=2), "cpu")
+    M, cryst, deg = 2, (0,), (1, 2)
+    chi, N = _chiN(M)
+    coeffs = {"cpl_0_1": 0.12, "cpl_0_2": -0.08}
+    neu = NeuralCrystalEnergy(chi, N, cryst, deg_psi=deg, coeffs=coeffs)
+    nn = dm.n_nodes
+    cc = np.cos(np.pi * mesh.node_coords[:, 0])
+    phi0 = [0.28 + 0.03 * cc, 0.30 + 0.03 * cc]
+    psi0 = [0.25 + 0.02 * cc]
+    eng = dict(chi=chi, N=N, dsig={0: 0.0}, dh={0: 0.0}, Tm={0: 1.0}, T=0.5)
+    enp = dict(onsager=np.eye(M), kappa=[0.01, 0.02], eps2={0: 0.015}, L={0: 1.2})
+    names = ["cpl_0_1", "cpl_0_2"]
+    tw = CrystalCHTwin(dm, M, cryst, dt=0.01, order=1, device="cpu")
+    g = tw.grads(phi0, psi0, eng, enp, 3, names, 0.28, neural_energy=neu)
+    # central FD via the twin's own detached forward at perturbed coeffs
+    def loss_at(cmod):
+        e2 = NeuralCrystalEnergy(chi, N, cryst, deg_psi=deg, coeffs=cmod)
+        return tw.loss_only(phi0, psi0, eng, enp, 3, 0.28, neural_energy=e2)
+    for nm in names:
+        base = dict(coeffs)
+        base[nm] += 1e-6; lp = loss_at(base)
+        base[nm] -= 2e-6; lm = loss_at(base)
+        fd = (lp - lm) / (2e-6)
+        assert abs(g[nm] - fd) / max(abs(fd), 1e-12) < 1e-6, (nm, g[nm], fd)
