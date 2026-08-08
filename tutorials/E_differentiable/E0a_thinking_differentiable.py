@@ -328,6 +328,16 @@ u_obs_vals = W @ u_true_all           # "measurements" at five probes
 # Evaluation point: uniform kappa away from the truth
 kappa_eval = np.ones(n_elem) * 1.3   # where we compute the gradient
 
+# Warm the constant-kappa Ke kernel used ONLY by PATH A's sensitivity assembly
+# below (solve_poisson above only ever touches the *_var kappa-weighted
+# variant). Without this, PATH A's timed block pays a one-time JIT compile for
+# a kernel variant that's never been launched yet, inflating "adjoint time" by
+# ~180x and corrupting the FD/adjoint cost-ratio measurement below (P1's own
+# launch-floor/JIT-tax lesson, applied to this file).
+_Ke_warm = wp.zeros((n_elem, bk['nbf'], bk['nbf']), dtype=wp.float64, device=DEVICE)
+wp.launch(make_poisson_element_matrices(bk['nbf'], bk['nqp'], dm.dim),
+          dim=n_elem, inputs=[bk['h'], bk['dN'], bk['w'], _Ke_warm], device=DEVICE)
+
 def J_func(kv: np.ndarray) -> float:
     """Scalar loss: (1/2) sum_i (u(x_i) - u_obs_i)^2."""
     _, _, _, ua, _ = solve_poisson(kv)

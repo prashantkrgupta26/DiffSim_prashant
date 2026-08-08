@@ -561,3 +561,59 @@ GPU FP64 peak estimate (queried, not assumed): `sm_count=22`, `arch=sm_89` (Ada 
 **Achieved efficiency: `98.0 / 187 ~= 52%` of estimated FP64 peak** — and rising with level (46% -> 46% -> 52%, still climbing at level 8, consistent with the launch-floor rule (i) diluting smaller runs).
 
 **Interpretation:** unlike B2's CPU einsum kernel (which hit <1% of practical peak, memory-bound), this custom Warp kernel is doing well: arithmetic intensity (excluding the small, cache-resident `dNtab`/`wtab` tables, counting only per-element-unique traffic — `h[e]` read, `Ke[e,:,:]` written) is `647 flops / 136 bytes ~= 4.76 FLOPs/byte`. Even at a generous GDDR6 bandwidth estimate for this card (order ~100-250 GB/s), the roofline ridge point (`FP64 peak / bandwidth`) sits at `~0.8-1.9` FLOPs/byte — well below the kernel's own `4.76`, so this kernel reads as **compute-bound**, not bandwidth-bound, across the whole plausible bandwidth range. Reaching roughly half of estimated FP64 peak on a small, per-thread, table-lookup-heavy kernel is a genuinely good result for a first-pass, non-hand-tuned implementation.
+
+## Task E0a - Thinking Differentiable
+
+**Date:** August 9, 2026
+**Script:** `tutorials/E_differentiable/E0a_thinking_differentiable.py`
+
+### Bug fix: adjoint timing block paid a hidden JIT tax
+
+The base script's own "COST TABLE" printed `FD/adjoint ratio = 0.4x` (FD looked *faster* than the adjoint!), flatly contradicting its own EXPECTED RESULTS block (`30-80x`). Root cause: `solve_poisson` assembles via `make_poisson_element_matrices_var` (kappa-weighted), but PATH A's sensitivity step separately calls the *constant*-kappa `make_poisson_element_matrices` for the first time ever, *inside* the timed block — so the adjoint timing silently included a one-time JIT compile. Fixed by adding a warm-up launch of that kernel before `t_a0 = time.time()` (mirrors P1's own launch-floor/JIT-tax lesson, applied here). Verified: adjoint time dropped `0.216s -> 0.001s`, FD/adjoint ratio corrected to `79.9x`, squarely in the expected range. Does not affect the three-way *correctness* check (already exact before the fix).
+
+### Observed Results (post-fix)
+
+```
+J at eval kappa          : 8.347e-03  (expect ~8.35e-03)
+adj  vs FD  max rel err  : 1.56e-08   (expect < 1e-6)
+tape vs FD  max rel err  : 1.56e-08   (expect < 1e-6)
+adj  vs tape max rel err : 3.41e-15   (expect < 1e-9)
+adjoint time              : 0.001s    (expect < 0.05)
+FD time                   : 0.086s    (expect < 1.5)
+FD / adj cost ratio       : 79.9x     (expect 30-80x)
+```
+
+Matches the docstring's EXPECTED RESULTS exactly, post-fix.
+
+### Explore (a) — Scale to level 4 and level 6
+
+| level | n_params | FD time | adjoint time | ratio |
+|---:|---:|---:|---:|---:|
+| 3 | 64 | 0.086s | 0.001s | 79.9x |
+| 4 | 256 | 0.624s | 0.002s | 299.4x |
+| 6 | 4,096 | 123.9s | 0.022s | **5,632x** |
+
+**Interpretation:** the ratio grows roughly in proportion to `n_params` (≈1.2-1.4x per parameter fairly consistently across all three levels), exactly as the O(N) vs O(1) theory predicts — FD cost scales linearly with parameter count, adjoint cost stays essentially flat (0.001s → 0.022s, a mere 22x increase for a 64x larger parameter count, mostly from the larger linear solves, not from any per-parameter cost). At level 6, FD took over two minutes for a gradient the adjoint computed in 22 milliseconds.
+
+### Explore (b) — Volume-integrated QoI (`J = int u dV`)
+
+Using `diffsim.sbm.adjoint.volume_qoi`: `J = 3.077e-01` at `kappa_eval`, adj vs FD max rel err `2.225e-08` — same order of magnitude as the probe-based `J`'s `1.56e-08`.
+
+**Interpretation:** the three-way check holds for this different (linear, not quadratic-in-`u`) QoI without any change to the adjoint machinery itself — only `dJ/du` changes (here, simply the mass row-sums `m`, since `J` is linear in `u`); the adjoint equation `A^T lam = dJ/du` and the gradient contraction formula are completely QoI-agnostic.
+
+### Explore (c) — Non-symmetric operator: why the adjoint always needs `A^T`
+
+Built a small nonsymmetric perturbation of the Poisson stiffness (standing in for a convection term, `||A-A^T||_max = 0.233` vs. `0.0` for the base symmetric case) to test three solve variants against the same right-hand side:
+
+```
+trans='T' (reuse forward factorization) vs. fresh-factorize A^T: max diff 4.4e-16  (agree to machine precision)
+trans='T' (correct adjoint) vs. plain lu.solve (no trans, WRONG): max diff 0.256   (substantially different)
+```
+
+**Interpretation:** the adjoint equation `A^T lam = dJ/du` always needs the transpose — this was true even in the symmetric Poisson case, just invisible, because `A=A^T` there makes a plain solve and a transposed solve identical by coincidence. Once symmetry is gone (convection breaks it), using plain `lu.solve` instead of `trans='T'` gives a measurably wrong answer. The LU-reuse argument survives fully intact regardless of symmetry: `splu`'s `trans='T'` option solves with the transposed system using the *same* factored `L`/`U` (confirmed to machine precision against a fresh `A^T` factorization) — reuse was never about symmetry, it was always about `trans='T'` being a built-in, nearly-free capability of LU-based solvers.
+
+### Explore (d) — `J = sum_i exp(kappa_i * u_i)`
+
+Analytic derivation: `dJ/dkappa_i = u_i * exp(kappa_i * u_i)`. Tape matched this exactly (`0.000e+00` error) across positive kappa, negative kappa, and a large-magnitude stress test (`kappa*u` up to `~30`, gradients ranging `~1e-12` to `~1e6`). Pushed further to find the real failure point: at `kappa*u=2000` (>> `~709`, FP64's `exp` overflow threshold), `J` and the corresponding gradient component both become `inf` — and the tape and the hand-derived analytic formula agree exactly even there (both `inf`, not one `inf` and one `NaN` or finite-but-wrong).
+
+**Interpretation:** contrary to what the prompt's phrasing ("try making kappa negative") might suggest, negative kappa is completely safe here — `exp` of a very negative argument just smoothly underflows toward `0`, no error. The real numerical hazard is large *positive* `kappa*u`, which overflows `exp` — and when it does, the tape's automatic differentiation propagates the resulting `inf` through the chain rule exactly the same way plain IEEE-754 arithmetic would in the hand-derived formula, rather than silently producing a wrong finite number or a `NaN`.
