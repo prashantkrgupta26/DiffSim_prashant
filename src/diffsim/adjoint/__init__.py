@@ -8,10 +8,12 @@ from .multiphase import (MultiEnergy, FHMultiEnergy, MultiCHDiscrete,
 from .neural_multiphase import BasisMultiEnergy, MobilityClosure
 from .linsolve_backend import (LinearBackend, ScipyBackend, CudssBackend,
                                scipy_to_torch_csr)
+from .crystallization_multi import CrystalEnergy, AdditiveCrystalEnergy
 
 __all__ = ["CHDiscrete", "CHForward", "CHAdjoint", "PolyEnergy", "FHEnergy",
            "PolyBasisEnergy", "CACHDiscrete", "CACHForward", "CACHAdjoint",
            "MultiEnergy", "FHMultiEnergy", "MultiCHDiscrete",
            "MultiCHForward", "MultiCHAdjoint", "BasisMultiEnergy",
            "MobilityClosure",
-           "LinearBackend", "ScipyBackend", "CudssBackend", "scipy_to_torch_csr"]
+           "LinearBackend", "ScipyBackend", "CudssBackend", "scipy_to_torch_csr",
+           "CrystalEnergy", "AdditiveCrystalEnergy"]
