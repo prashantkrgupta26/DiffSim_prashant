@@ -239,12 +239,9 @@ def _three_way_neural_crystal(dm, coords, M, crystallizable, deg_psi,
         for b in deg_psi:
             # stagger by species and degree for variety
             coeffs0[f"cpl_{k}_{b}"] = 0.10 * (1 + k * 0.3) * (1 - 0.2 * b % 3)
-    # basis_coeffs set to zero: CrystalCHTwin._mu_and_H does not implement the
-    # BasisMultiEnergy polynomial correction so nonzero basis coefficients
-    # would cause the twin forward to diverge from the numpy forward, breaking
-    # the adj/twin leg.  basis_* gradient verification is deferred until the
-    # twin gains the basis_leaves branch.
-    basis_coeffs0 = {}
+    # nonzero basis coefficient: CrystalCHTwin now implements the
+    # BasisMultiEnergy phi-correction branch (basis_leaves in _mu_and_H).
+    basis_coeffs0 = {"basis_0_2": 0.05}
 
     tgt = 0.22
 
@@ -254,14 +251,7 @@ def _three_way_neural_crystal(dm, coords, M, crystallizable, deg_psi,
     psi0 = [0.20 + 0.04 * cc for _ in range(K)]
 
     # param names to gate (species-0 params; valid for all configs)
-    # NOTE: basis_0_2 is excluded from names because CrystalCHTwin does not yet
-    # implement the BasisMultiEnergy polynomial correction in its torch forward
-    # march (its _mu_and_H uses only FH). Including basis_0_2 here would break
-    # the adj/twin leg since the twin forward diverges from the numpy forward
-    # when basis_coeffs are nonzero. This is a Task-3 gap: CrystalCHTwin needs
-    # the same basis_leaves branch that MultiCHTwin already has.
-    # TODO: re-enable "basis_0_2" once CrystalCHTwin._mu_and_H supports it.
-    names = ["cpl_0_1", "cpl_0_2",
+    names = ["cpl_0_1", "cpl_0_2", "basis_0_2",
              "chi_0_1", "N_0", "onsager_0_0", "kappa_0", "eps2_0", "L_0"]
 
     # ---- helper: build a NeuralCrystalEnergy with given coeffs/basis --------

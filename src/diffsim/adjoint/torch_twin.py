@@ -803,9 +803,16 @@ class CrystalCHTwin:
         g = torch.einsum("qad,ea,e->eqd", B["dN"], vals, B["dscale"])
         return v, g
 
-    def _mu_and_H(self, phi_gp, chi_t, Ninv):
-        """FH exchange potentials and their phi-Hessian at Gauss points
-        (identical to MultiCHTwin._mu_and_H, no energy-correction branch)."""
+    def _mu_and_H(self, phi_gp, chi_t, Ninv,
+                  basis_leaves=None, basis_meta=None):
+        """FH exchange potentials and their phi-Hessian at Gauss points.
+
+        Optional energy correction (BasisMultiEnergy phi-correction):
+          basis_leaves : dict  {(i, k): leaf_tensor}  — only requested ones
+          basis_meta   : dict  {mid, half, degrees}
+        Adds sum_k gamma_{i,k} * P_k(u_i) to mus[i]
+        and  sum_k gamma_{i,k} * P'_k(u_i)/half to H[i][i].
+        """
         M = self.M
         ps = 1.0 - sum(phi_gp)
         phi_of = lambda l: phi_gp[l] if l < M else ps
@@ -820,10 +827,26 @@ class CrystalCHTwin:
               - chi_t[i, M] - chi_t[M, j] + (Ninv[i] / phi_gp[i]
                                              if i == j else 0.0)
               for j in range(M)] for i in range(M)]
+        # --- energy correction ------------------------------------------------
+        if basis_leaves and basis_meta:
+            mid = basis_meta["mid"]
+            half = basis_meta["half"]
+            degrees = basis_meta["degrees"]
+            for i in range(M):
+                u = (phi_gp[i] - mid) / half
+                for k in degrees:
+                    key = (i, k)
+                    if key not in basis_leaves:
+                        continue
+                    gamma_ik = basis_leaves[key]
+                    pk, dpk = _legendre_torch(u, k)
+                    mus[i] = mus[i] + gamma_ik * pk
+                    H[i][i] = H[i][i] + gamma_ik * dpk / half
         return mus, H
 
     def _assemble(self, x, hpg, hsg, chi_t, Ninv, Lam, kap, eps2, L,
-                  dsig, drive, sigma, cpl_leaves=None, cpl_meta=None):
+                  dsig, drive, sigma, cpl_leaves=None, cpl_meta=None,
+                  basis_leaves=None, basis_meta=None):
         """Residual R and Jacobian J.  chi_t/Ninv are (M+1)-shaped tensors,
         Lam is M x M mobility, kap is length-M list, eps2/L/dsig/drive are
         length-K lists (per crystallizable species, in cryst order).
@@ -835,6 +858,11 @@ class CrystalCHTwin:
           dfdphi_k += sum_b c_{k,b} L_b(2*psi_k - 1)
           dfdpsi_k += phi_k * 2 * sum_b c_{k,b} L_b'(2*psi_k - 1)
         and the corresponding Jacobian blocks (both additive and neural coexist).
+
+        Optional phi-basis correction:
+          basis_leaves : dict {(i, k): leaf_tensor}  — BasisMultiEnergy gamma coeffs
+          basis_meta   : dict {mid, half, degrees}
+        When present, adds polynomial correction to muref (passed to _mu_and_H).
         """
         M, K, blk = self.M, self.K, self.blk
         R = torch.zeros(self.ndof, device=self.dev)
@@ -852,7 +880,9 @@ class CrystalCHTwin:
             for j in range(K):
                 v, g = self._ip(x[2 * M + j::blk], B)
                 psi_gp.append(v); gpsi.append(g)
-            muref, H = self._mu_and_H(phi_gp, chi_t, Ninv)
+            muref, H = self._mu_and_H(phi_gp, chi_t, Ninv,
+                                      basis_leaves=basis_leaves,
+                                      basis_meta=basis_meta)
             # crystal coupling: dfdphi_k += q dsig + p drive; assemble the
             # per-crystallizable-species scalar quantities keyed by cryst idx j
             q = [_q_t(psi_gp[j]) for j in range(K)]
@@ -965,13 +995,19 @@ class CrystalCHTwin:
 
     def march(self, phi0_list, psi0_list, chi_t, N_t, Lam, kap, eps2, L,
               dsig, drive, n_steps, newton_max=40, newton_tol=1e-12,
-              cpl_leaves=None, cpl_meta=None):
+              cpl_leaves=None, cpl_meta=None,
+              basis_leaves=None, basis_meta=None):
         """March n_steps of BDF1/BDF2.  Optional neural coupling:
           cpl_leaves : dict {(k, b): tensor}   coupling coefficients c_{k,b}
           cpl_meta   : dict {deg_psi: tuple}   degrees b
         When provided, the full neural coupling is applied every step (not
         just for requested-gradient names); the additive coupling path (dsig/
-        drive) coexists and is always applied from the supplied values."""
+        drive) coexists and is always applied from the supplied values.
+
+        Optional phi-basis correction:
+          basis_leaves : dict {(i, k): tensor}  BasisMultiEnergy gamma coeffs
+          basis_meta   : dict {mid, half, degrees}
+        """
         M, K, blk = self.M, self.K, self.blk
         Ninv = 1.0 / N_t
         x = torch.zeros(self.ndof, device=self.dev)
@@ -1016,7 +1052,9 @@ class CrystalCHTwin:
                 R, Jm = self._assemble(xk, hpg, hsg, chi_t, Ninv, Lam, kap,
                                        eps2, L, dsig, drive, sigma,
                                        cpl_leaves=cpl_leaves,
-                                       cpl_meta=cpl_meta)
+                                       cpl_meta=cpl_meta,
+                                       basis_leaves=basis_leaves,
+                                       basis_meta=basis_meta)
                 dx = torch.linalg.solve(Jm, -R)
                 xk = xk + dx
                 if float(dx.detach().abs().max()) < newton_tol:
@@ -1041,12 +1079,15 @@ class CrystalCHTwin:
           dsig_k, dh_k, Tm_k, eps2_k, L_k  (per crystallizable species k)
           chi_a_b (symmetric), N_i, onsager_a_b, kappa_i
           cpl_{k}_{b}  (neural coupling coefficients; requires neural_energy)
+          basis_{i}_{k} (BasisMultiEnergy phi-correction; requires neural_energy)
 
         neural_energy : NeuralCrystalEnergy or None.
           When provided, its FULL coupling (all c[(k,b)]) is applied to every
           march step regardless of which cpl_* names are requested; only the
           requested names receive gradients (the non-requested c[(k,b)] are
           treated as fixed constants).
+          Similarly, neural_energy.base.gamma is FULLY applied to _mu_and_H;
+          only requested basis_{i}_{k} names get gradients.
         """
         M, K = self.M, self.K
         cryst = self.crystallizable
@@ -1070,6 +1111,13 @@ class CrystalCHTwin:
                 v = 0.0
                 if neural_energy is not None:
                     v = float(neural_energy.c.get((k_sp, b_deg), 0.0))
+            elif nm.startswith("basis_"):
+                # basis_{i}_{k}: init from neural_energy.base.gamma[(i,k)] or 0.0
+                _, si, sk = nm.split("_")
+                i_sp, k_deg = int(si), int(sk)
+                v = 0.0
+                if neural_energy is not None:
+                    v = float(neural_energy.base.gamma.get((i_sp, k_deg), 0.0))
             elif nm.startswith("chi_") or nm.startswith("onsager_"):
                 base = chi0 if nm.startswith("chi_") else ons0
                 _, a, b = nm.split("_")
@@ -1108,10 +1156,15 @@ class CrystalCHTwin:
         # ---- coupling leaf dict {(k,b): tensor} for march ------------------
         c_leaves = {}   # {(k, b): leaf or constant tensor}
         c_meta = None
+        b_leaves = {}   # {(i, k): leaf or constant tensor} for basis correction
+        b_meta = None
         for nm, leaf in leaves.items():
             if nm.startswith("cpl_"):
                 _, sk, sb = nm.split("_")
                 c_leaves[(int(sk), int(sb))] = leaf
+            elif nm.startswith("basis_"):
+                _, si, sk = nm.split("_")
+                b_leaves[(int(si), int(sk))] = leaf
             elif nm.startswith("chi_"):
                 _, a, b = nm.split("_"); a, b = int(a), int(b)
                 E = torch.zeros(M + 1, M + 1, dtype=torch.float64,
@@ -1152,6 +1205,15 @@ class CrystalCHTwin:
             # neural_energy not supplied but cpl_* names requested — infer meta
             deg_psi = tuple(sorted({b for (_, b) in c_leaves}))
             c_meta = dict(deg_psi=deg_psi)
+        # ---- fill in constant basis coefficients from neural_energy.base ----
+        # (always apply full phi-correction; only requested basis_* get grads)
+        if neural_energy is not None:
+            base = neural_energy.base
+            b_meta = dict(mid=tt(base.mid), half=tt(base.half),
+                          degrees=base.degrees)
+            for (i, k), v in base.gamma.items():
+                if (i, k) not in b_leaves:
+                    b_leaves[(i, k)] = tt(float(v))
         # ---- per-crystallizable-species lists (in cryst order) ----
         Tt = tt(T)
         dsig = [dsig_d[k] for k in cryst]
@@ -1165,7 +1227,9 @@ class CrystalCHTwin:
         out = self.march(phis, psis, chi_t, N_t, Lam, kap, eps2, L,
                          dsig, drive, n_steps,
                          cpl_leaves=c_leaves if c_leaves else None,
-                         cpl_meta=c_meta)
+                         cpl_meta=c_meta,
+                         basis_leaves=b_leaves if b_leaves else None,
+                         basis_meta=b_meta)
         xN = out[-1]
         blk = self.blk
         tgt = torch.tensor(float(target), dtype=torch.float64,
@@ -1186,7 +1250,7 @@ class CrystalCHTwin:
 
         energy_params / engine_params : same dicts as grads().
         neural_energy : NeuralCrystalEnergy (or None).  When provided, its
-          full coupling is applied to the march.
+          full coupling and full phi-basis correction are applied to the march.
         """
         M, K = self.M, self.K
         cryst = self.crystallizable
@@ -1216,13 +1280,21 @@ class CrystalCHTwin:
             psis = [tt(psi0_list[j]) for j in range(K)]
             c_leaves = None
             c_meta = None
+            b_leaves = None
+            b_meta = None
             if neural_energy is not None:
                 c_leaves = {(k, b): tt(float(v))
                             for (k, b), v in neural_energy.c.items()}
                 c_meta = dict(deg_psi=neural_energy.deg_psi)
+                base = neural_energy.base
+                b_leaves = {(i, k): tt(float(v))
+                            for (i, k), v in base.gamma.items()}
+                b_meta = dict(mid=tt(base.mid), half=tt(base.half),
+                              degrees=base.degrees)
             out = self.march(phis, psis, chi_t, N_t, Lam, kap, eps2, L,
                              dsig, drive, n_steps,
-                             cpl_leaves=c_leaves, cpl_meta=c_meta)
+                             cpl_leaves=c_leaves, cpl_meta=c_meta,
+                             basis_leaves=b_leaves, basis_meta=b_meta)
             xN = out[-1]
             blk = self.blk
             tgt = torch.tensor(float(target), dtype=torch.float64,
