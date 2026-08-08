@@ -753,3 +753,70 @@ Observation-Jacobian conditioning (own from-scratch computation, 2 parameters):
 ```
 
 **Interpretation:** the single-IC unregularized fit genuinely diverges to an unstable, wrong-sign answer, directly reproducing (at this project's own small, tractable scale) the qualitative failure mode the base task's beyond-FH story describes — Tikhonov regularization pulls it to a stable, near-correct answer instead of letting it wander, exactly as advertised ("Tikhonov as science, not hack"). The conditioning result is the strongest, cleanest finding: with only one initial condition, `(M, kappa)` are almost perfectly *aliased* (second singular value `~1e-12`, i.e. two directions in parameter space are nearly indistinguishable from the data) — adding two more, differently-shaped initial conditions collapses that near-singularity by 9 orders of magnitude (`cond` `7.69e11 -> 3.65e2`). Notably, this from-scratch `3.65e2` lands right inside the range the quoted beyond-FH literature figures report for *their* diverse-protocol conditioning (`2e2-5e2`) — a satisfying, independent quantitative echo of the same mechanism in a different (much smaller) physical system.
+
+## Task E1 - Shape Optimization (Find the Hidden Circle)
+
+**Date:** August 9, 2026
+**Script:** `tutorials/E_differentiable/E1_shape_optimization.py`
+
+### Observed Results
+
+```
+recovered theta = [0.52004 0.4699  0.30984]
+true      theta = [0.52    0.47    0.31   ]
+|error|         = [4.10e-05 9.70e-05 1.56e-04]
+```
+
+Recovers the hidden disk to high accuracy (no stated docstring EXPECTED RESULTS block/asserts to check against, but errors are small and the loop converges cleanly) — no bug.
+
+### Explore (a) — Delete probes; find degenerate configurations
+
+| probe count | max param error | J_final |
+|---:|---:|---:|
+| 9 (default) | 0.00016 | 7.4e-08 |
+| 5 | 0.00049 | 6.2e-08 |
+| 4 | 0.00052 | 6.4e-08 |
+| 3 (ring) | 0.00039 | 1.1e-08 |
+| 2 | **0.064** | 4.9e-08 |
+| 1 | **0.129** | 1.9e-12 |
+
+| 3-probe configuration | max param error | J_final |
+|---|---:|---:|
+| standard ring (control) | 0.00039 | 1.1e-08 |
+| collinear (all on one horizontal line) | **0.082** | 4.2e-07 |
+| nearly coincident (tiny cluster) | **0.118** | 2.6e-08 |
+
+**Interpretation:** recovery stays accurate down to 3 well-spread probes (generically enough to determine 3 unknowns), but fails sharply at 2 or 1 probes — and, crucially, **count alone is not sufficient**: 3 *collinear* or *nearly-coincident* probes fail just as badly as having too few probes at all, despite nominally satisfying "3 readings for 3 unknowns." In every failure case, `J_final` stays small (the optimizer still successfully minimizes the — impoverished — objective) while the recovered geometry is measurably wrong — a direct, geometric echo of E0b's "misfit drop without parameter recovery" lesson and E0c's diverse-data lesson, now in shape-parameter space instead of a field or a scalar pair.
+
+### Explore (b) — Conductivity `kappa` as a 4th unknown
+
+Verified `kappa_gradient` itself directly against FD (independent of any optimization): `adjoint = -3.358522e+00`, `FD = -3.358522e+00`, relative error `2.57e-09` — exact.
+
+Joint 4-parameter optimization (`cx, cy, r, kappa` together, kappa starting at the wrong value 1.0 vs true 1.3):
+
+```
+recovered theta = [0.52228 0.45896 0.3424], kappa = 1.23129
+true      theta = [0.52    0.47    0.31  ], kappa = 1.3
+|error| theta    = [0.0023  0.0110  0.0324]   |error| kappa = 0.0687
+```
+
+**Interpretation:** the gradient formula itself is exact; the joint recovery is visibly less tight than the 3-parameter-only case (radius and kappa both off by several percent) — plausibly a genuine correlation between `kappa` and `r` (both influence the overall magnitude of `u` in a similar direction), compounded by an untuned hand-rolled Adam schedule for the new scalar parameter. This cleanly separates two different questions worth keeping separate whenever a gradient-based fit underperforms: is the *gradient* correct (yes, to 9 significant figures) vs. is the *optimization* well-tuned/well-conditioned for the *joint* parameter set (a separate, harder question, not yet fully resolved here).
+
+### Explore (c) — GridSDF voxel-level (level-set topology) optimization
+
+Voxel-level gradient verified directly against FD at the 5 highest-sensitivity voxels (32x32 grid, 1,089 parameters): all relative errors `1e-9` to `3e-8` — exact, matching `test_gradient_gridsdf_voxels`' own methodology.
+
+Naive unregularized Adam on all 1,089 voxel values (from a wrong-circle initial guess, targeting the same hidden-disk probe data) made slow, non-monotonic progress and then **failed**: the closest-point Newton projection became inadmissible at 11 of 64 surrogate Gauss points around iteration 44, even with gradient clipping and a generous `max_fail_frac=0.15` fallback.
+
+**Interpretation:** the core claim — the same adjoint machinery extends to thousands of voxel parameters with zero changes beyond swapping the oracle — is confirmed and exact at the gradient level. But raw, unregularized per-voxel gradient descent is numerically fragile in practice: `GridSDF` is only `C0` (piecewise multilinear, `near_eikonal=False`), so nothing prevents individual voxel updates from locally distorting the level set into a shape with an ill-defined or non-unique closest point (the same class of admissibility failure A3's Explore (c) hit with a sampled `GridSDF`). Production level-set topology optimization routinely adds explicit regularization (periodic reinitialization to a valid signed-distance field, or a smoothness/total-variation penalty on neighboring voxels) specifically to prevent this — machinery this tutorial deliberately doesn't build (consistent with the project's own YAGNI stance elsewhere, e.g. E0c's un-built REVOLVE checkpointing).
+
+### Performance Corner — forward vs. adjoint vs. tape vs. re-carve timing, 3 params vs. thousands
+
+| config | n_params | carve | forward solve | **adjoint solve** | tape sweep | (adj+tape)/forward |
+|---|---:|---:|---:|---:|---:|---:|
+| CSG circle | 3 | 2.44ms | 1.98ms | **0.133ms** | 1.52ms | 0.84x |
+| GridSDF n=16 | 289 | 38.2ms | 2.15ms | **0.120ms** | 25.0ms | 11.70x |
+| GridSDF n=32 | 1,089 | 14.8ms | 1.95ms | **0.119ms** | 14.2ms | 7.33x |
+| GridSDF n=48 | 2,401 | 15.0ms | 2.61ms | **0.118ms** | 13.8ms | 5.31x |
+
+**Interpretation:** the *adjoint linear solve* itself — the theoretically `O(1)` part, and the part that would cost `O(N)` separate solves under finite differences — stays essentially flat (`0.118-0.133ms`) across a `3` to `2,401` parameter range, exactly confirming the docstring's claim: this cost depends only on mesh size (fixed here), never on parameter count. The *tape sweep* (turning the mesh-level adjoint into per-parameter gradients) is NOT free — it costs meaningfully more for GridSDF (`14-25ms`) than for the 3-parameter CSG case (`1.5ms`), since it fundamentally has to touch each of the `(n+1)^2` voxels at least once. This is not a contradiction of the "adjoint is O(1)" claim — it's the correct, complete version of it: **zero extra *solves* regardless of parameter count, but still `O(N)` bookkeeping to distribute the sensitivity back to `N` individual parameters** — a cost that is real but, per-parameter, vastly cheaper than a full linear solve (at 2,401 params, the whole adjoint+tape pipeline still finishes in under 15ms combined, versus the multi-second cost `2,401` separate finite-difference solves would require).
