@@ -617,3 +617,71 @@ trans='T' (correct adjoint) vs. plain lu.solve (no trans, WRONG): max diff 0.256
 Analytic derivation: `dJ/dkappa_i = u_i * exp(kappa_i * u_i)`. Tape matched this exactly (`0.000e+00` error) across positive kappa, negative kappa, and a large-magnitude stress test (`kappa*u` up to `~30`, gradients ranging `~1e-12` to `~1e6`). Pushed further to find the real failure point: at `kappa*u=2000` (>> `~709`, FP64's `exp` overflow threshold), `J` and the corresponding gradient component both become `inf` — and the tape and the hand-derived analytic formula agree exactly even there (both `inf`, not one `inf` and one `NaN` or finite-but-wrong).
 
 **Interpretation:** contrary to what the prompt's phrasing ("try making kappa negative") might suggest, negative kappa is completely safe here — `exp` of a very negative argument just smoothly underflows toward `0`, no error. The real numerical hazard is large *positive* `kappa*u`, which overflows `exp` — and when it does, the tape's automatic differentiation propagates the resulting `inf` through the chain rule exactly the same way plain IEEE-754 arithmetic would in the hand-derived formula, rather than silently producing a wrong finite number or a `NaN`.
+
+## Task E0b - Anatomy of a Taped Brick
+
+**Date:** August 9, 2026
+**Script:** `tutorials/E_differentiable/E0b_anatomy_of_a_taped_brick.py`
+
+### Observed Results
+
+```
+Dot-product rel err       : 9.36e-18  (expect < 1e-12)
+Factorization reuse ratio : 2.33x    (expect > 1.2x)
+misfit J_init             : 8.3467e-03  (expect 5e-3 - 5e-2)
+misfit J_final            : 7.1454e-05  (expect < 5e-4)
+misfit drop                : 116.8x   (expect >= 100x)
+param error ratio         : 0.908  (expect 0.5 - 1.5)
+```
+
+Matches the docstring's EXPECTED RESULTS exactly — no bug this time.
+
+### Explore (a) — Add a convection term, re-run the dot-product test
+
+Built `C[i,j] = int N_i (v.grad N_j) dV`, `v=[1,0]`, added to the Poisson stiffness. (Two scratch-script bugs found and fixed along the way — both were *my* hand-rolled numpy gradient computations forgetting the `dscale=2/h` reference-to-physical scaling that the real kernels apply via `fe_dN_s`; the tutorial's own code was not affected.)
+
+```
+Pure convection term: ||C + C^T||_max = 8.333e-02  (NOT zero -- not skew-symmetric)
+Full nonsymmetric operator: ||A - A^T||_max = 0.375
+Dot-product test <Av,w> vs <v,A^Tw>: relative error 4.06e-17  (still machine precision)
+WRONG check <Av,w> vs <v,Aw> (using A instead of A^T): relative "error" 7.03e-03  (measurably large)
+```
+
+**Interpretation:** `C^T != -C` — the prompt's implied "yes" doesn't hold, because the domain has boundaries where `v=[1,0]` has nonzero normal component (the `x=0,1` faces). Integration by parts gives `C + C^T = int_boundary N_i N_j (v.n) dS`, a genuine boundary-flux term, not zero — confirmed to be a real, mathematically-explainable quantity (not roundoff noise, which would be ~1e-15 not ~0.08). Separately: the dot-product test itself passes at machine precision on the nonsymmetric operator, unaffected by the loss of symmetry — direct, concrete confirmation that the test validates transpose-correctness, a property fully independent of symmetry.
+
+### Explore (b) — Level 4 + Tikhonov regularization
+
+| config | J_init | J_final | misfit drop | param err ratio |
+|---|---:|---:|---:|---:|
+| level 3, no Tikhonov (baseline) | 8.3e-3 | 7.0e-5 | 118.9x | 0.908 |
+| level 4, no Tikhonov | 8.9e-3 | 2.0e-4 | 44.7x | 0.945 |
+| level 4, eps=0.001, ALPHA=36 (unchanged) | 2.0e-2 | 4.5e-3 | 4.6x | 0.899 |
+| level 4, eps=0.1, ALPHA=36 (unchanged) | 1.16 | 169 | **diverges** | 10.8 |
+| level 4, eps=1.0, ALPHA=0.5 (re-tuned down) | 11.5 | 0.063 | **181.7x** | 1.120 |
+
+**Interpretation:** level 4 (4x more parameters, same 5 probes) drops misfit less than level 3 at a fixed step budget (44.7x vs 118.9x) — confirms "more underdetermined" makes optimization harder, as the prompt hints. Naively adding Tikhonov regularization *without* re-tuning the step size is actively dangerous: at `eps=0.1-1.0` with the original `ALPHA=36`, the added quadratic term changes the objective's curvature enough that the same step size now overshoots catastrophically (`J_final` explodes to 169-2049, parameter error gets *worse* than doing nothing). Re-tuning `ALPHA` down for the regularized problem restores stable, even strong, convergence (up to 181.7x misfit drop) — but the *parameter*-space recovery still doesn't fundamentally improve (`param err ratio` stays >= 1.0 even at strong regularization and large misfit drop). Regularization fixes the optimization's conditioning/stability; it does not supply the missing information needed to actually pin down 256 unknowns from 5 probes.
+
+### Explore (c) — Single-blob misplaced initial guess + step-size sweep
+
+| init | ALPHA=36 | ALPHA=10 | ALPHA=2 | ALPHA=0.5 |
+|---|---|---|---|---|
+| flat (baseline) | drop 116.8x, ratio 0.908 | drop 64.0x, ratio 0.955 | drop 37.5x, ratio 0.977 | drop 3.2x, ratio 0.981 |
+| single-blob (misplaced) | drop 254.9x, ratio 0.849 | drop 140.2x, ratio 0.895 | drop 93.0x, ratio 0.914 | drop 7.6x, ratio 0.934 |
+
+No divergence at any tested `ALPHA`, including `2.0`.
+
+**Interpretation:** the misplaced single-blob guess recovers *better* than the flat guess at every step size tested (bigger misfit drop, smaller parameter error) — a single, even wrongly-placed, blob of structure is a better prior than no structure at all, since it gives the descent a head start that happens to be structurally closer to the (two-blob) truth. `ALPHA=2.0` (the prompt's suggested test) doesn't diverge for either initial guess — it's simply much slower to converge within a fixed 40-step budget (drop 37.5x vs 116.8x for flat init at the tuned `ALPHA=36`), a graceful, not catastrophic, degradation.
+
+### Explore (d) — Nonlinear, state-dependent `kappa(u) = 1 + alpha*u^2`
+
+Full derivation (see companion report for the complete math). Verified numerically: built a Picard-iterated forward solve, the full nonlinear Jacobian (standard kappa-weighted stiffness **plus** an extra term from `d(kappa)/du = 2*alpha*u` via the chain rule), and the adjoint using that full Jacobian, for `J = int u dV` and a scalar parameter `alpha`.
+
+```
+adjoint dJ/dalpha = -4.453117e-02
+FD dJ/dalpha       = -4.453117e-02
+relative error      = 2.72e-09
+```
+
+(First attempt gave a 99.6% mismatch — traced to the same missing `dscale` bug as Explore (a); the full Jacobian itself was verified independently against a directly-FD'd residual, `~1e-10` agreement per column, before trusting the adjoint result above.)
+
+**Interpretation:** the IFT/adjoint argument holds completely unchanged in form — `(dR/du)^T lambda = dJ/du`, solved once at the *converged* state, same as the linear case and same as E0b's own Newton-loop principle (§3(B)) — the only change is that `dR/du` now contains a genuine extra term (the residual is truly nonlinear in `u` once `kappa` depends on `u`), and the forward solve needs actual iteration (Picard here; Newton would work identically, since only the *converged* `u*` and the *relation* `R(u,m)=0` matter to the adjoint, not which algorithm reached it — the same "differentiate the relation, not the algorithm" principle from E0a/E0b §3, demonstrated concretely by using Picard, a different algorithm, and it not mattering at all).
