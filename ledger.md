@@ -484,3 +484,80 @@ Measured mid-continuation at `lam=8`, level 4 (`n_free=4913`, `nbf=8`, `nqp=8`, 
 **FLOP estimate for the `Me` einsum `"qa,qb,eq,q,e->eab"`:** counting 3 multiplies + 1 add per `(e,a,b,q)` term plus one final per-element scale gives `n_elems*nbf^2*nqp*4 + n_elems*nbf^2 = 8,650,752` FLOPs per call at level 4. Measured time per call (`0.0143s`) implies **~0.61 GFLOP/s** achieved. A practical peak on this machine (measured via a `2000x2000` BLAS `dgemm`) is **~77 GFLOP/s** — so the einsum runs at **~0.78% of practical peak**, over 100x off.
 
 **Interpretation:** this is a textbook memory-bound kernel. The computation is a *batch* of 4,096 tiny (`8x8`) independent matrices, not one large matmul — numpy's einsum engine can't lower a batched contraction with a non-reduced batch index (`e`) onto a single efficient BLAS GEMM call, so it falls back to a generic, unblocked, poorly-cache-reused loop. Arithmetic intensity is low (~1 FLOP per byte moved: reads `w_gp[e,q]`, writes `Me[e,a,b]`, both streamed from/to memory with almost no data reuse across elements), which is exactly the regime where a CPU is bottlenecked on memory bandwidth, not FLOPs — matching the `<1%`-of-peak result.
+
+## Task P1 - Cost Model and Scaling
+
+**Date:** August 8, 2026
+**Script:** `tutorials/P_performance/P1_cost_model_and_scaling.py`
+
+### Observed Results
+
+```
+level    n     nnz     mesh   constraints  assemble  factorize  backsolve
+5      1089    9409   0.0007    0.0001      0.0016    0.0020     0.0001
+6      4225   37249   0.0007    0.0001      0.0023    0.0099     0.0004
+7     16641  148225   0.0034    0.0001      0.0073    0.0512     0.0022
+8     66049  591361   0.0094    0.0003      0.0308    0.3124     0.0107
+```
+
+Matches the docstring's "Act 2" story exactly: constraints is cheap (`0.0003s` at level 8, not the historical `222s`), and the crown returns to the textbook holder — `factorize (0.31s) > assemble (0.03s) > mesh (0.01s) >> constraints (0.0003s)`. No bug.
+
+### Explore (a) — Add p=2 columns
+
+| level | n(p2/p1) | mesh | constraints | assemble | factorize | backsolve |
+|---:|---:|---:|---:|---:|---:|---:|
+| 5 | 3.880 | 1.77x | 1.98x | 2.13x | 4.84x | 7.07x |
+| 6 | 3.939 | 2.10x | 1.49x | 4.64x | 6.87x | 10.68x |
+| 7 | 3.969 | 1.67x | 1.44x | 5.72x | 8.83x | 8.74x |
+| 8 | 3.984 | 2.83x | 1.93x | 7.52x | 16.92x | 8.03x |
+
+**Interpretation:** neither of the prompt's predicted constants (DOF ratio `~2.25x`, kernel-work ratio `~5x`) holds cleanly for any single stage. Measured DOF ratio is `~3.98x` (matches A4's independent finding almost exactly), not `2.25x`. `assemble`'s ratio trends *upward* with level (`2.13x -> 7.52x`) rather than sitting at a fixed `~5x` — it mixes a per-element GPU kernel cost (closer to the predicted `(9/4)^2=5.06x`) with host-side CSR/triplet work that scales with `nnz`, whose own p2/p1 ratio grows with level. `factorize`'s ratio (up to `16.92x` at level 8) is the largest and most level-dependent of all, consistent with sparse factorization's superlinear dependence on a DOF ratio that's already `~4x`, not `2.25x`. `mesh` and `constraints` stay roughly flat (`~1.5-2.8x`), closest to (but not exactly) the raw DOF/element-count ratio.
+
+### Explore (b) — 3-D crossover (factorize vs. assemble)
+
+Clean crossover determination (median of 5 reps/level, full multi-level warmup first):
+
+| dim | level | n | assemble | factorize | ratio |
+|---|---:|---:|---:|---:|---:|
+| 2-D | 4 | 289 | 0.00091 | 0.00039 | 0.43 |
+| 2-D | 5 | 1,089 | 0.00110 | 0.00173 | **1.57** |
+| 3-D | 2 | 125 | 0.00147 | 0.00025 | 0.17 |
+| 3-D | 3 | 729 | 0.00192 | 0.00305 | **1.59** |
+
+**Interpretation:** 2-D crosses between level 4 and 5 (`n` 289->1089); 3-D crosses between level 2 and 3 (`n` 125->729) — two full refinement levels earlier. The crossover *DOF count* is actually similar in magnitude in both dimensions (order ~300-1000) — what changes is how fast you get there: 3-D's `8x`/level element growth reaches that same magnitude two levels sooner than 2-D's `4x`/level growth, which is exactly "comes much sooner" in the practical, mesh-refinement sense the prompt means. Measured exponents confirm the underlying cause: 3-D factorize exponent `1.82 -> 2.46` (approaching/exceeding `O(n^2)`) vs. assemble's `0.63 -> 0.99` (`~O(n)`) — this measured gap is P2's entire justification.
+
+### Explore (c) — JIT tax for a first-ever kernel variant
+
+Built a source-distinct-but-mathematically-identical copy of the p1 2-D stiffness kernel (avoids touching the shared `~/.cache/warp` disk cache — the prompt's own "careful" flag) to force a genuine first-ever compile:
+
+```
+cold (first-ever launch, log confirms "(compiled)" not "(cached)"): 0.5207s
+warm (2nd launch, same compiled kernel object):                     0.0001s
+warm (3rd launch):                                                  0.0001s
+
+JIT tax = 0.5206s  (~7,841x the warm launch cost)
+```
+
+**Interpretation:** the JIT tax for this specific p1 2-D variant is essentially the *entire* cost of one cold call — over half a second for a kernel whose warm launches complete in ~100 microseconds. This confirms the docstring's rule (ii) directly and quantifies it: never benchmark a cold kernel cache, and always warm every variant you intend to time before measuring (exactly the discipline `main()`'s own `stages(warm_level)` line already practices).
+
+### Explore (d) — FLOP ledger for the p1 2-D stiffness kernel, vs. GPU FP64 peak
+
+Counting operations directly in `poisson_Ke` (`make_poisson_element_matrices`, p1 2-D: `nbf=4`, `nqp=4`, `dim=2`) — 3 multiplies + 1 add per `(e,a,b,q)` term from the two `fe_dN_s` calls and their product, plus 1 multiply for `dJxW`, plus the per-element `jac`/`dscale` setup:
+
+```
+flops/element = dim + 1 + nqp*(nbf^2*(4*dim+2) + 1) = 647
+```
+
+Timed the isolated kernel launch (not the whole `assemble_csr` stage, which also includes host-side CSR triplet work) at levels 6/7/8, warmed and repeated:
+
+| level | n_elems | total FLOPs | achieved (min) |
+|---:|---:|---:|---:|
+| 6 | 4,096 | 2,650,112 | 46.1 GFLOP/s |
+| 7 | 16,384 | 10,600,448 | 85.5 GFLOP/s |
+| 8 | 65,536 | 42,401,792 | **98.0 GFLOP/s** |
+
+GPU FP64 peak estimate (queried, not assumed): `sm_count=22`, `arch=sm_89` (Ada Lovelace) via Warp's own device query; combined with Ada's public architecture facts (128 FP32 cores/SM, FP64 = 1/64 of FP32 on non-datacenter Ada) and the card's `2130 MHz` application boost clock (`nvidia-smi -q`): `FP32 peak = 2*22*128*2.13e9 ~= 12.0 TFLOPS`, `FP64 peak = 12.0/64 ~= 187 GFLOPS`.
+
+**Achieved efficiency: `98.0 / 187 ~= 52%` of estimated FP64 peak** — and rising with level (46% -> 46% -> 52%, still climbing at level 8, consistent with the launch-floor rule (i) diluting smaller runs).
+
+**Interpretation:** unlike B2's CPU einsum kernel (which hit <1% of practical peak, memory-bound), this custom Warp kernel is doing well: arithmetic intensity (excluding the small, cache-resident `dNtab`/`wtab` tables, counting only per-element-unique traffic — `h[e]` read, `Ke[e,:,:]` written) is `647 flops / 136 bytes ~= 4.76 FLOPs/byte`. Even at a generous GDDR6 bandwidth estimate for this card (order ~100-250 GB/s), the roofline ridge point (`FP64 peak / bandwidth`) sits at `~0.8-1.9` FLOPs/byte — well below the kernel's own `4.76`, so this kernel reads as **compute-bound**, not bandwidth-bound, across the whole plausible bandwidth range. Reaching roughly half of estimated FP64 peak on a small, per-thread, table-lookup-heavy kernel is a genuinely good result for a first-pass, non-hand-tuned implementation.
