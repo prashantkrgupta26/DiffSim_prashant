@@ -573,3 +573,178 @@ def test_crystal_twin_grads_vs_fd():
         print(f"  {nm:10s} twin={tw[nm]:+.10e} fd={fd:+.10e} "
               f"relerr={relerr:.2e}")
         assert relerr < 1e-6, f"{nm}: twin={tw[nm]} fd={fd} relerr={relerr}"
+
+
+# ==========================================================================
+# Task 5: THREE-WAY GATE — hand adjoint == autograd twin == finite differences
+# ==========================================================================
+
+def _check_three_way_crystal(res, tag):
+    """Check adj/twin < 1e-10, adj/fd < 1e-6 for every param in res."""
+    for p, (a, t, f) in res.items():
+        r_t = abs(a - t) / max(abs(t), 1e-14)
+        r_f = abs(a - f) / max(abs(f), 1e-14)
+        print(f"{tag} {p:14s} adj={a:+.6e} twin={t:+.6e} fd={f:+.6e} "
+              f"adj/twin={r_t:.2e} adj/fd={r_f:.2e}")
+        assert r_t < 1e-10, f"{tag} {p}: adj={a} twin={t} ratio={r_t}"
+        assert r_f < 1e-6, f"{tag} {p}: adj={a} fd={f} ratio={r_f}"
+
+
+def _three_way_crystal(dm, coords, M, crystallizable, order, n_steps,
+                       dt=1e-2):
+    """Three-way gate for CrystalCHForward/Adjoint vs CrystalCHTwin vs FD.
+
+    Mirrors _three_way_multi (test_multiphase_adjoint.py) but for the coupled
+    M-CH + K-Allen-Cahn system.  Loss = 0.5 sum_i ||phi_i,N - tgt||^2
+    + 0.5 sum_k ||psi_k,N - tgt||^2.  Returns {name: (adj, twin, fd)}.
+    """
+    from diffsim.adjoint import MobilityClosure
+    from diffsim.adjoint.crystallization_multi import (
+        CrystalCHForward, CrystalCHAdjoint)
+    from diffsim.adjoint.torch_twin import CrystalCHTwin
+
+    K = len(crystallizable)
+    nn = dm.n_nodes
+    blk = 2 * M + K
+
+    # --- base params (non-trivial, strong chi[0,1]) ---
+    chi0 = np.zeros((M + 1, M + 1))
+    for a in range(M + 1):
+        for b in range(a + 1, M + 1):
+            chi0[a, b] = chi0[b, a] = 2.5 if (a, b) == (0, 1) else 1.0
+    N0 = 1.0 + 0.3 * np.arange(M + 1, dtype=float)
+    ons0 = np.eye(M) + 0.1 * (np.ones((M, M)) - np.eye(M))
+    kap0 = [0.01 * (i + 1) for i in range(M)]
+    eps20 = {k: 0.012 + 0.003 * j for j, k in enumerate(crystallizable)}
+    L0 = {k: 1.2 + 0.2 * j for j, k in enumerate(crystallizable)}
+    dsig0 = {k: 1.0 + 0.2 * j for j, k in enumerate(crystallizable)}
+    dh0 = {k: -(0.8 + 0.15 * j) for j, k in enumerate(crystallizable)}
+    Tm0 = {k: 1.0 + 0.1 * j for j, k in enumerate(crystallizable)}
+    T = 0.5
+    tgt = 0.20
+
+    # cosine initial field for phi, modest psi
+    cc = np.cos(np.pi * coords[:, 0]) * np.cos(np.pi * coords[:, 1])
+    phi0 = [0.20 + 0.04 * cc for _ in range(M)]
+    psi0 = [0.15 + 0.05 * cc for _ in range(K)]
+
+    names = ["dsig_0", "dh_0", "Tm_0", "eps2_0", "L_0",
+             "chi_0_1", "N_0", "onsager_0_0", "kappa_0"]
+
+    # ---- forward + hand adjoint ----
+    def _make_energy():
+        return AdditiveCrystalEnergy(chi0, N0, crystallizable=crystallizable,
+                                     dsig=dict(dsig0), dh=dict(dh0),
+                                     Tm=dict(Tm0), T=T)
+
+    def _make_fwd(en):
+        mob = MobilityClosure("const", M=M, onsager=ons0)
+        fwd = CrystalCHForward(dm, en, crystallizable=crystallizable,
+                               mobility=mob,
+                               kappa=list(kap0), eps2=dict(eps20),
+                               L=dict(L0), dt=dt, order=order)
+        fwd.set_initial([p.copy() for p in phi0],
+                        psi0_list=[p.copy() for p in psi0])
+        fwd.run(n_steps)
+        return fwd
+
+    en0 = _make_energy()
+    fwd = _make_fwd(en0)
+    rec = fwd.steps[-1]
+
+    # dJdx at final step: phi_i rows and psi_j rows
+    dJdx_list = [np.zeros(blk * nn) for _ in range(n_steps)]
+    for i in range(M):
+        dJdx_list[-1][2 * i::blk] = rec["phis"][i] - tgt
+    for j in range(K):
+        dJdx_list[-1][2 * M + j::blk] = rec["psis"][j] - tgt
+    g_adj = CrystalCHAdjoint(fwd).gradient(dJdx_list, names)
+
+    # ---- autograd twin ----
+    twin = CrystalCHTwin(dm, M, crystallizable, dt=dt, order=order,
+                         device="cpu")
+    energy_params = dict(chi=chi0, N=N0, dsig=dsig0, dh=dh0, Tm=Tm0, T=T)
+    engine_params = dict(onsager=ons0, kappa=kap0, eps2=eps20, L=L0)
+    g_tw = twin.grads(phi0, psi0, energy_params, engine_params,
+                      n_steps, names, tgt)
+
+    # ---- central FD of same numpy loss ----
+    def _loss(en, mob_ons, kap, eps2, L_):
+        mob = MobilityClosure("const", M=M, onsager=np.asarray(mob_ons))
+        fwd_ = CrystalCHForward(dm, en, crystallizable=crystallizable,
+                                mobility=mob,
+                                kappa=list(kap), eps2=dict(eps2),
+                                L=dict(L_), dt=dt, order=order)
+        fwd_.set_initial([p.copy() for p in phi0],
+                         psi0_list=[p.copy() for p in psi0])
+        fwd_.run(n_steps)
+        rec_ = fwd_.steps[-1]
+        loss = 0.5 * sum(((p - tgt) ** 2).sum() for p in rec_["phis"])
+        loss += 0.5 * sum(((p - tgt) ** 2).sum() for p in rec_["psis"])
+        return float(loss)
+
+    def _fd(name):
+        eps = 1e-6
+
+        def bump(sign):
+            chi_ = chi0.copy()
+            N_ = N0.copy()
+            ons_ = ons0.copy()
+            kap_ = list(kap0)
+            eps2_ = dict(eps20)
+            L__ = dict(L0)
+            dsig_ = dict(dsig0)
+            dh_ = dict(dh0)
+            Tm_ = dict(Tm0)
+            if name.startswith("chi_"):
+                _, a, b = name.split("_"); a, b = int(a), int(b)
+                chi_[a, b] += sign * eps; chi_[b, a] += sign * eps
+            elif name.startswith("N_"):
+                N_[int(name.split("_")[1])] += sign * eps
+            elif name.startswith("onsager_"):
+                _, a, b = name.split("_"); a, b = int(a), int(b)
+                ons_[a, b] += sign * eps
+            elif name.startswith("kappa_"):
+                kap_[int(name.split("_")[1])] += sign * eps
+            elif name.startswith("eps2_"):
+                k = int(name.split("_")[1]); eps2_[k] += sign * eps
+            elif name.startswith("L_"):
+                k = int(name.split("_")[1]); L__[k] += sign * eps
+            elif name.startswith("dsig_"):
+                k = int(name.split("_")[1]); dsig_[k] += sign * eps
+            elif name.startswith("dh_"):
+                k = int(name.split("_")[1]); dh_[k] += sign * eps
+            elif name.startswith("Tm_"):
+                k = int(name.split("_")[1]); Tm_[k] += sign * eps
+            en_ = AdditiveCrystalEnergy(chi_, N_, crystallizable=crystallizable,
+                                         dsig=dsig_, dh=dh_, Tm=Tm_, T=T)
+            return _loss(en_, ons_, kap_, eps2_, L__)
+        return (bump(+1) - bump(-1)) / (2 * eps)
+
+    g_fd = {nm: _fd(nm) for nm in names}
+    return {nm: (g_adj[nm], g_tw[nm], g_fd[nm]) for nm in names}
+
+
+def test_three_way_crystal_ternary_bdf1():
+    """M=2 ternary (crystallizable=(0,)), BDF1, n_steps=3: adj == twin == FD."""
+    dm, mesh = _dm(2)
+    res = _three_way_crystal(dm, mesh.node_coords, M=2, crystallizable=(0,),
+                             order=1, n_steps=3)
+    _check_three_way_crystal(res, "ternary-bdf1")
+
+
+def test_three_way_crystal_ternary_bdf2():
+    """M=2 ternary (crystallizable=(0,)), BDF2, n_steps=4: adj == twin == FD."""
+    dm, mesh = _dm(2)
+    res = _three_way_crystal(dm, mesh.node_coords, M=2, crystallizable=(0,),
+                             order=2, n_steps=4)
+    _check_three_way_crystal(res, "ternary-bdf2")
+
+
+def test_three_way_crystal_quaternary_bdf1():
+    """M=3 quaternary (crystallizable=(0,2)), BDF1, n_steps=3:
+    both species 0 and 2 crystallize; adj == twin == FD."""
+    dm, mesh = _dm(2)
+    res = _three_way_crystal(dm, mesh.node_coords, M=3, crystallizable=(0, 2),
+                             order=1, n_steps=3)
+    _check_three_way_crystal(res, "quaternary-bdf1")

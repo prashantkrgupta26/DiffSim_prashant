@@ -422,6 +422,14 @@ class CrystalCHDiscrete:
                 i = int(name.split("_")[1])
                 gN_gphi = np.einsum("qad,e,eqd->eqa", dN, dscale, pi[i][bi][1])
                 addmu(i, -np.einsum("eq,eqa->ea", dJxW, gN_gphi))
+            elif name.startswith("onsager_"):
+                # const closure: Lam[a,b] scalar multiplies grad(mu_b) in
+                # the flux for phi_a -> dR_phi_a / d(onsager_a_b)
+                _, a, b = name.split("_")
+                a, b = int(a), int(b)
+                gmu_b = mi[b][bi][1]
+                gN = np.einsum("qad,e,eqd->eqa", dN, dscale, gmu_b)
+                addphi(a, np.einsum("eq,eqa->ea", dJxW, gN))
             elif name.startswith("mob_"):
                 dLam = mobility.dmatrix_dparam(phi_gp, name)
                 for i in range(M):
