@@ -748,3 +748,83 @@ def test_three_way_crystal_quaternary_bdf1():
     res = _three_way_crystal(dm, mesh.node_coords, M=3, crystallizable=(0, 2),
                              order=1, n_steps=3)
     _check_three_way_crystal(res, "quaternary-bdf1")
+
+
+# ==========================================================================
+# Task 6: GPU cuDSS parity — backend= seam smoke (CPU) + GPU-gated parity
+# ==========================================================================
+
+def _gpu_available():
+    try:
+        import warp as wp
+        return wp.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
+def test_crystal_backend_honored_cpu():
+    """Explicit ScipyBackend == default (None); confirms the backend= seam is live."""
+    from diffsim.adjoint.crystallization_multi import (
+        CrystalCHForward, CrystalCHAdjoint, AdditiveCrystalEnergy)
+    from diffsim.adjoint import ScipyBackend
+    dm, mesh = _dm(2)
+    M, cryst = 2, (0,)
+    chi, N = _chiN(M)
+    energy = AdditiveCrystalEnergy(chi, N, cryst, {0: 0.7}, {0: -0.9}, {0: 1.1})
+    cc = np.cos(np.pi * mesh.node_coords[:, 0])
+    phi0 = [0.28 + 0.03 * cc, 0.30 + 0.03 * cc]
+    psi0 = [0.25 + 0.02 * cc]
+    names = ["dsig_0", "L_0", "chi_0_1", "kappa_0"]
+
+    def run(backend):
+        fwd = CrystalCHForward(dm, energy, cryst, onsager=np.eye(M),
+                               kappa=[0.01, 0.02], eps2={0: 0.015}, L={0: 1.2},
+                               dt=0.01, order=1, backend=backend)
+        fwd.set_initial(phi0, psi0)
+        fwd.run(3)
+        blk = fwd.op.blk
+        dJdx = [np.zeros(fwd.op.ndof) for _ in range(3)]
+        for i in range(M):
+            dJdx[-1][2 * i::blk] = fwd.steps[-1]["phis"][i] - 0.28
+        dJdx[-1][2 * M::blk] = fwd.steps[-1]["psis"][0] - 0.25
+        return CrystalCHAdjoint(fwd).gradient(dJdx, names)
+
+    g_default = run(None)
+    g_explicit = run(ScipyBackend())
+    for nm in names:
+        assert np.isclose(g_default[nm], g_explicit[nm], rtol=1e-12), nm
+
+
+@pytest.mark.skipif(not _gpu_available(), reason="no CUDA GPU (rung-2 gate runs on gpubox)")
+def test_crystal_cudss_parity_gpu():
+    """cuDSS crystal adjoint gradients == scipy, to ~1e-8 (2M+K block)."""
+    from diffsim.adjoint.crystallization_multi import (
+        CrystalCHForward, CrystalCHAdjoint, AdditiveCrystalEnergy)
+    from diffsim.adjoint import ScipyBackend, CudssBackend
+    dm, mesh = _dm(3)
+    M, cryst = 2, (0,)
+    chi, N = _chiN(M)
+    energy = AdditiveCrystalEnergy(chi, N, cryst, {0: 0.7}, {0: -0.9}, {0: 1.1})
+    cc = np.cos(np.pi * mesh.node_coords[:, 0])
+    phi0 = [0.28 + 0.03 * cc, 0.30 + 0.03 * cc]
+    psi0 = [0.25 + 0.02 * cc]
+    names = ["dsig_0", "dh_0", "eps2_0", "L_0", "chi_0_1", "kappa_0"]
+
+    def run(backend):
+        fwd = CrystalCHForward(dm, energy, cryst, onsager=np.eye(M),
+                               kappa=[0.01, 0.02], eps2={0: 0.015}, L={0: 1.2},
+                               dt=0.01, order=2, backend=backend)
+        fwd.set_initial(phi0, psi0)
+        fwd.run(4)
+        blk = fwd.op.blk
+        dJdx = [np.zeros(fwd.op.ndof) for _ in range(4)]
+        for i in range(M):
+            dJdx[-1][2 * i::blk] = fwd.steps[-1]["phis"][i] - 0.28
+        dJdx[-1][2 * M::blk] = fwd.steps[-1]["psis"][0] - 0.25
+        return CrystalCHAdjoint(fwd).gradient(dJdx, names)
+
+    g_cpu = run(ScipyBackend())
+    g_gpu = run(CudssBackend("cuda:0"))
+    for nm in names:
+        assert np.isclose(g_gpu[nm], g_cpu[nm], rtol=1e-6, atol=1e-8), \
+            (nm, g_gpu[nm], g_cpu[nm])
