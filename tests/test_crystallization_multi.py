@@ -371,3 +371,104 @@ def test_crystal_discrete_dR_dparam_complex_step():
         cs = resid(pp).imag / h
         assert np.allclose(an, cs, atol=1e-8, rtol=1e-6), \
             f"dR_dparam mismatch for {name!r}"
+
+
+# ==========================================================================
+# Task 3: CrystalCHForward + CrystalCHAdjoint
+# ==========================================================================
+
+def test_crystal_forward_reduces_to_multi_when_K_empty():
+    """CrystalCHForward with crystallizable=() reproduces MultiCHForward
+    (K=0) to 1e-14 on a ternary (M=2) run for BDF1 and BDF2."""
+    from diffsim.adjoint import (MultiCHForward, FHMultiEnergy,
+                                  MobilityClosure)
+    from diffsim.adjoint.crystallization_multi import CrystalCHForward
+
+    M = 2
+    chi, N = _chiN(M=M)
+    ons = np.array([[1.0, 0.2], [0.2, 0.8]])
+    kap = [0.01, 0.02]
+    dt = 1e-2
+    dm, _mesh = _dm(2)
+
+    rng = np.random.default_rng(77)
+    nn = dm.n_nodes
+    phi0 = [0.15 + 0.05 * rng.random(nn) for _ in range(M)]
+
+    for order in (1, 2):
+        # MultiCHForward (K=0 reference)
+        multi = MultiCHForward(dm, FHMultiEnergy(chi, N), onsager=ons,
+                               kappa=kap, dt=dt, order=order)
+        multi.set_initial([p.copy() for p in phi0])
+        multi.run(3)
+
+        # CrystalCHForward with empty crystallizable
+        energy = AdditiveCrystalEnergy(chi, N, crystallizable=(), dsig={},
+                                       dh={}, Tm={}, T=0.5)
+        crystal = CrystalCHForward(dm, energy, crystallizable=(),
+                                   mobility=MobilityClosure("const", M=M,
+                                                            onsager=ons),
+                                   kappa=kap, eps2={}, L={}, dt=dt,
+                                   order=order)
+        crystal.set_initial([p.copy() for p in phi0], psi0_list=[])
+        crystal.run(3)
+
+        for i in range(M):
+            assert np.allclose(crystal.steps[-1]["phis"][i],
+                               multi.steps[-1]["phis"][i], atol=1e-14), \
+                f"phis[{i}] mismatch at order={order}"
+            assert np.allclose(crystal.steps[-1]["mus"][i],
+                               multi.steps[-1]["mus"][i], atol=1e-14), \
+                f"mus[{i}] mismatch at order={order}"
+
+
+def test_crystal_adjoint_returns_finite_grads():
+    """CrystalCHAdjoint.gradient returns finite grads for all param kinds
+    when M=2, K=1 (crystallizable=(0,))."""
+    from diffsim.adjoint import MobilityClosure
+    from diffsim.adjoint.crystallization_multi import (CrystalCHForward,
+                                                        CrystalCHAdjoint)
+
+    M = 2
+    crystallizable = (0,)
+    chi, N = _chiN(M=M)
+    ons = np.array([[1.0, 0.15], [0.15, 0.9]])
+    kap = [0.01, 0.02]
+    eps2 = {0: 0.015}
+    L = {0: 1.5}
+    dt = 1e-2
+    dm, _mesh = _dm(2)
+    nn = dm.n_nodes
+
+    energy = AdditiveCrystalEnergy(chi, N, crystallizable=crystallizable,
+                                   dsig={0: 1.2}, dh={0: -1.0}, Tm={0: 1.0},
+                                   T=0.5)
+    mob = MobilityClosure("const", M=M, onsager=ons)
+
+    rng = np.random.default_rng(123)
+    phi0 = [0.15 + 0.05 * rng.random(nn) for _ in range(M)]
+    psi0 = [0.1 + 0.05 * rng.random(nn)]   # K=1
+
+    fwd = CrystalCHForward(dm, energy, crystallizable=crystallizable,
+                           mobility=mob, kappa=kap, eps2=eps2, L=L, dt=dt,
+                           order=1)
+    fwd.set_initial(phi0, psi0_list=psi0)
+    N_steps = 3
+    fwd.run(N_steps)
+
+    blk = fwd.op.blk
+    ndof = fwd.op.ndof
+
+    # dJ/dx targets the final phi_0 field only
+    dJdx_list = [np.zeros(ndof) for _ in range(N_steps)]
+    dJdx_list[-1][0::blk] = 1.0   # phi_0 columns
+
+    param_names = ["dsig_0", "dh_0", "Tm_0", "eps2_0", "L_0",
+                   "chi_0_1", "N_0", "kappa_0"]
+    adj = CrystalCHAdjoint(fwd)
+    grads = adj.gradient(dJdx_list, param_names)
+
+    assert set(grads.keys()) == set(param_names), \
+        f"Missing keys: {set(param_names) - set(grads.keys())}"
+    for nm, val in grads.items():
+        assert np.isfinite(val), f"grad[{nm!r}] = {val} is not finite"

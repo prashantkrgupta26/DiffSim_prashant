@@ -192,6 +192,7 @@ class CrystalCHDiscrete:
         self.dim = dm.dim
         self.nn = dm.n_nodes
         self.ndof = self.blk * self.nn
+        self._mass = None
         blk = self.blk
         self.bins = []
         for pv, b in dm.bins.items():
@@ -219,6 +220,22 @@ class CrystalCHDiscrete:
             g = np.einsum("qad,ea,e->eqd", B["dN"], vals, B["dscale"])
             out.append((v, g))
         return out
+
+    def mass_matrix(self):
+        if self._mass is not None:
+            return self._mass
+        rows, cols, vals = [], [], []
+        for B in self.bins:
+            NN = np.einsum("eq,qa,qb->eab", B["dJxW"], B["N"], B["N"])
+            conn, nbf = B["conn"], B["nbf"]
+            rows.append(np.repeat(conn, nbf, axis=1).ravel())
+            cols.append(np.tile(conn, (1, nbf)).ravel())
+            vals.append(NN.ravel())
+        self._mass = sp.coo_matrix(
+            (np.concatenate(vals),
+             (np.concatenate(rows), np.concatenate(cols))),
+            shape=(self.nn, self.nn)).tocsr()
+        return self._mass
 
     def _rowslices(self):
         """gdof column slices for phi_i / mu_i / psi_j rows."""
@@ -421,3 +438,202 @@ class CrystalCHDiscrete:
                 for j, k in enumerate(cryst):
                     addpsi(j, L[k] * np.einsum("eq,qa->ea", dJxW * dpsi[j], N))
         return out
+
+
+# --------------------------------------------------------------------------
+# forward Newton-BDF march + per-step recorder
+# --------------------------------------------------------------------------
+class CrystalCHForward:
+    """Newton BDF march of the coupled M-CH + K-Allen-Cahn discrete operator,
+    recording per-step state and BDF coefficients for the adjoint reverse sweep.
+    M-generic, K>=0 generalisation of MultiCHForward (K=0) and CACHForward (M=1,K=1)."""
+
+    def __init__(self, dm, energy, crystallizable=(), mobility=None,
+                 onsager=None, kappa=None, eps2=None, L=None,
+                 dt=1e-2, order=1, newton_tol=1e-12, newton_max=40,
+                 backend=None):
+        from .linsolve_backend import ScipyBackend
+        from .neural_multiphase import MobilityClosure
+        self.op = CrystalCHDiscrete(dm, energy.M, crystallizable)
+        self.M = energy.M
+        self.K = len(tuple(crystallizable))
+        self.energy = energy
+        # --- resolve mobility ---
+        if mobility is not None:
+            if isinstance(mobility, MobilityClosure):
+                self.mobility = mobility
+            else:
+                self.mobility = MobilityClosure(
+                    "const", M=self.M,
+                    onsager=np.asarray(mobility, np.float64))
+        elif onsager is not None:
+            self.mobility = MobilityClosure(
+                "const", M=self.M,
+                onsager=np.asarray(onsager, np.float64))
+        else:
+            raise ValueError("CrystalCHForward: supply mobility= or onsager=")
+        self.kappa = [float(k) for k in (kappa or [])]
+        self.eps2 = {int(k): float(v) for k, v in (eps2 or {}).items()}
+        self.L = {int(k): float(v) for k, v in (L or {}).items()}
+        self.dt = float(dt)
+        self.order = order
+        self.newton_tol = newton_tol
+        self.newton_max = newton_max
+        self.backend = backend or ScipyBackend()
+        self.t = 0.0
+        self.dt_prev = None
+        self.steps = []
+
+    def set_initial(self, phi0_list, psi0_list=None):
+        self.phis = [np.asarray(p, np.float64).copy() for p in phi0_list]
+        self.mus = [np.zeros_like(self.phis[0]) for _ in range(self.M)]
+        if psi0_list is None or len(psi0_list) == 0:
+            self.psis = []
+        else:
+            assert len(psi0_list) == self.K, \
+                f"psi0_list length {len(psi0_list)} != K={self.K}"
+            self.psis = [np.asarray(p, np.float64).copy() for p in psi0_list]
+        # BDF history stacks: [slot0_copies, slot1_copies]
+        phi_snap = [p.copy() for p in self.phis]
+        self.hist_phi = [phi_snap, [p.copy() for p in phi_snap]]
+        psi_snap = [p.copy() for p in self.psis]
+        self.hist_psi = [psi_snap, [p.copy() for p in psi_snap]]
+        self.t = 0.0
+        self.dt_prev = None
+        self.steps = []
+
+    def _bdf(self):
+        if self.order == 1 or self.dt_prev is None or self.t < self.dt / 2:
+            return 1.0, [1.0]
+        rr = self.dt / self.dt_prev
+        return ((1.0 + 2.0 * rr) / (1.0 + rr),
+                [1.0 + rr, -rr * rr / (1.0 + rr)])
+
+    def _hist_gp(self, hist_stack, ch, nfields):
+        """Build per-field BDF history loads at Gauss points.
+
+        Returns a length-nfields list; each entry is a per-bin list of
+        [ne, nqp] arrays (sum_k (ch_k/dt) * interp(hist_stack[k][i])).
+        When nfields==0 returns []."""
+        if nfields == 0:
+            return []
+        result = [None] * nfields
+        for i in range(nfields):
+            acc = None
+            for k, cc in enumerate(ch):
+                hi = self.op.interp(hist_stack[k][i])
+                contrib = [(cc / self.dt) * hi[bi][0]
+                           for bi in range(len(hi))]
+                if acc is None:
+                    acc = contrib
+                else:
+                    acc = [acc[bi] + contrib[bi]
+                           for bi in range(len(hi))]
+            result[i] = acc
+        return result
+
+    def _params(self, sigma):
+        return dict(mobility=self.mobility, kappa=self.kappa,
+                    eps2=self.eps2, L=self.L, energy=self.energy,
+                    sigma=sigma)
+
+    def step(self, record=True):
+        c0_, ch = self._bdf()
+        sigma = c0_ / self.dt
+        hpg = self._hist_gp(self.hist_phi, ch, self.M)
+        hsg = self._hist_gp(self.hist_psi, ch, self.K)
+        params = self._params(sigma)
+        blk = self.op.blk
+        M, K = self.M, self.K
+        phis = [p.copy() for p in self.phis]
+        mus = [m.copy() for m in self.mus]
+        psis = [p.copy() for p in self.psis]
+        for _it in range(self.newton_max):
+            R, J = self.op.assemble(phis, mus, psis, hpg, hsg, params,
+                                    want_jac=True)
+            dx = self.backend.solve(J, -R)
+            for i in range(M):
+                phis[i] = phis[i] + dx[2 * i::blk]
+                mus[i] = mus[i] + dx[2 * i + 1::blk]
+            for j in range(K):
+                psis[j] = psis[j] + dx[2 * M + j::blk]
+            if np.abs(dx).max() < self.newton_tol:
+                break
+        self.phis, self.mus, self.psis = phis, mus, psis
+        if record:
+            x = np.zeros(self.op.ndof)
+            for i in range(M):
+                x[2 * i::blk] = phis[i]
+                x[2 * i + 1::blk] = mus[i]
+            for j in range(K):
+                x[2 * M + j::blk] = psis[j]
+            self.steps.append(dict(
+                phis=[p.copy() for p in phis],
+                mus=[m.copy() for m in mus],
+                psis=[p.copy() for p in psis],
+                x=x, sigma=sigma, ch=list(ch), dt=self.dt,
+                params=self._params(sigma)))
+        # roll history stacks
+        self.hist_phi = [[p.copy() for p in phis], self.hist_phi[0]]
+        self.hist_psi = [[p.copy() for p in psis], self.hist_psi[0]]
+        self.t += self.dt
+        self.dt_prev = self.dt
+
+    def run(self, n):
+        for _ in range(n):
+            self.step()
+
+
+# --------------------------------------------------------------------------
+# IFT reverse-sweep adjoint
+# --------------------------------------------------------------------------
+class CrystalCHAdjoint:
+    """Reverse-sweep dJ/dp for the coupled M-CH + K-Allen-Cahn system.
+    Mirrors MultiCHAdjoint (phi history) and CACHAdjoint (adds psi history).
+    The BDF history cotangent propagates BOTH phi-rows AND psi-rows."""
+
+    def __init__(self, fwd: CrystalCHForward):
+        self.fwd = fwd
+        self.op = fwd.op
+
+    def gradient(self, dJdx_list, param_names):
+        """dJdx_list[n] = dj/dx_n as a length-ndof node-major vector.
+        Returns {name: dJ/dname} for each name in param_names.
+        Handles residual-param names only (no phi0_ initial-condition gradient)."""
+        op = self.op
+        blk, M, K = op.blk, op.M, op.K
+        steps = self.fwd.steps
+        Ns = len(steps)
+        Mass = op.mass_matrix()
+        grads = {nm: 0.0 for nm in param_names}
+        pending = [np.zeros(op.ndof) for _ in range(Ns)]
+        # zero history loads for J rebuild (history load doesn't affect J)
+        zero_phi = [[np.zeros_like(B["dJxW"]) for B in op.bins]
+                    for _ in range(M)]
+        zero_psi = [[np.zeros_like(B["dJxW"]) for B in op.bins]
+                    for _ in range(K)]
+        for n in range(Ns - 1, -1, -1):
+            rec = steps[n]
+            _, J = op.assemble(rec["phis"], rec["mus"], rec["psis"],
+                               zero_phi, zero_psi, rec["params"],
+                               want_jac=True)
+            rhs = np.asarray(dJdx_list[n], np.float64) + pending[n]
+            lam = self.fwd.backend.solve_T(J, rhs)
+            for nm in param_names:
+                dRdp = op.dR_dparam(rec["phis"], rec["mus"], rec["psis"],
+                                    rec["params"], nm)
+                grads[nm] -= float(lam @ dRdp)
+            # history cotangent: R_n depends on phi_i,{n-k} through
+            # -(ch_k/dt) Mass on phi_i-rows, and on psi_j,{n-k} through
+            # -(ch_k/dt) Mass on psi_j-rows.
+            ch, dt = rec["ch"], rec["dt"]
+            for k, cc in enumerate(ch):
+                kn = n - (k + 1)
+                if kn < 0:
+                    continue
+                for i in range(M):
+                    pending[kn][2 * i::blk] += (cc / dt) * (Mass @ lam[2 * i::blk])
+                for j in range(K):
+                    pending[kn][2 * M + j::blk] += (
+                        (cc / dt) * (Mass @ lam[2 * M + j::blk]))
+        return grads
