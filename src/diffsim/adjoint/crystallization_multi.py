@@ -237,14 +237,6 @@ class CrystalCHDiscrete:
             shape=(self.nn, self.nn)).tocsr()
         return self._mass
 
-    def _rowslices(self):
-        """gdof column slices for phi_i / mu_i / psi_j rows."""
-        M, blk = self.M, self.blk
-        phi_c = [2 * i for i in range(M)]
-        mu_c = [2 * i + 1 for i in range(M)]
-        psi_c = [2 * M + j for j in range(self.K)]
-        return phi_c, mu_c, psi_c
-
     def assemble(self, phis, mus, psis, hist_phi_gp, hist_psi_gp, params,
                  want_jac=True):
         """R (len ndof) and, if want_jac, J = dR/dx (csr ndof x ndof).
@@ -464,7 +456,7 @@ class CrystalCHForward:
         from .neural_multiphase import MobilityClosure
         self.op = CrystalCHDiscrete(dm, energy.M, crystallizable)
         self.M = energy.M
-        self.K = len(tuple(crystallizable))
+        self.K = len(crystallizable)
         self.energy = energy
         # --- resolve mobility ---
         if mobility is not None:

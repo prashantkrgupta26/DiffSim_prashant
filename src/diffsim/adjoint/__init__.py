@@ -11,6 +11,7 @@ from .linsolve_backend import (LinearBackend, ScipyBackend, CudssBackend,
 from .crystallization_multi import (CrystalEnergy, AdditiveCrystalEnergy,
                                     CrystalCHDiscrete, CrystalCHForward,
                                     CrystalCHAdjoint)
+from .neural_crystal import NeuralCrystalEnergy
 
 __all__ = ["CHDiscrete", "CHForward", "CHAdjoint", "PolyEnergy", "FHEnergy",
            "PolyBasisEnergy", "CACHDiscrete", "CACHForward", "CACHAdjoint",
@@ -19,4 +20,5 @@ __all__ = ["CHDiscrete", "CHForward", "CHAdjoint", "PolyEnergy", "FHEnergy",
            "MobilityClosure",
            "LinearBackend", "ScipyBackend", "CudssBackend", "scipy_to_torch_csr",
            "CrystalEnergy", "AdditiveCrystalEnergy",
-           "CrystalCHDiscrete", "CrystalCHForward", "CrystalCHAdjoint"]
+           "CrystalCHDiscrete", "CrystalCHForward", "CrystalCHAdjoint",
+           "NeuralCrystalEnergy"]
