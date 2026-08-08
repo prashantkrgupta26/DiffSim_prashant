@@ -1,7 +1,13 @@
 """Sub-project 2: NeuralCrystalEnergy — non-parametric coupled free energy."""
+import sys
+import os
 import numpy as np
 import pytest
 from diffsim.adjoint.neural_crystal import NeuralCrystalEnergy, _legendre2_np
+
+# Make the examples directory importable for the recovery driver
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "examples"))
+from crystal_learn_from_synthetic import recover_coupling
 
 pytestmark = pytest.mark.ad
 
@@ -389,3 +395,36 @@ def test_three_way_neural_quaternary_bdf1():
         dm, mesh.node_coords, M=3, crystallizable=(0, 2),
         deg_psi=(1, 2), order=1, n_steps=3)
     _check_three_way(res, "neural-quaternary-bdf1")
+
+
+# ==========================================================================
+# Task 5: SYNTHETIC RECOVERY — recover planted coupling via hand adjoint
+#          from a single final phi+psi snapshot (the K>0 "learn it" payoff)
+# ==========================================================================
+
+# alias for the recovery driver (mirrors _dm used above)
+_dm_neural = _dm
+
+
+def test_synthetic_recovery_drops_loss():
+    """Plant cpl_0_1 + cpl_0_2, recover via hand adjoint trajectory-matching.
+
+    Asserts:
+    - loss drops >= 20x over 40 gradient-descent steps.
+    - cpl_0_1 (dominant, degree-1 mode) recovered within 25% of planted.
+
+    cpl_0_2 (degree-2) may converge more slowly from a single final snapshot
+    (weakly identifiable); the test only pins the dominant mode cpl_0_1.
+    """
+    dm, mesh = _dm_neural(2)
+    res = recover_coupling(dm, mesh.node_coords,
+                           planted={"cpl_0_1": 0.15, "cpl_0_2": -0.1},
+                           names=["cpl_0_1", "cpl_0_2"],
+                           n_steps=4, order=1, n_iter=40, lr=0.5)
+    loss_hist, th_hat, th_true = res
+    assert loss_hist[-1] <= loss_hist[0] / 20.0, (
+        f"Loss did not drop 20x: {loss_hist[0]:.4e} → {loss_hist[-1]:.4e}")
+    assert abs(th_hat["cpl_0_1"] - th_true["cpl_0_1"]) \
+        <= 0.25 * abs(th_true["cpl_0_1"]), (
+        f"cpl_0_1 not recovered: hat={th_hat['cpl_0_1']:.4f} "
+        f"true={th_true['cpl_0_1']:.4f}")
