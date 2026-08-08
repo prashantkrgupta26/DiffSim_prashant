@@ -105,3 +105,42 @@ def test_cpl_param_derivs_complex_step():
         for i in range(2):
             assert np.allclose(an_phi[i], cs_phi[i], atol=1e-9), (nm, "phi", i)
         assert np.allclose(an_psi[0], cs_psi[0], atol=1e-9), (nm, "psi")
+
+
+def test_reduction_matches_additive_up_to_gauge():
+    from diffsim.adjoint.crystallization_multi import AdditiveCrystalEnergy
+    M, cryst = 2, (0,)
+    chi, N = _chiN(M)
+    dsig, dh, Tm, T = {0: 0.7}, {0: -0.9}, {0: 1.1}, 0.5
+    add = AdditiveCrystalEnergy(chi, N, cryst, dsig, dh, Tm, T=T)
+
+    # project h_add onto shifted-Legendre L_b(u=2psi-1) for b in 1..4
+    from diffsim.adjoint.neural_multiphase import _legendre_np
+    x, w = np.polynomial.legendre.leggauss(64)
+    psi_q = 0.5 * (x + 1.0)
+    drive = dh[0] * (T / Tm[0] - 1.0)
+    h_add = (psi_q ** 2 * (1 - psi_q) ** 2) * dsig[0] + \
+            (3 * psi_q ** 2 - 2 * psi_q ** 3) * drive
+    deg = (1, 2, 3, 4)
+    coeffs = {}
+    for b in deg:
+        Lb, _ = _legendre_np(x, b)
+        coeffs[f"cpl_0_{b}"] = float((w * h_add * Lb).sum()
+                                     / (w * Lb * Lb).sum())
+    neu = NeuralCrystalEnergy(chi, N, cryst, deg_psi=deg, coeffs=coeffs,
+                              basis_degrees=(2, 3))  # basis coeffs 0 -> f_base == FH
+
+    phis, psis = _rand_state(M, 1, seed=7)
+    # dfdpsi exact (constant-independent)
+    assert np.allclose(neu.dfdpsi(phis, psis)[0],
+                       add.dfdpsi(phis, psis)[0], atol=1e-11)
+    # Hessian blocks exact
+    assert np.allclose(neu.d2fdphidpsi(phis, psis)[0][0],
+                       add.d2fdphidpsi(phis, psis)[0][0], atol=1e-11)
+    assert np.allclose(neu.d2fdpsidpsi(phis, psis)[0][0],
+                       add.d2fdpsidpsi(phis, psis)[0][0], atol=1e-11)
+    # dfdphi matches up to a per-species constant (the b=0 gauge)
+    dneu = neu.dfdphi(phis, psis)[0]
+    dadd = add.dfdphi(phis, psis)[0]
+    diff = dneu - dadd
+    assert np.allclose(diff - diff.mean(), 0.0, atol=1e-9)  # only a constant differs
