@@ -461,6 +461,21 @@ def test_three_way_quaternary_bdf1(device):
     _check_three_way(res, "Q-bdf1")
 
 
+# --- 3-D coverage: the CH adjoint stack is dimension-generic (dm.dim); these
+# exercise it on a 3-D hex mesh (build_uniform(dim=3), 8-node P1).  Numpy/torch
+# only — no Warp element kernel, so no 3-D-kernel compile cost here. ------------
+def test_three_way_ternary_3d_bdf1(device):
+    dm, mesh = _dm(2, dim=3)           # 4^3 hex cells, ternary
+    res = _three_way_multi(dm, mesh.node_coords, M=2, order=1, n_steps=2)
+    _check_three_way(res, "T-3D-bdf1")
+
+
+def test_three_way_ternary_3d_bdf2(device):
+    dm, mesh = _dm(2, dim=3)
+    res = _three_way_multi(dm, mesh.node_coords, M=2, order=2, n_steps=3)
+    _check_three_way(res, "T-3D-bdf2")
+
+
 # ==========================================================================
 # MultiCHTwin mean-phi offset leaf (twin == FD)
 # ==========================================================================
