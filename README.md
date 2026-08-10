@@ -212,7 +212,7 @@ twin = finite differences), CPU reference-grade *and* GPU-resident through a cuD
 backend validated at 256×128. **M6** makes the physics learnable: a
 gauge-anchored multi-component free energy and a named mobility closure fit by
 trajectory-matching through the same verified adjoint (φ-only / K=0 to date;
-crystallization-coupled learning is in progress). See the
+crystallization-coupled learning is in progress). The **CHNS coupling brick** (SP-0, `src/diffsim/physics/chns.py`) completes the two-phase foundation: a coupled (u, p, φ, μ) monolithic Newton solver with variable density/viscosity, surface-tension-coupled Cahn–Hilliard, a three-way-verified discrete-IFT adjoint (density ratio, viscosity ratio, We, mobility, Fr), and a 3-D dam-break GPU smoke on 215 K DOF via cuDSS. See the
 [roadmap](docs/dev/roadmap.md) for the measured evidence behind each, and the
 milestone reports in `docs/dev/` for the full stories.
 
