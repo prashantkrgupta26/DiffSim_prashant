@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-10
 **Status:** Evidence complete — awaiting Baskar's decision (Task 8 human gate)
-**Decision:** _pending — recommendation below_
+**Decision:** MONOLITHIC PRIMARY (Baskar, 2026-08-10) — staggered retained as documented forward-only fast mode. Quartic-bulk ruling ratified.
 
 ## What was built (both reviewed and approved on `feat/sp0-chns`)
 
