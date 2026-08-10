@@ -6,6 +6,7 @@ Configs extracted with:
   unzip -p $Z.zip "$Z/config/bubble_rise_2d/Re35We10/config.txt"
   unzip -p $Z.zip "$Z/config/bubble_rise_2d/Re35We125/config.txt"
   unzip -p $Z.zip "$Z/config/Dam_break_2d/config.txt"
+  unzip -p $Z.zip "$Z/config/Dam_break_3d/config.txt"
   unzip -p $Z.zip "$Z/config/RT_instability/2D/config.txt"
 
 Global Constraints:
@@ -258,6 +259,52 @@ DAM_BREAK_2D = CHNSCase(
         domain_Lx=4.0, domain_Ly=3.0,
     ),
     domain_aspect=(4, 3),  # legacy mesh max = [4.0, 3.0]
+)
+
+
+# ---------------------------------------------------------------------------
+# Case 3b: Dam Break 3D
+# ---------------------------------------------------------------------------
+# Source: config/Dam_break_3d/config.txt (chns_nonnewtonian zip)
+# Key legacy parameters (transcribed exactly):
+#   Re = 280000, We = 5444.44, Cn = 0.0075, Pe = 5925.9259, Fr = 1.0
+#   rhoH = 1.0, rhoL = 0.001  -> rho_ratio = 1000.0 (at 1e3 cap)
+#   etaH = 1.0, etaL = 0.01   -> eta_ratio = 100.0
+#   mesh min = [0,0,0], max = [4.0, 3.0, 1.0]; refine_lvl_base = 5
+#   caseTypeCHinit = "damBreak", vertInterfaceLoc = 2.0
+#   dt = 2.5e-4, totalTime = 6
+# NOTE: dim=3, level=5 (legacy refine_lvl_base = 5; the SP-0 GPU smoke runs
+#   this at level 5 = 33^3 nodes ~ 215k DOF at blk=dim+3=6, comfortably under
+#   the cuDSS ~1M-DOF direct-solve wall on the 48 GB RTX 6000 Ada).
+# The dam-break interface is a vertical plane in x (independent of y, z), so the
+# 2-D _tanh_dambreak_ic (uses x[:,0] only) is reused verbatim.  Cn differs from
+# the 2-D case (0.0075 vs 0.005) per the legacy 3-D config.
+DAM_BREAK_3D = CHNSCase(
+    name="dam_break_3d",
+    dim=3,
+    level=5,   # legacy refine_lvl_base = 5 (interface at 10)
+    # Source: Re = 280000, We = 5444.44
+    Re=280000.0,
+    We=5444.44,
+    # Source: Cn = 0.0075, Pe = 5925.9259
+    Cn=0.0075,
+    Pe=5925.9259,
+    # Source: Fr = 1.0
+    Fr=1.0,
+    # Source: rhoH=1.0, rhoL=0.001 -> ratio=1000.0 (at 1e3 cap)
+    rho_ratio=1000.0,
+    # Source: etaH=1.0, etaL=0.01 -> ratio=100.0 (below 1e3 cap)
+    eta_ratio=100.0,
+    # Source: totalTime = 6, dt = 2.5e-4
+    t_end=6.0,
+    dt0=2.5e-4,
+    # IC: dam-break; vertInterfaceLoc=2.0 on domain [0,4]x[0,3]x[0,1]
+    # Normalised interface at x=2.0/4.0=0.5 in unit domain (plane in x)
+    ic_fn=_tanh_dambreak_ic(
+        vert_interface_x=2.0, Cn=0.0075,
+        domain_Lx=4.0, domain_Ly=3.0,
+    ),
+    domain_aspect=(4, 3),  # legacy mesh max = [4.0, 3.0, 1.0]
 )
 
 
