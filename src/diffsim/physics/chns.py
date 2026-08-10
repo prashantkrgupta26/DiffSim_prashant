@@ -234,10 +234,24 @@ def make_chns_newton(nbf: int, nqp: int, dim: int):
 
     Per-GP inputs (all [ngp, ...], node-major bin GP ordering gp = e*nqp+q):
       u_gp[dim], gu_gp[dim,dim] (comp,sp), p_gp, gp_gp[dim], phi_gp,
-      gphi_gp[dim], mu_gp, gmu_gp[dim], un_gp[dim], phin_gp.
+      gphi_gp[dim], mu_gp, gmu_gp[dim], un_gp[dim], phin_gp, src_phi_gp.
     Scalars: dt, Re, We, Cn, Pe, cw_inv, agg, grav_scale, ghat[dim],
       rho_h/rho_l/eta_h/eta_l (mix_props endpoints).
     Emits Ae[ne, blk*nbf, blk*nbf], be[ne, blk*nbf] (be = -residual).
+
+    SP-1 deposition / MMS hooks (Task 9):
+      ``src_phi_gp`` — per-GP scalar source S(x, t) added to the CH phi row:
+        ``R^phi = INT psi[(phi-phi_n)/dt + u.grad phi + phi div u - S]
+                 + (1/Pe) INT grad psi . grad mu``,
+        so S grows the phase mass by INT S dV per unit time (the deposition
+        channel).
+      ``fbody_gp`` — per-GP momentum source f(x, t)[dim] entering BOTH the
+        Galerkin momentum body AND the strong residual r_mom (so the SUPG/PSPG
+        stabilization stays CONSISTENT — required for the MMS design-order
+        gate; a Galerkin-only body force leaves an O(1) stabilization
+        consistency error).  Same subtraction convention as f_grav.
+    Both are pure explicit RHS terms (no Jacobian; the sources do not depend on
+    the unknowns), passed as zeros when unused so the signature stays uniform.
     """
     import warp as wp
     from ..assembly.operators import _kernel_cache
@@ -267,6 +281,8 @@ def make_chns_newton(nbf: int, nqp: int, dim: int):
                gmu_gp: wp.array2d(dtype=wp.float64),   # [ngp, dim]
                un_gp: wp.array2d(dtype=wp.float64),    # [ngp, dim]
                phin_gp: wp.array(dtype=wp.float64),    # [ngp]
+               src_phi_gp: wp.array(dtype=wp.float64), # [ngp] CH source S(x,t)
+               fbody_gp: wp.array2d(dtype=wp.float64), # [ngp, dim] momentum src
                ghat: wp.array(dtype=wp.float64),       # [dim]
                dt: wp.float64, Re: wp.float64, We: wp.float64,
                Cn: wp.float64, Pe: wp.float64,
@@ -343,9 +359,11 @@ def make_chns_newton(nbf: int, nqp: int, dim: int):
                 ugradu[d] = ug
                 fcap_d = cw_inv * mu_gp[gp] * gphi_gp[gp, d]
                 fgrav_d = rho * grav_scale * ghat[d]
+                fmms_d = fbody_gp[gp, d]     # MMS/SP-1 momentum source
                 accel[d] = (u_gp[gp, d] - un_gp[gp, d]) / dt + ug
                 r_mom[d] = rho * (u_gp[gp, d] - un_gp[gp, d]) / dt \
-                    + rho * ug + Jg + gp_gp[gp, d] - fcap_d - fgrav_d
+                    + rho * ug + Jg + gp_gp[gp, d] - fcap_d - fgrav_d \
+                    - fmms_d
 
             # div u
             divu = wp.float64(0.0)
@@ -370,11 +388,12 @@ def make_chns_newton(nbf: int, nqp: int, dim: int):
                     #                - fcap - fgrav
                     fcap_d = cw_inv * mu_gp[gp] * gphi_gp[gp, d]
                     fgrav_d = rho * grav_scale * ghat[d]
+                    fmms_d = fbody_gp[gp, d]
                     Jg = wp.float64(0.0)
                     for s in range(dim):
                         Jg += (agg * gmu_gp[gp, s]) * gu_gp[gp, d, s]
                     mom_body = rho * (u_gp[gp, d] - un_gp[gp, d]) / dt \
-                        + rho * ugradu[d] + Jg - fcap_d - fgrav_d
+                        + rho * ugradu[d] + Jg - fcap_d - fgrav_d - fmms_d
                     Rd = Na * mom_body
                     # viscous (eta/Re) symgu[d,s] dN_a,s
                     visc = wp.float64(0.0)
@@ -395,8 +414,10 @@ def make_chns_newton(nbf: int, nqp: int, dim: int):
                 Rp += tau * gNa_rmom
                 wp.atomic_add(be, e, blk * a + dim, -Rp * dJxW)
                 # --- CH phi row (field dim+1), conservative advection ---
+                # SP-1 deposition hook: subtract source S so mass grows by
+                # INT S dV (pure RHS term; no Jacobian dependence on unknowns)
                 ch_body = (phiq - phin_gp[gp]) / dt + ugradphi \
-                    + phiq * divu
+                    + phiq * divu - src_phi_gp[gp]
                 Rphi = Na * ch_body
                 gNa_gmu = wp.float64(0.0)
                 for s in range(dim):

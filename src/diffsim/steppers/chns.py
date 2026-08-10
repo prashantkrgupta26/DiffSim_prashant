@@ -346,12 +346,31 @@ class CHNSMonolithicStepper:
     """
 
     def __init__(self, dm, case, dt, linsolver="splu", Cn_override=None,
-                 gravity=True, newton_tol=1e-10, newton_max=30):
+                 gravity=True, newton_tol=1e-10, newton_max=30,
+                 tstep="bdf1", src_fns=None, body_fn=None):
         assert linsolver == "splu", \
             "prototype scope: splu only (spike ruling; GPU solves are a " \
             "build-out concern)"
+        if tstep not in ("bdf1", "bdf2"):
+            raise ValueError(f"tstep must be 'bdf1' or 'bdf2', got {tstep!r}")
         import warp as wp
         self._wp = wp
+        self.tstep = tstep
+        # Forcing (MMS / SP-1 deposition).  src_fns: length-blk list of per-
+        # field source fns fn(xq,t)->[ngp] added to the RHS of each residual
+        # row (u_0..u_{dim-1}, p, phi, mu).  The CH-phi source rides the
+        # kernel's src_phi hook (SP-1 deposition channel); the u/p/mu sources
+        # ride a host-side residual correction.  body_fn: fn(xq,t)->[ngp,dim]
+        # for the dim momentum rows (NS body-force channel).
+        self.src_fns = src_fns
+        self.body_fn = body_fn
+        # MMS Dirichlet hooks: when set, the strong velocity rows target
+        # bc_u_fn(coords,t)[:,d] instead of 0 (the manufactured solution is
+        # not no-slip-compatible); bc_phi_fn/bc_mu_fn optionally pin phi/mu on
+        # boundary nodes to the manufactured field (Dirichlet CH for MMS).
+        self.bc_u_fn = None
+        self.bc_phi_fn = None
+        self.bc_mu_fn = None
         T = dm.constraints.T
         assert T.shape[0] == T.shape[1] and (
             abs(T - sp.eye(T.shape[0])).nnz == 0), \
@@ -423,11 +442,22 @@ class CHNSMonolithicStepper:
         self._mu = np.zeros(self.nn)
         self.u_n = np.zeros((self.nn, dim))
         self.phi_n = np.zeros(self.nn)
+        # A4b variable-step BDF2 history (u^{n-1}, phi^{n-1}); None => BDF1
+        # bootstrap on the first step.  dt_prev = dt of the last committed step.
+        self.u_nm1 = None
+        self.phi_nm1 = None
+        self.dt_prev = None
         self.t = 0.0
+        self._t_eval = float(self.dt)     # t^{n+1} for MMS source
         self._lumped = None
         self.last_newton_iters = 0
         self.last_clamped = 0
         self.last_wall = 0.0
+
+        # physical GP coords per bin (for MMS / SP-1 source evaluation)
+        for B in self.bins:
+            node_xy = self.coords[B["conn"]]              # [ne, nbf, dim]
+            B["xq"] = np.einsum("qa,ead->eqd", B["N"], node_xy)  # [ne,nqp,dim]
 
         self._kernel = make_chns_newton(
             self.bins[0]["nbf"], self.bins[0]["nqp"], dim)
@@ -520,6 +550,28 @@ class CHNSMonolithicStepper:
         return v, g
 
     # ------------------------------------------------------------------
+    # A4b variable-step BDF2 effective time term (module docstring of
+    # multiphase.py): the kernel's time term is (x - xn)/dt.  For BDF2 we
+    # want sigma*x - hist with sigma = a/dt, hist = (b x^n - c x^{n-1})/dt,
+    # a = (1+2r)/(1+r), b = 1+r, c = r^2/(1+r), r = dt/dt_prev.  Setting
+    # dt_eff = 1/sigma and xn_eff = hist/sigma reproduces this on the SAME
+    # kernel (no kernel change): (x - xn_eff)/dt_eff = sigma*x - hist.
+    # First step (dt_prev None) bootstraps BDF1: dt_eff=dt, xn_eff=x^n.
+    # ------------------------------------------------------------------
+    def _bdf_time(self):
+        if self.tstep == "bdf2" and self.dt_prev is not None \
+                and self.u_nm1 is not None:
+            r = self.dt / self.dt_prev
+            sigma = (1.0 + 2.0 * r) / (1.0 + r) / self.dt
+            bv = 1.0 + r
+            cv = r * r / (1.0 + r)
+            dt_eff = 1.0 / sigma
+            u_n_eff = (bv * self.u_n - cv * self.u_nm1) / self.dt / sigma
+            phi_n_eff = (bv * self.phi_n - cv * self.phi_nm1) / self.dt / sigma
+            return dt_eff, u_n_eff, phi_n_eff
+        return self.dt, self.u_n, self.phi_n
+
+    # ------------------------------------------------------------------
     # residual + jacobian via the Warp kernel
     # ------------------------------------------------------------------
     def _assemble(self, x, want_jac):
@@ -530,24 +582,39 @@ class CHNSMonolithicStepper:
         arr = lambda a_: wp.array(np.ascontiguousarray(a_, np.float64),
                                   dtype=wp.float64, device=d)
         ghat_d = arr(self.ghat)
+        dt_eff, u_n_eff, phi_n_eff = self._bdf_time()
         R = np.zeros(self.ndof)
         rows, cols, valsK = [], [], []
         n_clamp = 0
         n_gp = 0
+        have_src = (self.src_fns is not None) or (self.body_fn is not None)
         for B in self.bins:
             ne, nbf, nqp = B["ne"], B["nbf"], B["nqp"]
             n_gp += ne * nqp
             u_gp, gu = self._interp_vec(u, B)          # [e,q,d],[e,q,d,s]
-            un_gp, _ = self._interp_vec(self.u_n, B)
+            un_gp, _ = self._interp_vec(u_n_eff, B)
             p_gp, gp = self._interp(p, B)
             phi_gp, gphi = self._interp(phi, B)
-            phin_gp, _ = self._interp(self.phi_n, B)
+            phin_gp, _ = self._interp(phi_n_eff, B)
             mu_gp, gmu = self._interp(mu, B)
             ngp = ne * nqp
             # clamp count (mix_props on phi at GPs) — host-side diagnostic
             _, _, nc = mix_props(phi_gp.ravel(), self.rho_h, self.rho_l,
                                  self.eta_h, self.eta_l)
             n_clamp += int(nc)
+
+            # --- MMS / SP-1 sources at GPs (t^{n+1}) -----------------------
+            src_phi = np.zeros(ngp)
+            fbody = np.zeros((ngp, dim))
+            xq = B["xq"].reshape(ngp, dim)
+            if have_src and self.src_fns is not None \
+                    and len(self.src_fns) > dim + 1 \
+                    and self.src_fns[dim + 1] is not None:
+                src_phi = np.asarray(
+                    self.src_fns[dim + 1](xq, self._t_eval), float)
+            if have_src and self.body_fn is not None:
+                fbody = np.asarray(self.body_fn(xq, self._t_eval), float)
+                fbody = fbody.reshape(ngp, dim)
 
             Ae = wp.zeros((ne, blk * nbf, blk * nbf), dtype=wp.float64,
                           device=d)
@@ -564,8 +631,10 @@ class CHNSMonolithicStepper:
                 arr(gmu.reshape(ngp, dim)),
                 arr(un_gp.reshape(ngp, dim)),
                 arr(phin_gp.reshape(ngp)),
+                arr(src_phi.reshape(ngp)),
+                arr(fbody.reshape(ngp, dim)),
                 ghat_d,
-                wp.float64(self.dt), wp.float64(self.Re),
+                wp.float64(dt_eff), wp.float64(self.Re),
                 wp.float64(self.We), wp.float64(self.Cn),
                 wp.float64(self.Pe), wp.float64(self.cw_inv),
                 wp.float64(self.agg), wp.float64(self.grav_scale),
@@ -576,6 +645,28 @@ class CHNSMonolithicStepper:
             gdof = B["gdof"]
             # residual R = -be  (kernel emits be = -residual)
             np.add.at(R, gdof.ravel(), (-beh).ravel())
+
+            # --- host-side p/mu (and explicit u-row) src corrections -------
+            # The phi-row source rides the kernel (src_phi_gp) and the momentum
+            # body force rides the kernel (fbody_gp); the continuity, mu-row and
+            # any explicit u-row src_fns entries ride here as -INT N_a S_f
+            # (pure RHS, no Jacobian).
+            if self.src_fns is not None:
+                N = B["N"]
+                jac = (B["h"] / 2.0) ** dim
+                dJxW = B["w"][None, :] * jac[:, None]    # [ne, nqp]
+                for f in range(blk):
+                    if f == dim + 1:
+                        continue                         # phi -> kernel hook
+                    if f >= len(self.src_fns) or self.src_fns[f] is None:
+                        continue
+                    sf = np.asarray(self.src_fns[f](xq, self._t_eval), float)
+                    if not np.any(sf):
+                        continue
+                    Rsrc = -np.einsum("eq,qa,eq->ea", dJxW, N,
+                                      sf.reshape(ne, nqp))
+                    np.add.at(R, gdof[:, f::blk].ravel(), Rsrc.ravel())
+
             if want_jac:
                 Aeh = Ae.numpy()
                 rows.append(np.repeat(gdof, blk * nbf, axis=1).ravel())
@@ -601,11 +692,39 @@ class CHNSMonolithicStepper:
             for dd in range(dim):
                 rows.append(a * blk + dd)
         rows.append(0 * blk + dim)          # pressure pin at node 0
+        if self.bc_phi_fn is not None:
+            for a in np.where(self.bnd)[0]:
+                rows.append(a * blk + dim + 1)
+        if self.bc_mu_fn is not None:
+            for a in np.where(self.bnd)[0]:
+                rows.append(a * blk + dim + 2)
         return np.asarray(rows, np.int64)
 
-    def _apply_bc(self, x, R, J):
+    def _bc_target(self, x):
+        """Dirichlet target vector t so the strong rows enforce x_row = t_row.
+        Default: u=0 no-slip, p_node0=0.  With MMS hooks, boundary velocity /
+        phi / mu target the manufactured field at t^{n+1}."""
+        blk, dim = self.blk, self.dim
         rows = self._bc_rows()
-        R[rows] = x[rows]                   # target 0 (u=0, p_node0=0)
+        tgt = np.zeros_like(x)              # default: u=0, p_node0=0 targets
+        if self.bc_u_fn is not None:
+            ub = np.asarray(self.bc_u_fn(self.coords, self._t_eval), float)
+            for a in np.where(self.bnd)[0]:
+                for dd in range(dim):
+                    tgt[a * blk + dd] = ub[a, dd]
+        if self.bc_phi_fn is not None:
+            pb = np.asarray(self.bc_phi_fn(self.coords, self._t_eval), float)
+            for a in np.where(self.bnd)[0]:
+                tgt[a * blk + dim + 1] = pb[a]
+        if self.bc_mu_fn is not None:
+            mb = np.asarray(self.bc_mu_fn(self.coords, self._t_eval), float)
+            for a in np.where(self.bnd)[0]:
+                tgt[a * blk + dim + 2] = mb[a]
+        return rows, tgt
+
+    def _apply_bc(self, x, R, J):
+        rows, tgt = self._bc_target(x)
+        R[rows] = x[rows] - tgt[rows]       # Newton row: x_row -> tgt_row
         J = J.tolil()
         for r in rows:
             J.rows[r] = [int(r)]
@@ -617,6 +736,7 @@ class CHNSMonolithicStepper:
     # ------------------------------------------------------------------
     def step(self):
         t0 = time.perf_counter()
+        self._t_eval = self.t + self.dt      # MMS source / BC at t^{n+1}
         x = self.pack()
         it = 0
         rnorm = np.inf
@@ -630,7 +750,8 @@ class CHNSMonolithicStepper:
             x = x + dx
             if float(np.abs(dx).max()) < self.newton_tol:
                 R, _ = self._assemble(x, want_jac=False)
-                R[self._bc_rows()] = x[self._bc_rows()]
+                rows, tgt = self._bc_target(x)
+                R[rows] = x[rows] - tgt[rows]
                 rnorm = float(np.linalg.norm(R))
                 break
         else:
@@ -645,6 +766,10 @@ class CHNSMonolithicStepper:
                 f"mix_props clamp counter {clamped} > 1% of {ngp} GPs")
 
         u, p, phi, mu = self.unpack(x)
+        # BDF2 history: shift x^{n-1} <- x^n BEFORE overwriting x^n <- x^{n+1}
+        self.u_nm1 = self.u_n.copy()
+        self.phi_nm1 = self.phi_n.copy()
+        self.dt_prev = self.dt
         self.u_n = u.copy()
         self.phi_n = phi.copy()
         self._u, self._p, self._phi, self._mu = u, p, phi, mu
@@ -655,6 +780,37 @@ class CHNSMonolithicStepper:
         return {"t": self.t, "newton_iters": self.last_newton_iters,
                 "clamped": self.last_clamped,
                 "wall_per_step": self.last_wall}
+
+    # ------------------------------------------------------------------
+    def energy(self):
+        r"""Discrete free energy E = E_kin + E_interface + E_bulk (GP-integrated).
+
+          E_kin       = INT (1/2) rho |u|^2                  (kinetic)
+          E_interface = (1/We) INT (Cn^2/2) |grad phi|^2     (gradient / capillary)
+          E_bulk      = (1/We) INT (1/4)(phi^2 - 1)^2        (double-well)
+
+        The CH part carries the 1/We surface-tension scaling of the
+        non-dimensional CHNS free energy.  For an UNFORCED closed system with
+        no gravity, this quantity is non-increasing between steps (the
+        structural-diagnostic gate).  Returns a dict of the three parts + total.
+        """
+        e_kin = e_int = e_bulk = 0.0
+        for B in self.bins:
+            jac = (B["h"] / 2.0) ** self.dim
+            dJxW = B["w"][None, :] * jac[:, None]           # [ne, nqp]
+            u_gp, _ = self._interp_vec(self._u, B)          # [e,q,d]
+            phi_gp, gphi = self._interp(self._phi, B)       # [e,q], [e,q,d]
+            rho_gp, _, _ = mix_props(phi_gp.ravel(), self.rho_h, self.rho_l,
+                                     self.eta_h, self.eta_l)
+            rho_gp = rho_gp.reshape(phi_gp.shape)
+            e_kin += float(np.sum(dJxW * 0.5 * rho_gp
+                                  * np.sum(u_gp ** 2, axis=-1)))
+            e_int += float(np.sum(dJxW * 0.5 * self.Cn ** 2
+                                  * np.sum(gphi ** 2, axis=-1))) / self.We
+            e_bulk += float(np.sum(dJxW * 0.25
+                                   * (phi_gp ** 2 - 1.0) ** 2)) / self.We
+        return {"kinetic": e_kin, "interface": e_int, "bulk": e_bulk,
+                "total": e_kin + e_int + e_bulk}
 
     # ------------------------------------------------------------------
     def march(self, t_end, snap_every=None):
@@ -674,3 +830,71 @@ class CHNSMonolithicStepper:
                     "clamped": self.last_clamped,
                 })
         return snaps
+
+
+def CHNSStepper(dm, case, dt, mode="auto", tstep="bdf1", linsolver="splu",
+                Cn_override=None, gravity=True, src_fns=None, body_fn=None,
+                **kwargs):
+    r"""SP-0 Task 9 facade — the ONE public entry point for CHNS forward
+    marching.  Thin dispatcher over the two reviewed coupling prototypes; the
+    coupling decision (docs/dev/2026-08-10-sp0-coupling-decision.md, Baskar
+    2026-08-10) is baked in: ``mode="auto"`` -> MONOLITHIC (the adjoint-bearing
+    primary mode).
+
+    Parameters
+    ----------
+    dm, case, dt : DeviceMesh, CHNSCase, float
+        Uniform Q1 mesh (constraints.T == identity), non-dim case, fixed step.
+    mode : {"auto", "monolithic", "staggered"}
+        "auto"/"monolithic" -> ``CHNSMonolithicStepper`` (the decided primary,
+        adjoint-bearing, machine-exact mass conservation, BDF1/BDF2).
+        "staggered" -> ``CHNSStaggeredStepper``, the DOCUMENTED FORWARD-ONLY
+        fast mode (retained per the decision memo; 4.8x faster per step, no
+        adjoint, secular mass drift).  It is BDF1-only: passing tstep="bdf2"
+        with mode="staggered" raises.
+    tstep : {"bdf1", "bdf2"}
+        Time scheme (monolithic only).  "bdf2" is variable-step BDF2 with the
+        MultiPhaseStepper A4b coefficients, BDF1-bootstrapped on the first step.
+    linsolver : {"splu"}
+        Prototype scope (spike ruling); GPU solves are a later build-out.
+    Cn_override : {None, "2h", float}
+        None -> case.Cn; "2h" -> 2*hmin (the Cn >= h resolvability convention
+        the coupling-decision memo's guard finding binds benchmark configs to);
+        float -> as-is.
+    src_fns : list or None
+        SP-1 deposition / MMS forcing hook.  Length-blk (= dim+3) list of
+        per-field source functions fn(xq[ngp,dim], t) -> [ngp] added to the RHS
+        of each residual row (u_0..u_{dim-1}, p, phi, mu).  The CH-phi entry
+        (index dim+1) rides the monolithic kernel's src hook (the deposition
+        channel); the others ride a host-side residual correction.  Static per
+        step, evaluated at t^{n+1}.  (Ignored by the staggered forward mode.)
+    body_fn : callable or None
+        NS body-force channel fn(xq, t) -> [ngp, dim] added to the dim momentum
+        rows (MMS convenience; monolithic only).
+
+    Returns
+    -------
+    A stepper instance implementing the shared protocol (.step, .march, .phi,
+    .u, .p, .energy [monolithic], .mass_phi, snapshot dicts).
+    """
+    if mode in ("auto", "monolithic"):
+        return CHNSMonolithicStepper(
+            dm, case, dt, linsolver=linsolver, Cn_override=Cn_override,
+            gravity=gravity, tstep=tstep, src_fns=src_fns, body_fn=body_fn,
+            **kwargs)
+    if mode == "staggered":
+        if tstep != "bdf1":
+            raise ValueError(
+                "CHNSStaggeredStepper is BDF1-only (documented forward-only "
+                f"fast mode); got tstep={tstep!r}.  Use mode='monolithic' for "
+                "BDF2.")
+        if src_fns is not None or body_fn is not None:
+            raise ValueError(
+                "src_fns/body_fn (SP-1 deposition / MMS forcing) are wired on "
+                "the monolithic mode only; the staggered fast mode does not "
+                "carry the source hook.")
+        return CHNSStaggeredStepper(
+            dm, case, dt, linsolver=linsolver, Cn_override=Cn_override,
+            **kwargs)
+    raise ValueError(
+        f"mode must be 'auto', 'monolithic', or 'staggered', got {mode!r}")

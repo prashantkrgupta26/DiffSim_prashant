@@ -130,7 +130,8 @@ class CHNSDiscrete:
     """
 
     def __init__(self, level, dim, case, dt, dm, gravity=True,
-                 Cn_override=None, newton_tol=1e-10, newton_max=30):
+                 Cn_override=None, newton_tol=1e-10, newton_max=30,
+                 src_fns=None, body_fn=None, tstep="bdf1"):
         T = dm.constraints.T
         assert T.shape[0] == T.shape[1] and (
             abs(T - sp.eye(T.shape[0])).nnz == 0), \
@@ -145,6 +146,20 @@ class CHNSDiscrete:
         self.gravity = bool(gravity)
         self.newton_tol = float(newton_tol)
         self.newton_max = int(newton_max)
+        # MMS / SP-1 forcing: src_fns is a length-blk list of per-field source
+        # functions fn(xq[ngp,dim], t) -> [ngp], added to the RHS of each
+        # residual row (u_0..u_{dim-1}, p, phi, mu).  None entries -> no source.
+        # body_fn is a convenience alias: fn(xq, t) -> [ngp, dim] for the dim
+        # momentum rows (the NS body-force channel).  Both static per step;
+        # evaluated at t^{n+1} (fully-implicit convention).
+        self.src_fns = src_fns
+        self.body_fn = body_fn
+        if tstep not in ("bdf1", "bdf2"):
+            raise ValueError(f"tstep must be 'bdf1' or 'bdf2', got {tstep!r}")
+        self.tstep = tstep
+        self.u_nm1 = None                 # x^{n-1} (None => BDF1 bootstrap)
+        self.phi_nm1 = None
+        self.dt_prev = None
 
         # --- non-dim parameters -------------------------------------------
         self.Re = float(case.Re)
@@ -180,9 +195,12 @@ class CHNSDiscrete:
             gdof = (conn[:, :, None] * self.blk
                     + np.arange(self.blk)[None, None, :]).reshape(
                         ne, self.blk * nbf)
+            # physical GP coords xq[ne, nqp, dim] (for MMS source evaluation)
+            node_xy = dm.mesh.node_coords[conn]               # [ne, nbf, dim]
+            xq = np.einsum("qa,ead->eqd", N, node_xy)         # [ne, nqp, dim]
             self.bins.append(dict(conn=conn, N=N, dN=dN, w=w, h=h, ne=ne,
                                   nbf=nbf, nqp=N.shape[0], dscale=dscale,
-                                  dJxW=dJxW, gdof=gdof))
+                                  dJxW=dJxW, gdof=gdof, xq=xq))
             hmin = min(hmin, float(h.min()))
         self.h = hmin
 
@@ -206,6 +224,7 @@ class CHNSDiscrete:
         self.u_n = np.zeros((self.nn, self.dim))
         self.phi_n = np.zeros(self.nn)
         self.t = 0.0
+        self._t_eval = float(self.dt)     # t^{n+1} for MMS source (updated per step)
         self._lumped = None
 
     # ------------------------------------------------------------------
@@ -279,7 +298,21 @@ class CHNSDiscrete:
     # ==================================================================
     def _assemble(self, x, want_jac):
         u, p, phi, mu = self.unpack(x)
-        blk, dim, dt = self.blk, self.dim, self.dt
+        blk, dim = self.blk, self.dim
+        # A4b variable-step BDF2 effective time term: reproduce sigma*x - hist
+        # via an effective (dt, x^n) on the SAME BDF1 kernel — dt_eff = 1/sigma,
+        # xn_eff = hist/sigma (see steppers/chns.py:_bdf_time).  BDF1 default.
+        if self.tstep == "bdf2" and self.dt_prev is not None \
+                and self.u_nm1 is not None:
+            rr = self.dt / self.dt_prev
+            sig = (1.0 + 2.0 * rr) / (1.0 + rr) / self.dt
+            bv, cv = 1.0 + rr, rr * rr / (1.0 + rr)
+            dt = 1.0 / sig
+            u_n_eff = (bv * self.u_n - cv * self.u_nm1) / self.dt / sig
+            phi_n_eff = (bv * self.phi_n - cv * self.phi_nm1) / self.dt / sig
+        else:
+            dt = self.dt
+            u_n_eff, phi_n_eff = self.u_n, self.phi_n
         Re, We, Cn, Pe, Fr = self.Re, self.We, self.Cn, self.Pe, self.Fr
         cw_inv = 1.0 / (Cn * We)
         R = np.zeros(self.ndof)
@@ -300,10 +333,10 @@ class CHNSDiscrete:
             n_gp += ne * nqp
 
             u_gp, gu = self._interp_vec(u, B)          # [e,q,d], [e,q,d,s]
-            un_gp, _ = self._interp_vec(self.u_n, B)
+            un_gp, _ = self._interp_vec(u_n_eff, B)
             p_gp, gp = self._interp(p, B)
             phi_gp, gphi = self._interp(phi, B)
-            phin_gp, _ = self._interp(self.phi_n, B)
+            phin_gp, _ = self._interp(phi_n_eff, B)
             mu_gp, gmu = self._interp(mu, B)
 
             # --- local rho, eta at GPs (implicit phi) ----------------------
@@ -364,18 +397,26 @@ class CHNSDiscrete:
             # --- capillary + gravity body forces [e,q,comp] ----------------
             fcap = cw_inv * mu_gp[..., None] * gphi     # [e,q,s]
             fgrav = (rho_gp[..., None] * grav_scale) * ghat[None, None, :]
+            # MMS/SP-1 momentum source enters BOTH r_mom (strong, SUPG/PSPG
+            # consistency) and the Galerkin body — same convention as the
+            # kernel's fbody_gp.
+            fmms = np.zeros((ne, nqp, dim))
+            if self.body_fn is not None:
+                bf = np.asarray(self.body_fn(B["xq"].reshape(ne * nqp, dim),
+                                             self._t_eval), float)
+                fmms = bf.reshape(ne, nqp, dim)
 
             # --- momentum strong residual (p1: no viscous lap) -------------
             # r_mom = rho(u-u_n)/dt + rho ugradu + Jgradu + grad p - fcap - fgrav
             r_mom = (rho_gp[..., None] * (u_gp - un_gp) / dt
                      + rho_gp[..., None] * ugradu
-                     + Jgradu + gp - fcap - fgrav)      # [e,q,comp]
+                     + Jgradu + gp - fcap - fgrav - fmms)  # [e,q,comp]
 
             # ---------------- RESIDUAL ROWS --------------------------------
             # momentum galerkin: INT N_a * [rho(u-un)/dt + rho ugradu + Jgradu]
             mom_body = (rho_gp[..., None] * (u_gp - un_gp) / dt
                         + rho_gp[..., None] * ugradu + Jgradu
-                        - fcap - fgrav)                 # [e,q,comp]
+                        - fcap - fgrav - fmms)          # [e,q,comp]
             # INT N_a * mom_body  -> [e,a,comp]
             Rmom = np.einsum("eq,qa,eqd->ead", dJxW, N, mom_body)
             # viscous (2 eta/Re) D(u):D(w):  eta/Re (grad u + grad u^T):grad w
@@ -420,6 +461,24 @@ class CHNSDiscrete:
             Rmu = (np.einsum("eq,qa,eq->ea", dJxW, N, mu_gp - fp)
                    - Cn ** 2 * np.einsum("eq,eqas,eqs->ea", dJxW, dNp, gphi))
             np.add.at(R, B["gdof"][:, dim + 2::blk].ravel(), Rmu.ravel())
+
+            # --- MMS / SP-1 forcing: -INT N_a * S_f per field f ------------
+            # S does not depend on the unknowns -> RHS only (no Jacobian).
+            # The momentum body force (body_fn) is NOT applied here — it enters
+            # r_mom / mom_body above (SUPG/PSPG consistency).  This loop carries
+            # the p / phi / mu (and any explicit u-row) src_fns entries.
+            if self.src_fns is not None:
+                t_eval = self._t_eval
+                xq = B["xq"].reshape(ne * nqp, dim)          # [ngp, dim]
+                for f in range(blk):
+                    if f >= len(self.src_fns) or self.src_fns[f] is None:
+                        continue
+                    sf = np.asarray(self.src_fns[f](xq, t_eval), float)
+                    if not np.any(sf):
+                        continue
+                    sf = sf.reshape(ne, nqp)
+                    Rsrc = -np.einsum("eq,qa,eq->ea", dJxW, N, sf)
+                    np.add.at(R, B["gdof"][:, f::blk].ravel(), Rsrc.ravel())
 
             if not want_jac:
                 continue
@@ -723,6 +782,7 @@ class CHNSDiscrete:
     # Newton step
     # ------------------------------------------------------------------
     def step(self, guards=True):
+        self._t_eval = self.t + self.dt      # MMS source evaluated at t^{n+1}
         x = self.pack()
         it = 0
         rnorm = np.inf
@@ -751,7 +811,11 @@ class CHNSDiscrete:
                 f"mix_props clamp counter {clamped} > 1% of {ngp} GPs")
 
         u, p, phi, mu = self.unpack(x)
-        # commit history (BDF1: previous = just-converged state)
+        # commit history: shift x^{n-1} <- x^n before x^n <- x^{n+1} (BDF2);
+        # BDF1 ignores x^{n-1}.
+        self.u_nm1 = self.u_n.copy()
+        self.phi_nm1 = self.phi_n.copy()
+        self.dt_prev = self.dt
         self.u_n = u.copy()
         self.phi_n = phi.copy()
         self.u, self.p, self.phi, self.mu = u, p, phi, mu
