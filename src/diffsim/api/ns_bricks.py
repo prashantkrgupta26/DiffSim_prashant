@@ -511,15 +511,194 @@ def make_linear_ns_be(nbf: int, nqp: int, dim: int):
     return lin_ns_be
 
 
+def make_linear_ns_Ae_var(nbf: int, nqp: int, dim: int):
+    """Variable-coefficient element-matrix kernel: per-GP nu_q [ne*nqp]
+    (dynamic viscosity) and rho_q [ne*nqp] (density). Momentum time +
+    convection terms scaled by rho_q; viscous term uses nu_q (= eta_q);
+    tau_m computed from local kinematic viscosity nu_loc = nu_q / rho_q.
+    Same metric tau formula as the constant-nu kernel — local-coefficient
+    generalization only, no formula redesign."""
+    key = ("lin_ns_Ae_var", nbf, nqp, dim)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+    ndof = dim + 1
+    dim_pow = float(dim)
+    dim_f = float(dim)
+
+    @wp.kernel(module="unique", enable_backward=False,
+               module_options=({"max_unroll": 0}
+                               if (dim >= 3 or nbf > 4) else {}))
+    def lin_ns_Ae_var(conn: wp.array2d(dtype=wp.int32),
+                      h: wp.array(dtype=wp.float64),
+                      Ntab: wp.array2d(dtype=wp.float64),
+                      dNtab: wp.array3d(dtype=wp.float64),
+                      lapNtab: wp.array2d(dtype=wp.float64),
+                      wtab: wp.array(dtype=wp.float64),
+                      aq: wp.array2d(dtype=wp.float64),
+                      div_aq: wp.array(dtype=wp.float64),
+                      gaq: wp.array2d(dtype=wp.float64),
+                      nu_q: wp.array(dtype=wp.float64),
+                      rho_q: wp.array(dtype=wp.float64),
+                      sigma: wp.float64, sig2tau: wp.float64,
+                      tau_scale: wp.float64,
+                      s_skew: wp.float64, newton: wp.int32,
+                      Ae: wp.array3d(dtype=wp.float64)):
+        e = wp.tid()
+        fe = FEMElm()
+        fe.e = e
+        fe.he = h[e]
+        jac = wp.pow(fe.he * wp.float64(0.5), wp.float64(dim_pow))
+        dscale = wp.float64(2.0) / fe.he
+        for q in range(nqp):
+            fe.q = q
+            dJxW = fe_detJxW_s(wtab, fe, jac)
+            gp = e * nqp + q
+            amag = wp.float64(0.0)
+            for d in range(dim):
+                amag += aq[gp, d] * aq[gp, d]
+            amag = wp.sqrt(amag)
+            eta_loc = nu_q[gp]                            # dynamic viscosity
+            rho_loc = rho_q[gp]                           # density
+            nu_loc = eta_loc / rho_loc                    # kinematic viscosity
+            tauM = tau_m_metric(amag, fe.he, nu_loc, sig2tau,
+                                wp.float64(dim_f)) * tau_scale
+            tauC = tau_c_metric(tauM, fe.he, wp.float64(dim_f))
+            diva = div_aq[gp]
+            for a in range(nbf):
+                Na = fe_N(Ntab, fe, a)
+                agw = wp.float64(0.0)
+                for d in range(dim):
+                    agw += aq[gp, d] * fe_dN_s(dNtab, fe, a, d, dscale)
+                for b in range(nbf):
+                    Nb = fe_N(Ntab, fe, b)
+                    agu = wp.float64(0.0)
+                    lap = wp.float64(0.0)
+                    for d in range(dim):
+                        agu += aq[gp, d] * fe_dN_s(dNtab, fe, b, d, dscale)
+                        lap += fe_dN_s(dNtab, fe, a, d, dscale) \
+                            * fe_dN_s(dNtab, fe, b, d, dscale)
+                    conv = agu + s_skew * diva * Nb
+                    # Strong residual: rho*(sigma u + a.grad u) - eta lap u
+                    # (complete G4 form, local coefficients)
+                    resu = rho_loc * (sigma * Nb + conv) \
+                        - eta_loc * lapNtab[fe.q, b] * dscale * dscale
+                    diag = (rho_loc * sigma * Na * Nb
+                            + rho_loc * Na * conv
+                            + eta_loc * lap
+                            + tauM * agw * resu) * dJxW
+                    for i in range(dim):
+                        wp.atomic_add(Ae, e, ndof * a + i, ndof * b + i, diag)
+                        for j in range(dim):
+                            wp.atomic_add(
+                                Ae, e, ndof * a + i, ndof * b + j,
+                                tauC * fe_dN_s(dNtab, fe, a, i, dscale)
+                                * fe_dN_s(dNtab, fe, b, j, dscale) * dJxW)
+                        wp.atomic_add(
+                            Ae, e, ndof * a + i, ndof * b + dim,
+                            (-fe_dN_s(dNtab, fe, a, i, dscale) * Nb
+                             + tauM * agw
+                             * fe_dN_s(dNtab, fe, b, i, dscale)) * dJxW)
+                        wp.atomic_add(
+                            Ae, e, ndof * a + dim, ndof * b + i,
+                            (Na * fe_dN_s(dNtab, fe, b, i, dscale)
+                             + tauM * fe_dN_s(dNtab, fe, a, i, dscale)
+                             * resu) * dJxW)
+                    if newton == 1:
+                        for i in range(dim):
+                            for j in range(dim):
+                                wp.atomic_add(
+                                    Ae, e, ndof * a + i, ndof * b + j,
+                                    Na * Nb * gaq[gp, i * dim + j] * dJxW)
+                    wp.atomic_add(Ae, e, ndof * a + dim, ndof * b + dim,
+                                  tauM * lap * dJxW)
+
+    _kernel_cache[key] = lin_ns_Ae_var
+    return lin_ns_Ae_var
+
+
+def make_linear_ns_be_var(nbf: int, nqp: int, dim: int):
+    """Variable-coefficient RHS kernel: per-GP nu_q [ne*nqp] and rho_q
+    [ne*nqp] for tau_m; fq [ne*nqp, dim] is the body force at GPs.
+    Same SUPG/PSPG consistency as the constant-nu kernel; tau uses
+    local kinematic nu_loc = nu_q / rho_q."""
+    key = ("lin_ns_be_var", nbf, nqp, dim)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+    ndof = dim + 1
+    dim_pow = float(dim)
+    dim_f = float(dim)
+
+    @wp.kernel(module="unique", enable_backward=False,
+               module_options=({"max_unroll": 0}
+                               if (dim >= 3 or nbf > 4) else {}))
+    def lin_ns_be_var(conn: wp.array2d(dtype=wp.int32),
+                      h: wp.array(dtype=wp.float64),
+                      Ntab: wp.array2d(dtype=wp.float64),
+                      dNtab: wp.array3d(dtype=wp.float64),
+                      wtab: wp.array(dtype=wp.float64),
+                      aq: wp.array2d(dtype=wp.float64),
+                      fq: wp.array2d(dtype=wp.float64),
+                      nu_q: wp.array(dtype=wp.float64),
+                      rho_q: wp.array(dtype=wp.float64),
+                      sig2tau: wp.float64,
+                      tau_scale: wp.float64,
+                      be: wp.array2d(dtype=wp.float64)):
+        e = wp.tid()
+        fe = FEMElm()
+        fe.e = e
+        fe.he = h[e]
+        jac = wp.pow(fe.he * wp.float64(0.5), wp.float64(dim_pow))
+        dscale = wp.float64(2.0) / fe.he
+        for q in range(nqp):
+            fe.q = q
+            dJxW = fe_detJxW_s(wtab, fe, jac)
+            gp = e * nqp + q
+            amag = wp.float64(0.0)
+            for d in range(dim):
+                amag += aq[gp, d] * aq[gp, d]
+            amag = wp.sqrt(amag)
+            nu_loc = nu_q[gp] / rho_q[gp]
+            tauM = tau_m_metric(amag, fe.he, nu_loc, sig2tau,
+                                wp.float64(dim_f)) * tau_scale
+            for a in range(nbf):
+                Na = fe_N(Ntab, fe, a)
+                agw = wp.float64(0.0)
+                for d in range(dim):
+                    agw += aq[gp, d] * fe_dN_s(dNtab, fe, a, d, dscale)
+                for i in range(dim):
+                    wp.atomic_add(be, e, ndof * a + i,
+                                  (Na + tauM * agw) * fq[gp, i] * dJxW)
+                    wp.atomic_add(be, e, ndof * a + dim,
+                                  tauM * fe_dN_s(dNtab, fe, a, i, dscale)
+                                  * fq[gp, i] * dJxW)
+
+    _kernel_cache[key] = lin_ns_be_var
+    return lin_ns_be_var
+
+
 def assemble_linear_ns(dm, aq_by_bin, div_aq_by_bin, fq_by_bin, nu,
                        sigma=0.0, sig2tau=None, s_skew=0.5,
-                       gaq_by_bin=None, newton=False, tau_scale=1.0):
+                       gaq_by_bin=None, newton=False, tau_scale=1.0,
+                       nu_q_by_bin=None, rho_q_by_bin=None,
+                       f_q_by_bin=None):
     """(A, b) constrained, node-major ndof=dim+1. aq/div_aq/fq: per-bin GP
-    arrays (host numpy). sig2tau defaults to (2 sigma)^2."""
+    arrays (host numpy). sig2tau defaults to (2 sigma)^2.
+
+    Optional per-GP variable-coefficient kwargs (all None -> bit-identical to
+    the constant-nu path; static gate selects the variable-nu kernel variants):
+      nu_q_by_bin  : dict[pv -> ndarray [n_elem_bin, nqp]]  dynamic viscosity
+      rho_q_by_bin : dict[pv -> ndarray [n_elem_bin, nqp]]  density
+      f_q_by_bin   : dict[pv -> ndarray [n_elem_bin, nqp, dim]]  body force
+                     (adds to fq_by_bin on the RHS load path)
+
+    When nu_q_by_bin/rho_q_by_bin are supplied the variable-nu kernel variants
+    are used: momentum time+convection terms scaled by rho_q; viscous term uses
+    nu_q (= eta_q); tau_m per GP via local kinematic nu_loc = nu_q / rho_q."""
     dim = dm.dim
     ndof = dim + 1
     if sig2tau is None:
         sig2tau = (2.0 * sigma) ** 2
+    use_var = nu_q_by_bin is not None or rho_q_by_bin is not None
     d = dm.device
     rows, cols, vals = [], [], []
     F_full = np.zeros(dm.n_nodes * ndof)
@@ -535,25 +714,58 @@ def assemble_linear_ns(dm, aq_by_bin, div_aq_by_bin, fq_by_bin, nu,
                  np.ascontiguousarray(
                      gaq_by_bin[pv].reshape(-1, dim * dim)))
         gaq = wp.array(ga_np, dtype=wp.float64, device=d)
-        fq = wp.array(np.ascontiguousarray(fq_by_bin[pv]), dtype=wp.float64,
-                      device=d)
+        # Effective body force: sum prescribed fq and optional extra f_q_by_bin
+        fq_np = np.ascontiguousarray(fq_by_bin[pv])
+        if f_q_by_bin is not None:
+            fq_np = fq_np + np.ascontiguousarray(
+                f_q_by_bin[pv].reshape(fq_np.shape))
+        fq = wp.array(fq_np, dtype=wp.float64, device=d)
         Ae = wp.zeros((ne, nbf * ndof, nbf * ndof), dtype=wp.float64,
                       device=d)
         be = wp.zeros((ne, nbf * ndof), dtype=wp.float64, device=d)
-        kA = make_linear_ns_Ae(nbf, nqp, dim)
-        kb = make_linear_ns_be(nbf, nqp, dim)
-        wp.launch(kA, dim=ne, inputs=[b["conn"], b["h"], b["N"], b["dN"],
-                                      b["lapN"],       # G4: complete resu
-                                      b["w"], aq, dq, gaq, wp.float64(nu),
-                                      wp.float64(sigma), wp.float64(sig2tau),
-                                      wp.float64(tau_scale),
-                                      wp.float64(s_skew),
-                                      wp.int32(1 if newton else 0), Ae],
-                  device=d)
-        wp.launch(kb, dim=ne, inputs=[b["conn"], b["h"], b["N"], b["dN"],
-                                      b["w"], aq, fq, wp.float64(nu),
-                                      wp.float64(sig2tau),
-                                      wp.float64(tau_scale), be], device=d)
+        if use_var:
+            # Variable-coefficient path: per-GP nu_q and rho_q arrays
+            nuq_np = (np.ascontiguousarray(nu_q_by_bin[pv]).ravel()
+                      if nu_q_by_bin is not None else
+                      np.full(ne * nqp, nu))
+            rhoq_np = (np.ascontiguousarray(rho_q_by_bin[pv]).ravel()
+                       if rho_q_by_bin is not None else
+                       np.ones(ne * nqp))
+            nuq = wp.array(nuq_np, dtype=wp.float64, device=d)
+            rhoq = wp.array(rhoq_np, dtype=wp.float64, device=d)
+            kA = make_linear_ns_Ae_var(nbf, nqp, dim)
+            kb = make_linear_ns_be_var(nbf, nqp, dim)
+            wp.launch(kA, dim=ne, inputs=[b["conn"], b["h"], b["N"], b["dN"],
+                                          b["lapN"],
+                                          b["w"], aq, dq, gaq, nuq, rhoq,
+                                          wp.float64(sigma),
+                                          wp.float64(sig2tau),
+                                          wp.float64(tau_scale),
+                                          wp.float64(s_skew),
+                                          wp.int32(1 if newton else 0), Ae],
+                      device=d)
+            wp.launch(kb, dim=ne, inputs=[b["conn"], b["h"], b["N"], b["dN"],
+                                          b["w"], aq, fq, nuq, rhoq,
+                                          wp.float64(sig2tau),
+                                          wp.float64(tau_scale), be],
+                      device=d)
+        else:
+            kA = make_linear_ns_Ae(nbf, nqp, dim)
+            kb = make_linear_ns_be(nbf, nqp, dim)
+            wp.launch(kA, dim=ne, inputs=[b["conn"], b["h"], b["N"], b["dN"],
+                                          b["lapN"],       # G4: complete resu
+                                          b["w"], aq, dq, gaq, wp.float64(nu),
+                                          wp.float64(sigma),
+                                          wp.float64(sig2tau),
+                                          wp.float64(tau_scale),
+                                          wp.float64(s_skew),
+                                          wp.int32(1 if newton else 0), Ae],
+                      device=d)
+            wp.launch(kb, dim=ne, inputs=[b["conn"], b["h"], b["N"], b["dN"],
+                                          b["w"], aq, fq, wp.float64(nu),
+                                          wp.float64(sig2tau),
+                                          wp.float64(tau_scale), be],
+                      device=d)
         Aeh, beh = Ae.numpy(), be.numpy()
         conn = dm.mesh.conn_of[pv].astype(np.int64)
         gdof = (conn[:, :, None] * ndof
