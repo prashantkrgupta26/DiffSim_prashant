@@ -347,7 +347,8 @@ class CHNSMonolithicStepper:
 
     def __init__(self, dm, case, dt, linsolver="splu", Cn_override=None,
                  gravity=True, newton_tol=1e-10, newton_max=30,
-                 tstep="bdf1", src_fns=None, body_fn=None, interface="ch"):
+                 tstep="bdf1", src_fns=None, body_fn=None, interface="ch",
+                 device=None):
         assert linsolver == "splu", \
             "prototype scope: splu only (spike ruling; GPU solves are a " \
             "build-out concern)"
@@ -359,6 +360,16 @@ class CHNSMonolithicStepper:
         self.interface = interface
         import warp as wp
         self._wp = wp
+        # device parity (SP-0 Task 12): the monolithic assembly launches the
+        # Warp kernel and creates all its work arrays on self.device.  Default
+        # is the DeviceMesh's own device (back-compat: CPU on a laptop, cuda:0
+        # on a GPU box); an explicit device= overrides it and — if it differs
+        # from dm.device — the per-bin basis-table device arrays (conn/h/N/dN/
+        # w) are re-materialised on the target device below.  The COO triplets
+        # still come back to the host (be.numpy()/Ae.numpy()) and the solve
+        # stays host splu: a device-kernel + host-solve gate (plan-sanctioned;
+        # device assembly is out of scope for this rung).
+        self.device = str(device) if device is not None else str(dm.device)
         self.tstep = tstep
         # Forcing (MMS / SP-1 deposition).  src_fns: length-blk list of per-
         # field source fns fn(xq,t)->[ngp] added to the RHS of each residual
@@ -433,12 +444,24 @@ class CHNSMonolithicStepper:
             gdof = (conn[:, :, None] * self.blk
                     + np.arange(self.blk)[None, None, :]).reshape(
                         ne, self.blk * nbf)
+            # device basis tables: reuse the DeviceMesh bin arrays when the
+            # target device matches; otherwise re-materialise on self.device
+            # (device-parity path — dm may be a CPU DeviceMesh driven onto CUDA).
+            if self.device == str(dm.device):
+                conn_d, h_d, N_d, dN_d, w_d = (
+                    b["conn"], b["h"], b["N"], b["dN"], b["w"])
+            else:
+                _dev = self.device
+                conn_d = wp.array(np.ascontiguousarray(conn.astype(np.int32)),
+                                  dtype=wp.int32, device=_dev)
+                h_d = wp.array(h, dtype=wp.float64, device=_dev)
+                N_d = wp.array(N, dtype=wp.float64, device=_dev)
+                dN_d = wp.array(dN, dtype=wp.float64, device=_dev)
+                w_d = wp.array(w, dtype=wp.float64, device=_dev)
             self.bins.append(dict(
                 pv=pv, conn=conn, N=N, dN=dN, w=w, h=h, ne=ne, nbf=nbf,
                 nqp=nqp, dscale=dscale, gdof=gdof,
-                # device basis tables (from DeviceMesh bin)
-                conn_d=b["conn"], h_d=b["h"], N_d=b["N"], dN_d=b["dN"],
-                w_d=b["w"]))
+                conn_d=conn_d, h_d=h_d, N_d=N_d, dN_d=dN_d, w_d=w_d))
 
         self.bnd = np.asarray(dm.mesh.boundary_nodes, bool)
         self.coords = np.asarray(dm.mesh.node_coords, np.float64)
@@ -606,7 +629,7 @@ class CHNSMonolithicStepper:
         wp = self._wp
         u, p, phi, mu = self.unpack(x)
         blk, dim = self.blk, self.dim
-        d = self.dm.device
+        d = self.device
         arr = lambda a_: wp.array(np.ascontiguousarray(a_, np.float64),
                                   dtype=wp.float64, device=d)
         ghat_d = arr(self.ghat)
@@ -869,7 +892,7 @@ class CHNSMonolithicStepper:
 
 def CHNSStepper(dm, case, dt, mode="auto", tstep="bdf1", linsolver="splu",
                 Cn_override=None, gravity=True, src_fns=None, body_fn=None,
-                interface="ch", **kwargs):
+                interface="ch", device=None, **kwargs):
     r"""SP-0 Task 9 facade — the ONE public entry point for CHNS forward
     marching.  Thin dispatcher over the two reviewed coupling prototypes; the
     coupling decision (docs/dev/2026-08-10-sp0-coupling-decision.md, Baskar
@@ -906,6 +929,12 @@ def CHNSStepper(dm, case, dt, mode="auto", tstep="bdf1", linsolver="splu",
     body_fn : callable or None
         NS body-force channel fn(xq, t) -> [ngp, dim] added to the dim momentum
         rows (MMS convenience; monolithic only).
+    device : str or None
+        Compute device for the monolithic Warp assembly ("cpu", "cuda:0", …).
+        None -> the DeviceMesh's own device (SP-0 Task 12 device-parity knob).
+        A CUDA device runs the coupled-residual/Jacobian kernel on the GPU; the
+        COO triplets still return to the host and the linear solve stays splu
+        (device-kernel + host-solve gate).  Staggered mode rejects a CUDA device.
     interface : {"ch", "cac"}
         Interface model (monolithic only; the staggered fast mode is CH-only
         and raises on "cac").  "ch" (default) -> Cahn-Hilliard 4-field brick.
@@ -922,8 +951,13 @@ def CHNSStepper(dm, case, dt, mode="auto", tstep="bdf1", linsolver="splu",
         return CHNSMonolithicStepper(
             dm, case, dt, linsolver=linsolver, Cn_override=Cn_override,
             gravity=gravity, tstep=tstep, src_fns=src_fns, body_fn=body_fn,
-            interface=interface, **kwargs)
+            interface=interface, device=device, **kwargs)
     if mode == "staggered":
+        if device is not None and not str(device).startswith("cpu"):
+            raise ValueError(
+                "device= (CUDA parity) is wired on the monolithic mode only; "
+                "the staggered fast mode is host-splu throughout.  Use "
+                "mode='monolithic'.")
         if interface != "ch":
             raise ValueError(
                 "interface='cac' (Conservative Allen-Cahn) is wired on the "
