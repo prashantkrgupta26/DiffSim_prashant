@@ -28,7 +28,7 @@ Build a differentiable, GPU-resident simulator for extrusion-based additive manu
 
 Sources in `local_code_old/AM/` (Bitbucket zips, extracted and surveyed):
 
-- **`chns_nonnewtonian` (≡ `proteus`, byte-identical physics):** Dendrite-KT projection-based CHNS (Khanwale lineage): VMS/SUPG, Korteweg surface tension, BDF1/BDF2/θ, polynomial + Flory–Huggins free energies, interface-band octree AMR, ~10.3k LOC. Validated configs: dam break 2-D/3-D, jet atomization, RT instability, bubble rise, Couette, MMS. **Contains no non-Newtonian rheology** (pure linear φ-mixture viscosity), no deposition machinery, no thermal coupling, no contact angle. The name refers to its `.gitmodules` pin of a `suresh-dendrite-kt` branch of the dendrite-kt submodule, which is **not in the zip** (submodules aren't bundled). If that branch is obtained, survey it; until then Suresh's rheology work is paper-only (Neural Constitutive Equations PDF). Value: validation configs + MMS cases + projection-scheme reference. DiffSim already replicates this physics lineage.
+- **`chns_nonnewtonian` (≡ `proteus`, byte-identical physics):** Dendrite-KT projection-based CHNS (Khanwale lineage): VMS/SUPG, Korteweg surface tension, BDF1/BDF2/θ, polynomial + Flory–Huggins free energies, interface-band octree AMR, ~10.3k LOC. Validated configs: dam break 2-D/3-D, jet atomization, RT instability, bubble rise, Couette, MMS. **Contains no non-Newtonian rheology** (pure linear φ-mixture viscosity), no deposition machinery, no thermal coupling, no contact angle. The name refers to its `.gitmodules` pin of a `suresh-dendrite-kt` branch of the dendrite-kt submodule, which is **not in the zip** (submodules aren't bundled). If that branch is obtained, survey it; until then Suresh's rheology work is paper-only (Neural Constitutive Equations PDF). Value: validation configs + MMS cases + projection-scheme reference for SP-0. **Correction (2026-08-10 survey):** DiffSim does *not* yet replicate this lineage — its NS and CH stacks are mature but uncoupled (no variable ρ(φ)/η(φ) in momentum, no μ∇φ surface-tension force, no flow advection in CH). Building the coupled CHNS brick is SP-0.
 - **`admanufacturing` (ADM, ~2.7k LOC):** voxel-activation transient heat conduction with convection+radiation BCs on tracked external surfaces; per-voxel diffusivity switching on activation; `.ctr`/`.csv` toolpath schedule formats (layer/contour/interior voxel sequences, N timesteps per voxel); ABS/PEKK material configs; octree refine-around-active-voxel and coarsen-behind; VTU output + checkpointing. Value: **toolpath/schedule format to adopt**, deposition-scheduling reference, thermal-rung reference, dynamic-adaptivity pattern.
 - **Paraview pipeline** (`config/Paraview/` in chns): PVD generation, φ=0 isocontour time series and video, slice extraction, energy `.plt` logs. Seed for the viz module.
 
@@ -62,6 +62,8 @@ The toolpath is prescribed, so the region needing resolution is known *a priori*
 2. **SP-3+ — interval-based dynamic adaptivity** (ADM-style refine-ahead/coarsen-behind), introduced only if the static corridor is the measured bottleneck (likely for tall walls, e.g. 46-layer Wolfs/Suiker prints). Remesh at layer boundaries (natural checkpoints), conservative field transfer; adjoint handles remesh events by transposing the prolongation/restriction operators between intervals. The mesh sequence is treated as fixed — correct, since it derives from the prescribed toolpath, not the solution.
 3. **Never** solution-adaptive error estimators in the differentiable path: solution-dependent refinement makes the mesh a discontinuous function of parameters and poisons gradients.
 
+**Known gap (2026-08-10 survey):** `assembly="device"` currently requires a uniform mesh (asserts identity constraint operator); graded-octree runs fall back to host assembly. Lifting this is scheduled with the first rung that needs GPU-scale graded meshes.
+
 ### 4.5 Cross-cutting standards (every sub-project)
 
 - **Differentiability gate:** forward + adjoint + three-way verification (adjoint/FD/twin) before a rung is done — the crystallization discipline.
@@ -72,14 +74,21 @@ The toolpath is prescribed, so the region needing resolution is known *a priori*
 
 ## 5. Sub-project ladder
 
-Dependencies are linear SP-1→2→3→4→5; SP-6 can start after SP-2 (calibration needs rheology gradients, not thermal).
+Dependencies are linear SP-0→1→2→3→4→5; SP-6 can start after SP-2 (calibration needs rheology gradients, not thermal).
+
+### SP-0 · CHNS coupling (two-phase flow brick)
+DiffSim's NS (VMS + SBM + adjoint) and M-component CH (adjoint, GPU) stacks are individually mature but have never been coupled (verified by code survey 2026-08-10). SP-0 builds the coupled two-phase flow brick everything else rides on.
+- **Scope:** u-advected phase equation + variable-density/viscosity NS (quasi-incompressible; AGG mass-flux term if CH) + surface tension in potential form μ∇φ, VMS-stabilized. **Interface-model decision (conservative Allen–Cahn vs CH) is made here** via a 2-D spike, evaluated *with a mass source present* so the SP-1 bookkeeping (§4.3) is anticipated, not retrofitted.
+- **Validation:** legacy configs as anchors — dam break 2-D/3-D, bubble rise (Re35/We10 and Re35/We125), RT instability — against published Khanwale results.
+- **Adjoint scope decision:** the Leray projection split is only partially adjointed today (linearized NS kernel taped; pressure correction not). SP-0's design must choose monolithic-coupled vs projection-split treatment for the adjoint path.
+- **Exit gate:** 3-way-verified gradients through the coupled march (densities, viscosities, surface-tension coefficient, mobility); 2-D benchmarks matched; ≥1 3-D benchmark on GPU; VTU/PVD series + interface movie produced by the (nascent) viz path.
 
 ### SP-1 · Deposition core (≙ M-print-1)
-The keystone rung: isothermal two-phase **Newtonian** deposition with a moving volumetric source following a toolpath.
-- **DiffSim brick:** smoothed deposition source — phase + mass + momentum injection tracking nozzle position, differentiable w.r.t. print speed, extrusion rate, standoff, layer height. Interface-model decision (conservative Allen–Cahn vs existing CH) made here via a 2-D spike, honoring the source-term mass bookkeeping (§4.3). Non-uniform-octree CH check (§4.4).
+The AM keystone rung: isothermal two-phase **Newtonian** deposition with a moving volumetric source following a toolpath, on the SP-0 brick.
+- **DiffSim brick:** smoothed deposition source — phase + mass + momentum injection tracking nozzle position, differentiable w.r.t. print speed, extrusion rate, standoff, layer height (the CH kernel's existing `src_fns` space-time source hook is the landing point; the adjoint w.r.t. source parameters is new). Non-uniform-octree CH check (§4.4).
 - **App scaffold:** `diffsim-3dprint` repo — toolpath/schedule ingest (ADM `.ctr`/`.csv`), case runner, viz module (§4.5).
 - **Validation:** single strand on a plate; bead cross-section (W/D, H/D) vs Comminal/Serdeczny across layer-height/nozzle-diameter and nozzle-velocity/extrusion-velocity ratios; round/spread regimes. Target ~10 %; tripwire: >15 % miss → revisit ε/mobility/source calibration before proceeding.
-- **Exit gate:** 3-way-verified gradients of bead shape w.r.t. process parameters (2-D); 3-D strand validated on GPU; strand movie + cross-section overlay plot shipped; legacy regression anchors (dam break, jet) passing on the DiffSim side.
+- **Exit gate:** 3-way-verified gradients of bead shape w.r.t. process parameters (2-D); 3-D strand validated on GPU; strand movie + cross-section overlay plot shipped.
 
 ### SP-2 · Yield-stress rheology (≙ M-print-2)
 - **Scope:** Herschel–Bulkley/Bingham + Papanastasiou regularization behind `RheologyClosure`.
@@ -111,4 +120,4 @@ The keystone rung: isothermal two-phase **Newtonian** deposition with a moving v
 
 ## 6. Next step
 
-Brainstorm → spec → plan SP-1 (deposition core) as its own sub-project, starting with the two SP-1-internal design decisions flagged here: CAC-vs-CH interface model under a mass source, and CH-on-nonuniform-octree verification.
+Brainstorm → spec → plan SP-0 (CHNS coupling) as its own sub-project. Its entry decisions: CAC-vs-CH interface model (spiked with a mass source present), monolithic-coupled vs projection-split adjoint treatment, and which legacy benchmark set gates the rung.
