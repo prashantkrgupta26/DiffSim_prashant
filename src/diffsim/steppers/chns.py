@@ -349,9 +349,11 @@ class CHNSMonolithicStepper:
                  gravity=True, newton_tol=1e-10, newton_max=30,
                  tstep="bdf1", src_fns=None, body_fn=None, interface="ch",
                  device=None):
-        assert linsolver == "splu", \
-            "prototype scope: splu only (spike ruling; GPU solves are a " \
-            "build-out concern)"
+        assert linsolver in ("splu", "cudss"), \
+            "monolithic scope: splu (host SuperLU) or cudss (GPU direct " \
+            "sparse via solvers.linsolve.solve_linear; SP-0 Task 12 — " \
+            "host-splu fill-in is prohibitive for 3-D at level >= 5)"
+        self.linsolver = linsolver
         if tstep not in ("bdf1", "bdf2"):
             raise ValueError(f"tstep must be 'bdf1' or 'bdf2', got {tstep!r}")
         if interface not in ("ch", "cac"):
@@ -366,9 +368,10 @@ class CHNSMonolithicStepper:
         # on a GPU box); an explicit device= overrides it and — if it differs
         # from dm.device — the per-bin basis-table device arrays (conn/h/N/dN/
         # w) are re-materialised on the target device below.  The COO triplets
-        # still come back to the host (be.numpy()/Ae.numpy()) and the solve
-        # stays host splu: a device-kernel + host-solve gate (plan-sanctioned;
-        # device assembly is out of scope for this rung).
+        # still come back to the host (be.numpy()/Ae.numpy()); the Newton
+        # solve is linsolver: host splu (2-D default) or cudss (GPU direct —
+        # required for 3-D level>=5 where host-splu fill-in is prohibitive).
+        # Device assembly is out of scope for this rung (plan-sanctioned).
         self.device = str(device) if device is not None else str(dm.device)
         self.tstep = tstep
         # Forcing (MMS / SP-1 deposition).  src_fns: length-blk list of per-
@@ -804,7 +807,11 @@ class CHNSMonolithicStepper:
             rnorm = float(np.linalg.norm(R))
             if rnorm < self.newton_tol:
                 break
-            dx = splu(J.tocsc()).solve(-R)
+            if self.linsolver == "cudss":
+                from ..solvers.linsolve import solve_linear
+                dx = solve_linear(J, -R, solver="cudss", device=self.device)
+            else:
+                dx = splu(J.tocsc()).solve(-R)
             x = x + dx
             if float(np.abs(dx).max()) < self.newton_tol:
                 R, _ = self._assemble(x, want_jac=False)
@@ -913,8 +920,12 @@ def CHNSStepper(dm, case, dt, mode="auto", tstep="bdf1", linsolver="splu",
     tstep : {"bdf1", "bdf2"}
         Time scheme (monolithic only).  "bdf2" is variable-step BDF2 with the
         MultiPhaseStepper A4b coefficients, BDF1-bootstrapped on the first step.
-    linsolver : {"splu"}
-        Prototype scope (spike ruling); GPU solves are a later build-out.
+    linsolver : {"splu", "cudss"}
+        Newton linear solver (monolithic; the staggered fast mode is splu-
+        only).  "splu" = host SuperLU (2-D default).  "cudss" = NVIDIA cuDSS
+        GPU direct sparse via solvers.linsolve.solve_linear — required for
+        3-D at level >= 5, where host-splu 3-D fill-in is prohibitive
+        (measured: one level-5 3-D Newton step > 19 min wall on splu).
     Cn_override : {None, "2h", float}
         None -> case.Cn; "2h" -> 2*hmin (the Cn >= h resolvability convention
         the coupling-decision memo's guard finding binds benchmark configs to);

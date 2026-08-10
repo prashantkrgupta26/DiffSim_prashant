@@ -87,6 +87,8 @@ def main():
     ap.add_argument("--level", type=int, default=5)
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--device", type=str, default="cpu")
+    ap.add_argument("--linsolver", type=str, default="splu",
+                    choices=["splu", "cudss"])
     ap.add_argument("--dt", type=float, default=None)
     ap.add_argument("--out", type=str,
                     default=os.path.join(_HERE, "results", "dam3d"))
@@ -110,7 +112,8 @@ def main():
     # Compile timing: first stepper ctor triggers make_chns_newton(dim=3).
     t_comp0 = time.perf_counter()
     st = CHNSMonolithicStepper(dm, case, dt=dt, Cn_override="2h",
-                               gravity=True, device=args.device)
+                               gravity=True, device=args.device,
+                               linsolver=args.linsolver)
     compile_wall = time.perf_counter() - t_comp0
 
     phi0 = _dambreak_ic_3d(coords, st.Cn)
@@ -161,6 +164,7 @@ def main():
 
     metrics = dict(
         case=case.name, dim=case.dim, level=args.level, device=args.device,
+        linsolver=args.linsolver,
         dt=dt, n_nodes=int(n_nodes), n_dof=int(ndof), blk=int(blk),
         steps_requested=args.steps, steps_run=steps_run,
         build_wall_s=build_wall, compile_wall_s=compile_wall,
