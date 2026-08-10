@@ -585,3 +585,36 @@ def test_cac_stationary_drop():
     for interface in ("ch", "cac"):
         assert drift[interface] < 1e-11 * dm.n_nodes, (
             f"{interface} mass drift {drift[interface]:.3e} >= 1e-11*n")
+
+
+# ---------------------------------------------------------------------------
+# Final-review hardening: facade ValueError guards (all staggered guards)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("kwargs,match", [
+    # bad mode
+    (dict(mode="bad"),
+     "mode must be"),
+    # staggered + bdf2
+    (dict(mode="staggered", tstep="bdf2"),
+     "BDF1-only"),
+    # staggered + cac
+    (dict(mode="staggered", interface="cac"),
+     "cac.*monolithic|monolithic.*cac|interface='cac'",),
+    # staggered + src_fns
+    (dict(mode="staggered", src_fns=["dummy"]),
+     "src_fns"),
+    # staggered + CUDA device
+    (dict(mode="staggered", device="cuda:0"),
+     "device=.*monolithic|staggered.*host|CUDA|cuda"),
+    # staggered + gravity=False
+    (dict(mode="staggered", gravity=False),
+     "gravity=False"),
+])
+def test_chns_facade_guard_raises(kwargs, match):
+    """CHNSStepper raises ValueError for all documented incompatible arguments."""
+    from diffsim.steppers.chns import CHNSStepper
+    from chns.cases import BUBBLE_RISE_RE35_WE10
+
+    dm, mesh, cons = _make_dm(level=3, dim=2)
+    with pytest.raises(ValueError, match=match):
+        CHNSStepper(dm, BUBBLE_RISE_RE35_WE10, dt=1e-2, **kwargs)

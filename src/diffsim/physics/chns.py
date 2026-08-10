@@ -77,6 +77,14 @@ def mix_props(
         Mixture viscosity, clamped from below.
     n_clamped : int
         Number of entries where at least one property was clamped.
+
+    Warning
+    -------
+    The compiled Warp kernel (``make_chns_newton``) and its mirror
+    (``CHNSDiscrete._assemble``) hardcode the default constants
+    ``floor_frac=1e-3`` and ``Ci=(4, 36)``.  Calling this helper with
+    non-default values voids parity with the kernel/mirror — the per-GP
+    coefficients will differ from what the Newton assembly uses.
     """
     phi = np.asarray(phi, dtype=float)
 
@@ -196,6 +204,14 @@ def tau_m_gp(
     -------
     tau : ndarray, shape [ngp]
         Stabilization parameter at each Gauss point.
+
+    Warning
+    -------
+    The compiled Warp kernel (``make_chns_newton``) and its mirror
+    (``CHNSDiscrete._assemble``) hardcode the default constants
+    ``floor_frac=1e-3`` and ``Ci=(4, 36)``.  Calling this helper with
+    non-default values voids parity with the kernel/mirror — the per-GP
+    tau values will differ from what the Newton assembly uses.
     """
     u_gp = np.asarray(u_gp, dtype=float)
     rho_gp = np.asarray(rho_gp, dtype=float)

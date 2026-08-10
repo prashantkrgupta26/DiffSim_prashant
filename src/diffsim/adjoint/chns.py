@@ -1362,7 +1362,14 @@ class CHNSAdjoint:
     # ------------------------------------------------------------------
     def gradients(self, params=("rho_ratio", "eta_ratio", "We",
                                  "mobility", "Fr")):
-        """Return {param: dJ/dp} via the reverse sweep.  Requires march()."""
+        """Return {param: dJ/dp} via the reverse sweep.  Requires march().
+
+        Note: this method mutates the mirror's history via ``set_history``
+        during the backward sweep (each step restores the recorded u_n/phi_n
+        so the Jacobian reproduces J_n exactly).  Call ``march`` again before
+        reusing the mirror for forward stepping — the history left after
+        ``gradients`` is the history of step 0, not the final state.
+        """
         m = self.m
         N = len(self.steps)
         assert N > 0, "call march(n_steps) before gradients()"

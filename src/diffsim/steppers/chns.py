@@ -86,9 +86,11 @@ from .leray import LerayProjectionStepper
 
 class CHNSStaggeredStepper:
     def __init__(self, dm, case, dt, linsolver="splu", Cn_override=None):
-        assert linsolver == "splu", \
-            "prototype scope: splu only (spike ruling; GPU solves are " \
-            "a build-out concern)"
+        if linsolver != "splu":
+            raise ValueError(
+                f"CHNSStaggeredStepper prototype scope: splu only (spike "
+                f"ruling; GPU solves are a build-out concern), got "
+                f"linsolver={linsolver!r}")
         self.dm = dm
         self.case = case
         self.dt = float(dt)
@@ -349,10 +351,13 @@ class CHNSMonolithicStepper:
                  gravity=True, newton_tol=1e-10, newton_max=30,
                  tstep="bdf1", src_fns=None, body_fn=None, interface="ch",
                  device=None):
-        assert linsolver in ("splu", "cudss"), \
-            "monolithic scope: splu (host SuperLU) or cudss (GPU direct " \
-            "sparse via solvers.linsolve.solve_linear; SP-0 Task 12 — " \
-            "host-splu fill-in is prohibitive for 3-D at level >= 5)"
+        if linsolver not in ("splu", "cudss"):
+            raise ValueError(
+                f"CHNSMonolithicStepper: linsolver must be 'splu' (host "
+                f"SuperLU) or 'cudss' (GPU direct sparse via "
+                f"solvers.linsolve.solve_linear; SP-0 Task 12 — host-splu "
+                f"fill-in is prohibitive for 3-D at level >= 5), "
+                f"got {linsolver!r}")
         self.linsolver = linsolver
         if tstep not in ("bdf1", "bdf2"):
             raise ValueError(f"tstep must be 'bdf1' or 'bdf2', got {tstep!r}")
@@ -984,6 +989,11 @@ def CHNSStepper(dm, case, dt, mode="auto", tstep="bdf1", linsolver="splu",
                 "src_fns/body_fn (SP-1 deposition / MMS forcing) are wired on "
                 "the monolithic mode only; the staggered fast mode does not "
                 "carry the source hook.")
+        if not gravity:
+            raise ValueError(
+                "staggered mode does not support gravity=False; "
+                "CHNSStaggeredStepper hardcodes ghat=(0,-1) and cannot "
+                "suppress gravity.  Use mode='monolithic' for gravity=False.")
         return CHNSStaggeredStepper(
             dm, case, dt, linsolver=linsolver, Cn_override=Cn_override,
             **kwargs)

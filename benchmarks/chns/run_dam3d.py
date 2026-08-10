@@ -187,7 +187,11 @@ def main():
     print(f"metrics -> {jpath}")
     print(f"vtu     -> {vtu_path} ({vtu_mb} MB)" if vtu_written
           else "vtu     -> NOT WRITTEN")
-    return 0 if (not died and vtu_written) else 1
+    drift_fail = (not died) and (mass_drift > 1e-10)
+    if drift_fail:
+        print(f"FAIL: abs mass drift {mass_drift:.3e} > 1e-10 "
+              f"(antisymmetric-IC note: use abs metric; rel_drift={rel_drift:.3e})")
+    return 0 if (not died and vtu_written and not drift_fail) else 1
 
 
 if __name__ == "__main__":
