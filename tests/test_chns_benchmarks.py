@@ -6,6 +6,17 @@ SP-0 coupling winner).  The mesh is the unit square [0,1]^2; the interface is
 resolved with Cn_override="2h" (the coupling-decision memo's guard finding:
 benchmarks must resolve Cn >~ h, else the monolithic clamp-guard fires).
 
+Structural-diagnostics contract (for cross-reference with _assert_structural):
+  - mass drift asserted per gate (|Δm| < 1e-8; machine-exact for conservative
+    CH with no source);
+  - energy-monotonicity (free energy non-increasing between steps) and parasitic-
+    current bound (max|u| < 1e-3) are asserted ONLY in test_energy_nonincreasing_and_parasitic
+    — the dedicated unforced relaxing-drop test is the only setting where
+    energy monotonicity holds (gravity and driving sources break it for the
+    bubble/dam/RT scenarios);
+  - anti-freeze guards per gate: final u finite AND Newton iters > 0 across
+    the run (verifies the stepper did not silently skip Newton iterations).
+
 ================================================================================
 REFERENCES (physical direction; sourcing decision recorded)
 ================================================================================
@@ -99,7 +110,7 @@ def _rt_ic(coords, Cn, yi=0.5, amp=0.05):
 
 def _march(case, level, dt, nsteps, ic, sign):
     """Return the stepper + tracked series after nsteps.  Structural
-    diagnostics (mass drift, energy) are captured too."""
+    diagnostics (mass drift, energy, newton_iters) are captured too."""
     from diffsim.steppers.chns import CHNSStepper
     dm, mesh, cons = _make_dm(level)
     coords = mesh.node_coords
@@ -107,7 +118,7 @@ def _march(case, level, dt, nsteps, ic, sign):
                      gravity=True)
     st.set_initial(ic(coords, st.Cn))
     m0 = st.mass_phi()
-    cy, front, tip, energy = [], [], [], [st.energy()["total"]]
+    cy, front, tip, energy, newton_iters_list = [], [], [], [st.energy()["total"]], []
     for _ in range(nsteps):
         st.step()
         assert np.isfinite(st.phi).all() and np.isfinite(st.u).all(), \
@@ -116,8 +127,10 @@ def _march(case, level, dt, nsteps, ic, sign):
         front.append(metrics.surge_front_x(st.phi, coords))
         tip.append(metrics.spike_tip_y(st.phi, coords))
         energy.append(st.energy()["total"])
+        newton_iters_list.append(st.last_newton_iters)
     return dict(st=st, coords=coords, h=st.h, sign=sign, m0=m0,
                 cy=cy, front=front, tip=tip, energy=energy,
+                newton_iters_list=newton_iters_list,
                 mass_drift=float(abs(st.mass_phi() - m0)))
 
 
@@ -132,14 +145,22 @@ def _assert_structural(res, mass_tol=1e-8):
     # mass drift < 1e-8 (no source; conservative CH advection is machine-exact)
     assert res["mass_drift"] < mass_tol, \
         f"mass drift {res['mass_drift']:.3e} >= {mass_tol}"
+    # anti-freeze guard 1: final velocity must be finite
+    assert np.isfinite(res["st"].u).all(), \
+        "anti-freeze: final u contains non-finite values"
+    # anti-freeze guard 2: Newton iters must be > 0 on every step (stepper
+    # did not silently skip the Newton solve)
+    total_iters = sum(res["newton_iters_list"])
+    assert total_iters > 0, \
+        (f"anti-freeze: total Newton iters = {total_iters} across "
+         f"{len(res['newton_iters_list'])} steps; stepper appears frozen")
 
 
 # ===========================================================================
 # Bubble rise Re35/We10 and Re35/We125
 # ===========================================================================
 @pytest.mark.parametrize("name,case,sign", [
-    ("bubble_rise_re35_we10",
-     replace(C.BUBBLE_RISE_RE35_WE10, rho_ratio=10.0), -1),
+    ("bubble_rise_re35_we10", C.BUBBLE_RISE_RE35_WE10, -1),
     ("bubble_rise_re35_we125", C.BUBBLE_RISE_RE35_WE125, -1),
 ])
 def test_bubble_rise(name, case, sign):
@@ -223,7 +244,7 @@ def test_energy_nonincreasing_and_parasitic():
     from diffsim.steppers.chns import CHNSStepper
     dm, mesh, cons = _make_dm(5)
     coords = mesh.node_coords
-    case = replace(C.BUBBLE_RISE_RE35_WE10, rho_ratio=10.0)
+    case = C.BUBBLE_RISE_RE35_WE10
     st = CHNSStepper(dm, case, dt=1e-3, mode="auto", Cn_override="2h",
                      gravity=False)
     r = np.sqrt((coords[:, 0] - 0.5) ** 2 + (coords[:, 1] - 0.5) ** 2)

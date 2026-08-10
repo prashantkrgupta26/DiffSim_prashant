@@ -213,31 +213,35 @@ def test_staggered_bubble_smoke():
 # ---------------------------------------------------------------------------
 # Task 7: monolithic (u,p,phi,mu) Warp kernel + stepper
 # ---------------------------------------------------------------------------
-def test_monolithic_parity_vs_mirror():
+@pytest.mark.parametrize("tstep", ["bdf1", "bdf2"])
+def test_monolithic_parity_vs_mirror(tstep):
     """CHNSMonolithicStepper must reproduce CHNSDiscrete (the numpy mirror,
-    ground truth) to 1e-10 relative on (phi, u, p) after 3 BDF1 steps.
-    Level-4 (16x16) 2-D, BUBBLE_RISE_RE35_WE10 with rho_ratio=10 (the
-    staggered-smoke override), same dt and Newton tolerance."""
-    from dataclasses import replace
+    ground truth) to 1e-10 relative on (phi, u, p) after 3 steps.
+    Level-4 (16x16) 2-D, BUBBLE_RISE_RE35_WE10 (rho_ratio already 10.0),
+    same dt, same tstep, and Newton tolerance 1e-12.
+    For bdf2: 3 steps engage the 2-step history past the BDF1 bootstrap
+    (step 1 = BDF1, steps 2-3 = BDF2 with stored history)."""
     from diffsim.adjoint.chns import CHNSDiscrete
     from diffsim.steppers.chns import CHNSMonolithicStepper
 
     level = 4
     dm, mesh, cons = _make_dm(level=level, dim=2)
-    case = replace(BUBBLE_RISE_RE35_WE10, rho_ratio=10.0)
+    case = BUBBLE_RISE_RE35_WE10
     dt = case.dt0
 
     coords = mesh.node_coords
     # light bubble phi=-1 inside; use Cn_override="2h" for resolvability
     # (matches the sibling gates); build phi0 with the mirror's Cn.
     ref = CHNSDiscrete(level=level, dim=2, case=case, dt=dt, dm=dm,
-                       gravity=True, Cn_override="2h", newton_tol=1e-12)
+                       gravity=True, Cn_override="2h", newton_tol=1e-12,
+                       tstep=tstep)
     r = np.sqrt((coords[:, 0] - 0.5) ** 2 + (coords[:, 1] - 0.35) ** 2)
     phi0 = -np.tanh((r - 0.2) / (ref.Cn * np.sqrt(2.0)))
     ref.set_initial(phi0)
 
     mono = CHNSMonolithicStepper(dm, case, dt=dt, linsolver="splu",
-                                 Cn_override="2h", newton_tol=1e-12)
+                                 Cn_override="2h", newton_tol=1e-12,
+                                 tstep=tstep)
     mono.set_initial(phi0)
 
     for _ in range(3):
@@ -252,11 +256,67 @@ def test_monolithic_parity_vs_mirror():
     rphi = relmax(mono.phi, ref.phi)
     ru = relmax(mono.u, ref.u)
     rp = relmax(mono.p, ref.p)
-    print(f"[monolithic parity] rel(phi)={rphi:.3e} rel(u)={ru:.3e} "
+    print(f"[monolithic parity tstep={tstep}] rel(phi)={rphi:.3e} "
+          f"rel(u)={ru:.3e} rel(p)={rp:.3e}")
+    assert rphi <= 1e-10, f"phi parity {rphi:.3e} > 1e-10 (tstep={tstep})"
+    assert ru <= 1e-10, f"u parity {ru:.3e} > 1e-10 (tstep={tstep})"
+    assert rp <= 1e-10, f"p parity {rp:.3e} > 1e-10 (tstep={tstep})"
+
+
+def test_monolithic_parity_body_fn():
+    """body_fn contract: CHNSMonolithicStepper and CHNSDiscrete must both
+    accept a nonzero smooth body force via body_fn and produce identical
+    results to 1e-10 relative.  BDF1, 2 steps, level-4, same setup as
+    test_monolithic_parity_vs_mirror[bdf1].
+
+    Body force: f(x,t) = [0.1*sin(pi*x0)*cos(pi*x1), 0.05*cos(pi*x0)]
+    (smooth, nonzero momentum source; matches the MMS body_fn signature
+    fn(xq[ngp,dim], t) -> [ngp, dim]).
+    This closes the two-sided contract over the fbody_gp hook."""
+    from diffsim.adjoint.chns import CHNSDiscrete
+    from diffsim.steppers.chns import CHNSMonolithicStepper
+
+    level = 4
+    dm, mesh, cons = _make_dm(level=level, dim=2)
+    case = BUBBLE_RISE_RE35_WE10
+    dt = case.dt0
+
+    def body_fn(xq, t):
+        x0, x1 = xq[:, 0], xq[:, 1]
+        f0 = 0.1 * np.sin(np.pi * x0) * np.cos(np.pi * x1)
+        f1 = 0.05 * np.cos(np.pi * x0)
+        return np.stack([f0, f1], axis=1)
+
+    coords = mesh.node_coords
+    ref = CHNSDiscrete(level=level, dim=2, case=case, dt=dt, dm=dm,
+                       gravity=True, Cn_override="2h", newton_tol=1e-12,
+                       body_fn=body_fn)
+    r = np.sqrt((coords[:, 0] - 0.5) ** 2 + (coords[:, 1] - 0.35) ** 2)
+    phi0 = -np.tanh((r - 0.2) / (ref.Cn * np.sqrt(2.0)))
+    ref.set_initial(phi0)
+
+    mono = CHNSMonolithicStepper(dm, case, dt=dt, linsolver="splu",
+                                 Cn_override="2h", newton_tol=1e-12,
+                                 body_fn=body_fn)
+    mono.set_initial(phi0)
+
+    for _ in range(2):
+        ref.step()
+        mono.step()
+
+    def relmax(a, b):
+        a = np.asarray(a).ravel()
+        b = np.asarray(b).ravel()
+        return float(np.max(np.abs(a - b)) / max(np.max(np.abs(b)), 1e-30))
+
+    rphi = relmax(mono.phi, ref.phi)
+    ru = relmax(mono.u, ref.u)
+    rp = relmax(mono.p, ref.p)
+    print(f"[body_fn parity] rel(phi)={rphi:.3e} rel(u)={ru:.3e} "
           f"rel(p)={rp:.3e}")
-    assert rphi <= 1e-10, f"phi parity {rphi:.3e} > 1e-10"
-    assert ru <= 1e-10, f"u parity {ru:.3e} > 1e-10"
-    assert rp <= 1e-10, f"p parity {rp:.3e} > 1e-10"
+    assert rphi <= 1e-10, f"phi parity {rphi:.3e} > 1e-10 (body_fn)"
+    assert ru <= 1e-10, f"u parity {ru:.3e} > 1e-10 (body_fn)"
+    assert rp <= 1e-10, f"p parity {rp:.3e} > 1e-10 (body_fn)"
 
 
 def test_monolithic_bubble_smoke():

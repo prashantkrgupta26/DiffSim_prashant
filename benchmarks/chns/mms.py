@@ -137,7 +137,7 @@ def build_mms(case, Cn, Re, We, Pe, rho_ratio, eta_ratio, gravity=False,
         fgrav = rho * grav_scale * ghat[d]
         f = (rho * dt_u[d] + rho * ugradu + Jgradu
              - visc_div(d) + gp[d] - fcap - fgrav)
-        f_u.append(sp.simplify(f) if False else f)
+        f_u.append(f)
 
     # --- continuity forcing S_p = div u (exact ~0) --------------------------
     S_p = sp.diff(u0, x) + sp.diff(u1, y)

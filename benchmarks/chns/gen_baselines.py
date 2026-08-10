@@ -17,8 +17,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import replace
-
 import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -94,7 +92,7 @@ def main():
         "steps). See the test module REFERENCES for Hysing 2009 / Martin-Moyce "
         "1952 direction. Regenerate with benchmarks/chns/gen_baselines.py.")}
 
-    b10 = _march(replace(C.BUBBLE_RISE_RE35_WE10, rho_ratio=10.0), 5,
+    b10 = _march(C.BUBBLE_RISE_RE35_WE10, 5,
                  C.BUBBLE_RISE_RE35_WE10.dt0, 40, bubble_ic, -1)
     base["bubble_rise_re35_we10"] = dict(
         level=5, dt=C.BUBBLE_RISE_RE35_WE10.dt0, nsteps=40, gravity=True,
