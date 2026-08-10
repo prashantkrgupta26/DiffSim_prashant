@@ -423,3 +423,38 @@ def test_all_cases_construct_and_ic_fn():
         assert np.any(np.abs(phi0) > 0.9), (
             f"{case.name}: no nodes with |phi| > 0.9; tanh may not be saturating"
         )
+
+    # --- Orientation gates ---
+    # RT_2D: module convention phi=+1 = heavy phase; heavy-on-top unstable IC.
+    # Interface at y_iface=6/8=0.75 in normalised coords.
+    # Top quarter (y > 0.75) should be predominantly heavy (phi > 0) -> mean > 0.5.
+    # Bottom quarter (y < 0.25) should be predominantly light (phi < 0) -> mean < -0.5.
+    phi_rt = RT_2D.ic_fn(x_test)
+    top_mask = x_test[:, 1] > 0.75
+    bot_mask = x_test[:, 1] < 0.25
+    assert top_mask.any() and bot_mask.any(), "RT_2D orientation gate: no nodes in top/bottom quarter"
+    mean_top = float(phi_rt[top_mask].mean())
+    mean_bot = float(phi_rt[bot_mask].mean())
+    assert mean_top > 0.5, (
+        f"RT_2D: mean phi in top quarter = {mean_top:.4f}; expected > 0.5 "
+        f"(phi=+1 = heavy phase on top)"
+    )
+    assert mean_bot < -0.5, (
+        f"RT_2D: mean phi in bottom quarter = {mean_bot:.4f}; expected < -0.5 "
+        f"(phi=-1 = light phase below)"
+    )
+
+    # Bubble cases: bubble is the LIGHT phase (rhoL) in legacy Hysing configs.
+    # Module convention: phi=+1 = heavy -> bubble interior = phi=-1.
+    # Drop centre at (xc=0.5, yc=0.25) in normalised coords; check phi at centre < -0.9.
+    for bubble_case in [BUBBLE_RISE_RE35_WE10, BUBBLE_RISE_RE35_WE125]:
+        phi_b = bubble_case.ic_fn(x_test)
+        # Find the grid point closest to the drop centre (0.5, 0.25)
+        dist_to_centre = np.sqrt((x_test[:, 0] - 0.5) ** 2 + (x_test[:, 1] - 0.25) ** 2)
+        centre_idx = int(np.argmin(dist_to_centre))
+        phi_centre = float(phi_b[centre_idx])
+        assert phi_centre < -0.9, (
+            f"{bubble_case.name}: phi at drop centre = {phi_centre:.4f}; "
+            f"expected < -0.9 (bubble = light phase -> phi=-1 inside, "
+            f"module convention phi=+1 = heavy)"
+        )

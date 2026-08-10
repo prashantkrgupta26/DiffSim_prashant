@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")  # non-interactive backend; must be set before pyplot import
+matplotlib.use("Agg", force=True)  # non-interactive backend; must be set before pyplot import
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 

@@ -66,22 +66,22 @@ def _tanh_drop_ic(
     yc: float,
     radius: float,
     Cn: float,
-    domain_Lx: float = 1.0,
-    domain_Ly: float = 1.0,
 ) -> Callable[[np.ndarray], np.ndarray]:
     """Return an ic_fn for a circular drop centred at (xc, yc) with given radius.
 
     The tanh profile spans [-1, 1] with interface half-width ~ Cn * referenceLengthScale.
-    phi = +1 inside bubble (rhoL phase), phi = -1 outside (rhoH phase).
-    Coordinates x[:,0], x[:,1] are assumed to be in [0, domain_Lx] x [0, domain_Ly].
+    Module convention: phi=+1 = heavy phase (rhoH), phi=-1 = light phase (rhoL).
+    Bubble/drop is the LIGHT phase (rhoL) in the legacy Hysing bubble-rise configs,
+    so phi = -1 inside the bubble, phi = +1 outside (continuous heavy phase).
+    Coordinates x[:,0], x[:,1] are assumed to be in normalised unit domain coords.
     """
     _eps = Cn  # interface half-width parameter
 
     def ic_fn(x: np.ndarray) -> np.ndarray:
         # x: [n, 2] in physical coords
         r = np.sqrt((x[:, 0] - xc) ** 2 + (x[:, 1] - yc) ** 2)
-        # tanh profile: +1 inside bubble, -1 outside
-        return -np.tanh((r - radius) / (_eps * np.sqrt(2)))
+        # tanh profile: -1 inside bubble (light phase), +1 outside (heavy phase)
+        return np.tanh((r - radius) / (_eps * np.sqrt(2)))
 
     return ic_fn
 
@@ -120,8 +120,11 @@ def _tanh_rt_ic(
 
     Legacy config: caseTypeCHinit = "rayleighTaylor", amplitudeInitial = 0.1,
     vertInterfaceLoc = 6.0 on domain max=[1.0, 8.0].
-    Heavy fluid (rhoH) on top (phi = +1), light fluid (rhoL) below (phi = -1).
-    Perturbed interface y = y_iface + A * cos(2*pi*x / Lx_norm).
+
+    Module convention: phi=+1 = heavy phase (rhoH); phi=+1 is ABOVE the interface
+    (heavy-on-top unstable configuration for RT instability).
+    Legacy config labels the heavy fluid rhoL=10 (labels inverted vs ours; values
+    transcribed faithfully). Perturbed interface y = y_iface + A * cos(2*pi*x / Lx_norm).
     """
     _eps = Cn
 
@@ -132,7 +135,8 @@ def _tanh_rt_ic(
         A_norm = amplitude / domain_Ly
         # Cosine perturbation in x (normalised)
         y_pert = y_iface + A_norm * np.cos(2.0 * np.pi * x[:, 0])
-        return -np.tanh((x[:, 1] - y_pert) / (_eps * np.sqrt(2)))
+        # phi=+1 above interface (heavy phase on top); no leading minus
+        return np.tanh((x[:, 1] - y_pert) / (_eps * np.sqrt(2)))
 
     return ic_fn
 
@@ -173,7 +177,6 @@ BUBBLE_RISE_RE35_WE10 = CHNSCase(
     # Normalised to [0,1]x[0,2]: centre (0.5, 0.25), radius 0.25 in unit domain
     ic_fn=_tanh_drop_ic(
         xc=0.5, yc=0.25, radius=0.25, Cn=0.01,
-        domain_Lx=2.0, domain_Ly=4.0,
     ),
     domain_aspect=(1, 2),  # legacy mesh max = [2.0, 4.0]
 )
@@ -212,7 +215,6 @@ BUBBLE_RISE_RE35_WE125 = CHNSCase(
     # IC: same geometry as Re35We10 — drop at (1.0, 1.0) radius 0.5 on [0,2]x[0,4]
     ic_fn=_tanh_drop_ic(
         xc=0.5, yc=0.25, radius=0.25, Cn=0.005,
-        domain_Lx=2.0, domain_Ly=4.0,
     ),
     domain_aspect=(1, 2),  # legacy mesh max = [2.0, 4.0]
 )
