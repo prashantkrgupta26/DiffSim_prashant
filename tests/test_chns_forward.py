@@ -360,3 +360,204 @@ def test_monolithic_bubble_smoke():
     assert np.all(np.diff(last) > 0), (
         f"bubble centroid_y not strictly rising over last 5 steps: {last}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 10: Conservative Allen-Cahn (CAC) interface variant
+# ---------------------------------------------------------------------------
+_ATANH_08 = np.arctanh(0.8)      # tanh(z)=0.8 -> z=atanh(0.8)~1.0986
+
+
+def _interface_eps_from_cut(phi, coords, y_cut, h):
+    r"""Effective interface scale eps = sqrt(2)*Cn measured from the 10-90%
+    tanh distance along the horizontal cut y ~ y_cut.
+
+    For phi(x) = -tanh((x - x_i)/eps) the value crosses +-0.8 (the 10%-90% band
+    of the [-1,1]-scaled tanh) at |x - x_i| = eps*atanh(0.8).  So the raw
+    10-90% x-distance is  d = 2*eps*atanh(0.8), and the physical interface
+    scale is  eps = d / (2*atanh(0.8)).  Returns eps (directly comparable to
+    the analytic sqrt(2)*Cn), or nan if the cut has no clean crossing.
+    """
+    yv = coords[:, 1]
+    y0 = yv[np.argmin(np.abs(yv - y_cut))]
+    row = np.where(np.abs(yv - y0) < 0.25 * h)[0]
+    if row.size < 4:
+        return float("nan")
+    xr = coords[row, 0]
+    order = np.argsort(xr)
+    xr = xr[order]
+    pr = phi[row][order]
+
+    def x_at(level):
+        # first monotone crossing of phi == level (left interface of the drop)
+        for i in range(len(pr) - 1):
+            a, b = pr[i], pr[i + 1]
+            if (a - level) * (b - level) <= 0 and a != b:
+                t = (level - a) / (b - a)
+                return xr[i] + t * (xr[i + 1] - xr[i])
+        return None
+    x_hi = x_at(0.8)
+    x_lo = x_at(-0.8)
+    if x_hi is None or x_lo is None:
+        return float("nan")
+    d = abs(x_lo - x_hi)                       # raw 10-90% distance
+    return d / (2.0 * _ATANH_08)              # -> eps = sqrt(2)*Cn
+
+
+@pytest.mark.parametrize("interface", ["ch", "cac"])
+def test_cac_parity_kernel_vs_mirror(interface):
+    """CHNSMonolithicStepper(interface=) must reproduce CHNSDiscrete(interface=)
+    (the numpy mirror) to 1e-10 relative on (phi, u, p) after 3 steps.  Runs
+    for BOTH interfaces (the "ch" leg re-covers the existing gate; the "cac"
+    leg is the new Task-10 parity gate, incl. the frozen-beta multiplier)."""
+    from diffsim.adjoint.chns import CHNSDiscrete
+    from diffsim.steppers.chns import CHNSMonolithicStepper
+
+    level = 4
+    dm, mesh, cons = _make_dm(level=level, dim=2)
+    case = BUBBLE_RISE_RE35_WE10
+    dt = case.dt0
+
+    coords = mesh.node_coords
+    ref = CHNSDiscrete(level=level, dim=2, case=case, dt=dt, dm=dm,
+                       gravity=True, Cn_override="2h", newton_tol=1e-12,
+                       interface=interface)
+    r = np.sqrt((coords[:, 0] - 0.5) ** 2 + (coords[:, 1] - 0.35) ** 2)
+    phi0 = -np.tanh((r - 0.2) / (ref.Cn * np.sqrt(2.0)))
+    ref.set_initial(phi0)
+
+    mono = CHNSMonolithicStepper(dm, case, dt=dt, linsolver="splu",
+                                 Cn_override="2h", newton_tol=1e-12,
+                                 interface=interface)
+    mono.set_initial(phi0)
+
+    for _ in range(3):
+        ref.step()
+        mono.step()
+
+    def relmax(a, b):
+        a = np.asarray(a).ravel()
+        b = np.asarray(b).ravel()
+        return float(np.max(np.abs(a - b)) / max(np.max(np.abs(b)), 1e-30))
+
+    rphi = relmax(mono.phi, ref.phi)
+    ru = relmax(mono.u, ref.u)
+    rp = relmax(mono.p, ref.p)
+    print(f"[cac parity interface={interface}] rel(phi)={rphi:.3e} "
+          f"rel(u)={ru:.3e} rel(p)={rp:.3e} "
+          f"newton(last)={mono.last_newton_iters}")
+    assert rphi <= 1e-10, f"phi parity {rphi:.3e} > 1e-10 ({interface})"
+    assert ru <= 1e-10, f"u parity {ru:.3e} > 1e-10 ({interface})"
+    assert rp <= 1e-10, f"p parity {rp:.3e} > 1e-10 ({interface})"
+
+
+@pytest.mark.parametrize("interface", ["ch", "cac"])
+def test_interface_mass_source_conservation(interface):
+    """Brief Step-1 gate: with a FIXED Gaussian src_fns blob on the phi-row,
+    BOTH interfaces satisfy the source-respecting mass bookkeeping
+        | Int phi(t_n) - Int phi(0) - n*dt*Int s | / |Int phi(0)|  <= 1e-6
+    (Int via lumped mass, partition of unity), AND the interface width along a
+    mid-domain horizontal cut stays within 20% (CAC) / 40% (CH) of the analytic
+    sqrt(2)*Cn over the run.  Static source -> Int_0^t Int s dt = n*dt*Int s."""
+    from diffsim.steppers.chns import CHNSStepper
+
+    level = 5
+    dm, mesh, cons = _make_dm(level=level, dim=2)
+    case = BUBBLE_RISE_RE35_WE10
+    dt = case.dt0
+    coords = mesh.node_coords
+    h = float(dm.mesh.tree.h().min())
+    Cn = 2.0 * h                                  # Cn_override="2h"
+
+    # Fixed Gaussian blob source on the phi-row (index dim+1 = 3 in 2-D).
+    A = 5.0
+    x0, y0, rad = 0.5, 0.5, 3.0 * h
+    blk = 2 + 3
+
+    def src_phi(xq, t):
+        rr2 = (xq[:, 0] - x0) ** 2 + (xq[:, 1] - y0) ** 2
+        return A * np.exp(-rr2 / (2.0 * rad ** 2))
+
+    src_fns = [None] * blk
+    src_fns[2 + 1] = src_phi
+
+    st = CHNSStepper(dm, case, dt, mode="monolithic", Cn_override="2h",
+                     gravity=False, interface=interface, src_fns=src_fns)
+    # a resolved tanh drop so an interface exists for the width metric
+    r = np.sqrt((coords[:, 0] - x0) ** 2 + (coords[:, 1] - y0) ** 2)
+    phi0 = -np.tanh((r - 0.25) / (Cn * np.sqrt(2.0)))
+    st.set_initial(phi0)
+
+    M = st.lumped_mass()
+    mass0 = float(M @ phi0)
+    src_int = float(M @ src_phi(coords, 0.0))     # Int s dOmega (partition of 1)
+
+    n_steps = 10
+    widths = []
+    for k in range(1, n_steps + 1):
+        st.step()
+        mass_k = float(M @ st.phi)
+        expected = mass0 + k * dt * src_int
+        rel = abs(mass_k - expected) / max(abs(mass0), 1e-30)
+        assert rel <= 1e-6, (
+            f"[{interface}] mass-source bookkeeping rel {rel:.3e} > 1e-6 "
+            f"at step {k}")
+        w = _interface_eps_from_cut(st.phi, coords, y_cut=0.5, h=h)
+        if np.isfinite(w):
+            widths.append(w)
+
+    analytic = np.sqrt(2.0) * Cn
+    tol = 0.20 if interface == "cac" else 0.40
+    w_arr = np.asarray(widths)
+    assert w_arr.size > 0, f"[{interface}] no finite interface width measured"
+    dev = float(np.max(np.abs(w_arr - analytic) / analytic))
+    print(f"[mass-src {interface}] final rel-mass ok; width mean="
+          f"{w_arr.mean():.4e} analytic={analytic:.4e} maxdev={dev:.2%} "
+          f"(tol {tol:.0%})")
+    assert dev <= tol, (
+        f"[{interface}] interface width dev {dev:.2%} > {tol:.0%} of "
+        f"sqrt(2)Cn={analytic:.3e}")
+
+
+def test_cac_stationary_drop():
+    """CAC stationary drop (gravity off): after 5 steps the parasitic current
+    stays BOUNDED (no spurious blow-up) and mass is machine-flat.  The
+    parasitic level is REPORTED alongside the CH (potential-form) baseline in
+    the SAME config — the Korteweg surface tension is intentionally less
+    well-balanced than Jacqmin's potential form, so CAC's max|u| is O(1e-2) vs
+    CH's O(1e-4); this ~30x gap is direct A/B evidence (see the decision memo
+    docs/dev/2026-08-10-sp0-interface-decision.md), not a failure.  The strict
+    parasitic gate lives on the CH mirror (test_chns_discrete_stationary_drop);
+    here we bound CAC loosely and assert the well-balanced CH baseline."""
+    from diffsim.steppers.chns import CHNSStepper
+
+    level = 5
+    dm, mesh, cons = _make_dm(level=level, dim=2)
+    coords = mesh.node_coords
+    r = np.sqrt((coords[:, 0] - 0.5) ** 2 + (coords[:, 1] - 0.5) ** 2)
+
+    umax = {}
+    drift = {}
+    for interface in ("ch", "cac"):
+        st = CHNSStepper(dm, BUBBLE_RISE_RE35_WE10, dt=1e-3, mode="monolithic",
+                         gravity=False, Cn_override="2h", interface=interface)
+        phi0 = -np.tanh((r - 0.25) / (st.Cn * np.sqrt(2.0)))
+        st.set_initial(phi0)
+        M = st.lumped_mass()
+        mass0 = float(M @ phi0)
+        for _ in range(5):
+            st.step()
+        umax[interface] = float(np.abs(st.u).max())
+        drift[interface] = abs(float(M @ st.phi) - mass0)
+
+    print(f"[stationary drop A/B] parasitic max|u|: CH={umax['ch']:.3e} "
+          f"CAC={umax['cac']:.3e} (ratio {umax['cac']/umax['ch']:.1f}x); "
+          f"mass drift CH={drift['ch']:.3e} CAC={drift['cac']:.3e}")
+    # CH potential form: well-balanced, strict bound (same as the mirror gate).
+    assert umax["ch"] < 1e-3, f"CH parasitic max|u|={umax['ch']:.3e} >= 1e-3"
+    # CAC Korteweg: bounded (no blow-up) — loose bound documenting the level.
+    assert umax["cac"] < 5e-2, f"CAC parasitic max|u|={umax['cac']:.3e} >= 5e-2"
+    # both interfaces: mass machine-flat on the closed box.
+    for interface in ("ch", "cac"):
+        assert drift[interface] < 1e-11 * dm.n_nodes, (
+            f"{interface} mass drift {drift[interface]:.3e} >= 1e-11*n")
