@@ -277,3 +277,149 @@ def test_variable_coefficient_none_path_identical():
     assert np.allclose(b_ref, b_var, rtol=1e-12, atol=0), (
         f"RHS mismatch: max|diff|={np.abs(b_ref - b_var).max():.3e}"
     )
+
+
+# ===========================================================================
+# Task 4: Benchmark harness — cases, metrics, movie writer
+# ===========================================================================
+# benchmarks/ is NOT a Python package on sys.path in tests.
+# We use sys.path.insert to make benchmarks/ importable, matching the pattern
+# in benchmarks/_bench_bootstrap.py used by the benchmark scripts themselves.
+import sys as _sys
+import os as _os
+_BENCH_DIR = _os.path.normpath(
+    _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "benchmarks")
+)
+if _BENCH_DIR not in _sys.path:
+    _sys.path.insert(0, _BENCH_DIR)  # allow: from chns.X import ...
+_REPO_DIR = _os.path.normpath(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".."))
+if _REPO_DIR not in _sys.path:
+    _sys.path.insert(0, _REPO_DIR)   # allow: from benchmarks.chns.X import ...
+
+from chns.cases import (
+    CHNSCase,
+    BUBBLE_RISE_RE35_WE10,
+    BUBBLE_RISE_RE35_WE125,
+    DAM_BREAK_2D,
+    RT_2D,
+)
+from chns import metrics
+from chns import movie
+
+
+# ---------------------------------------------------------------------------
+# Helper: analytic tanh disk
+# ---------------------------------------------------------------------------
+def _make_disk_grid(n=128, xc=0.5, yc=0.3, radius=0.15, Cn=0.01):
+    """Return (phi, coords) for a tanh disk on an n x n unit grid."""
+    lin = np.linspace(0.0, 1.0, n, endpoint=False) + 0.5 / n
+    xx, yy = np.meshgrid(lin, lin, indexing="ij")
+    coords = np.column_stack([xx.ravel(), yy.ravel()])
+    r = np.sqrt((coords[:, 0] - xc) ** 2 + (coords[:, 1] - yc) ** 2)
+    eps = Cn * np.sqrt(2)
+    phi = -np.tanh((r - radius) / eps)
+    return phi, coords
+
+
+# ---------------------------------------------------------------------------
+# Task 4 tests: metrics
+# ---------------------------------------------------------------------------
+
+def test_centroid_y_tanh_disk():
+    """Analytic tanh disk at (0.5, 0.3) on 128^2: centroid_y approx 0.3 (tol 1e-2)."""
+    phi, coords = _make_disk_grid(n=128, xc=0.5, yc=0.3, radius=0.15, Cn=0.01)
+    cy = metrics.centroid_y(phi, coords)
+    assert abs(cy - 0.3) < 1e-2, f"centroid_y={cy:.5f}, expected ~0.3"
+
+
+def test_circularity_disk_approx_one():
+    """Analytic tanh disk: circularity approx 1.0 (tol 5e-2)."""
+    n = 128
+    phi, coords = _make_disk_grid(n=n, xc=0.5, yc=0.5, radius=0.15, Cn=0.01)
+    h = 1.0 / n
+    circ = metrics.circularity(phi, coords, h)
+    assert abs(circ - 1.0) < 0.05, f"circularity={circ:.5f}, expected ~1.0"
+
+
+def test_circularity_ellipse_less_than_0_95():
+    """A 2:1 ellipse should have circularity < 0.95 (less round than a circle)."""
+    n = 128
+    h = 1.0 / n
+    lin = np.linspace(0.0, 1.0, n, endpoint=False) + 0.5 / n
+    xx, yy = np.meshgrid(lin, lin, indexing="ij")
+    coords = np.column_stack([xx.ravel(), yy.ravel()])
+    # Semi-axes: a=0.20 (x), b=0.10 (y) -> 2:1 ratio
+    a, b = 0.20, 0.10
+    xc, yc = 0.5, 0.5
+    Cn = 0.01
+    r_ell = np.sqrt(((coords[:, 0] - xc) / a) ** 2 + ((coords[:, 1] - yc) / b) ** 2)
+    phi = -np.tanh((r_ell - 1.0) / (Cn * np.sqrt(2)))
+    circ = metrics.circularity(phi, coords, h)
+    assert circ < 0.95, f"Ellipse circularity={circ:.5f}, should be < 0.95"
+
+
+def test_rise_velocity_linear():
+    """Rise velocity of a linearly increasing centroid series = constant slope."""
+    dt = 0.01
+    t = np.arange(20) * dt
+    centroid = 0.3 + 0.5 * t  # linear: velocity = 0.5 everywhere
+    vel = metrics.rise_velocity(centroid, dt)
+    assert vel.shape == centroid.shape
+    assert np.allclose(vel, 0.5, atol=1e-10), f"Expected constant 0.5, got {vel}"
+
+
+# ---------------------------------------------------------------------------
+# Task 4 tests: movie smoke test
+# ---------------------------------------------------------------------------
+
+def test_write_interface_movie_smoke(tmp_path):
+    """3 synthetic frames -> gif file exists and has nonzero size."""
+    n = 32
+    lin = np.linspace(0.0, 1.0, n, endpoint=False) + 0.5 / n
+    xx, yy = np.meshgrid(lin, lin, indexing="ij")
+    coords = np.column_stack([xx.ravel(), yy.ravel()])
+
+    # 3 frames: disk radius grows from 0.10 to 0.16
+    snapshots = []
+    for radius in [0.10, 0.13, 0.16]:
+        r = np.sqrt((coords[:, 0] - 0.5) ** 2 + (coords[:, 1] - 0.5) ** 2)
+        phi = -np.tanh((r - radius) / (0.03 * np.sqrt(2)))
+        snapshots.append(phi)
+
+    out_path = str(tmp_path / "interface_movie.gif")
+    movie.write_interface_movie(snapshots, coords, out_path, fps=5)
+
+    assert _os.path.exists(out_path), "GIF file was not created"
+    assert _os.path.getsize(out_path) > 0, "GIF file is empty"
+
+
+# ---------------------------------------------------------------------------
+# Task 4 tests: case instances
+# ---------------------------------------------------------------------------
+
+def test_all_cases_construct_and_ic_fn():
+    """All four case instances construct and ic_fn returns finite phi in [-1.05, 1.05]."""
+    cases = [BUBBLE_RISE_RE35_WE10, BUBBLE_RISE_RE35_WE125, DAM_BREAK_2D, RT_2D]
+    # Small 16x16 test grid in [0,1]^2 (cases normalise internally)
+    lin = np.linspace(0.0, 1.0, 16, endpoint=False) + 0.5 / 16
+    xx, yy = np.meshgrid(lin, lin, indexing="ij")
+    x_test = np.column_stack([xx.ravel(), yy.ravel()])
+
+    for case in cases:
+        assert isinstance(case, CHNSCase), f"{case.name} is not a CHNSCase"
+        phi0 = case.ic_fn(x_test)
+        assert phi0.shape == (x_test.shape[0],), (
+            f"{case.name}: ic_fn shape mismatch {phi0.shape}"
+        )
+        assert np.isfinite(phi0).all(), f"{case.name}: ic_fn returned non-finite values"
+        assert phi0.min() >= -1.05, (
+            f"{case.name}: phi0.min()={phi0.min():.4f} < -1.05"
+        )
+        assert phi0.max() <= 1.05, (
+            f"{case.name}: phi0.max()={phi0.max():.4f} > 1.05"
+        )
+        # Interface width check: |phi| near interior should approach 1
+        # (tanh saturates; at least some nodes far from interface have |phi| > 0.9)
+        assert np.any(np.abs(phi0) > 0.9), (
+            f"{case.name}: no nodes with |phi| > 0.9; tanh may not be saturating"
+        )
