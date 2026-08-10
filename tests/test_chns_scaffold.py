@@ -100,6 +100,91 @@ def test_ch_advection_translates_blob():
 
 
 # ---------------------------------------------------------------------------
+# Task 6 prerequisite: bulk="quartic" [-1,1] double-well mode
+# ---------------------------------------------------------------------------
+
+def _make_quartic_ch(level=4, Cn=0.05, Pe=100.0, dt=1e-3, adv_gp=None):
+    """1-species [-1,1] quartic double-well CH: kappa=Cn^2, onsager=1/Pe,
+    chi_aa zeros (required ctor arg, unused in quartic mode)."""
+    import warp as wp
+    wp.init()
+    from diffsim.octree.build import build_uniform
+    from diffsim.mesh.nodes import build_mesh
+    from diffsim.mesh.constraints import build_constraints
+    from diffsim.mesh.basis import basis_tables
+    from diffsim.assembly.operators import DeviceMesh
+    from diffsim.physics.multiphase import MultiPhaseStepper
+    from diffsim import default_device
+
+    tree = build_uniform(level, dim=2)
+    mesh = build_mesh(tree, p=1)
+    cons = build_constraints(mesh)
+    dm = DeviceMesh.from_mesh(mesh, cons, basis_tables(1, dim=2),
+                              default_device())
+    st = MultiPhaseStepper(
+        dm, M=1, K=0, chi_aa=np.zeros((2, 2)),
+        onsager=[[1.0 / Pe]], kappa=[Cn ** 2],
+        dt=dt, bulk="quartic", adv_gp=adv_gp,
+    )
+    return st, mesh, cons
+
+
+def test_quartic_ch_tanh_blob_converges_and_bounded():
+    """[-1,1] tanh blob under quartic CH: Newton converges every step and
+    phi stays in [-1.05, 1.05] (the well is self-restoring; no (0,1)
+    clip may fire — a simplex clip would destroy the phi=-1 phase)."""
+    Cn = 0.05
+    st, mesh, cons = _make_quartic_ch(level=4, Cn=Cn, Pe=100.0, dt=1e-3)
+    xc = mesh.node_coords[cons.free_nodes]
+    r = np.sqrt((xc[:, 0] - 0.5) ** 2 + (xc[:, 1] - 0.5) ** 2)
+    phi0 = -np.tanh((r - 0.25) / (Cn * np.sqrt(2.0)))   # +1 inside, -1 out
+    st.set_initial([lambda x: phi0])
+
+    for _ in range(5):
+        x, iters, ok = st._attempt(st.dt)
+        assert ok, f"quartic CH Newton failed to converge (iters={iters})"
+        st.x = x
+        st.hist = x.copy()
+        st.t += st.dt
+        phi = st.phi(0)
+        assert np.isfinite(phi).all(), "non-finite phi"
+        assert phi.min() > -1.05 and phi.max() < 1.05, (
+            f"phi left [-1.05, 1.05]: [{phi.min():.4f}, {phi.max():.4f}]"
+        )
+    # the light phase must survive (a (0,1) clip would have erased phi=-1)
+    assert st.phi(0).min() < -0.9, (
+        f"phi=-1 phase lost: min={st.phi(0).min():.4f}"
+    )
+
+
+def test_quartic_ch_uniform_state_stationary():
+    """Uniform phi=+1 is an exact stationary point of the quartic well
+    (f'(1) = 0): one step must leave phi unchanged to Newton tolerance
+    and converge immediately."""
+    st, mesh, cons = _make_quartic_ch(level=3, Cn=0.05, Pe=100.0, dt=1e-3)
+    st.set_initial([lambda x: np.ones(len(x))])
+    x, iters, ok = st._attempt(st.dt)
+    assert ok, f"Newton failed on the uniform state (iters={iters})"
+    phi1 = x[0::st.ndof]
+    assert np.abs(phi1 - 1.0).max() < 1e-8, (
+        f"uniform phi=+1 not stationary: max drift "
+        f"{np.abs(phi1 - 1.0).max():.3e}"
+    )
+    mu1 = x[1::st.ndof]
+    assert np.abs(mu1).max() < 1e-8, (
+        f"mu != 0 on the uniform state: {np.abs(mu1).max():.3e}"
+    )
+
+
+def test_quartic_rejects_K():
+    """quartic bulk is CH-only: K>0 must raise ConfigError."""
+    from diffsim.physics.multiphase import make_mpf_newton
+    from diffsim.errors import ConfigError
+    with pytest.raises(ConfigError):
+        make_mpf_newton(4, 4, 2, M=1, K=1, bulk="quartic")
+
+
+# ---------------------------------------------------------------------------
 # Task 3: per-GP variable rho/eta/body-force in linear NS assembly
 # ---------------------------------------------------------------------------
 

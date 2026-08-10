@@ -68,6 +68,20 @@ from the p1 form:
   Note the LINEAR phi_k prefactor of f_cr (their Eq. 3 phi*rho[...]),
   vs phi^2/N in p1.
 
+"quartic" — the plain [-1,1] Ginzburg-Landau double-well (SP-0 CHNS;
+matches the adjoint/chns.py CHNSDiscrete contract):
+
+  f = SUM_i (phi_i^2 - 1)^2 / 4 + SUM_i (kap_i/2)|grad phi_i|^2
+  mu_bulk_i = phi_i^3 - phi_i      (d/dphi_i = 3 phi_i^2 - 1)
+
+  NO entropy log, NO chi coupling, NO eliminated solvent, NO b-reg in
+  the mu row; phi_i is an order parameter on [-1, 1], NOT a (0,1)
+  volume fraction.  K = 0 and mob="const" enforced.  The (0,1) simplex
+  projection (_project) is gated OFF (the quartic well is
+  self-restoring); the _attempt trust clamp is retained.  chi_aa is a
+  required ctor arg but unused — pass zeros((2, 2)).  CHNS mapping:
+  kappa=[Cn^2], onsager=[[1/Pe]], adv_gp = GP velocity.
+
 DYNAMICS (P1 Sec 3 = 2310.11844 Sec 2.2).
 
 CH (each retained phi_i):  dphi_i/dt = div( SUM_j Lam_ij grad mu_j ),
@@ -513,8 +527,14 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
            tfield, dth, aniso, film, chadv)
     if key in _kernel_cache:
         return _kernel_cache[key]
-    if bulk not in ("p1", "r14"):
-        raise ConfigError(f"bulk must be 'p1' or 'r14', got {bulk!r}")
+    if bulk not in ("p1", "r14", "quartic"):
+        raise ConfigError(
+            f"bulk must be 'p1', 'r14' or 'quartic', got {bulk!r}")
+    if bulk == "quartic" and K != 0:
+        raise ConfigError(
+            "bulk='quartic' is the plain [-1,1] CH double-well (SP-0 "
+            "CHNS); crystallinity coupling is undefined there — K must "
+            "be 0")
     if mob not in ("const", "fastmode", "fastmode_n", "slowmode_n"):
         raise ConfigError(
             f"mob must be one of const/fastmode/fastmode_n/slowmode_n, "
@@ -542,6 +562,11 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
     Kp = max(K, 1)
     ndof = 2 * M + 2 * K
     R14 = bulk == "r14"
+    # QUARTIC (SP-0 CHNS): plain [-1,1] double-well f = (phi^2-1)^2/4
+    # per species — mu_bulk_i = phi_i^3 - phi_i, d/dphi = 3 phi_i^2 - 1.
+    # NO entropy log, NO chi coupling, NO solvent, NO b-reg in the mu
+    # row; K = 0 enforced above.  kappa/onsager/adv_gp plumbing shared.
+    QUARTIC = bulk == "quartic"
     FASTMODE = mob == "fastmode"
     SLOWN = mob == "slowmode_n"
     MATMOB = mob in ("fastmode_n", "slowmode_n")
@@ -800,29 +825,45 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                 for k in range(Kp):
                     dmudpsi[i, k] = wp.float64(0.0)
             for i in range(M):
-                v = Ninv[i] * (_rlog(phiv[i]) + wp.float64(1.0)) \
-                    - Ninv[M] * (_rlog(phiv[M]) + wp.float64(1.0)) \
-                    + Ssp[i] - Ssp[M] \
-                    + breg * (_binv2(phiv[M]) - _binv2(phiv[i]))
-                if i < K:
-                    if wp.static(R14):
-                        v += Wv[i]
-                    else:
-                        v += wp.float64(2.0) * phiv[i] * Ninv[i] * Wv[i]
-                mub[i] = v
-                for j in range(M):
-                    dv = Ninv[M] * _rinv(phiv[M]) - chiE[i, M] \
-                        - chiE[M, j] \
-                        + wp.float64(2.0) * breg * _binv3(phiv[M])
-                    if j == i:
-                        dv += Ninv[i] * _rinv(phiv[i]) \
-                            + wp.float64(2.0) * breg * _binv3(phiv[i])
-                        if wp.static(not R14):
-                            if i < K:      # r14 bulk is linear in phi
-                                dv += wp.float64(2.0) * Ninv[i] * Wv[i]
-                    else:
-                        dv += chiE[i, j]
-                    dmudphi[i, j] = dv
+                if wp.static(QUARTIC):
+                    # [-1,1] quartic double-well: mu_bulk = phi^3 - phi
+                    # (f = (phi^2-1)^2/4); Jacobian 3 phi^2 - 1.  No
+                    # entropy/chi/solvent/b-reg terms; K = 0 enforced.
+                    ph = phiv[i]
+                    mub[i] = ph * ph * ph - ph
+                    for j in range(M):
+                        dv = wp.float64(0.0)
+                        if j == i:
+                            dv = wp.float64(3.0) * ph * ph \
+                                - wp.float64(1.0)
+                        dmudphi[i, j] = dv
+                else:
+                    v = Ninv[i] * (_rlog(phiv[i]) + wp.float64(1.0)) \
+                        - Ninv[M] * (_rlog(phiv[M]) + wp.float64(1.0)) \
+                        + Ssp[i] - Ssp[M] \
+                        + breg * (_binv2(phiv[M]) - _binv2(phiv[i]))
+                    if i < K:
+                        if wp.static(R14):
+                            v += Wv[i]
+                        else:
+                            v += wp.float64(2.0) * phiv[i] * Ninv[i] \
+                                * Wv[i]
+                    mub[i] = v
+                    for j in range(M):
+                        dv = Ninv[M] * _rinv(phiv[M]) - chiE[i, M] \
+                            - chiE[M, j] \
+                            + wp.float64(2.0) * breg * _binv3(phiv[M])
+                        if j == i:
+                            dv += Ninv[i] * _rinv(phiv[i]) \
+                                + wp.float64(2.0) * breg \
+                                * _binv3(phiv[i])
+                            if wp.static(not R14):
+                                if i < K:  # r14 bulk is linear in phi
+                                    dv += wp.float64(2.0) * Ninv[i] \
+                                        * Wv[i]
+                        else:
+                            dv += chiE[i, j]
+                        dmudphi[i, j] = dv
                 for k in range(K):
                     # d mu_i / d psi_k = dS_i/dpsi_k - dS_s/dpsi_k
                     dv = wp.float64(0.0)
@@ -1681,7 +1722,17 @@ class MultiPhaseStepper:
                     "A2 wall energy on the MOVING (top) face is " \
                     "unsupported (substrate face only in film mode)"
         self.bulk, self.mob = bulk, mob
-        assert bulk in ("p1", "r14")
+        # "quartic" (SP-0 CHNS): plain [-1,1] double-well CH — see the
+        # kernel-factory note.  K = 0 and mob="const" only; phi is NOT
+        # a (0,1) volume fraction, so the simplex projection in
+        # _project is gated OFF for this mode (trust clamp retained).
+        assert bulk in ("p1", "r14", "quartic")
+        if bulk == "quartic":
+            assert self.K == 0, "bulk='quartic' requires K=0"
+            assert mob == "const", \
+                "bulk='quartic': composition-dependent mobility " \
+                "closures are (0,1) volume-fraction laws; mob='const' " \
+                "only"
         assert mob in ("const", "fastmode", "fastmode_n", "slowmode_n")
         self.D_lo = (np.ones(n_sp) if D_lo is None
                      else np.asarray(D_lo, np.float64).reshape(n_sp))
@@ -1908,17 +1959,24 @@ class MultiPhaseStepper:
         return vals, grads
 
     def _project(self, x):
-        """Projected iterates: phi simplex-aware clip, psi in [0, 1]."""
-        lo, hi = 1e-3, 1.0 - 1e-3
-        phis = [x[2 * i::self.ndof] for i in range(self.M)]
-        for p in phis:
-            np.clip(p, lo, None, out=p)
-        s = sum(phis)
-        bad = s > hi
-        if np.any(bad):
-            scale = hi / s[bad]
+        """Projected iterates: phi simplex-aware clip, psi in [0, 1].
+
+        bulk='quartic': phi lives on [-1, 1] and the quartic well is
+        SELF-RESTORING outside it (f' = phi^3 - phi pushes back), so the
+        (0,1) simplex clip is SKIPPED entirely — clipping a [-1,1] field
+        to [1e-3, 1) would destroy the light phase.  The _attempt trust
+        clamp (|d phi| <= 2 per Newton step) still bounds increments."""
+        if self.bulk != "quartic":
+            lo, hi = 1e-3, 1.0 - 1e-3
+            phis = [x[2 * i::self.ndof] for i in range(self.M)]
             for p in phis:
-                p[bad] *= scale
+                np.clip(p, lo, None, out=p)
+            s = sum(phis)
+            bad = s > hi
+            if np.any(bad):
+                scale = hi / s[bad]
+                for p in phis:
+                    p[bad] *= scale
         if self.clip_psi:
             for k in range(self.K):
                 np.clip(x[2 * self.M + 2 * k::self.ndof], 0.0, 1.0,
