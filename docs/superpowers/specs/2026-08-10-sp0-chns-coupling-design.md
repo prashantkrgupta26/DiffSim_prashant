@@ -18,7 +18,7 @@ Non-dimensional CHNS in the Khanwale form, matching the legacy configs' paramete
 - **Phase:** ∂ₜφ + ∇·(**u**φ) = (1/Pe) ∇·(M∇μ), μ = f′(φ) − Cn²∇²φ, f = ¼(φ²−1)² — the existing M=1 CH residual plus one new advection term. Conservative Allen–Cahn (CAC) variant spiked later behind the same interface (§3).
 - **Momentum:** ρ(φ)(∂ₜ**u** + **u**·∇**u**) + **J**·∇**u** = −∇p + (1/Re)∇·(2η(φ)**D**) + (Cn·We)⁻¹ μ∇φ + ρ(φ)**g**/Fr², ∇·**u** = 0. **J** = AGG mass-flux correction (active for CH at unmatched densities; dropped for CAC). Surface tension in potential form μ∇φ (auditable by energy diagnostics; minimizes parasitic currents per Jacqmin).
 - **Closures:** linear ρ(φ), η(φ) interpolation with positivity pullback (legacy pattern, CHNSIntegrandsGenForm lines 132–202); ratios gated to 10³.
-- **Discretization:** VMS/PSPG per existing `ns_bricks` conventions (skew-symmetric convection s=1/2, τ_m h-form); Q1 elements; BDF1 first, BDF2 after gates pass (mirrors `MultiPhaseStepper`'s `tstep` ladder).
+- **Discretization:** VMS/PSPG per existing `ns_bricks` conventions (skew-symmetric convection s=1/2, τ_m h-form), with **τ_m computed per quadrature point from the local η(φ)** — at contrast 10³ a constant-viscosity τ_m mis-stabilizes one phase (research doc §3); Q1 elements; BDF1 first, BDF2 after gates pass (mirrors `MultiPhaseStepper`'s `tstep` ladder).
 
 ## 2. Components (all inside DiffSim; no app-repo component in SP-0)
 
@@ -39,7 +39,7 @@ Non-dimensional CHNS in the Khanwale form, matching the legacy configs' paramete
 2. **Adjoint tractability:** a written-out transpose plan for each — monolithic: JᵀΛ on the coupled Jacobian; staggered: reverse chain through CH-solve → momentum → pressure-Poisson → correction including the currently-untaped Leray pieces — judged on concreteness.
 3. **GPU path:** monolithic — does the blockch Schur factorization extend to the (dim+3)-block saddle; staggered — do existing device solvers cover each sub-solve.
 
-**Timebox:** one task-cluster, not a mini-project. Tiebreak: if evidence is mixed, **monolithic wins by default** (adjoint-first standard).
+**Timebox:** one task-cluster, not a mini-project. Tiebreak: if evidence is mixed, **monolithic wins by default** (adjoint-first standard). Admissible outcome: *both* survive as modes — the research doc (§3) anticipates monolithic during active deposition/yield transitions and projection for quasi-steady relaxation; if the spike shows complementary strengths, SP-0 builds out one as primary (with the adjoint) and keeps the other's scaffolding as a documented forward-only mode.
 
 **Interface spike (after coupling decision):** CAC-vs-CH A/B on the winner, run *with a `src_fns` mass source on* (fixed Gaussian blob), checking interface-profile fidelity and conservation bookkeeping ("mass matches ∫source dt"). Also memo'd. CAC form: ∂ₜφ + ∇·(**u**φ) = γ[ε∇²φ − F′(φ)/ε − β(t)√F(φ)], with the Lagrange multiplier β(t) modified to respect the source.
 
