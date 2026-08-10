@@ -153,3 +153,58 @@ def test_chns_discrete_bubble_rises():
     assert np.all(np.diff(last) > 0), (
         f"bubble centroid_y not strictly increasing over last 5 steps: {last}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 6: staggered CH -> NS projection prototype smoke
+# ---------------------------------------------------------------------------
+def test_staggered_bubble_smoke():
+    """CHNSStaggeredStepper, BUBBLE_RISE_RE35_WE10 at level 5 (32x32),
+    rho_ratio pinned to 10 for the smoke (the case value is already 10;
+    pinned via dataclasses.replace so a future case edit cannot silently
+    change this gate), 20 steps at case dt0:
+      - no NaN in phi/u/p at any snapshot,
+      - |mass drift| printed and < 1e-6 (staggered is NOT exactly
+        conservative: convective-form CH advection + the split — the
+        loose bound is the gate, the actual value is spike evidence),
+      - light bubble (phi=-1) centroid strictly rising over the last 5
+        steps.
+    Cn_override="2h" mirrors the CHNSDiscrete twin tests above (case
+    Cn=0.01 is below the level-5 h=1/32; the sibling monolithic gates
+    use the same 2h resolvability convention)."""
+    from dataclasses import replace
+    from diffsim.steppers.chns import CHNSStaggeredStepper
+
+    level = 5
+    dm, mesh, cons = _make_dm(level=level, dim=2)
+    case = replace(BUBBLE_RISE_RE35_WE10, rho_ratio=10.0)
+    st = CHNSStaggeredStepper(dm, case, dt=case.dt0, Cn_override="2h")
+
+    xc = mesh.node_coords[cons.free_nodes]
+    r = np.sqrt((xc[:, 0] - 0.5) ** 2 + (xc[:, 1] - 0.35) ** 2)
+    phi0 = np.tanh((r - 0.2) / (st.Cn * np.sqrt(2.0)))  # phi=-1 light bubble
+    st.set_initial(phi0)
+
+    mass0 = st.mass_phi()
+    snaps = st.march(t_end=20 * case.dt0)
+    assert len(snaps) == 20
+
+    cy = []
+    for s in snaps:
+        assert np.isfinite(s["phi"]).all(), f"NaN phi at t={s['t']}"
+        assert np.isfinite(s["u"]).all(), f"NaN u at t={s['t']}"
+        assert np.isfinite(s["p"]).all(), f"NaN p at t={s['t']}"
+        cy.append(metrics.centroid_y(-s["phi"], xc))  # bubble = phi<0
+
+    drift = abs(st.mass_phi() - mass0)
+    wall = float(np.mean([s["wall_per_step"] for s in snaps]))
+    print(f"[staggered smoke] |mass drift| = {drift:.3e} (bound 1e-6), "
+          f"wall/step = {wall:.3f} s, "
+          f"newton_iters(last) = {st.last_newton_iters}, "
+          f"clamped(last) = {st.last_clamped}")
+    assert drift < 1e-6, f"|mass drift| {drift:.3e} >= 1e-6"
+
+    last = np.asarray(cy[-5:])
+    assert np.all(np.diff(last) > 0), (
+        f"bubble centroid_y not strictly rising over last 5 steps: {last}"
+    )
