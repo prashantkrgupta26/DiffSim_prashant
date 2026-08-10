@@ -20,12 +20,13 @@ tau_m_gp legacy
   ``src/diffsim/physics/vms.py:48-56`` (``tau_hbased_host``) to per-GP local
   rho, eta.  Constant mapping (tau_hbased_host symbol -> chns.py symbol):
 
-    tau_hbased_host        chns.py            Value   Role
-    ------------------     ---------------    -----   -------------------------
-    (2*b0/dt)^2  (b0=1)   Ci0 / dt^2         4/dt^2  transient term
-    c1=4.0                 Ci0=4.0            4.0     advective coefficient
-    c2CI=36*16*dim         Ci1^2              1296    viscous coefficient^2
-    nu = eta/(rho*Re)      eta_gp/(rho_gp*Re) --      kinematic viscosity, local
+    tau_hbased_host            chns.py                    Value              Role
+    ------------------         ---------------            -----              -------------------------
+    (2*b0/dt)^2  (b0=1)        4.0 / dt^2                 4/dt^2             transient term
+    c1=4.0                     ci0=4.0                    4.0                advective coefficient
+    c2CI=CI_F*16*dim (dim-dep) ci_f*16*dim * nu^2/h^4     1152 @ dim=2       viscous coefficient
+                                                           1728 @ dim=3
+    nu = eta/(rho*Re)          eta_gp/(rho_gp*Re)         --                 kinematic viscosity, local
 
   The outer ``/ rho_gp`` converts the pressure-stabilized tauM (units of
   time/density) into the momentum stabilization form required by the CHNS
@@ -158,14 +159,16 @@ def tau_m_gp(
     (``tau_hbased_host``) generalized to per-GP local (rho, eta):
 
         tau_m = [ (2*b0/dt)^2 + c1*|u|^2/h^2
-                              + (Ci1*nu_local/h^2)^2 ]^{-1/2} / rho_gp
+                              + c2CI*nu_local^2/h^4 ]^{-1/2} / rho_gp
 
-    where b0=1, c1=Ci0=4, nu_local = eta_gp/(rho_gp*Re), and Ci1=36.
+    where b0=1, c1=ci0=4, nu_local = eta_gp/(rho_gp*Re), dim inferred from
+    u_gp.shape[-1], and c2CI = CI_F * 16 * dim = 36 * 16 * dim
+    (1152 for dim=2, 1728 for dim=3).
 
     Constant mapping to ``tau_hbased_host`` (vms.py:48-56):
-      - transient: (2*b0/dt)^2 with b0=1  <=>  Ci0/dt^2  (= 4/dt^2)
-      - advective: c1*|u|^2/h^2  (c1=4)   <=>  Ci0*u_mag**2/h**2
-      - viscous:   c2CI*nu^2/h^4           <=>  (Ci1*nu_local/h^2)^2
+      - transient: (2*b0/dt)^2 with b0=1  <=>  4/dt^2  (Ci[0]/dt^2)
+      - advective: c1*|u|^2/h^2  (c1=4)   <=>  Ci[0]*u_mag**2/h**2
+      - viscous:   c2CI*nu^2/h^4           <=>  Ci[1]*16*dim*nu_local**2/h**4
 
     See also: ``src/diffsim/api/ns_bricks.py:341-514`` for the constant-nu
     element kernels (make_linear_ns_Ae / make_linear_ns_be) being generalized.
@@ -184,8 +187,10 @@ def tau_m_gp(
         Time step size.
     Re : float
         Reynolds number.
-    Ci : tuple (Ci0, Ci1), optional
-        Stabilization constants.  Default (4.0, 36.0).
+    Ci : tuple (ci0, ci_f), optional
+        Stabilization constants: ci0=advective coefficient (default 4.0),
+        ci_f=CI_F in the house constant c2CI = ci_f * 16 * dim (default 36.0).
+        Default (4.0, 36.0).
 
     Returns
     -------
@@ -196,13 +201,17 @@ def tau_m_gp(
     rho_gp = np.asarray(rho_gp, dtype=float)
     eta_gp = np.asarray(eta_gp, dtype=float)
 
-    Ci0, Ci1 = float(Ci[0]), float(Ci[1])
+    ci0, ci_f = float(Ci[0]), float(Ci[1])
+    dim = u_gp.shape[-1]
 
     u_mag = np.sqrt(np.sum(u_gp ** 2, axis=-1))  # [ngp]
 
-    term_trans = Ci0 / dt ** 2           # (2*b0/dt)^2 with b0=1, Ci0=4
-    term_adv = Ci0 * u_mag ** 2 / h ** 2  # c1*|u|^2/h^2, c1=Ci0=4
-    term_visc = (Ci1 * eta_gp / (rho_gp * Re * h ** 2)) ** 2
+    nu_loc = eta_gp / (rho_gp * Re)               # local kinematic viscosity
+
+    c2CI = ci_f * 16.0 * dim                      # house constant: 36*16*dim
+    term_trans = ci0 / dt ** 2                    # (2*b0/dt)^2 with b0=1, ci0=4
+    term_adv = ci0 * u_mag ** 2 / h ** 2          # c1*|u|^2/h^2, c1=ci0=4
+    term_visc = c2CI * nu_loc ** 2 / h ** 4       # c2CI*nu^2/h^4 (dim-aware)
 
     denom = np.sqrt(term_trans + term_adv + term_visc)
     return 1.0 / (denom * rho_gp)
