@@ -1304,3 +1304,300 @@ class CrystalCHTwin:
             loss = loss + 0.5 * sum(
                 ((xN[2 * M + j::blk] - tgt) ** 2).sum() for j in range(K))
             return float(loss)
+
+
+# --------------------------------------------------------------------------
+# Coupled Cahn-Hilliard / Navier-Stokes (CHNS) twin (SP-0 Task 11)
+# — autograd reference for adjoint/chns.CHNSAdjoint (three-way gate).
+# --------------------------------------------------------------------------
+class CHNSTwin:
+    r"""Autograd twin of adjoint/chns.CHNSDiscrete (interface='ch', BDF1).
+
+    Faithful torch reimplementation of the coupled (u, p, phi, mu) monolithic
+    residual: variable rho(phi)/eta(phi) via mix_props, capillary mu*grad phi,
+    AGG mass flux, gravity, symmetric-D viscous, SUPG/PSPG on the FULL momentum
+    strong residual with a DIFFERENTIATED tau — every term mirrors the numpy
+    mirror's residual rows.  Marched with torch.linalg.solve inside a plain
+    Newton loop; autograd through the converged march returns the IFT gradient
+    the hand adjoint (CHNSAdjoint) must reproduce.
+
+    DOF layout: node-major blk = dim + 3, (u_0..u_{dim-1}, p, phi, mu).
+    Boundary: no-slip u (strong), pressure pin at node 0 (strong).
+
+    Differentiable scalar params (leaf tensors):
+      rho_ratio, eta_ratio, We, mobility (== 1/Pe, the Pe*M knob), Fr.
+    CPU float64 throughout.
+    """
+
+    def __init__(self, dm, case, dt, Cn, gravity=True, device="cpu"):
+        self.dim = dm.dim
+        self.nn = dm.n_nodes
+        self.blk = self.dim + 3
+        self.ndof = self.blk * self.nn
+        self.dt = float(dt)
+        self.Cn = float(Cn)
+        self.Re = float(case.Re)
+        self.gravity = bool(gravity)
+        self.dev = device
+        t = lambda a, d=torch.float64: torch.tensor(np.asarray(a), dtype=d,
+                                                    device=device)
+        self.bins = []
+        blk = self.blk
+        for pv, b in dm.bins.items():
+            tb = dm.tables_by_p[pv]
+            conn = dm.mesh.conn_of[pv].astype(np.int64)
+            h = np.asarray(dm.mesh.tree.h()[dm.mesh.bins[pv]], np.float64)
+            ne, nbf = conn.shape
+            jac = (h / 2.0) ** self.dim
+            dJxW = np.asarray(tb.w)[None, :] * jac[:, None]
+            gdof = (conn[:, :, None] * blk
+                    + np.arange(blk)[None, None, :]).reshape(ne, blk * nbf)
+            self.bins.append(dict(
+                conn=t(conn, torch.int64), N=t(tb.N), dN=t(tb.dN),
+                dJxW=t(dJxW), dscale=t(2.0 / h), h=float(h[0]),
+                ne=ne, nbf=nbf, nqp=np.asarray(tb.N).shape[0],
+                gd=[t(gdof[:, f::blk].ravel(), torch.int64)
+                    for f in range(blk)]))
+        # boundary rows (no-slip velocity; pressure pin node 0)
+        bnd = np.asarray(dm.mesh.boundary_nodes, bool)
+        bc = []
+        for a in np.where(bnd)[0]:
+            for d in range(self.dim):
+                bc.append(a * blk + d)
+        bc.append(0 * blk + self.dim)
+        self.bc_rows = t(np.asarray(bc, np.int64), torch.int64)
+        self.coords = np.asarray(dm.mesh.node_coords, np.float64)
+        self._dm = dm
+        # attach a numpy CHNSDiscrete for the exact (detached) Newton Jacobian
+        self._attach_mirror(case, gravity)
+
+    def _ipv(self, field, B):
+        # field [nn, dim] -> v[e,q,d], g[e,q,d,s]
+        vals = field[B["conn"]]
+        v = torch.einsum("qa,ead->eqd", B["N"], vals)
+        g = torch.einsum("qas,ead,e->eqds", B["dN"], vals, B["dscale"])
+        return v, g
+
+    def _ip(self, field, B):
+        vals = field[B["conn"]]
+        v = torch.einsum("qa,ea->eq", B["N"], vals)
+        g = torch.einsum("qad,ea,e->eqd", B["dN"], vals, B["dscale"])
+        return v, g
+
+    def unpack(self, x):
+        blk, dim = self.blk, self.dim
+        u = torch.stack([x[d::blk] for d in range(dim)], dim=1)
+        p = x[dim::blk]
+        phi = x[dim + 1::blk]
+        mu = x[dim + 2::blk]
+        return u, p, phi, mu
+
+    def _residual(self, x, u_n, phi_n, P):
+        dim, blk = self.dim, self.blk
+        dt, Re, Cn = self.dt, self.Re, self.Cn
+        rho_h, eta_h = 1.0, 1.0
+        rho_l = 1.0 / P["rho_ratio"]
+        eta_l = 1.0 / P["eta_ratio"]
+        a_rho = 0.5 * (rho_h - rho_l)
+        b_rho = 0.5 * (rho_h + rho_l)
+        a_eta = 0.5 * (eta_h - eta_l)
+        b_eta = 0.5 * (eta_h + eta_l)
+        agg = -0.5 * (rho_h - rho_l) * P["mobility"]
+        cw_inv = 1.0 / (Cn * P["We"])
+        grav_scale = 1.0 / P["Fr"] ** 2
+        mobility = P["mobility"]
+        u, p, phi, mu = self.unpack(x)
+        ghat = torch.zeros(dim, dtype=torch.float64, device=self.dev)
+        if self.gravity:
+            ghat[-1] = -1.0
+        R = torch.zeros(self.ndof, dtype=torch.float64, device=self.dev)
+        # soft clamp floor: mix_props clamps below 1e-3*lo; the twin uses
+        # interior data so the raw values stay well above the floor (no clamp
+        # engaged -> matches the mirror's unclamped branch).  We keep the raw
+        # (unclamped) value so autograd sees the linear interp slope everywhere.
+        for B in self.bins:
+            dJxW, N, dN, ds = B["dJxW"], B["N"], B["dN"], B["dscale"]
+            h_ = B["h"]
+            u_gp, gu = self._ipv(u, B)
+            un_gp, _ = self._ipv(u_n, B)
+            p_gp, gp = self._ip(p, B)
+            phi_gp, gphi = self._ip(phi, B)
+            phin_gp, _ = self._ip(phi_n, B)
+            mu_gp, gmu = self._ip(mu, B)
+            rho_gp = a_rho * phi_gp + b_rho
+            eta_gp = a_eta * phi_gp + b_eta
+            c2CI = 36.0 * 16.0 * dim
+            nu_loc = eta_gp / (rho_gp * Re)
+            A_t = 4.0 / dt ** 2
+            Bu_t = 4.0 * (u_gp ** 2).sum(-1) / h_ ** 2
+            C_t = c2CI * nu_loc ** 2 / h_ ** 4
+            denom = torch.sqrt(A_t + Bu_t + C_t)
+            tau = 1.0 / (denom * rho_gp)
+            J_gp = agg * gmu
+            ugradu = torch.einsum("eqs,eqds->eqd", u_gp, gu)
+            Jgradu = torch.einsum("eqs,eqds->eqd", J_gp, gu)
+            ugradphi = torch.einsum("eqs,eqs->eq", u_gp, gphi)
+            fcap = cw_inv * mu_gp[..., None] * gphi
+            fgrav = (rho_gp[..., None] * grav_scale) * ghat[None, None, :]
+            r_mom = (rho_gp[..., None] * (u_gp - un_gp) / dt
+                     + rho_gp[..., None] * ugradu + Jgradu + gp - fcap - fgrav)
+            mom_body = (rho_gp[..., None] * (u_gp - un_gp) / dt
+                        + rho_gp[..., None] * ugradu + Jgradu - fcap - fgrav)
+            Rmom = torch.einsum("eq,qa,eqd->ead", dJxW, N, mom_body)
+            symgu = gu + gu.transpose(2, 3)
+            dNp = torch.einsum("qas,e->eqas", dN, ds)
+            Rvisc = (1.0 / Re) * torch.einsum(
+                "eq,eq,eqds,eqas->ead", dJxW, eta_gp, symgu, dNp)
+            Rpres = -torch.einsum("eq,eq,eqad->ead", dJxW, p_gp, dNp)
+            ugw = torch.einsum("eqs,eqas->eqa", u_gp, dNp)
+            Rsupg = torch.einsum("eq,eq,eqa,eqd->ead", dJxW, tau, ugw, r_mom)
+            Ru = Rmom + Rvisc + Rpres + Rsupg
+            for d in range(dim):
+                R = R.index_add(0, B["gd"][d], Ru[:, :, d].reshape(-1))
+            divu = torch.einsum("eqdd->eq", gu)
+            Rcont = torch.einsum("eq,qa,eq->ea", dJxW, N, divu)
+            Rpspg = torch.einsum("eq,eq,eqas,eqs->ea", dJxW, tau, dNp, r_mom)
+            R = R.index_add(0, B["gd"][dim], (Rcont + Rpspg).reshape(-1))
+            ch_body = (phi_gp - phin_gp) / dt + ugradphi + phi_gp * divu
+            Rphi = (torch.einsum("eq,qa,eq->ea", dJxW, N, ch_body)
+                    + mobility * torch.einsum("eq,eqas,eqs->ea", dJxW, dNp,
+                                              gmu))
+            R = R.index_add(0, B["gd"][dim + 1], Rphi.reshape(-1))
+            fp = phi_gp ** 3 - phi_gp
+            Rmu = (torch.einsum("eq,qa,eq->ea", dJxW, N, mu_gp - fp)
+                   - Cn ** 2 * torch.einsum("eq,eqas,eqs->ea", dJxW, dNp,
+                                            gphi))
+            R = R.index_add(0, B["gd"][dim + 2], Rmu.reshape(-1))
+        # boundary rows: residual = x_dof (no-slip, pin)
+        R = R.index_copy(0, self.bc_rows, x[self.bc_rows])
+        return R
+
+    def _attach_mirror(self, case, gravity):
+        """Lazily build a numpy CHNSDiscrete used ONLY to supply the exact
+        analytic Newton Jacobian at the (detached) current iterate.  The
+        gradient never flows through this — J is detached in the Newton update
+        (standard IFT trick: at convergence the J-graph term vanishes because
+        R=0), so using the FD-verified analytic mirror J is both exact and much
+        cheaper than a per-iterate autograd Jacobian."""
+        from .chns import CHNSDiscrete
+        self._mirror = CHNSDiscrete(level=0, dim=self.dim, case=case,
+                                    dt=self.dt, dm=self._dm, gravity=gravity,
+                                    Cn_override=self.Cn, newton_tol=1e-12)
+
+    def march(self, phi0, P, n_steps, u0=None, newton_max=40, newton_tol=1e-12):
+        """March n_steps; returns the terminal packed state x_N (autograd).
+
+        Newton Jacobian: if a numpy mirror was attached (_attach_mirror), the
+        exact analytic J is assembled at the detached iterate with the current
+        (detached) float param values; otherwise falls back to a per-iterate
+        autograd Jacobian.  Either way the RESIDUAL is graph-connected, so
+        autograd-through-convergence returns the IFT gradient."""
+        dim, blk = self.dim, self.dim + 3
+        t = lambda a: torch.tensor(np.asarray(a), dtype=torch.float64,
+                                   device=self.dev)
+        phi0 = t(phi0)
+        u_n = (torch.zeros(self.nn, dim, dtype=torch.float64, device=self.dev)
+               if u0 is None else t(u0))
+        phi_n = phi0.clone()
+        x = torch.zeros(self.ndof, dtype=torch.float64, device=self.dev)
+        for d in range(dim):
+            x[d::blk] = u_n[:, d]
+        x[dim + 1::blk] = phi0
+        mir = getattr(self, "_mirror", None)
+        if mir is not None:
+            # push current (detached) param values into the mirror
+            pv = {k: float(v.detach()) if torch.is_tensor(v) else float(v)
+                  for k, v in P.items()}
+            mir.rho_ratio = pv["rho_ratio"]; mir.rho_l = 1.0 / mir.rho_ratio
+            mir.eta_ratio = pv["eta_ratio"]; mir.eta_l = 1.0 / mir.eta_ratio
+            mir.We = pv["We"]; mir.Fr = pv["Fr"]
+            mir.Pe = 1.0 / pv["mobility"]
+            mir.agg = -0.5 * (mir.rho_h - mir.rho_l) / mir.Pe
+        for _ in range(n_steps):
+            xk = x.clone()
+            un_np = u_n.detach().cpu().numpy()
+            phin_np = phi_n.detach().cpu().numpy()
+            for it in range(newton_max):
+                R = self._residual(xk, u_n, phi_n, P)
+                if mir is not None:
+                    mir.set_history(un_np, phin_np)
+                    Js = mir.jacobian(xk.detach().cpu().numpy())
+                    J = torch.tensor(Js.toarray(), dtype=torch.float64,
+                                     device=self.dev)
+                else:
+                    J = _jacobian_dense(
+                        lambda z: self._residual(z, u_n, phi_n, P),
+                        xk, self.ndof)
+                # J detached, R graph-connected: the corrective step carries
+                # the IFT param-sensitivity (at convergence R~0 so the value is
+                # unchanged, but its param-gradient is exactly -J^{-1} dR/dp).
+                step = torch.linalg.solve(J, -R)
+                xk = xk + step
+                if float(step.detach().abs().max()) < newton_tol:
+                    break
+            x = xk
+            u_n = torch.stack([x[d::blk] for d in range(dim)], dim=1)
+            phi_n = x[dim + 1::blk]
+        return x
+
+    def grads(self, phi0, params0, names, n_steps, objective,
+              phi_target=None, coords=None, u0=None):
+        """Build leaf tensors for the requested scalar params, march, backprop
+        the objective, return {name: leaf.grad}.  params0 is a dict with keys
+        rho_ratio, eta_ratio, We, mobility, Fr (floats)."""
+        leaves = {}
+        P = {}
+        for k, v in params0.items():
+            if k in names:
+                leaves[k] = torch.tensor(float(v), dtype=torch.float64,
+                                         device=self.dev, requires_grad=True)
+                P[k] = leaves[k]
+            else:
+                P[k] = torch.tensor(float(v), dtype=torch.float64,
+                                    device=self.dev)
+        xN = self.march(phi0, P, n_steps, u0=u0)
+        J = self._objective(xN, objective, phi_target, coords)
+        J.backward()
+        return {nm: float(leaves[nm].grad) for nm in names}
+
+    def loss(self, phi0, params0, n_steps, objective, phi_target=None,
+             coords=None, u0=None):
+        """Detached scalar objective (for FD checks)."""
+        with torch.no_grad():
+            P = {k: torch.tensor(float(v), dtype=torch.float64, device=self.dev)
+                 for k, v in params0.items()}
+            xN = self.march(phi0, P, n_steps, u0=u0)
+            return float(self._objective(xN, objective, phi_target, coords))
+
+    def _lumped(self):
+        w = torch.zeros(self.nn, dtype=torch.float64, device=self.dev)
+        for B in self.bins:
+            Ma = torch.einsum("eq,qa->ea", B["dJxW"], B["N"])
+            w = w.index_add(0, B["conn"].reshape(-1), Ma.reshape(-1))
+        return w
+
+    def _objective(self, xN, objective, phi_target, coords):
+        blk, dim = self.blk, self.dim
+        phi = xN[dim + 1::blk]
+        w = self._lumped()
+        if objective == "terminal_phi_mismatch":
+            tgt = torch.tensor(np.asarray(phi_target), dtype=torch.float64,
+                               device=self.dev)
+            return 0.5 * (w * (phi - tgt) ** 2).sum()
+        elif objective == "centroid_y":
+            cc = self.coords if coords is None else np.asarray(coords)
+            y = torch.tensor(cc[:, 1], dtype=torch.float64, device=self.dev)
+            heavy = 0.5 * (1.0 + phi)
+            num = (w * y * heavy).sum()
+            den = (w * heavy).sum()
+            return num / den
+        raise ValueError(f"unknown objective {objective!r}")
+
+
+def _jacobian_dense(fn, x, ndof):
+    """Dense Jacobian d fn / d x via torch.autograd.functional.jacobian,
+    detached from the outer graph (used inside the Newton loop where we only
+    need the linear solve operator, not its derivative)."""
+    xd = x.detach().clone().requires_grad_(True)
+    Jf = torch.autograd.functional.jacobian(fn, xd, vectorize=True)
+    return Jf.detach()
