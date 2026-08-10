@@ -220,7 +220,7 @@ def tau_m_gp(
 # ---------------------------------------------------------------------------
 # Task 7 (SP-0): monolithic (u, p, phi, mu) Warp kernel factory
 # ---------------------------------------------------------------------------
-def make_chns_newton(nbf: int, nqp: int, dim: int):
+def make_chns_newton(nbf: int, nqp: int, dim: int, interface: str = "ch"):
     r"""Element residual (``be = -R``) + Jacobian (``Ae``) Warp kernel for the
     coupled BDF1 CHNS system, node-major ``blk = dim + 3`` per node ordered
     ``(u_0..u_{dim-1}, p, phi, mu)``.  This is the compiled twin of
@@ -252,11 +252,31 @@ def make_chns_newton(nbf: int, nqp: int, dim: int):
         consistency error).  Same subtraction convention as f_grav.
     Both are pure explicit RHS terms (no Jacobian; the sources do not depend on
     the unknowns), passed as zeros when unused so the signature stays uniform.
+
+    ``interface`` (static, part of the cache key):
+      "ch" (default) -> the Cahn-Hilliard 4-field brick above; the CH kernel is
+        byte-identical to the pre-CAC factory.
+      "cac" -> Conservative Allen-Cahn (spec §3): the phi-row becomes
+        R^phi = INT psi[(phi-phi_n)/dt + u.grad phi + phi div u]
+              + gamma Cn INT gpsi.gphi
+              + gamma INT psi[F'(phi)/Cn + beta sqrt(F(phi))]  (- src),
+        gamma = 1/Pe, F = 1/4(phi^2-1)^2; the mu-row is a trivial identity
+        R^mu = INT chi mu (mu -> 0, a wasted DOF); the momentum potential
+        capillary (mu grad phi) and AGG flux are dropped, and surface tension
+        is the Galerkin-only Korteweg form +(Cn/We)(gphi(x)gphi):grad w.  The
+        Lagrange multiplier ``beta`` is FROZEN per Newton iterate (computed
+        host-side, passed as a scalar) — no dbeta/dphi block, so the sparse
+        structure matches CH.  Mirrors adjoint.chns.CHNSDiscrete(interface=
+        "cac") exactly (parity gated 1e-10).  ``gamma``/``beta`` scalar args
+        are ignored on the CH path.
     """
     import warp as wp
     from ..assembly.operators import _kernel_cache
 
-    key = ("chns_newton", nbf, nqp, dim)
+    if interface not in ("ch", "cac"):
+        raise ValueError(f"interface must be 'ch' or 'cac', got {interface!r}")
+    cac = (interface == "cac")
+    key = ("chns_newton", nbf, nqp, dim, interface)
     if key in _kernel_cache:
         return _kernel_cache[key]
 
@@ -288,6 +308,7 @@ def make_chns_newton(nbf: int, nqp: int, dim: int):
                Cn: wp.float64, Pe: wp.float64,
                cw_inv: wp.float64, agg: wp.float64,
                grav_scale: wp.float64,
+               gamma: wp.float64, beta: wp.float64,
                rho_h: wp.float64, rho_l: wp.float64,
                eta_h: wp.float64, eta_l: wp.float64,
                Ae: wp.array3d(dtype=wp.float64),
@@ -355,9 +376,16 @@ def make_chns_newton(nbf: int, nqp: int, dim: int):
                 Jg = wp.float64(0.0)     # (J.grad)u_d = sum_s J_s du_d/dx_s
                 for s in range(dim):
                     ug += u_gp[gp, s] * gu_gp[gp, d, s]
-                    Jg += (agg * gmu_gp[gp, s]) * gu_gp[gp, d, s]
+                    if not cac:
+                        Jg += (agg * gmu_gp[gp, s]) * gu_gp[gp, d, s]
                 ugradu[d] = ug
-                fcap_d = cw_inv * mu_gp[gp] * gphi_gp[gp, d]
+                # CAC drops the potential-form capillary (mu grad phi) and the
+                # AGG flux J; surface tension is the Galerkin-only Korteweg term
+                # added in the residual-row loop below (r_mom carries neither).
+                if cac:
+                    fcap_d = wp.float64(0.0)
+                else:
+                    fcap_d = cw_inv * mu_gp[gp] * gphi_gp[gp, d]
                 fgrav_d = rho * grav_scale * ghat[d]
                 fmms_d = fbody_gp[gp, d]     # MMS/SP-1 momentum source
                 accel[d] = (u_gp[gp, d] - un_gp[gp, d]) / dt + ug
@@ -383,18 +411,30 @@ def make_chns_newton(nbf: int, nqp: int, dim: int):
                 for s in range(dim):
                     ugw += u_gp[gp, s] * (dNtab[q, a, s] * dscale)
                 # --- momentum rows d ---
+                # gphi . grad N_a (reused by the CAC Korteweg term)
+                gphi_gNa = wp.float64(0.0)
+                for s in range(dim):
+                    gphi_gNa += gphi_gp[gp, s] * (dNtab[q, a, s] * dscale)
                 for d in range(dim):
                     # galerkin body: rho(u-un)/dt + rho ugradu + Jgradu
                     #                - fcap - fgrav
-                    fcap_d = cw_inv * mu_gp[gp] * gphi_gp[gp, d]
+                    if cac:
+                        fcap_d = wp.float64(0.0)
+                    else:
+                        fcap_d = cw_inv * mu_gp[gp] * gphi_gp[gp, d]
                     fgrav_d = rho * grav_scale * ghat[d]
                     fmms_d = fbody_gp[gp, d]
                     Jg = wp.float64(0.0)
-                    for s in range(dim):
-                        Jg += (agg * gmu_gp[gp, s]) * gu_gp[gp, d, s]
+                    if not cac:
+                        for s in range(dim):
+                            Jg += (agg * gmu_gp[gp, s]) * gu_gp[gp, d, s]
                     mom_body = rho * (u_gp[gp, d] - un_gp[gp, d]) / dt \
                         + rho * ugradu[d] + Jg - fcap_d - fgrav_d - fmms_d
                     Rd = Na * mom_body
+                    # CAC Korteweg surface tension (Galerkin only):
+                    #   +(Cn/We) (grad phi)_d (grad phi . grad N_a)
+                    if cac:
+                        Rd += (Cn / We) * gphi_gp[gp, d] * gphi_gNa
                     # viscous (eta/Re) symgu[d,s] dN_a,s
                     visc = wp.float64(0.0)
                     for s in range(dim):
@@ -413,24 +453,41 @@ def make_chns_newton(nbf: int, nqp: int, dim: int):
                     gNa_rmom += (dNtab[q, a, s] * dscale) * r_mom[s]
                 Rp += tau * gNa_rmom
                 wp.atomic_add(be, e, blk * a + dim, -Rp * dJxW)
-                # --- CH phi row (field dim+1), conservative advection ---
+                # --- phi row (field dim+1), conservative advection ---
                 # SP-1 deposition hook: subtract source S so mass grows by
                 # INT S dV (pure RHS term; no Jacobian dependence on unknowns)
                 ch_body = (phiq - phin_gp[gp]) / dt + ugradphi \
                     + phiq * divu - src_phi_gp[gp]
                 Rphi = Na * ch_body
-                gNa_gmu = wp.float64(0.0)
-                for s in range(dim):
-                    gNa_gmu += (dNtab[q, a, s] * dscale) * gmu_gp[gp, s]
-                Rphi += (wp.float64(1.0) / Pe) * gNa_gmu
+                if cac:
+                    # CAC flux: +gamma Cn (gNa.gphi)
+                    #           +gamma N_a [F'(phi)/Cn + beta sqrt(F(phi))]
+                    gNa_gphi_p = wp.float64(0.0)
+                    for s in range(dim):
+                        gNa_gphi_p += (dNtab[q, a, s] * dscale) * gphi_gp[gp, s]
+                    Fp = phiq * phiq * phiq - phiq
+                    Fq = wp.float64(0.25) * (phiq * phiq - wp.float64(1.0)) \
+                        * (phiq * phiq - wp.float64(1.0))
+                    sqrtF = wp.sqrt(wp.max(Fq, wp.float64(0.0)))
+                    Rphi += gamma * Cn * gNa_gphi_p \
+                        + gamma * Na * (Fp / Cn + beta * sqrtF)
+                else:
+                    gNa_gmu = wp.float64(0.0)
+                    for s in range(dim):
+                        gNa_gmu += (dNtab[q, a, s] * dscale) * gmu_gp[gp, s]
+                    Rphi += (wp.float64(1.0) / Pe) * gNa_gmu
                 wp.atomic_add(be, e, blk * a + dim + 1, -Rphi * dJxW)
-                # --- CH mu row (field dim+2) ---
-                fp = phiq * phiq * phiq - phiq
-                Rmu = Na * (mu_gp[gp] - fp)
-                gNa_gphi = wp.float64(0.0)
-                for s in range(dim):
-                    gNa_gphi += (dNtab[q, a, s] * dscale) * gphi_gp[gp, s]
-                Rmu += -(Cn * Cn) * gNa_gphi
+                # --- mu row (field dim+2) ---
+                if cac:
+                    # trivial mu = 0 row: R^mu = INT N_a mu
+                    Rmu = Na * mu_gp[gp]
+                else:
+                    fp = phiq * phiq * phiq - phiq
+                    Rmu = Na * (mu_gp[gp] - fp)
+                    gNa_gphi = wp.float64(0.0)
+                    for s in range(dim):
+                        gNa_gphi += (dNtab[q, a, s] * dscale) * gphi_gp[gp, s]
+                    Rmu += -(Cn * Cn) * gNa_gphi
                 wp.atomic_add(be, e, blk * a + dim + 2, -Rmu * dJxW)
 
             # ============ JACOBIAN BLOCKS (Ae) =========================
@@ -450,9 +507,10 @@ def make_chns_newton(nbf: int, nqp: int, dim: int):
                         dNb_s = dNtab[q, b, s] * dscale
                         dNa_s = dNtab[q, a, s] * dscale
                         uGNb += u_gp[gp, s] * dNb_s
-                        JGNb += (agg * gmu_gp[gp, s]) * dNb_s
+                        if not cac:
+                            JGNb += (agg * gmu_gp[gp, s]) * dNb_s
                         gNagNb += dNa_s * dNb_s
-                    # c1 = (rho/dt) N_b + rho u.gradN_b + J.gradN_b
+                    # c1 = (rho/dt) N_b + rho u.gradN_b + J.gradN_b (JGNb=0 CAC)
                     c1 = rho * (Nb / dt) + rho * uGNb + JGNb
 
                     # ---- momentum rows d ----
@@ -493,12 +551,25 @@ def make_chns_newton(nbf: int, nqp: int, dim: int):
                         valp = -dNa_d * Nb + tau * ugw * dNb_d
                         wp.atomic_add(Ae, e, rowd, blk * b + dim, valp * dJxW)
                         # (phi col dim+1)
-                        # galerkin: drho N_b accel_d - cw_inv mu dNb_d
+                        # galerkin: drho N_b accel_d - cap_cw mu dNb_d
                         #           - grav_scale ghat_d drho N_b
                         # viscous eta(phi): (1/Re) deta N_b symgu[d,s] dNa_s
+                        if cac:
+                            cap_mu = wp.float64(0.0)
+                        else:
+                            cap_mu = cw_inv * mu_gp[gp]
                         vphi = Na * (drho * Nb * accel[d]
-                                     - cw_inv * mu_gp[gp] * dNb_d
+                                     - cap_mu * dNb_d
                                      - grav_scale * ghat[d] * drho * Nb)
+                        # CAC Korteweg d/dphi: (Cn/We)[dNb_d (gphi.gNa)
+                        #                              + gphi_d (gNa.gNb)]
+                        if cac:
+                            gphi_gNa_j = wp.float64(0.0)
+                            for s in range(dim):
+                                gphi_gNa_j += gphi_gp[gp, s] \
+                                    * (dNtab[q, a, s] * dscale)
+                            vphi += (Cn / We) * (dNb_d * gphi_gNa_j
+                                                 + gphi_gp[gp, d] * gNagNb)
                         visc_phi = wp.float64(0.0)
                         for s in range(dim):
                             symds = gu_gp[gp, d, s] + gu_gp[gp, s, d]
@@ -506,24 +577,27 @@ def make_chns_newton(nbf: int, nqp: int, dim: int):
                         vphi += (wp.float64(1.0) / Re) * deta * Nb * visc_phi
                         # SUPG: tau ugw * dr_mom/dphi
                         dr_phi = drho * Nb * accel[d] \
-                            - cw_inv * mu_gp[gp] * dNb_d \
+                            - cap_mu * dNb_d \
                             - grav_scale * ghat[d] * drho * Nb
                         vphi += tau * ugw * dr_phi
                         # SUPG tau-derivative: dtau/dphi N_b ugw r_mom_d
                         vphi += ugw * r_mom[d] * dtau_dphi * Nb
                         wp.atomic_add(Ae, e, rowd, blk * b + dim + 1,
                                       vphi * dJxW)
-                        # (mu col dim+2)
-                        # galerkin: -cw_inv N_b gphi_d + agg (dNb.gu_d)
-                        dNb_gu_d = wp.float64(0.0)
-                        for s in range(dim):
-                            dNb_gu_d += (dNtab[q, b, s] * dscale) \
-                                * gu_gp[gp, d, s]
-                        vmu = Na * (-cw_inv * Nb * gphi_gp[gp, d]
-                                    + agg * dNb_gu_d)
-                        # SUPG: tau ugw * dr_mom/dmu
-                        dr_mu = -cw_inv * Nb * gphi_gp[gp, d] + agg * dNb_gu_d
-                        vmu += tau * ugw * dr_mu
+                        # (mu col dim+2) — zero in CAC (no mu-coupling)
+                        if cac:
+                            vmu = wp.float64(0.0)
+                        else:
+                            dNb_gu_d = wp.float64(0.0)
+                            for s in range(dim):
+                                dNb_gu_d += (dNtab[q, b, s] * dscale) \
+                                    * gu_gp[gp, d, s]
+                            vmu = Na * (-cw_inv * Nb * gphi_gp[gp, d]
+                                        + agg * dNb_gu_d)
+                            # SUPG: tau ugw * dr_mom/dmu
+                            dr_mu = -cw_inv * Nb * gphi_gp[gp, d] \
+                                + agg * dNb_gu_d
+                            vmu += tau * ugw * dr_mu
                         wp.atomic_add(Ae, e, rowd, blk * b + dim + 2,
                                       vmu * dJxW)
 
@@ -556,10 +630,15 @@ def make_chns_newton(nbf: int, nqp: int, dim: int):
                     wp.atomic_add(Ae, e, rowc, blk * b + dim,
                                   tau * gNagNb * dJxW)
                     # d/dphi: tau gNa . dr_mom/dphi + tau-deriv
+                    # (CAC: r_mom has no capillary term -> cap contribution 0)
                     cphi = wp.float64(0.0)
                     for s in range(dim):
-                        dr_s = drho * Nb * accel[s] \
-                            - cw_inv * mu_gp[gp] * (dNtab[q, b, s] * dscale) \
+                        if cac:
+                            cap_s = wp.float64(0.0)
+                        else:
+                            cap_s = cw_inv * mu_gp[gp] \
+                                * (dNtab[q, b, s] * dscale)
+                        dr_s = drho * Nb * accel[s] - cap_s \
                             - grav_scale * ghat[s] * drho * Nb
                         cphi += (dNtab[q, a, s] * dscale) * dr_s
                     gNa_rmom = wp.float64(0.0)
@@ -567,39 +646,70 @@ def make_chns_newton(nbf: int, nqp: int, dim: int):
                         gNa_rmom += (dNtab[q, a, s] * dscale) * r_mom[s]
                     cphi = tau * cphi + gNa_rmom * dtau_dphi * Nb
                     wp.atomic_add(Ae, e, rowc, blk * b + dim + 1, cphi * dJxW)
-                    # d/dmu: tau gNa . dr_mom/dmu
-                    cmu = wp.float64(0.0)
-                    for s in range(dim):
-                        dNb_gu_s = wp.float64(0.0)
-                        for ss in range(dim):
-                            dNb_gu_s += (dNtab[q, b, ss] * dscale) \
-                                * gu_gp[gp, s, ss]
-                        dr_s = -cw_inv * gphi_gp[gp, s] * Nb + agg * dNb_gu_s
-                        cmu += (dNtab[q, a, s] * dscale) * dr_s
+                    # d/dmu: tau gNa . dr_mom/dmu (0 in CAC — no mu-coupling)
+                    if cac:
+                        cmu = wp.float64(0.0)
+                    else:
+                        cmu = wp.float64(0.0)
+                        for s in range(dim):
+                            dNb_gu_s = wp.float64(0.0)
+                            for ss in range(dim):
+                                dNb_gu_s += (dNtab[q, b, ss] * dscale) \
+                                    * gu_gp[gp, s, ss]
+                            dr_s = -cw_inv * gphi_gp[gp, s] * Nb \
+                                + agg * dNb_gu_s
+                            cmu += (dNtab[q, a, s] * dscale) * dr_s
                     wp.atomic_add(Ae, e, rowc, blk * b + dim + 2,
                                   tau * cmu * dJxW)
 
-                    # ---- CH phi row (dim+1) ----
+                    # ---- phi row (dim+1) ----
                     rowp = blk * a + dim + 1
                     for jc in range(dim):
                         dNb_jc = dNtab[q, b, jc] * dscale
                         # u.grad phi -> N_b dphi/dx_jc ; phi div u -> phi dNb_jc
                         val = Na * (Nb * gphi_gp[gp, jc] + phiq * dNb_jc)
                         wp.atomic_add(Ae, e, rowp, blk * b + jc, val * dJxW)
-                    # d/dphi: (1/dt)N_b + u.gradN_b + divu N_b
-                    cpp = Na * (Nb / dt + uGNb + divu * Nb)
-                    wp.atomic_add(Ae, e, rowp, blk * b + dim + 1, cpp * dJxW)
-                    # d/dmu: (1/Pe) gNa.gNb
-                    wp.atomic_add(Ae, e, rowp, blk * b + dim + 2,
-                                  (wp.float64(1.0) / Pe) * gNagNb * dJxW)
+                    if cac:
+                        # d/dphi: (1/dt)N_b + u.gradN_b + divu N_b
+                        #   + gamma Cn (gNa.gNb)
+                        #   + gamma N_a [F''/Cn + beta F'/(2 sqrt F)] N_b
+                        Fp2 = phiq * phiq * phiq - phiq
+                        Fq2 = wp.float64(0.25) \
+                            * (phiq * phiq - wp.float64(1.0)) \
+                            * (phiq * phiq - wp.float64(1.0))
+                        sqrtF2 = wp.sqrt(wp.max(Fq2, wp.float64(0.0)))
+                        dsqrtF = wp.float64(0.0)
+                        if sqrtF2 > wp.float64(1e-12):
+                            dsqrtF = Fp2 / (wp.float64(2.0) * sqrtF2)
+                        cpp = Na * (Nb / dt + uGNb + divu * Nb) \
+                            + gamma * Cn * gNagNb \
+                            + gamma * Na * (fpp / Cn + beta * dsqrtF) * Nb
+                        wp.atomic_add(Ae, e, rowp, blk * b + dim + 1,
+                                      cpp * dJxW)
+                        # no d/dmu coupling in CAC
+                    else:
+                        # d/dphi: (1/dt)N_b + u.gradN_b + divu N_b
+                        cpp = Na * (Nb / dt + uGNb + divu * Nb)
+                        wp.atomic_add(Ae, e, rowp, blk * b + dim + 1,
+                                      cpp * dJxW)
+                        # d/dmu: (1/Pe) gNa.gNb
+                        wp.atomic_add(Ae, e, rowp, blk * b + dim + 2,
+                                      (wp.float64(1.0) / Pe) * gNagNb * dJxW)
 
-                    # ---- CH mu row (dim+2) ----
+                    # ---- mu row (dim+2) ----
                     rowm = blk * a + dim + 2
-                    # d/dphi: -Na f'' Nb - Cn^2 gNa.gNb
-                    cmp = -Na * fpp * Nb - (Cn * Cn) * gNagNb
-                    wp.atomic_add(Ae, e, rowm, blk * b + dim + 1, cmp * dJxW)
-                    # d/dmu: Na Nb
-                    wp.atomic_add(Ae, e, rowm, blk * b + dim + 2, Na * Nb * dJxW)
+                    if cac:
+                        # trivial mu = 0 row: d/dmu = Na Nb
+                        wp.atomic_add(Ae, e, rowm, blk * b + dim + 2,
+                                      Na * Nb * dJxW)
+                    else:
+                        # d/dphi: -Na f'' Nb - Cn^2 gNa.gNb
+                        cmp = -Na * fpp * Nb - (Cn * Cn) * gNagNb
+                        wp.atomic_add(Ae, e, rowm, blk * b + dim + 1,
+                                      cmp * dJxW)
+                        # d/dmu: Na Nb
+                        wp.atomic_add(Ae, e, rowm, blk * b + dim + 2,
+                                      Na * Nb * dJxW)
 
     _kernel_cache[key] = chns_k
     return chns_k

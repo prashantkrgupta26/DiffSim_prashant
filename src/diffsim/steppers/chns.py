@@ -347,12 +347,16 @@ class CHNSMonolithicStepper:
 
     def __init__(self, dm, case, dt, linsolver="splu", Cn_override=None,
                  gravity=True, newton_tol=1e-10, newton_max=30,
-                 tstep="bdf1", src_fns=None, body_fn=None):
+                 tstep="bdf1", src_fns=None, body_fn=None, interface="ch"):
         assert linsolver == "splu", \
             "prototype scope: splu only (spike ruling; GPU solves are a " \
             "build-out concern)"
         if tstep not in ("bdf1", "bdf2"):
             raise ValueError(f"tstep must be 'bdf1' or 'bdf2', got {tstep!r}")
+        if interface not in ("ch", "cac"):
+            raise ValueError(
+                f"interface must be 'ch' or 'cac', got {interface!r}")
+        self.interface = interface
         import warp as wp
         self._wp = wp
         self.tstep = tstep
@@ -392,6 +396,10 @@ class CHNSMonolithicStepper:
         self.rho_h, self.rho_l = 1.0, 1.0 / self.rho_ratio
         self.eta_h, self.eta_l = 1.0, 1.0 / self.eta_ratio
         self.agg = -0.5 * (self.rho_h - self.rho_l) / self.Pe
+        # CAC mobility gamma = 1/Pe (== CH Onsager coeff); beta frozen per
+        # Newton iterate (computed host-side in _assemble for interface="cac").
+        self.gamma = 1.0 / self.Pe
+        self._beta_frozen = 0.0
         hmin = float(dm.mesh.tree.h().min())
         self.h = hmin
         if Cn_override is None:
@@ -460,7 +468,8 @@ class CHNSMonolithicStepper:
             B["xq"] = np.einsum("qa,ead->eqd", B["N"], node_xy)  # [ne,nqp,dim]
 
         self._kernel = make_chns_newton(
-            self.bins[0]["nbf"], self.bins[0]["nqp"], dim)
+            self.bins[0]["nbf"], self.bins[0]["nqp"], dim,
+            interface=self.interface)
 
     # ------------------------------------------------------------------
     # protocol properties
@@ -534,6 +543,25 @@ class CHNSMonolithicStepper:
         """int phi dV via lumped mass (partition of unity)."""
         return float(self.lumped_mass() @ self._phi)
 
+    def _cac_beta(self, phi):
+        r"""Source-respecting CAC Lagrange multiplier from the current phi
+        (a cheap GP reduction; mirrors adjoint.chns.CHNSDiscrete._cac_beta):
+            beta = -( Int F'(phi)/Cn ) / ( Int sqrt(F(phi)) ),
+        F = 1/4(phi^2-1)^2, F' = phi^3 - phi.  Frozen per Newton iterate."""
+        Cn = self.Cn
+        num = 0.0
+        den = 0.0
+        for B in self.bins:
+            phi_gp, _ = self._interp(phi, B)              # [e, q]
+            Fp = phi_gp ** 3 - phi_gp
+            F = 0.25 * (phi_gp ** 2 - 1.0) ** 2
+            jac = (B["h"] / 2.0) ** self.dim
+            dJxW = B["w"][None, :] * jac[:, None]
+            num += float(np.sum(dJxW * (Fp / Cn)))
+            den += float(np.sum(dJxW * np.sqrt(np.maximum(F, 0.0))))
+        den = den if abs(den) > 1e-300 else 1e-300
+        return -num / den
+
     # ------------------------------------------------------------------
     # field interpolation to GPs (scalar + vector), matching the mirror
     # ------------------------------------------------------------------
@@ -583,6 +611,12 @@ class CHNSMonolithicStepper:
                                   dtype=wp.float64, device=d)
         ghat_d = arr(self.ghat)
         dt_eff, u_n_eff, phi_n_eff = self._bdf_time()
+        # CAC: freeze beta per Newton iterate from the current iterate's phi
+        # (both residual+jac calls within a Newton step see the same x -> the
+        # frozen-beta contract, no dbeta/dphi block, matching the mirror).
+        if self.interface == "cac":
+            self._beta_frozen = self._cac_beta(phi)
+        beta = self._beta_frozen
         R = np.zeros(self.ndof)
         rows, cols, valsK = [], [], []
         n_clamp = 0
@@ -638,6 +672,7 @@ class CHNSMonolithicStepper:
                 wp.float64(self.We), wp.float64(self.Cn),
                 wp.float64(self.Pe), wp.float64(self.cw_inv),
                 wp.float64(self.agg), wp.float64(self.grav_scale),
+                wp.float64(self.gamma), wp.float64(beta),
                 wp.float64(self.rho_h), wp.float64(self.rho_l),
                 wp.float64(self.eta_h), wp.float64(self.eta_l),
                 Ae, be], device=d)
@@ -834,7 +869,7 @@ class CHNSMonolithicStepper:
 
 def CHNSStepper(dm, case, dt, mode="auto", tstep="bdf1", linsolver="splu",
                 Cn_override=None, gravity=True, src_fns=None, body_fn=None,
-                **kwargs):
+                interface="ch", **kwargs):
     r"""SP-0 Task 9 facade — the ONE public entry point for CHNS forward
     marching.  Thin dispatcher over the two reviewed coupling prototypes; the
     coupling decision (docs/dev/2026-08-10-sp0-coupling-decision.md, Baskar
@@ -871,6 +906,12 @@ def CHNSStepper(dm, case, dt, mode="auto", tstep="bdf1", linsolver="splu",
     body_fn : callable or None
         NS body-force channel fn(xq, t) -> [ngp, dim] added to the dim momentum
         rows (MMS convenience; monolithic only).
+    interface : {"ch", "cac"}
+        Interface model (monolithic only; the staggered fast mode is CH-only
+        and raises on "cac").  "ch" (default) -> Cahn-Hilliard 4-field brick.
+        "cac" -> Conservative Allen-Cahn (spec §3): source-respecting Lagrange
+        multiplier, trivial-mu row, Korteweg surface tension.  See the A/B
+        decision memo docs/dev/2026-08-10-sp0-interface-decision.md.
 
     Returns
     -------
@@ -881,8 +922,13 @@ def CHNSStepper(dm, case, dt, mode="auto", tstep="bdf1", linsolver="splu",
         return CHNSMonolithicStepper(
             dm, case, dt, linsolver=linsolver, Cn_override=Cn_override,
             gravity=gravity, tstep=tstep, src_fns=src_fns, body_fn=body_fn,
-            **kwargs)
+            interface=interface, **kwargs)
     if mode == "staggered":
+        if interface != "ch":
+            raise ValueError(
+                "interface='cac' (Conservative Allen-Cahn) is wired on the "
+                "monolithic mode only (the decided primary; spec §3); the "
+                "staggered fast mode is CH-only.  Use mode='monolithic'.")
         if tstep != "bdf1":
             raise ValueError(
                 "CHNSStaggeredStepper is BDF1-only (documented forward-only "
