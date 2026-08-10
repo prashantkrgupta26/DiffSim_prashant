@@ -1028,3 +1028,364 @@ class CHNSDiscrete:
         while self.t < t_end - 1e-12:
             out.append(self.step())
         return out
+
+    # ==================================================================
+    # ADJOINT SUPPORT (Task 11): parametric residual + cross-step block
+    # ==================================================================
+    # These helpers back CHNSAdjoint.  They are CH-interface only (the SP-0
+    # adjoint exit gate is the CH mode; CAC adjoint is out of scope).  The
+    # forward Newton path above is untouched; the adjoint re-assembles J_n on
+    # the backward pass (memory-light) via self.jacobian(x_n) after restoring
+    # that step's history, and forms parameter cotangents dR/dp by COMPLEX-STEP
+    # through _residual_param (machine-exact, reuses the exact residual code
+    # path so the derivative is guaranteed consistent with the forward term).
+
+    _ADJ_PARAMS = ("rho_ratio", "eta_ratio", "We", "mobility", "Fr")
+
+    def _residual_param(self, x, u_n, phi_n, overrides=None, dtype=np.float64):
+        r"""Galerkin+SUPG+PSPG CH residual with scalar-parameter overrides,
+        dtype-generic (supports complex-step).  Mirrors the RESIDUAL rows of
+        _assemble exactly for interface=="ch"; BDF1 only (the adjoint gate is
+        BDF1).  ``overrides`` maps any of {rho_ratio, eta_ratio, We, mobility,
+        Fr} to a (possibly complex) value; ``mobility`` == 1/Pe (the Pe*M knob).
+        Boundary rows (no-slip u, pressure pin) are replaced by x_dof so the
+        parametric derivative through the BC rows is zero (BCs are param-free).
+        """
+        assert self.interface == "ch", "adjoint is CH-interface only"
+        ov = overrides or {}
+        blk, dim = self.blk, self.dim
+        dt = self.dt
+
+        rho_ratio = ov.get("rho_ratio", self.rho_ratio)
+        eta_ratio = ov.get("eta_ratio", self.eta_ratio)
+        We = ov.get("We", self.We)
+        mobility = ov.get("mobility", 1.0 / self.Pe)      # Pe*M knob, M=1
+        Fr = ov.get("Fr", self.Fr)
+        Re, Cn = self.Re, self.Cn
+
+        rho_h, eta_h = 1.0, 1.0
+        rho_l = 1.0 / rho_ratio
+        eta_l = 1.0 / eta_ratio
+        a_rho = 0.5 * (rho_h - rho_l)
+        b_rho = 0.5 * (rho_h + rho_l)
+        a_eta = 0.5 * (eta_h - eta_l)
+        b_eta = 0.5 * (eta_h + eta_l)
+        agg = -0.5 * (rho_h - rho_l) * mobility           # AGG prefactor
+        cw_inv = 1.0 / (Cn * We)
+        grav_scale = 1.0 / Fr ** 2
+
+        u, p, phi, mu = self.unpack(x)
+        u = u.astype(dtype); p = p.astype(dtype)
+        phi = phi.astype(dtype); mu = mu.astype(dtype)
+        u_n = np.asarray(u_n, dtype).reshape(self.nn, dim)
+        phi_n = np.asarray(phi_n, dtype)
+
+        ghat = np.zeros(dim)
+        if self.gravity:
+            ghat[-1] = -1.0
+        R = np.zeros(self.ndof, dtype=dtype)
+
+        # floors for clamp (real comparison on the real part; derivative 0 where
+        # clamped matches the mix_props convention)
+        rho_floor = 1e-3 * (1.0 / self.rho_ratio)
+        eta_floor = 1e-3 * (1.0 / self.eta_ratio)
+
+        for B in self.bins:
+            dJxW = B["dJxW"].astype(dtype)
+            N, dN, dscale = B["N"], B["dN"], B["dscale"]
+            ne, nbf, nqp = B["ne"], B["nbf"], B["nqp"]
+            h_e = B["h"]
+
+            u_gp, gu = self._interp_vec(u, B)
+            un_gp, _ = self._interp_vec(u_n, B)
+            p_gp, gp = self._interp(p, B)
+            phi_gp, gphi = self._interp(phi, B)
+            phin_gp, _ = self._interp(phi_n, B)
+            mu_gp, gmu = self._interp(mu, B)
+
+            rho_raw = a_rho * phi_gp + b_rho
+            eta_raw = a_eta * phi_gp + b_eta
+            rho_gp = np.where(np.real(rho_raw) >= rho_floor, rho_raw, rho_floor)
+            eta_gp = np.where(np.real(eta_raw) >= eta_floor, eta_raw, eta_floor)
+
+            # tau (per GP, local rho/eta) — same closed form as _assemble
+            h_ = float(h_e[0])
+            c2CI = 36.0 * 16.0 * dim
+            nu_loc = eta_gp / (rho_gp * Re)
+            A_t = 4.0 / dt ** 2
+            Bu_t = 4.0 * np.sum(u_gp ** 2, axis=-1) / h_ ** 2
+            C_t = c2CI * nu_loc ** 2 / h_ ** 4
+            denom = np.sqrt(A_t + Bu_t + C_t)
+            tau = 1.0 / (denom * rho_gp)
+
+            J_gp = agg * gmu
+            ugradu = np.einsum("eqs,eqds->eqd", u_gp, gu)
+            Jgradu = np.einsum("eqs,eqds->eqd", J_gp, gu)
+            ugradphi = np.einsum("eqs,eqs->eq", u_gp, gphi)
+
+            fcap = cw_inv * mu_gp[..., None] * gphi
+            fgrav = (rho_gp[..., None] * grav_scale) * ghat[None, None, :]
+            fmms = np.zeros((ne, nqp, dim), dtype=dtype)
+            if self.body_fn is not None:
+                bf = np.asarray(self.body_fn(B["xq"].reshape(ne * nqp, dim),
+                                             self._t_eval), float)
+                fmms = bf.reshape(ne, nqp, dim).astype(dtype)
+
+            r_mom = (rho_gp[..., None] * (u_gp - un_gp) / dt
+                     + rho_gp[..., None] * ugradu
+                     + Jgradu + gp - fcap - fgrav - fmms)
+
+            mom_body = (rho_gp[..., None] * (u_gp - un_gp) / dt
+                        + rho_gp[..., None] * ugradu + Jgradu
+                        - fcap - fgrav - fmms)
+            Rmom = np.einsum("eq,qa,eqd->ead", dJxW, N, mom_body)
+            symgu = gu + np.transpose(gu, (0, 1, 3, 2))
+            dNp = np.einsum("qas,e->eqas", dN, dscale)
+            Rvisc = (1.0 / Re) * np.einsum(
+                "eq,eq,eqds,eqas->ead", dJxW, eta_gp, symgu, dNp)
+            Rpres = -np.einsum("eq,eq,eqad->ead", dJxW, p_gp, dNp)
+            ugw = np.einsum("eqs,eqas->eqa", u_gp, dNp)
+            Rsupg = np.einsum("eq,eq,eqa,eqd->ead", dJxW, tau, ugw, r_mom)
+            Ru = Rmom + Rvisc + Rpres + Rsupg
+            for d in range(dim):
+                np.add.at(R, B["gdof"][:, d::blk].ravel(), Ru[:, :, d].ravel())
+
+            divu = np.einsum("eqdd->eq", gu)
+            Rcont = np.einsum("eq,qa,eq->ea", dJxW, N, divu)
+            Rpspg = np.einsum("eq,eq,eqas,eqs->ea", dJxW, tau, dNp, r_mom)
+            Rp = Rcont + Rpspg
+            np.add.at(R, B["gdof"][:, dim::blk].ravel(), Rp.ravel())
+
+            ch_body = (phi_gp - phin_gp) / dt + ugradphi + phi_gp * divu
+            Rphi = (np.einsum("eq,qa,eq->ea", dJxW, N, ch_body)
+                    + mobility * np.einsum("eq,eqas,eqs->ea", dJxW, dNp, gmu))
+            np.add.at(R, B["gdof"][:, dim + 1::blk].ravel(), Rphi.ravel())
+
+            fp = phi_gp ** 3 - phi_gp
+            Rmu = (np.einsum("eq,qa,eq->ea", dJxW, N, mu_gp - fp)
+                   - Cn ** 2 * np.einsum("eq,eqas,eqs->ea", dJxW, dNp, gphi))
+            np.add.at(R, B["gdof"][:, dim + 2::blk].ravel(), Rmu.ravel())
+
+        # boundary rows: residual = x_dof (param-independent)
+        rows = self._bc_rows()
+        R[rows] = x[rows].astype(dtype)
+        return R
+
+    def dR_dparam(self, x, u_n, phi_n, name):
+        r"""Explicit dR/dp (length-ndof) at fixed state x and BDF1 history,
+        by complex-step through _residual_param.  ``name`` in _ADJ_PARAMS."""
+        p0 = dict(rho_ratio=self.rho_ratio, eta_ratio=self.eta_ratio,
+                  We=self.We, mobility=1.0 / self.Pe, Fr=self.Fr)[name]
+        hstep = 1e-30
+        ov = {name: p0 + 1j * hstep}
+        Rc = self._residual_param(x, u_n, phi_n, overrides=ov,
+                                  dtype=np.complex128)
+        return np.imag(Rc) / hstep
+
+    def cross_step_matrix(self, x, u_n, phi_n):
+        r"""Analytic dR/d(x_n): the BDF1 history block.  u_n enters step n+1
+        only through rho*(u-u_n)/dt (Galerkin momentum + SUPG r_mom + PSPG
+        r_mom); phi_n enters only through (phi-phi_n)/dt (CH phi Galerkin row).
+        rho/eta/tau use phi^{n+1} only (NOT phi_n) — verified against
+        _assemble — so no other history dependence exists.  Returns a sparse
+        ndof x ndof matrix C with C[i,j] = dR_i/dx_n[j]."""
+        blk, dim = self.blk, self.dim
+        dt = self.dt
+        u, p, phi, mu = self.unpack(x)
+        rho_h, rho_l = 1.0, 1.0 / self.rho_ratio
+        a_rho, b_rho = 0.5 * (rho_h - rho_l), 0.5 * (rho_h + rho_l)
+        eta_h, eta_l = 1.0, 1.0 / self.eta_ratio
+        a_eta, b_eta = 0.5 * (eta_h - eta_l), 0.5 * (eta_h + eta_l)
+        Re, Cn = self.Re, self.Cn
+        rows, cols, vals = [], [], []
+        for B in self.bins:
+            dJxW, N, dN, dscale = B["dJxW"], B["N"], B["dN"], B["dscale"]
+            ne, nbf, nqp = B["ne"], B["nbf"], B["nqp"]
+            h_ = float(B["h"][0])
+            u_gp, gu = self._interp_vec(u, B)
+            phi_gp, _ = self._interp(phi, B)
+            rho_raw = a_rho * phi_gp + b_rho
+            eta_raw = a_eta * phi_gp + b_eta
+            rho_gp = np.maximum(rho_raw, 1e-3 * rho_l)
+            eta_gp = np.maximum(eta_raw, 1e-3 * eta_l)
+            c2CI = 36.0 * 16.0 * dim
+            nu_loc = eta_gp / (rho_gp * Re)
+            denom = np.sqrt(4.0 / dt ** 2
+                            + 4.0 * np.sum(u_gp ** 2, axis=-1) / h_ ** 2
+                            + c2CI * nu_loc ** 2 / h_ ** 4)
+            tau = 1.0 / (denom * rho_gp)
+            dNp = np.einsum("qas,e->eqas", dN, dscale)
+            ugw = np.einsum("eqs,eqas->eqa", u_gp, dNp)     # [e,q,a]
+            gdof = B["gdof"]
+            Ae = np.zeros((ne, blk * nbf, blk * nbf))
+
+            def addblk(fr, fc, mat):
+                Ae[:, fr::blk, fc::blk] += mat
+
+            # d(mom_body, SUPG r_mom, PSPG r_mom)/du_n[b,jc]: the u_n term is
+            # rho*(u-u_n)/dt, so its jc-component derivative wrt u_n[b] carries
+            # coefficient -rho/dt * N_b on component jc.
+            #   Galerkin momentum comp jc: INT N_a * (-rho/dt) N_b
+            #   SUPG      momentum comp jc: INT tau ugw_a * (-rho/dt) N_b
+            #   PSPG      continuity     : INT tau gNa_jc * (-rho/dt) N_b
+            coef = -(1.0 / dt) * rho_gp                     # [e,q]
+            gal = np.einsum("eq,qa,eq,qb->eab", dJxW, N, coef, N)
+            supg = np.einsum("eq,eq,eqa,eq,qb->eab", dJxW, tau, ugw, coef, N)
+            for jc in range(dim):
+                addblk(jc, jc, gal + supg)                  # momentum comp jc
+                pspg = np.einsum("eq,eq,eqa,eq,qb->eab", dJxW, tau,
+                                 dNp[:, :, :, jc], coef, N)
+                addblk(dim, jc, pspg)                       # continuity
+            # phi Galerkin: (phi - phi_n)/dt -> d/dphi_n[b] = -N_b/dt
+            phi_hist = np.einsum("eq,qa,qb->eab", dJxW * (-1.0 / dt), N, N)
+            addblk(dim + 1, dim + 1, phi_hist)
+
+            rows.append(np.repeat(gdof, blk * nbf, axis=1).ravel())
+            cols.append(np.tile(gdof, (1, blk * nbf)).ravel())
+            vals.append(Ae.ravel())
+        C = sp.coo_matrix((np.concatenate(vals),
+                           (np.concatenate(rows), np.concatenate(cols))),
+                          shape=(self.ndof, self.ndof)).tocsr()
+        # boundary rows of R are x_dof (no x_n dependence) -> zero those rows
+        bc = self._bc_rows()
+        C = C.tolil()
+        for r in bc:
+            C.rows[r] = []
+            C.data[r] = []
+        return C.tocsr()
+
+
+# ==========================================================================
+# Task 11: discrete-IFT adjoint through the coupled CHNS BDF1 march
+# ==========================================================================
+class CHNSAdjoint:
+    r"""Reverse-mode (discrete-IFT) adjoint of the CHNS mirror (CHNSDiscrete),
+    CH interface only (the SP-0 exit gate; CAC adjoint is SP-1+ work).
+
+    Forward pass marches ``mirror`` for ``n_steps`` from a set initial state,
+    storing each step's converged packed state x_n and its BDF1 history
+    (u_n, phi_n = the PREVIOUS committed state).  The backward pass RE-ASSEMBLES
+    J_n = jacobian(x_n) on demand (memory-light: no stored factorizations) after
+    restoring that step's history, and solves the per-step transposed system
+
+        J_n^T lam_n = dJ/dx_n  -  (dR_{n+1}/dx_n)^T lam_{n+1}
+
+    where the cross-step block dR_{n+1}/dx_n is the BDF1 history coupling
+    (mirror.cross_step_matrix): u_n, phi_n enter step n+1 ONLY through the time
+    terms rho*(u-u_n)/dt (momentum Galerkin + SUPG + PSPG) and (phi-phi_n)/dt
+    (CH phi row).  rho/eta/tau depend on phi^{n+1} only, so there is no other
+    history dependence.  Parameter cotangents:  dJ/dp = -sum_n lam_n^T dR_n/dp,
+    each dR_n/dp a complex-step re-assembly (mirror.dR_dparam).
+
+    Objectives (terminal, selectable):
+      "terminal_phi_mismatch":  J = 0.5 sum_i w_i (phi_i(T) - phi*_i)^2
+         with lumped weights w_i = INT N_i and a passed phi_target.
+      "centroid_y" (SMOOTH heavy-phase centroid):
+         J = sum_i w_i y_i (1+phi_i)/2  /  sum_i w_i (1+phi_i)/2.
+         This differs from the benchmark's masked metric (metrics.centroid_y,
+         a non-smooth phi>0 mask) BY DESIGN — the smooth form is differentiable
+         everywhere, which the adjoint requires; the masked metric has a
+         zero-measure-but-nondifferentiable boundary the discrete adjoint cannot
+         see.  Documented divergence, per the task brief.
+    """
+
+    def __init__(self, mirror, objective="terminal_phi_mismatch",
+                 phi_target=None, coords=None):
+        if mirror.interface != "ch":
+            raise ValueError("CHNSAdjoint supports interface='ch' only")
+        if mirror.tstep != "bdf1":
+            raise ValueError("CHNSAdjoint supports tstep='bdf1' only")
+        self.m = mirror
+        self.objective = objective
+        self.phi_target = (None if phi_target is None
+                           else np.asarray(phi_target, np.float64).copy())
+        self.coords = (mirror.coords if coords is None
+                       else np.asarray(coords, np.float64))
+        self.steps = []      # list of dict(x, u_n, phi_n) per committed step
+
+    # ------------------------------------------------------------------
+    def march(self, n_steps):
+        """March the mirror n_steps, recording (x_n, history) each step."""
+        self.steps = []
+        m = self.m
+        for _ in range(n_steps):
+            u_n = m.u_n.copy()
+            phi_n = m.phi_n.copy()
+            m.step()
+            self.steps.append(dict(x=m.pack(), u_n=u_n, phi_n=phi_n))
+        return self.steps
+
+    # ------------------------------------------------------------------
+    def objective_value(self):
+        """Scalar J at the terminal recorded state."""
+        xN = self.steps[-1]["x"]
+        _, _, phi, _ = self.m.unpack(xN)
+        return float(self._J_of_phi(phi))
+
+    def _J_of_phi(self, phi):
+        w = self.m.lumped_mass()
+        if self.objective == "terminal_phi_mismatch":
+            return 0.5 * float(np.sum(w * (phi - self.phi_target) ** 2))
+        elif self.objective == "centroid_y":
+            y = self.coords[:, 1]
+            heavy = 0.5 * (1.0 + phi)
+            num = float(np.sum(w * y * heavy))
+            den = float(np.sum(w * heavy))
+            return num / den
+        raise ValueError(f"unknown objective {self.objective!r}")
+
+    def _dJ_dphi(self, phi):
+        """dJ/dphi (length nn) at the terminal state."""
+        w = self.m.lumped_mass()
+        if self.objective == "terminal_phi_mismatch":
+            return w * (phi - self.phi_target)
+        elif self.objective == "centroid_y":
+            y = self.coords[:, 1]
+            heavy = 0.5 * (1.0 + phi)
+            num = float(np.sum(w * y * heavy))
+            den = float(np.sum(w * heavy))
+            J = num / den
+            # d/dphi_i: (w_i/2)(y_i)/den - (w_i/2) num/den^2 = (w_i/2)(y_i-J)/den
+            return 0.5 * w * (y - J) / den
+        raise ValueError(f"unknown objective {self.objective!r}")
+
+    def _seed(self, n_steps):
+        """dJ/dx_n for every step: only the terminal step (phi dofs) is nonzero."""
+        m = self.m
+        blk, dim = m.blk, m.dim
+        seeds = [np.zeros(m.ndof) for _ in range(n_steps)]
+        xN = self.steps[-1]["x"]
+        _, _, phi, _ = m.unpack(xN)
+        seeds[-1][dim + 1::blk] = self._dJ_dphi(phi)
+        return seeds
+
+    # ------------------------------------------------------------------
+    def gradients(self, params=("rho_ratio", "eta_ratio", "We",
+                                 "mobility", "Fr")):
+        """Return {param: dJ/dp} via the reverse sweep.  Requires march()."""
+        m = self.m
+        N = len(self.steps)
+        assert N > 0, "call march(n_steps) before gradients()"
+        seeds = self._seed(N)
+        grads = {p: 0.0 for p in params}
+        lam_next = None
+        rec_next = None
+        for n in range(N - 1, -1, -1):
+            rec = self.steps[n]
+            x_n = rec["x"]
+            # restore this step's BDF1 history so jacobian(x_n) reproduces J_n
+            m.set_history(rec["u_n"], rec["phi_n"])
+            J = m.jacobian(x_n)
+            rhs = seeds[n].copy()
+            if lam_next is not None:
+                # cross-step block dR_{n+1}/dx_n at step (n+1)'s state/history
+                C = m.cross_step_matrix(rec_next["x"], rec_next["u_n"],
+                                        rec_next["phi_n"])
+                rhs = rhs - C.T @ lam_next
+            lam = splu(J.T.tocsc()).solve(rhs)
+            for p in params:
+                dRdp = m.dR_dparam(x_n, rec["u_n"], rec["phi_n"], p)
+                grads[p] -= float(lam @ dRdp)
+            lam_next = lam
+            rec_next = rec
+        return grads
