@@ -480,10 +480,17 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                     bulk: str = "p1", mob: str = "const",
                     theta: str = "kwc", tfield: bool = False,
                     dth: bool = False, aniso: bool = False,
-                    film: bool = False):
+                    film: bool = False, chadv: bool = False):
     """Monolithic Newton kernel for the 2M+2K node-major system.
     (M, K, bulk, mob, theta, tfield, dth, aniso) compile-time; see
     module docstring.
+    chadv=True compiles the prescribed-velocity advection term into the
+    phi rows: r_phi_i += Na*(u_gp.grad_phi_i)*dJxW, plus the matching
+    Jacobian block Na*(u_gp.grad_Nb)*dJxW on the (phi_i, phi_i) diagonal.
+    u is prescribed — no derivative w.r.t. u is assembled. Solenoidal u
+    assumed; convective form. chadv=False (default) is bit-identical to
+    the pre-adv kernel: the ugp kernel arg is still passed but the term
+    compiles out via wp.static.
     theta="frozen" replaces the KWC theta rows by the EXACT bookkeeping
     identity theta = theta_old (mass-matrix row) — the anchor's marker
     semantics, and the well-posed form of the alpha = beta = 0 limit:
@@ -503,7 +510,7 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
     the phi/psi/theta rows (vertical = dim-1).
     All flags default False = the pre-A-pack kernel bit-identically."""
     key = ("mpf_newton", nbf, nqp, dim, M, K, bulk, mob, theta,
-           tfield, dth, aniso, film)
+           tfield, dth, aniso, film, chadv)
     if key in _kernel_cache:
         return _kernel_cache[key]
     if bulk not in ("p1", "r14"):
@@ -529,6 +536,7 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
     DTH = bool(dth)
     ANISO = bool(aniso)
     FILM = bool(film)
+    CHADV = bool(chadv)
     vax = dim - 1               # film vertical = LAST axis (wodo)
     dim_pow = float(dim)
     Kp = max(K, 1)
@@ -561,6 +569,7 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
               grads: wp.array3d(dtype=wp.float64),   # [ngp, ndof, dim]
               hist: wp.array2d(dtype=wp.float64),    # [ngp, ndof] (mu rows 0)
               src: wp.array2d(dtype=wp.float64),     # [ngp, ndof] MMS
+              ugp: wp.array2d(dtype=wp.float64),     # [ngp, dim] prescribed u
               qpsi: wp.array2d(dtype=wp.float64),    # [ngp, Kp] FDT noise
               qphi: wp.array3d(dtype=wp.float64),    # [ngp, M, dim] CHC
               chi_aa: wp.array2d(dtype=wp.float64),  # [(M+1), (M+1)]
@@ -1121,6 +1130,15 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                         # frame advection Int v (K xi_y/h) dphi/dxi_y
                         # (S3a; raw xi_y-derivative, coefficient adv)
                         r_p += Na * adv * grads[gp, 2 * i, vax] * dJxW
+                    if wp.static(CHADV):
+                        # prescribed-velocity advection (convective form);
+                        # solenoidal u assumed — no div(u) term.
+                        # r_phi_i += Na * (u_gp . grad_phi_i) * dJxW
+                        udotgphi = wp.float64(0.0)
+                        for dd in range(dim):
+                            udotgphi += (ugp[gp, dd]
+                                         * grads[gp, 2 * i, dd])
+                        r_p += Na * udotgphi * dJxW
                     r_m = (Na * (vals[gp, 2 * i + 1] - mub[i]
                                  - src[gp, 2 * i + 1])) * dJxW \
                         - kap[i] * gphi[i] * dJxW
@@ -1189,6 +1207,14 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                         # d/dx of the frame-advection term (S3a)
                         advw = Na * adv * dNtab[q, b, vax] * dscale \
                             * dJxW
+                    chadvw = wp.float64(0.0)
+                    if wp.static(CHADV):
+                        # d/dphi_b of prescribed-adv term:
+                        # Na*(u_gp.grad_Nb)*dJxW
+                        for dd in range(dim):
+                            chadvw += (ugp[gp, dd]
+                                       * dNtab[q, b, dd] * dscale)
+                        chadvw *= Na * dJxW
                     for i in range(M):
                         ra = ndof * a + 2 * i
                         # phi_i row: time + transport
@@ -1197,6 +1223,9 @@ def make_mpf_newton(nbf: int, nqp: int, dim: int, M: int, K: int,
                         if wp.static(FILM):
                             wp.atomic_add(Ae, e, ra, ndof * b + 2 * i,
                                           advw)
+                        if wp.static(CHADV):
+                            wp.atomic_add(Ae, e, ra, ndof * b + 2 * i,
+                                          chadvw)
                         if wp.static(FASTMODE):
                             wp.atomic_add(Ae, e, ra, ndof * b + 1,
                                           lam * lapw)
@@ -1544,7 +1573,7 @@ class MultiPhaseStepper:
                  wall_g=None, wall_h=None, wall_face=(1, 0),
                  delta_a=None, m_a=None, a_reg=1e-8, tstep="bdf1",
                  film=None, assembly="host", block_sparse=False,
-                 matfree=False):
+                 matfree=False, adv_gp=None):
         from ..physics.poisson import gauss_points
         self.dm = dm
         self.M, self.K = int(M), int(K)
@@ -1730,6 +1759,10 @@ class MultiPhaseStepper:
         self.dirichlet = dirichlet
         self.g_fns = g_fns
         self.src_fns = src_fns
+        # adv_gp: optional [n_elem, nqp, dim] prescribed velocity at GPs
+        # (re-settable between steps via stepper.adv_gp = ...; None compiles
+        # out the term — the no-adv kernel is bit-identical to pre-adv).
+        self.adv_gp = adv_gp
         # guards=False disables the trust clamp + projection (plain
         # Newton — the S0 parity gate matches the reference stepper's
         # unguarded iteration; production keeps them on)
@@ -2094,11 +2127,30 @@ class MultiPhaseStepper:
         self._sigma = sigma
         if self.linsolver in ("blockch", "blockch_dev"):
             self._m_ref = self._mob_ref(t_new)
+        # adv_gp: prescribed velocity at GPs — frozen per attempt
+        # (re-settable between steps via stepper.adv_gp = ...).
+        # Stored as dict pv -> [ngp, dim] flat array (mirrors src_gp layout).
+        adv_gp_ctx = {}
+        if self.adv_gp is not None:
+            if isinstance(self.adv_gp, dict):
+                adv_gp_ctx = {pv: np.ascontiguousarray(
+                    v, dtype=np.float64).reshape(-1, self.dm.dim)
+                    for pv, v in self.adv_gp.items()}
+            else:
+                # single-array path: flat [n_elem*nqp, dim] or [n_elem,nqp,dim]
+                flat = np.ascontiguousarray(
+                    self.adv_gp, dtype=np.float64).reshape(-1, self.dm.dim)
+                # distribute across bins (each bin gets its contiguous slice)
+                off = 0
+                for pv, b in self.dm.bins.items():
+                    ngp = len(self.mesh.conn_of[pv]) * b["nqp"]
+                    adv_gp_ctx[pv] = flat[off:off + ngp]
+                    off += ngp
         return dict(sigma=sigma, t_new=t_new, drive_d=drive_d,
                     K_tot=K_tot, minv=minv, mlat=mlat, mvert=mvert,
                     tq_gp=tq_gp, dtea=dtea, dtref=dtref,
                     hist_gp=hist_gp, qpsi_gp=qpsi_gp, qphi_gp=qphi_gp,
-                    src_gp=src_gp)
+                    src_gp=src_gp, adv_gp=adv_gp_ctx)
 
     # -- blockch (B-track): representative scalars + pair/AC meta --------
     def _mob_ref(self, t_new):
@@ -2255,16 +2307,23 @@ class MultiPhaseStepper:
                                  self.theta_mode,
                                  self.T_mode == "field",
                                  self.D_T is not None, self.aniso,
-                                 self.film_on)
+                                 self.film_on,
+                                 self.adv_gp is not None)
             p = self._par
             tq_d = (arr(tq_gp[pv]) if tq_gp is not None
                     else self._tq_dummy)
             xiy_d = (self._xiy_wp[pv] if self.film_on
                      else self._tq_dummy)
+            ngp_pv = ne * nqp
+            ugp_d = (arr(ctx["adv_gp"][pv]) if self.adv_gp is not None
+                     else (self._zugp_d[pv]
+                           if hasattr(self, "_zugp_d")
+                           else arr(np.zeros((ngp_pv, self.dm.dim)))))
+
             wp.launch(kk, dim=ne, inputs=[
                 b["conn"], b["h"], b["N"], b["dN"], b["w"],
                 arr(vals[pv]), arr(grads[pv]), arr(hist_gp[pv]),
-                arr(src_gp[pv]), arr(qpsi_gp[pv]), arr(qphi_gp[pv]),
+                arr(src_gp[pv]), ugp_d, arr(qpsi_gp[pv]), arr(qphi_gp[pv]),
                 p["chi_aa"], p["chi_ac"], p["chi_ca"], p["chi_cc"],
                 p["Ninv"], p["Ons"], p["dlo"], p["dhi"], p["Dslf"],
                 wp.float64(self.ls_drop[0]),
@@ -2503,6 +2562,7 @@ class MultiPhaseStepper:
         # mirror) + zero buffers for compile-dead/inactive inputs
         self._vals_dev, self._grads_dev = {}, {}
         self._zsrc_d, self._zqpsi_d, self._zqphi_d = {}, {}, {}
+        self._zugp_d = {}
         for pv, b in self.dm.bins.items():
             ngp = len(self.mesh.conn_of[pv]) * b["nqp"]
             self._vals_dev[pv] = wp.zeros((ngp, nd), dtype=wp.float64,
@@ -2519,6 +2579,9 @@ class MultiPhaseStepper:
                 self._zqphi_d[pv] = wp.zeros(
                     (ngp, self.M, self.dm.dim), dtype=wp.float64,
                     device=d)
+            # zero ugp for the compile-dead (no-adv) branch
+            self._zugp_d[pv] = wp.zeros((ngp, self.dm.dim),
+                                        dtype=wp.float64, device=d)
         # A2 wall slots: Jacobian (mu_i row, phi_i col) face blocks for
         # species with h_i != 0; rhs rows for any active species
         # (host-order concatenation — values built per attempt)
@@ -2598,6 +2661,7 @@ class MultiPhaseStepper:
                                       node_pattern=True, matvec_only=True)
         self._vals_dev, self._grads_dev = {}, {}
         self._zsrc_d, self._zqpsi_d, self._zqphi_d = {}, {}, {}
+        self._zugp_d = {}
         for pv, b in self.dm.bins.items():
             ngp = len(self.mesh.conn_of[pv]) * b["nqp"]
             self._vals_dev[pv] = wp.zeros((ngp, nd), dtype=wp.float64,
@@ -2613,6 +2677,9 @@ class MultiPhaseStepper:
             if not self.noise_phi > 0.0:
                 self._zqphi_d[pv] = wp.zeros(
                     (ngp, self.M, self.dm.dim), dtype=wp.float64, device=d)
+            # zero ugp for the compile-dead (no-adv) branch
+            self._zugp_d[pv] = wp.zeros((ngp, self.dm.dim),
+                                        dtype=wp.float64, device=d)
         self._dev_bufs = {}
 
     def _dev_inputs(self, ctx):
@@ -2626,10 +2693,13 @@ class MultiPhaseStepper:
         arr = lambda a_: wp.array(np.ascontiguousarray(a_),
                                   dtype=wp.float64, device=d)
         tq_gp = ctx["tq_gp"]
+        adv_gp_ctx = ctx["adv_gp"]
         dev = dict(
             hist={pv: arr(v) for pv, v in ctx["hist_gp"].items()},
             src=({pv: arr(v) for pv, v in ctx["src_gp"].items()}
                  if self.src_fns is not None else self._zsrc_d),
+            ugp=({pv: arr(v) for pv, v in adv_gp_ctx.items()}
+                 if self.adv_gp is not None else self._zugp_d),
             qpsi=({pv: arr(v) for pv, v in ctx["qpsi_gp"].items()}
                   if (self.noise_psi > 0.0 and self.K)
                   else self._zqpsi_d),
@@ -2691,7 +2761,8 @@ class MultiPhaseStepper:
                                  self.theta_mode,
                                  self.T_mode == "field",
                                  self.D_T is not None, self.aniso,
-                                 self.film_on)
+                                 self.film_on,
+                                 self.adv_gp is not None)
             tq_full = dev["tq"][pv] if dev["tq"] is not None else None
             xiy_full = self._xiy_wp[pv] if self.film_on else None
             for e0 in range(0, ne, nb_cap):
@@ -2705,6 +2776,7 @@ class MultiPhaseStepper:
                     self._vals_dev[pv][s0:s1],
                     self._grads_dev[pv][s0:s1],
                     dev["hist"][pv][s0:s1], dev["src"][pv][s0:s1],
+                    dev["ugp"][pv][s0:s1],
                     dev["qpsi"][pv][s0:s1], dev["qphi"][pv][s0:s1],
                     p["chi_aa"], p["chi_ac"], p["chi_ca"], p["chi_cc"],
                     p["Ninv"], p["Ons"], p["dlo"], p["dhi"], p["Dslf"],
