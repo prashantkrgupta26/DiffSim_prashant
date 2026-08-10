@@ -72,6 +72,16 @@ CH mu residual (test chi):
 tau_m: physics.chns.tau_m_gp with LOCAL rho/eta per Gauss point (contrast-aware
 stabilization), house constants Ci=(4, 36), c2CI = 36*16*dim.
 
+Momentum convection: plain convective form rho*(u.grad)u — NOT the spec's skew-symmetric
+s=1/2 form (controller ruling: convective is the parity target for the spike phase; skew
+revisit deferred to Task 9 build-out). The Task 7 kernel must match the convective form.
+
+mix_props clamp Jacobian convention: drho/deta = interpolation slope where unclamped,
+exactly 0 where clamped (piecewise-constant at the clamp boundary) — kernel must match.
+
+History commit rule: after each converged step, u_n and phi_n <- converged state; p and mu
+carry no history (BDF1 on u,phi only).
+
 SUPG/PSPG choice (parity contract, per the escalation note): the SUPG/PSPG
 weighting acts on the FULL momentum strong residual r_mom_strong INCLUDING the
 pressure gradient, capillary and gravity forces — this mirrors make_linear_ns_Ae
@@ -125,6 +135,8 @@ class CHNSDiscrete:
         assert T.shape[0] == T.shape[1] and (
             abs(T - sp.eye(T.shape[0])).nnz == 0), \
             "CHNSDiscrete assumes constraints.T == identity (uniform mesh)"
+        assert int(dim) == int(dm.dim), (
+            f"dim arg ({dim}) disagrees with dm.dim ({dm.dim})")
         self.dm = dm
         self.case = case
         self.level = int(level)
@@ -521,12 +533,12 @@ class CHNSDiscrete:
                 addblk(d, dim + 2, mfc + mJ)
 
             #### --- viscous already added above; --- SUPG derivatives ------
-            # Rsupg = INT tau (u.grad w_a) . r_mom.  We include tau as frozen
-            # (tau' contributions are higher-order and omitted — DOCUMENTED:
-            # matches make_linear_ns_Ae which linearises with tau held; SUPG is
-            # Picard-level).  Then d/d(dof) has two pieces:
+            # Rsupg = INT tau (u.grad w_a) . r_mom.
+            # tau is differentiated (Newton-consistent): dtau_du and dtau_dphi
+            # terms follow.  d/d(dof) therefore has three pieces:
             #   (i) d(u.grad w_a)/du * r_mom   (SUPG test depends on u)
             #   (ii) tau (u.grad w_a) . d r_mom/d(dof)
+            #   (iii) d tau/d(dof) * (u.grad w_a) . r_mom   (Newton-consistent)
             # ugw[e,q,a] = u.grad w_a ; bake dJxW into the SUPG weight so all
             # blocks contracted against tau_ugw carry the quadrature measure.
             tau_ugw = (dJxW * tau)[:, :, None] * ugw         # [e,q,a]
