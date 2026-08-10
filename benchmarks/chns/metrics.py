@@ -56,6 +56,50 @@ def rise_velocity(centroid_series: np.ndarray, dt: float) -> np.ndarray:
     return vel
 
 
+def surge_front_x(phi: np.ndarray, coords: np.ndarray,
+                  band: float = 0.1) -> float:
+    """Dam-break surge-front x-position: the maximum x reached by the heavy
+    phase (phi > 0) within a thin bottom band y < band.
+
+    Args:
+        phi   : [n] phase field (phi=+1 heavy column, -1 light).
+        coords: [n, dim] node coords.
+        band  : bottom-band thickness (fraction of unit height) over which the
+                leading front is measured (default 0.1).
+
+    Returns:
+        float: max x of the phi>0 front in the bottom band; nan if none.
+    """
+    phi = np.asarray(phi, float)
+    coords = np.asarray(coords, float)
+    mask = (phi > 0.0) & (coords[:, 1] < band)
+    if not mask.any():
+        return float("nan")
+    return float(np.max(coords[mask, 0]))
+
+
+def spike_tip_y(phi: np.ndarray, coords: np.ndarray,
+                x_band: float = 0.5, x_width: float = 0.1) -> float:
+    """Rayleigh-Taylor spike-tip y-position: the minimum y reached by the heavy
+    phase (phi > 0) descending through a central x-band (the falling spike).
+
+    Args:
+        phi    : [n] phase field (phi=+1 heavy on top).
+        coords : [n, dim] node coords.
+        x_band : centre of the x-band to sample (default 0.5).
+        x_width: half-width of the x-band (default 0.1).
+
+    Returns:
+        float: min y of the phi>0 heavy phase in the central band; nan if none.
+    """
+    phi = np.asarray(phi, float)
+    coords = np.asarray(coords, float)
+    mask = (phi > 0.0) & (np.abs(coords[:, 0] - x_band) < x_width)
+    if not mask.any():
+        return float("nan")
+    return float(np.min(coords[mask, 1]))
+
+
 def circularity(phi: np.ndarray, coords: np.ndarray, h: float) -> float:
     """Compute circularity from the diffuse phase field on a regular grid.
 

@@ -1,0 +1,61 @@
+{
+  "_README": "SP-0 Task 9 PROVISIONAL internal-reproducibility baselines for the CI benchmark gates (tests/test_chns_benchmarks.py). NOT physical reference values (unit-square non-dimensional CHNS, Cn=2h, truncated steps). See the test module REFERENCES for Hysing 2009 / Martin-Moyce 1952 direction. Regenerate with benchmarks/chns/gen_baselines.py.",
+  "bubble_rise_re35_we10": {
+    "level": 5,
+    "dt": 0.0025,
+    "nsteps": 40,
+    "gravity": true,
+    "cy_final": 0.5399284187246749,
+    "rise_peak": 0.011813457762643864,
+    "circ_min": 2.7564863308099263,
+    "mass_drift": 0.0,
+    "energy_final": 0.0076870591883430525
+  },
+  "bubble_rise_re35_we125": {
+    "level": 5,
+    "dt": 0.0025,
+    "nsteps": 40,
+    "gravity": true,
+    "cy_final": 0.5403343368002828,
+    "rise_peak": 0.01976681076807374,
+    "circ_min": 2.7277589001354365,
+    "mass_drift": 0.0,
+    "energy_final": 0.0011422185086575865
+  },
+  "dam_break": {
+    "level": 4,
+    "dt": 0.00025,
+    "nsteps": 60,
+    "gravity": true,
+    "surge_front_x_at": [
+      19,
+      39,
+      59
+    ],
+    "surge_front_x": [
+      0.375,
+      0.375,
+      0.375
+    ],
+    "circ_min": 2.2889254983264515,
+    "mass_drift": 1.6653345369377348e-16,
+    "energy_final": 4.030490448071222e-05
+  },
+  "rt": {
+    "level": 4,
+    "dt": 0.0001,
+    "nsteps": 60,
+    "gravity": true,
+    "spike_tip_y_at": [
+      29,
+      59
+    ],
+    "spike_tip_y": [
+      0.5,
+      0.5
+    ],
+    "circ_min": 2.449288760095007,
+    "mass_drift": 6.5052130349130266e-18,
+    "energy_final": 0.0012114907789667001
+  }
+}
