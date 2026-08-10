@@ -41,13 +41,15 @@ The source **cancels by construction** — β preserves exactly the source-injec
 
 ## A/B evidence
 
-All at level 5 (32×32), ρ-ratio 10, `Cn_override="2h"` (Cn=2h, the resolvability convention), BUBBLE_RISE_RE35_WE10 params, monolithic BDF1, splu. Source (where on) = fixed Gaussian blob on the φ-row, A=2, radius 3h. Bubble rise: up to 200 steps, gravity on. Static drop: gravity off, 5 steps. (`scratchpad/ab.py`, reproducible.)
+All at level 5 (32×32), ρ-ratio 10, `Cn_override="2h"` (Cn=2h, the resolvability convention), BUBBLE_RISE_RE35_WE10 params, monolithic BDF1, splu. Source (where on) = fixed Gaussian blob on the φ-row, A=2, radius 3h. Bubble rise: up to 200 steps, gravity on. Static drop: gravity off, 5 steps. Numbers below are from the committed driver `benchmarks/chns/ab_interface.py` (Fix round 1; the original `scratchpad/ab.py` is superseded).
+
+**Normalization (mass conservation rows).** Denominator = `|∫φ₀|` (lumped-mass inner product `M @ phi_0`). Horizon: 200-step/to-divergence — no-source row uses the full 200-step run; sourced row uses T = steps-to-divergence or 200, whichever is shorter. `∫s` = `M @ s(coords, t=0)` (static Gaussian, partition-of-unity lumped mass; s does not depend on time). These normalization conventions are distinct from the committed 10-step `rel < 1e-6` gate in `test_interface_mass_source_conservation` (which checks bookkeeping step-by-step, not the cumulative T-step drift).
 
 | Axis | CH (potential form) | CAC (Korteweg form) | Winner |
 |---|---|---|---|
-| **Bubble rise robustness** | survives 200 steps | **DIVERGES @ step 37** (parasitic-driven blow-up, umax→6.3, φ overshoots to −2.5, then singular Jacobian) | **CH** |
-| Mass conservation, no source | 0.0 (machine-exact) | 2.0e-13 (machine-exact) | tie |
-| Mass conservation, with source (`|∫φ−∫φ₀−∫₀ᵗ∫s|` rel) | 2.2e-5 (over 200 steps) | **3.9e-6** (to divergence @37) | **CAC** |
+| **Bubble rise robustness** | survives 200 steps | **DIVERGES @ step 37** (parasitic-driven blow-up, singular Jacobian) | **CH** |
+| Mass conservation, no source (`|∫φ_T−∫φ₀|/|∫φ₀|`, 200 steps) | 0.0 (machine-exact) | 2.0e-13 (machine-exact) | tie |
+| Mass conservation, with source (`|∫φ_T−∫φ₀−T·dt·∫s|/|∫φ₀|`, to divergence/200) | 3.9e-9 (200 steps) | **7.1e-10** (to divergence @37) | **CAC** |
 | Parasitic currents, static drop (max\|u\|) | **3.6e-4** | 1.3e-2 (~37× worse) | **CH** |
 | Newton iters (avg/max), bubble rise | 3.0 / 4 | 3.6 / 7 | **CH** |
 | Wall/step (splu, CPU) | 226 ms | 272 ms (~20% slower) | **CH** |
@@ -56,7 +58,7 @@ All at level 5 (32×32), ρ-ratio 10, `Cn_override="2h"` (Cn=2h, the resolvabili
 ### Readings
 
 - **Robustness (the decisive axis).** CAC blows up on bubble rise at these coarse settings by step 37. The mechanism is the Korteweg surface tension: its parasitic currents (37× CH's on the static drop) feed back into the momentum equation and destabilize the rising interface. This is the well-known result that Jacqmin's potential form `μ∇φ` is near-parasitic-free while the Korteweg divergence form is not well-balanced on a discrete diffuse interface. CH's potential form survives cleanly.
-- **Conservation (CAC's designed strength).** CAC delivers on its premise: with a mass source, its bookkeeping (3.9e-6 to divergence) is *tighter* than CH's (2.2e-5), and its no-source drift is machine-exact like CH's. The source-respecting β works exactly as derived. **If parasitic currents were controlled, CAC's conservation edge would matter for AM deposition** (where injected mass is the quantity of interest).
+- **Conservation (CAC's designed strength).** CAC delivers on its premise: with a mass source, its bookkeeping (7.1e-10 to divergence) is *tighter* than CH's (3.9e-9 over 200 steps), and its no-source drift is machine-exact like CH's. The source-respecting β works exactly as derived. **If parasitic currents were controlled, CAC's conservation edge would matter for AM deposition** (where injected mass is the quantity of interest). Note: both interfaces achieve very tight sourced-mass drift in the committed driver — the conservative-advection CH phi-row is effectively machine-exact too; the conservation gap is smaller than the original scratchpad/ab.py reported (where a different accumulation convention was used).
 - **Profile fidelity.** Both interfaces hold the tanh interface width to within a few percent of √2·Cn under a mass source — neither smears nor sharpens. Not a discriminator.
 - **Cost / Newton.** CAC is ~20% slower per step and needs slightly more Newton iterations (frozen-β Picard costs a little), but both are minor next to the robustness gap.
 

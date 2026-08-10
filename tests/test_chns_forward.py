@@ -56,11 +56,20 @@ def _make_dm(level, dim=2):
 # ---------------------------------------------------------------------------
 # Step 1: analytic Jacobian vs central finite differences
 # ---------------------------------------------------------------------------
-def test_chns_discrete_jacobian_vs_fd():
+@pytest.mark.parametrize("interface", ["ch", "cac"])
+def test_chns_discrete_jacobian_vs_fd(interface):
+    """Analytic J @ v vs central-FD of the residual, rel error < 1e-6.
+
+    CH: standard frozen-nothing (mu is a PDE unknown).
+    CAC: _freeze_beta=True is set before the FD perturb so the numerically-
+    differenced residual uses the same frozen beta as the analytic Jacobian.
+    The reviewer measured ~3.6e-10 for CAC; tolerance 1e-6 is comfortable.
+    """
     from diffsim.adjoint.chns import CHNSDiscrete
 
     dm, mesh, cons = _make_dm(level=3, dim=2)
-    op = CHNSDiscrete(level=3, dim=2, case=BUBBLE_RISE_RE35_WE10, dt=1e-2, dm=dm)
+    op = CHNSDiscrete(level=3, dim=2, case=BUBBLE_RISE_RE35_WE10, dt=1e-2,
+                      dm=dm, interface=interface)
 
     rng = np.random.default_rng(0)
     coords = mesh.node_coords
@@ -82,6 +91,16 @@ def test_chns_discrete_jacobian_vs_fd():
     # history: previous state = current phi, u=0 (only needed by residual)
     op.set_history(u_n=np.zeros((n, dim)), phi_n=phi.copy())
 
+    # For CAC: freeze beta at the value computed from the base point x.
+    # The analytic Jacobian treats beta as a constant (Picard-on-beta);
+    # the FD residuals must use the same frozen beta so the linearisation
+    # is consistent.  _freeze_beta=True prevents _assemble from recomputing
+    # beta when we evaluate residual(x ± eps*v).
+    if interface == "cac":
+        # Compute residual once to trigger beta freeze at x.
+        _ = op.residual(x)
+        op._freeze_beta = True
+
     R0 = op.residual(x)
     J = op.jacobian(x)
 
@@ -94,7 +113,12 @@ def test_chns_discrete_jacobian_vs_fd():
         fd = (Rp - Rm) / (2.0 * eps)
         Jv = J @ v
         rel = np.linalg.norm(Jv - fd) / max(np.linalg.norm(Jv), 1e-30)
-        assert rel < 1e-6, f"Jacobian vs FD rel error {rel:.3e} >= 1e-6"
+        assert rel < 1e-6, (
+            f"[{interface}] Jacobian vs FD rel error {rel:.3e} >= 1e-6")
+
+    # Restore (no side-effect for CAC after this test)
+    if interface == "cac":
+        op._freeze_beta = False
 
 
 # ---------------------------------------------------------------------------

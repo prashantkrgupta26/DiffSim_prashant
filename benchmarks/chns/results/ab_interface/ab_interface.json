@@ -1,0 +1,65 @@
+{
+  "ch": {
+    "bubble_rise_nosrc": {
+      "interface": "ch",
+      "diverge_step": null,
+      "steps_completed": 200,
+      "mass_drift_nosrc": 0.0,
+      "mass_drift_src": 0.0,
+      "newton_avg": 3.005,
+      "newton_max": 4,
+      "wall_per_step": 0.2259183185454458
+    },
+    "bubble_rise_src": {
+      "interface": "ch",
+      "diverge_step": null,
+      "steps_completed": 200,
+      "mass_drift_nosrc": 0.07781307942650548,
+      "mass_drift_src": 3.930575604432907e-09,
+      "newton_avg": 3.005,
+      "newton_max": 4,
+      "wall_per_step": 0.22645778838545083
+    },
+    "parasitic_umax": 0.00036388270068209383
+  },
+  "cac": {
+    "bubble_rise_nosrc": {
+      "interface": "cac",
+      "diverge_step": 37,
+      "steps_completed": 36,
+      "mass_drift_nosrc": 2.0368145053480443e-13,
+      "mass_drift_src": 2.0368145053480443e-13,
+      "newton_avg": 3.611111111111111,
+      "newton_max": 7,
+      "wall_per_step": 0.27206688423434067
+    },
+    "bubble_rise_src": {
+      "interface": "cac",
+      "diverge_step": 37,
+      "steps_completed": 36,
+      "mass_drift_nosrc": 0.014006354296365995,
+      "mass_drift_src": 7.070986175850956e-10,
+      "newton_avg": 3.611111111111111,
+      "newton_max": 7,
+      "wall_per_step": 0.2722656712608619
+    },
+    "parasitic_umax": 0.013309606325463396
+  },
+  "parasitic_ratio": 36.57663939647226,
+  "normalization": "mass_drift_nosrc: |Int phi_T - Int phi_0| / |Int phi_0|; horizon = 200 steps (or steps_completed if shorter). mass_drift_src: |Int phi_T - Int phi_0 - T*dt*Int s| / |Int phi_0|; T = steps completed before divergence or 200. Int via lumped-mass M (partition-of-unity row sums); Int s = M @ s(coords, t=0) (static Gaussian source).",
+  "config": {
+    "level": 5,
+    "max_steps": 200,
+    "dt": 0.0025,
+    "Cn_override": "2h",
+    "Cn_eff": 0.0625,
+    "h": 0.03125,
+    "rho_ratio": 10.0,
+    "src_A": 2.0,
+    "src_x0": 0.5,
+    "src_y0": 0.5,
+    "src_rad_h_mult": 3.0,
+    "parasitic_drop_steps": 5,
+    "parasitic_dt": 0.001
+  }
+}
