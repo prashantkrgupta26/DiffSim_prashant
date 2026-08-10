@@ -35,7 +35,7 @@ tau_m_gp legacy
 
 import numpy as np
 
-__all__ = ["mix_props", "capillary_gp", "tau_m_gp"]
+__all__ = ["mix_props", "capillary_gp", "tau_m_gp", "make_chns_newton"]
 
 # ---------------------------------------------------------------------------
 # Phase-mixture linear interpolation
@@ -215,3 +215,370 @@ def tau_m_gp(
 
     denom = np.sqrt(term_trans + term_adv + term_visc)
     return 1.0 / (denom * rho_gp)
+
+
+# ---------------------------------------------------------------------------
+# Task 7 (SP-0): monolithic (u, p, phi, mu) Warp kernel factory
+# ---------------------------------------------------------------------------
+def make_chns_newton(nbf: int, nqp: int, dim: int):
+    r"""Element residual (``be = -R``) + Jacobian (``Ae``) Warp kernel for the
+    coupled BDF1 CHNS system, node-major ``blk = dim + 3`` per node ordered
+    ``(u_0..u_{dim-1}, p, phi, mu)``.  This is the compiled twin of
+    ``diffsim.adjoint.chns.CHNSDiscrete._assemble`` — every term/block mirrors
+    that numpy reference (the executable spec); parity is gated to 1e-10.
+
+    The host interpolates the state to Gauss points and passes per-GP arrays;
+    the kernel builds the local rho/eta (mix_props), the DIFFERENTIATED tau
+    (Newton-consistent dtau_du, dtau_dphi), the momentum strong residual
+    ``r_mom`` and the Galerkin/SUPG/PSPG rows + their exact Jacobian blocks.
+
+    Per-GP inputs (all [ngp, ...], node-major bin GP ordering gp = e*nqp+q):
+      u_gp[dim], gu_gp[dim,dim] (comp,sp), p_gp, gp_gp[dim], phi_gp,
+      gphi_gp[dim], mu_gp, gmu_gp[dim], un_gp[dim], phin_gp.
+    Scalars: dt, Re, We, Cn, Pe, cw_inv, agg, grav_scale, ghat[dim],
+      rho_h/rho_l/eta_h/eta_l (mix_props endpoints).
+    Emits Ae[ne, blk*nbf, blk*nbf], be[ne, blk*nbf] (be = -residual).
+    """
+    import warp as wp
+    from ..assembly.operators import _kernel_cache
+
+    key = ("chns_newton", nbf, nqp, dim)
+    if key in _kernel_cache:
+        return _kernel_cache[key]
+
+    blk = dim + 3
+    dim_pow = float(dim)
+    c2CI = 36.0 * 16.0 * dim
+
+    @wp.kernel(module="unique", enable_backward=False,
+               module_options={"max_unroll": 0})
+    def chns_k(conn: wp.array2d(dtype=wp.int32),
+               h: wp.array(dtype=wp.float64),
+               Ntab: wp.array2d(dtype=wp.float64),
+               dNtab: wp.array3d(dtype=wp.float64),
+               wtab: wp.array(dtype=wp.float64),
+               u_gp: wp.array2d(dtype=wp.float64),     # [ngp, dim]
+               gu_gp: wp.array3d(dtype=wp.float64),    # [ngp, dim, dim] comp,sp
+               p_gp: wp.array(dtype=wp.float64),       # [ngp]
+               gp_gp: wp.array2d(dtype=wp.float64),    # [ngp, dim]
+               phi_gp: wp.array(dtype=wp.float64),     # [ngp]
+               gphi_gp: wp.array2d(dtype=wp.float64),  # [ngp, dim]
+               mu_gp: wp.array(dtype=wp.float64),      # [ngp]
+               gmu_gp: wp.array2d(dtype=wp.float64),   # [ngp, dim]
+               un_gp: wp.array2d(dtype=wp.float64),    # [ngp, dim]
+               phin_gp: wp.array(dtype=wp.float64),    # [ngp]
+               ghat: wp.array(dtype=wp.float64),       # [dim]
+               dt: wp.float64, Re: wp.float64, We: wp.float64,
+               Cn: wp.float64, Pe: wp.float64,
+               cw_inv: wp.float64, agg: wp.float64,
+               grav_scale: wp.float64,
+               rho_h: wp.float64, rho_l: wp.float64,
+               eta_h: wp.float64, eta_l: wp.float64,
+               Ae: wp.array3d(dtype=wp.float64),
+               be: wp.array2d(dtype=wp.float64)):
+        e = wp.tid()
+        he = h[e]
+        jac = wp.pow(he * wp.float64(0.5), wp.float64(dim_pow))
+        dscale = wp.float64(2.0) / he
+        h2 = he * he
+        h4 = h2 * h2
+
+        a_rho = wp.float64(0.5) * (rho_h - rho_l)
+        b_rho = wp.float64(0.5) * (rho_h + rho_l)
+        a_eta = wp.float64(0.5) * (eta_h - eta_l)
+        b_eta = wp.float64(0.5) * (eta_h + eta_l)
+        rho_floor = wp.float64(1e-3) * rho_l
+        eta_floor = wp.float64(1e-3) * eta_l
+
+        for q in range(nqp):
+            dJxW = wtab[q] * jac
+            gp = e * nqp + q
+
+            # ---- local rho, eta (mix_props, clamp) --------------------
+            phiq = phi_gp[gp]
+            rho_raw = a_rho * phiq + b_rho
+            eta_raw = a_eta * phiq + b_eta
+            rho = wp.max(rho_raw, rho_floor)
+            eta = wp.max(eta_raw, eta_floor)
+            # drho/dphi, deta/dphi: slope where unclamped, exactly 0 clamped
+            drho = a_rho
+            if rho_raw < rho_floor:
+                drho = wp.float64(0.0)
+            deta = a_eta
+            if eta_raw < eta_floor:
+                deta = wp.float64(0.0)
+
+            # ---- tau_m (per GP, local rho/eta) + derivatives ----------
+            umag2 = wp.float64(0.0)
+            for d in range(dim):
+                umag2 += u_gp[gp, d] * u_gp[gp, d]
+            nu_loc = eta / (rho * Re)
+            A_t = wp.float64(4.0) / (dt * dt)
+            Bu_t = wp.float64(4.0) * umag2 / h2
+            C_t = wp.float64(c2CI) * nu_loc * nu_loc / h4
+            denom = wp.sqrt(A_t + Bu_t + C_t)
+            tau = wp.float64(1.0) / (denom * rho)
+            # dC/deta, dC/drho -> ddenom/dphi (via C only)
+            dC_deta = wp.float64(2.0) * wp.float64(c2CI) * eta \
+                / (h4 * rho * rho * Re * Re)
+            dC_drho = wp.float64(-2.0) * wp.float64(c2CI) * eta * eta \
+                / (h4 * rho * rho * rho * Re * Re)
+            ddenom_dphi = (dC_deta * deta + dC_drho * drho) \
+                / (wp.float64(2.0) * denom)
+            dtau_dphi = -tau * (ddenom_dphi / denom + drho / rho)
+            # dtau/du_k = -tau * (4 u_k / h^2) / denom^2
+
+            # ---- momentum strong residual r_mom[dim] ------------------
+            # r_mom = rho(u-un)/dt + rho ugradu + Jgradu + gradp
+            #         - fcap - fgrav
+            r_mom = wp.vector(length=dim, dtype=wp.float64)
+            ugradu = wp.vector(length=dim, dtype=wp.float64)
+            accel = wp.vector(length=dim, dtype=wp.float64)   # (u-un)/dt+ugradu
+            for d in range(dim):
+                ug = wp.float64(0.0)     # (u.grad)u_d = sum_s u_s du_d/dx_s
+                Jg = wp.float64(0.0)     # (J.grad)u_d = sum_s J_s du_d/dx_s
+                for s in range(dim):
+                    ug += u_gp[gp, s] * gu_gp[gp, d, s]
+                    Jg += (agg * gmu_gp[gp, s]) * gu_gp[gp, d, s]
+                ugradu[d] = ug
+                fcap_d = cw_inv * mu_gp[gp] * gphi_gp[gp, d]
+                fgrav_d = rho * grav_scale * ghat[d]
+                accel[d] = (u_gp[gp, d] - un_gp[gp, d]) / dt + ug
+                r_mom[d] = rho * (u_gp[gp, d] - un_gp[gp, d]) / dt \
+                    + rho * ug + Jg + gp_gp[gp, d] - fcap_d - fgrav_d
+
+            # div u
+            divu = wp.float64(0.0)
+            for d in range(dim):
+                divu += gu_gp[gp, d, d]
+            # u.grad phi
+            ugradphi = wp.float64(0.0)
+            for s in range(dim):
+                ugradphi += u_gp[gp, s] * gphi_gp[gp, s]
+
+            # ============ RESIDUAL ROWS (be = -R) ======================
+            for a in range(nbf):
+                Na = Ntab[q, a]
+                # physical grad of test a
+                # u.grad w_a  (SUPG test)
+                ugw = wp.float64(0.0)
+                for s in range(dim):
+                    ugw += u_gp[gp, s] * (dNtab[q, a, s] * dscale)
+                # --- momentum rows d ---
+                for d in range(dim):
+                    # galerkin body: rho(u-un)/dt + rho ugradu + Jgradu
+                    #                - fcap - fgrav
+                    fcap_d = cw_inv * mu_gp[gp] * gphi_gp[gp, d]
+                    fgrav_d = rho * grav_scale * ghat[d]
+                    Jg = wp.float64(0.0)
+                    for s in range(dim):
+                        Jg += (agg * gmu_gp[gp, s]) * gu_gp[gp, d, s]
+                    mom_body = rho * (u_gp[gp, d] - un_gp[gp, d]) / dt \
+                        + rho * ugradu[d] + Jg - fcap_d - fgrav_d
+                    Rd = Na * mom_body
+                    # viscous (eta/Re) symgu[d,s] dN_a,s
+                    visc = wp.float64(0.0)
+                    for s in range(dim):
+                        symds = gu_gp[gp, d, s] + gu_gp[gp, s, d]
+                        visc += symds * (dNtab[q, a, s] * dscale)
+                    Rd += (eta / Re) * visc
+                    # pressure -div(w) p -> -(dN_a,d) p
+                    Rd += -(dNtab[q, a, d] * dscale) * p_gp[gp]
+                    # SUPG tau (u.grad w_a) r_mom_d
+                    Rd += tau * ugw * r_mom[d]
+                    wp.atomic_add(be, e, blk * a + d, -Rd * dJxW)
+                # --- continuity row (field dim) ---
+                Rp = Na * divu
+                gNa_rmom = wp.float64(0.0)
+                for s in range(dim):
+                    gNa_rmom += (dNtab[q, a, s] * dscale) * r_mom[s]
+                Rp += tau * gNa_rmom
+                wp.atomic_add(be, e, blk * a + dim, -Rp * dJxW)
+                # --- CH phi row (field dim+1), conservative advection ---
+                ch_body = (phiq - phin_gp[gp]) / dt + ugradphi \
+                    + phiq * divu
+                Rphi = Na * ch_body
+                gNa_gmu = wp.float64(0.0)
+                for s in range(dim):
+                    gNa_gmu += (dNtab[q, a, s] * dscale) * gmu_gp[gp, s]
+                Rphi += (wp.float64(1.0) / Pe) * gNa_gmu
+                wp.atomic_add(be, e, blk * a + dim + 1, -Rphi * dJxW)
+                # --- CH mu row (field dim+2) ---
+                fp = phiq * phiq * phiq - phiq
+                Rmu = Na * (mu_gp[gp] - fp)
+                gNa_gphi = wp.float64(0.0)
+                for s in range(dim):
+                    gNa_gphi += (dNtab[q, a, s] * dscale) * gphi_gp[gp, s]
+                Rmu += -(Cn * Cn) * gNa_gphi
+                wp.atomic_add(be, e, blk * a + dim + 2, -Rmu * dJxW)
+
+            # ============ JACOBIAN BLOCKS (Ae) =========================
+            fpp = wp.float64(3.0) * phiq * phiq - wp.float64(1.0)
+            for a in range(nbf):
+                Na = Ntab[q, a]
+                ugw = wp.float64(0.0)
+                for s in range(dim):
+                    ugw += u_gp[gp, s] * (dNtab[q, a, s] * dscale)
+                for b in range(nbf):
+                    Nb = Ntab[q, b]
+                    # u.grad N_b, J.grad N_b, gNa.gNb
+                    uGNb = wp.float64(0.0)
+                    JGNb = wp.float64(0.0)
+                    gNagNb = wp.float64(0.0)
+                    for s in range(dim):
+                        dNb_s = dNtab[q, b, s] * dscale
+                        dNa_s = dNtab[q, a, s] * dscale
+                        uGNb += u_gp[gp, s] * dNb_s
+                        JGNb += (agg * gmu_gp[gp, s]) * dNb_s
+                        gNagNb += dNa_s * dNb_s
+                    # c1 = (rho/dt) N_b + rho u.gradN_b + J.gradN_b
+                    c1 = rho * (Nb / dt) + rho * uGNb + JGNb
+
+                    # ---- momentum rows d ----
+                    for d in range(dim):
+                        rowd = blk * a + d
+                        dNa_d = dNtab[q, a, d] * dscale
+                        dNb_d = dNtab[q, b, d] * dscale
+                        # (u col jc)
+                        for jc in range(dim):
+                            dNa_jc = dNtab[q, a, jc] * dscale
+                            dNb_jc = dNtab[q, b, jc] * dscale
+                            val = wp.float64(0.0)
+                            # galerkin diagonal (transient+conv-second)
+                            if jc == d:
+                                val += Na * c1
+                            # galerkin conv-first: rho N_b gu[d,jc]
+                            val += Na * (rho * Nb * gu_gp[gp, d, jc])
+                            # viscous: (1/Re) eta (delta gNa.gNb + gNa_jc gNb_d)
+                            if jc == d:
+                                val += (wp.float64(1.0) / Re) * eta * gNagNb
+                            val += (wp.float64(1.0) / Re) * eta * dNa_jc * dNb_d
+                            # SUPG (ii): tau ugw * [diag c1 + conv-first]
+                            supg = wp.float64(0.0)
+                            if jc == d:
+                                supg += c1
+                            supg += rho * Nb * gu_gp[gp, d, jc]
+                            val += tau * ugw * supg
+                            # SUPG (i): test depends on u_jc: N_b dN_a,jc
+                            val += tau * (Nb * dNa_jc) * r_mom[d]
+                            # SUPG (iii): dtau/du_jc N_b, weight ugw r_mom_d
+                            dtau_du_jc = -tau * (wp.float64(4.0)
+                                                 * u_gp[gp, jc] / h2) \
+                                / (denom * denom)
+                            val += ugw * r_mom[d] * dtau_du_jc * Nb
+                            wp.atomic_add(Ae, e, rowd, blk * b + jc, val * dJxW)
+                        # (p col dim)
+                        # galerkin pressure -(dN_a,d) N_b ; SUPG tau ugw dNb_d
+                        valp = -dNa_d * Nb + tau * ugw * dNb_d
+                        wp.atomic_add(Ae, e, rowd, blk * b + dim, valp * dJxW)
+                        # (phi col dim+1)
+                        # galerkin: drho N_b accel_d - cw_inv mu dNb_d
+                        #           - grav_scale ghat_d drho N_b
+                        # viscous eta(phi): (1/Re) deta N_b symgu[d,s] dNa_s
+                        vphi = Na * (drho * Nb * accel[d]
+                                     - cw_inv * mu_gp[gp] * dNb_d
+                                     - grav_scale * ghat[d] * drho * Nb)
+                        visc_phi = wp.float64(0.0)
+                        for s in range(dim):
+                            symds = gu_gp[gp, d, s] + gu_gp[gp, s, d]
+                            visc_phi += symds * (dNtab[q, a, s] * dscale)
+                        vphi += (wp.float64(1.0) / Re) * deta * Nb * visc_phi
+                        # SUPG: tau ugw * dr_mom/dphi
+                        dr_phi = drho * Nb * accel[d] \
+                            - cw_inv * mu_gp[gp] * dNb_d \
+                            - grav_scale * ghat[d] * drho * Nb
+                        vphi += tau * ugw * dr_phi
+                        # SUPG tau-derivative: dtau/dphi N_b ugw r_mom_d
+                        vphi += ugw * r_mom[d] * dtau_dphi * Nb
+                        wp.atomic_add(Ae, e, rowd, blk * b + dim + 1,
+                                      vphi * dJxW)
+                        # (mu col dim+2)
+                        # galerkin: -cw_inv N_b gphi_d + agg (dNb.gu_d)
+                        dNb_gu_d = wp.float64(0.0)
+                        for s in range(dim):
+                            dNb_gu_d += (dNtab[q, b, s] * dscale) \
+                                * gu_gp[gp, d, s]
+                        vmu = Na * (-cw_inv * Nb * gphi_gp[gp, d]
+                                    + agg * dNb_gu_d)
+                        # SUPG: tau ugw * dr_mom/dmu
+                        dr_mu = -cw_inv * Nb * gphi_gp[gp, d] + agg * dNb_gu_d
+                        vmu += tau * ugw * dr_mu
+                        wp.atomic_add(Ae, e, rowd, blk * b + dim + 2,
+                                      vmu * dJxW)
+
+                    # ---- continuity row (dim) ----
+                    rowc = blk * a + dim
+                    # d/du_jc
+                    for jc in range(dim):
+                        dNa_jc = dNtab[q, a, jc] * dscale
+                        dNb_jc = dNtab[q, b, jc] * dscale
+                        # galerkin: Na dN_b,jc
+                        val = Na * dNb_jc
+                        # PSPG diag: tau gNa_jc * c1
+                        val += tau * dNa_jc * c1
+                        # PSPG conv-first: sum_s tau gNa_s rho N_b gu[s,jc]
+                        conv = wp.float64(0.0)
+                        for s in range(dim):
+                            conv += (dNtab[q, a, s] * dscale) \
+                                * (rho * Nb * gu_gp[gp, s, jc])
+                        val += tau * conv
+                        # PSPG tau-deriv: dtau/du_jc N_b (gNa . r_mom)
+                        gNa_rmom = wp.float64(0.0)
+                        for s in range(dim):
+                            gNa_rmom += (dNtab[q, a, s] * dscale) * r_mom[s]
+                        dtau_du_jc = -tau * (wp.float64(4.0)
+                                             * u_gp[gp, jc] / h2) \
+                            / (denom * denom)
+                        val += gNa_rmom * dtau_du_jc * Nb
+                        wp.atomic_add(Ae, e, rowc, blk * b + jc, val * dJxW)
+                    # d/dp: tau gNa . gNb
+                    wp.atomic_add(Ae, e, rowc, blk * b + dim,
+                                  tau * gNagNb * dJxW)
+                    # d/dphi: tau gNa . dr_mom/dphi + tau-deriv
+                    cphi = wp.float64(0.0)
+                    for s in range(dim):
+                        dr_s = drho * Nb * accel[s] \
+                            - cw_inv * mu_gp[gp] * (dNtab[q, b, s] * dscale) \
+                            - grav_scale * ghat[s] * drho * Nb
+                        cphi += (dNtab[q, a, s] * dscale) * dr_s
+                    gNa_rmom = wp.float64(0.0)
+                    for s in range(dim):
+                        gNa_rmom += (dNtab[q, a, s] * dscale) * r_mom[s]
+                    cphi = tau * cphi + gNa_rmom * dtau_dphi * Nb
+                    wp.atomic_add(Ae, e, rowc, blk * b + dim + 1, cphi * dJxW)
+                    # d/dmu: tau gNa . dr_mom/dmu
+                    cmu = wp.float64(0.0)
+                    for s in range(dim):
+                        dNb_gu_s = wp.float64(0.0)
+                        for ss in range(dim):
+                            dNb_gu_s += (dNtab[q, b, ss] * dscale) \
+                                * gu_gp[gp, s, ss]
+                        dr_s = -cw_inv * gphi_gp[gp, s] * Nb + agg * dNb_gu_s
+                        cmu += (dNtab[q, a, s] * dscale) * dr_s
+                    wp.atomic_add(Ae, e, rowc, blk * b + dim + 2,
+                                  tau * cmu * dJxW)
+
+                    # ---- CH phi row (dim+1) ----
+                    rowp = blk * a + dim + 1
+                    for jc in range(dim):
+                        dNb_jc = dNtab[q, b, jc] * dscale
+                        # u.grad phi -> N_b dphi/dx_jc ; phi div u -> phi dNb_jc
+                        val = Na * (Nb * gphi_gp[gp, jc] + phiq * dNb_jc)
+                        wp.atomic_add(Ae, e, rowp, blk * b + jc, val * dJxW)
+                    # d/dphi: (1/dt)N_b + u.gradN_b + divu N_b
+                    cpp = Na * (Nb / dt + uGNb + divu * Nb)
+                    wp.atomic_add(Ae, e, rowp, blk * b + dim + 1, cpp * dJxW)
+                    # d/dmu: (1/Pe) gNa.gNb
+                    wp.atomic_add(Ae, e, rowp, blk * b + dim + 2,
+                                  (wp.float64(1.0) / Pe) * gNagNb * dJxW)
+
+                    # ---- CH mu row (dim+2) ----
+                    rowm = blk * a + dim + 2
+                    # d/dphi: -Na f'' Nb - Cn^2 gNa.gNb
+                    cmp = -Na * fpp * Nb - (Cn * Cn) * gNagNb
+                    wp.atomic_add(Ae, e, rowm, blk * b + dim + 1, cmp * dJxW)
+                    # d/dmu: Na Nb
+                    wp.atomic_add(Ae, e, rowm, blk * b + dim + 2, Na * Nb * dJxW)
+
+    _kernel_cache[key] = chns_k
+    return chns_k

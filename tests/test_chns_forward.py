@@ -208,3 +208,95 @@ def test_staggered_bubble_smoke():
     assert np.all(np.diff(last) > 0), (
         f"bubble centroid_y not strictly rising over last 5 steps: {last}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 7: monolithic (u,p,phi,mu) Warp kernel + stepper
+# ---------------------------------------------------------------------------
+def test_monolithic_parity_vs_mirror():
+    """CHNSMonolithicStepper must reproduce CHNSDiscrete (the numpy mirror,
+    ground truth) to 1e-10 relative on (phi, u, p) after 3 BDF1 steps.
+    Level-4 (16x16) 2-D, BUBBLE_RISE_RE35_WE10 with rho_ratio=10 (the
+    staggered-smoke override), same dt and Newton tolerance."""
+    from dataclasses import replace
+    from diffsim.adjoint.chns import CHNSDiscrete
+    from diffsim.steppers.chns import CHNSMonolithicStepper
+
+    level = 4
+    dm, mesh, cons = _make_dm(level=level, dim=2)
+    case = replace(BUBBLE_RISE_RE35_WE10, rho_ratio=10.0)
+    dt = case.dt0
+
+    coords = mesh.node_coords
+    # light bubble phi=-1 inside; use Cn_override="2h" for resolvability
+    # (matches the sibling gates); build phi0 with the mirror's Cn.
+    ref = CHNSDiscrete(level=level, dim=2, case=case, dt=dt, dm=dm,
+                       gravity=True, Cn_override="2h", newton_tol=1e-12)
+    r = np.sqrt((coords[:, 0] - 0.5) ** 2 + (coords[:, 1] - 0.35) ** 2)
+    phi0 = -np.tanh((r - 0.2) / (ref.Cn * np.sqrt(2.0)))
+    ref.set_initial(phi0)
+
+    mono = CHNSMonolithicStepper(dm, case, dt=dt, linsolver="splu",
+                                 Cn_override="2h", newton_tol=1e-12)
+    mono.set_initial(phi0)
+
+    for _ in range(3):
+        ref.step()
+        mono.step()
+
+    def relmax(a, b):
+        a = np.asarray(a).ravel()
+        b = np.asarray(b).ravel()
+        return float(np.max(np.abs(a - b)) / max(np.max(np.abs(b)), 1e-30))
+
+    rphi = relmax(mono.phi, ref.phi)
+    ru = relmax(mono.u, ref.u)
+    rp = relmax(mono.p, ref.p)
+    print(f"[monolithic parity] rel(phi)={rphi:.3e} rel(u)={ru:.3e} "
+          f"rel(p)={rp:.3e}")
+    assert rphi <= 1e-10, f"phi parity {rphi:.3e} > 1e-10"
+    assert ru <= 1e-10, f"u parity {ru:.3e} > 1e-10"
+    assert rp <= 1e-10, f"p parity {rp:.3e} > 1e-10"
+
+
+def test_monolithic_bubble_smoke():
+    """CHNSMonolithicStepper smoke: 20 steps at level 5, no NaN, light-bubble
+    centroid strictly rising over the last 5 steps, and (conservative CH
+    advection) mass drift machine-exact — bound 1e-11 (the mirror achieves
+    0.0; actual printed)."""
+    from dataclasses import replace
+    from diffsim.steppers.chns import CHNSMonolithicStepper
+
+    level = 5
+    dm, mesh, cons = _make_dm(level=level, dim=2)
+    case = replace(BUBBLE_RISE_RE35_WE10, rho_ratio=10.0)
+    st = CHNSMonolithicStepper(dm, case, dt=case.dt0, Cn_override="2h")
+
+    xc = mesh.node_coords[cons.free_nodes]
+    r = np.sqrt((xc[:, 0] - 0.5) ** 2 + (xc[:, 1] - 0.35) ** 2)
+    phi0 = -np.tanh((r - 0.2) / (st.Cn * np.sqrt(2.0)))  # phi=-1 light bubble
+    st.set_initial(phi0)
+
+    mass0 = st.mass_phi()
+    snaps = st.march(t_end=20 * case.dt0)
+    assert len(snaps) == 20
+
+    cy = []
+    for s in snaps:
+        assert np.isfinite(s["phi"]).all(), f"NaN phi at t={s['t']}"
+        assert np.isfinite(s["u"]).all(), f"NaN u at t={s['t']}"
+        assert np.isfinite(s["p"]).all(), f"NaN p at t={s['t']}"
+        cy.append(metrics.centroid_y(-s["phi"], xc))  # bubble = phi<0
+
+    drift = abs(st.mass_phi() - mass0)
+    wall = float(np.mean([s["wall_per_step"] for s in snaps]))
+    print(f"[monolithic smoke] |mass drift| = {drift:.3e} (bound 1e-11), "
+          f"wall/step = {wall:.3f} s, "
+          f"newton_iters(last) = {st.last_newton_iters}, "
+          f"clamped(last) = {st.last_clamped}")
+    assert drift < 1e-11, f"|mass drift| {drift:.3e} >= 1e-11"
+
+    last = np.asarray(cy[-5:])
+    assert np.all(np.diff(last) > 0), (
+        f"bubble centroid_y not strictly rising over last 5 steps: {last}"
+    )
