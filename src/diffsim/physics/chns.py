@@ -11,20 +11,25 @@ Spec reference
   CHNSIntegrandsGenForm.hpp:125-217 pullback pattern is mirrored here for the
   phase-mixture averaging (linear-in-phi interpolation).
 
+  Element-matrix / RHS constant-viscosity kernels being generalized:
+  ``src/diffsim/api/ns_bricks.py:341-514`` (make_linear_ns_Ae / make_linear_ns_be).
+
 tau_m_gp legacy
 ---------------
-  Generalizes the constant-viscosity h-based form in
-  ``src/diffsim/physics/vms.py:tau_hbased_host`` (lines 48-56) to
-  per-GP local rho, eta:
-    - vms.py uses `nu = eta / (rho * Re)` as a single scalar;
-      here rho and eta vary per GP so we write the formula in primitive vars.
-    - Ci0 maps to `c1`  (advective coefficient, 4.0).
-    - The transient term uses (Ci0/dt^2) which equals (2/dt)^2 when Ci0=4,
-      matching vms.py's (2*b0/dt)^2 with b0=1.
-    - Ci1 maps to the viscous coefficient (36.0), matching CI_F in vms.py.
-    - The outer /rho factor converts the pressure-stabilized tauM (units of
-      time/density) into the momentum form required by the CHNS variational
-      residual (see spec §1).
+  Generalizes the constant-viscosity h-based tau formula in
+  ``src/diffsim/physics/vms.py:48-56`` (``tau_hbased_host``) to per-GP local
+  rho, eta.  Constant mapping (tau_hbased_host symbol -> chns.py symbol):
+
+    tau_hbased_host        chns.py            Value   Role
+    ------------------     ---------------    -----   -------------------------
+    (2*b0/dt)^2  (b0=1)   Ci0 / dt^2         4/dt^2  transient term
+    c1=4.0                 Ci0=4.0            4.0     advective coefficient
+    c2CI=36*16*dim         Ci1^2              1296    viscous coefficient^2
+    nu = eta/(rho*Re)      eta_gp/(rho_gp*Re) --      kinematic viscosity, local
+
+  The outer ``/ rho_gp`` converts the pressure-stabilized tauM (units of
+  time/density) into the momentum stabilization form required by the CHNS
+  variational residual (see spec §1).
 """
 
 import numpy as np
@@ -125,6 +130,7 @@ def capillary_gp(
         Capillary force density at each Gauss point.
     """
     mu_gp = np.asarray(mu_gp, dtype=float)
+    assert mu_gp.ndim == 1, f"mu_gp must be 1-D, got shape {mu_gp.shape}"
     grad_phi_gp = np.asarray(grad_phi_gp, dtype=float)
 
     prefactor = 1.0 / (Cn * We)
@@ -148,16 +154,21 @@ def tau_m_gp(
 ) -> np.ndarray:
     """Per-Gauss-point VMS momentum stabilization parameter tau_m.
 
-    Implements the h-based form generalized to local (rho, eta):
+    Implements the h-based form from ``src/diffsim/physics/vms.py:48-56``
+    (``tau_hbased_host``) generalized to per-GP local (rho, eta):
 
-        tau_m = [ (Ci0/dt^2) + (Ci0*|u|/h)^2
-                              + (Ci1*eta/(rho*Re*h^2))^2 ]^{-1/2} / rho
+        tau_m = [ (2*b0/dt)^2 + c1*|u|^2/h^2
+                              + (Ci1*nu_local/h^2)^2 ]^{-1/2} / rho_gp
 
-    This is the variable-density extension of ``physics.vms.tau_hbased_host``
-    (vms.py:48-56).  Constants Ci0=4, Ci1=36 match CI_F=36 and c1=4 from
-    vms.py; with constant nu=eta/(rho*Re) the formulas agree up to the outer
-    /rho factor and the squaring of the advective term (h-form vs metric-form
-    difference, recorded in vms.py:13-18).
+    where b0=1, c1=Ci0=4, nu_local = eta_gp/(rho_gp*Re), and Ci1=36.
+
+    Constant mapping to ``tau_hbased_host`` (vms.py:48-56):
+      - transient: (2*b0/dt)^2 with b0=1  <=>  Ci0/dt^2  (= 4/dt^2)
+      - advective: c1*|u|^2/h^2  (c1=4)   <=>  Ci0*u_mag**2/h**2
+      - viscous:   c2CI*nu^2/h^4           <=>  (Ci1*nu_local/h^2)^2
+
+    See also: ``src/diffsim/api/ns_bricks.py:341-514`` for the constant-nu
+    element kernels (make_linear_ns_Ae / make_linear_ns_be) being generalized.
 
     Parameters
     ----------
@@ -189,8 +200,8 @@ def tau_m_gp(
 
     u_mag = np.sqrt(np.sum(u_gp ** 2, axis=-1))  # [ngp]
 
-    term_trans = Ci0 / dt ** 2
-    term_adv = (Ci0 * u_mag / h) ** 2
+    term_trans = Ci0 / dt ** 2           # (2*b0/dt)^2 with b0=1, Ci0=4
+    term_adv = Ci0 * u_mag ** 2 / h ** 2  # c1*|u|^2/h^2, c1=Ci0=4
     term_visc = (Ci1 * eta_gp / (rho_gp * Re * h ** 2)) ** 2
 
     denom = np.sqrt(term_trans + term_adv + term_visc)
