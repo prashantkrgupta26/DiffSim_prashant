@@ -281,8 +281,9 @@ def run_case(name, full=False, level=None, max_wall_min=WALL_CAP_DEFAULT_MIN,
                 export_vtu(mesh, vp, fields={"phi": p})
                 vtu_files.append(vp)
             if vtu_files:
+                import pathlib
                 from diffsim.viz.export import _write_pvd
-                _write_pvd(vtu_files[0], vtu_files)
+                _write_pvd(pathlib.Path(vtu_files[0]), vtu_files)
     except Exception as e:
         print(f"[run_case] VTU export skipped: {e}")
 
