@@ -69,6 +69,50 @@ CH mu residual (test chi):
     R^mu = INT chi (mu - f'(phi)) - Cn^2 INT grad chi . grad phi
     f'(phi) = phi^3 - phi          (double-well f = 1/4 (phi^2-1)^2)
 
+================================================================================
+CONSERVATIVE ALLEN-CAHN (CAC) MODE  (interface="cac", spec §3)
+================================================================================
+Selected by ``interface="cac"``.  Same (u, p, phi, mu) DOF layout (TRIVIAL-MU
+option: smallest diff, mu becomes a wasted DOF pinned to 0 by an identity row —
+a documented build-out optimisation would drop to a dim+2 layout).  gamma = 1/Pe
+is the CAC mobility (the SAME Onsager coefficient the CH phi-flux uses, so the
+two interfaces share the Pe*M mobility knob for the adjoint).
+
+phi-row (strong):
+    dphi/dt + div(u phi)
+        = gamma [ Cn lap(phi) - F'(phi)/Cn - beta(t) sqrt(F(phi)) ] + s_phi
+    F(phi) = (1/4)(phi^2-1)^2 >= 0,  F'(phi) = phi^3 - phi.
+phi-row (weak, test psi; -gamma Cn lap phi integrated by parts under no-flux):
+    R^phi = INT psi[(phi-phi_n)/dt + u.grad phi + phi div u]
+          + gamma Cn INT grad psi . grad phi
+          + gamma INT psi [ F'(phi)/Cn + beta sqrt(F(phi)) ]     ( - INT psi s_phi )
+
+Source-respecting Lagrange multiplier beta(t) (see ``_cac_beta``):
+    Integrating the phi-row over Omega with no-flux / no-slip and conservative
+    advection gives Int div(u phi)=0 and Int Cn lap(phi)=0; demanding
+    d/dt Int phi = Int s_phi (mass grows EXACTLY by the source) yields
+        beta(t) = -( Int F'(phi)/Cn dOmega ) / ( Int sqrt(F(phi)) dOmega ).
+    s_phi CANCELS by construction — the multiplier preserves exactly the
+    source-injected mass, nothing more.  (General form keeps the lap term in the
+    numerator: beta = Int[Cn lap phi - F'/Cn] / Int sqrt F; = the reduced form
+    under the no-flux gate.)  beta is evaluated IMPLICITLY at phi^{n+1} but
+    FROZEN per Newton iterate (Picard-on-beta): the local residual/Jacobian
+    treat beta as a constant (no rank-one dbeta/dphi block), which keeps the
+    sparse structure and is the standard AC practice.  The kernel freezes beta
+    identically (host-side scalar arg).
+
+mu-row (CAC): trivial identity  R^mu = INT chi mu  (drives mu -> 0).
+
+Momentum surface tension (CAC): the potential-form mu grad phi capillary AND
+the AGG mass flux J are DROPPED (spec §3).  Surface tension is the
+Korteweg-equivalent form
+    f_st = -(Cn/We) div( grad phi (x) grad phi ),
+weak form  +(Cn/We) (grad phi (x) grad phi) : grad w  (first-derivatives only,
+standard for AC-based CHNS, Joshi & Jaiman 2020 lineage).  A strong Korteweg
+force needs a Q1-unavailable weak 2nd derivative at GPs, so it is GALERKIN-ONLY
+(omitted from r_mom / SUPG / PSPG) — a documented pragmatic ruling.  CH mode's
+mu-grad-phi form is untouched.
+
 tau_m: physics.chns.tau_m_gp with LOCAL rho/eta per Gauss point (contrast-aware
 stabilization), house constants Ci=(4, 36), c2CI = 36*16*dim.
 
@@ -131,7 +175,7 @@ class CHNSDiscrete:
 
     def __init__(self, level, dim, case, dt, dm, gravity=True,
                  Cn_override=None, newton_tol=1e-10, newton_max=30,
-                 src_fns=None, body_fn=None, tstep="bdf1"):
+                 src_fns=None, body_fn=None, tstep="bdf1", interface="ch"):
         T = dm.constraints.T
         assert T.shape[0] == T.shape[1] and (
             abs(T - sp.eye(T.shape[0])).nnz == 0), \
@@ -157,6 +201,24 @@ class CHNSDiscrete:
         if tstep not in ("bdf1", "bdf2"):
             raise ValueError(f"tstep must be 'bdf1' or 'bdf2', got {tstep!r}")
         self.tstep = tstep
+        # -------------------------------------------------------------------
+        # Interface model: "ch" (Cahn-Hilliard, the default 4-field brick) or
+        # "cac" (Conservative Allen-Cahn, source-respecting Lagrange
+        # multiplier).  See the class docstring section "CONSERVATIVE
+        # ALLEN-CAHN (CAC) MODE" for the full derivation.  gamma = 1/Pe is the
+        # CAC mobility (same Onsager coefficient the CH phi-flux uses, so the
+        # two interfaces share the Pe·M knob for the adjoint).
+        # -------------------------------------------------------------------
+        if interface not in ("ch", "cac"):
+            raise ValueError(
+                f"interface must be 'ch' or 'cac', got {interface!r}")
+        self.interface = interface
+        self.gamma = 1.0 / float(case.Pe)      # CAC mobility (== CH onsager)
+        # beta frozen per Newton iterate (Picard-on-beta): recomputed from the
+        # current iterate's phi at the top of every _assemble, then held
+        # constant while differentiating the local residual (the standard AC
+        # practice — keeps the sparse structure, no rank-one dbeta/dphi block).
+        self._beta_frozen = 0.0
         self.u_nm1 = None                 # x^{n-1} (None => BDF1 bootstrap)
         self.phi_nm1 = None
         self.dt_prev = None
@@ -278,6 +340,47 @@ class CHNSDiscrete:
         return m
 
     # ------------------------------------------------------------------
+    # CAC source-respecting Lagrange multiplier beta(phi)  (frozen per iterate)
+    # ------------------------------------------------------------------
+    def _cac_beta(self, phi):
+        r"""beta(t) for the Conservative Allen-Cahn phi-row, computed from the
+        CURRENT iterate's phi by GP quadrature (a cheap scalar reduction).
+
+        Derivation (no-flux / no-slip closed box, conservative advection).
+        The CAC phi-row is
+            dphi/dt + div(u phi)
+                = gamma [ Cn lap(phi) - F'(phi)/Cn - beta sqrt(F(phi)) ] + s_phi
+        Integrate over Omega.  Int div(u phi) = 0 (conservative advection +
+        no-penetration), and Int Cn lap(phi) = Cn * boundary flux = 0 (no-flux).
+        Demanding d/dt Int phi = Int s_phi (mass grows EXACTLY by the source):
+            Int s_phi = gamma [ 0 - Int F'/Cn - beta Int sqrt(F) ] + Int s_phi
+            => 0 = -Int F'/Cn - beta Int sqrt(F)
+            => beta = -( Int F'(phi)/Cn ) / Int sqrt(F(phi)).
+        The source s_phi CANCELS by construction — beta is "source-respecting":
+        whatever mass the source injects is preserved, nothing more.  We keep
+        the lap term explicit in the numerator (it integrates to 0 here but the
+        general form is beta = Int[Cn lap(phi) - F'/Cn] / Int sqrt(F); the weak
+        Int Cn lap phi = -Int Cn |grad phi|^2 term would need a boundary
+        correction, so under the no-flux gate we use the reduced numerator).
+
+        Guards Int sqrt(F) away from 0 (flat phi == +-1 everywhere) with a
+        tiny floor; beta multiplies sqrt(F) which is then ~0, so the value is
+        immaterial there.
+        """
+        Cn = self.Cn
+        num = 0.0   # Int F'(phi)/Cn
+        den = 0.0   # Int sqrt(F(phi))
+        for B in self.bins:
+            phi_gp, _ = self._interp(phi, B)              # [e, q]
+            Fp = phi_gp ** 3 - phi_gp                      # F'(phi)
+            F = 0.25 * (phi_gp ** 2 - 1.0) ** 2            # F(phi) >= 0
+            sqrtF = np.sqrt(np.maximum(F, 0.0))
+            num += float(np.sum(B["dJxW"] * (Fp / Cn)))
+            den += float(np.sum(B["dJxW"] * sqrtF))
+        den = den if abs(den) > 1e-300 else 1e-300
+        return -num / den
+
+    # ------------------------------------------------------------------
     # interpolation of a nodal field to GPs (value + physical gradient)
     # ------------------------------------------------------------------
     def _interp(self, field, B):
@@ -299,6 +402,18 @@ class CHNSDiscrete:
     def _assemble(self, x, want_jac):
         u, p, phi, mu = self.unpack(x)
         blk, dim = self.blk, self.dim
+        cac = (self.interface == "cac")
+        gamma = self.gamma
+        # Freeze beta per Newton iterate (Picard-on-beta): both residual and
+        # jacobian within one Newton step call _assemble with the SAME x, so
+        # this recompute is naturally frozen-per-iterate, and the local
+        # residual below treats beta as a constant (no dbeta/dphi block).
+        # When self._freeze_beta is set (the FD-Jacobian gate), beta is held at
+        # the previously-frozen value so the numerically-differenced residual
+        # matches the frozen-beta analytic Jacobian exactly.
+        if cac and not getattr(self, "_freeze_beta", False):
+            self._beta_frozen = self._cac_beta(phi)
+        beta = self._beta_frozen
         # A4b variable-step BDF2 effective time term: reproduce sigma*x - hist
         # via an effective (dt, x^n) on the SAME BDF1 kernel — dt_eff = 1/sigma,
         # xn_eff = hist/sigma (see steppers/chns.py:_bdf_time).  BDF1 default.
@@ -315,6 +430,11 @@ class CHNSDiscrete:
             u_n_eff, phi_n_eff = self.u_n, self.phi_n
         Re, We, Cn, Pe, Fr = self.Re, self.We, self.Cn, self.Pe, self.Fr
         cw_inv = 1.0 / (Cn * We)
+        # CAC drops the potential-form capillary (mu grad phi) AND the AGG mass
+        # flux (spec §3).  cap_cw / agg_eff zero those channels in CAC so the
+        # residual/Jacobian have no mu-coupling except the trivial mu=0 row.
+        cap_cw = 0.0 if cac else cw_inv
+        agg_eff = 0.0 if cac else self.agg
         R = np.zeros(self.ndof)
         rows, cols, vals = [], [], []
         n_clamp = 0
@@ -383,8 +503,8 @@ class CHNSDiscrete:
                        * (4.0 * u_gp / h_ ** 2)[...]
                        / denom[..., None] ** 2)                    # [e,q,k]
 
-            # --- AGG flux J = agg * grad mu --------------------------------
-            J_gp = self.agg * gmu                      # [e,q,s]
+            # --- AGG flux J = agg * grad mu (agg_eff==0 drops it in CAC) ----
+            J_gp = agg_eff * gmu                        # [e,q,s]
 
             # --- convective derivatives ------------------------------------
             # (u.grad)u : [e,q,comp]  = sum_s u_s d u_comp/d x_s
@@ -395,7 +515,20 @@ class CHNSDiscrete:
             ugradphi = np.einsum("eqs,eqs->eq", u_gp, gphi)
 
             # --- capillary + gravity body forces [e,q,comp] ----------------
-            fcap = cw_inv * mu_gp[..., None] * gphi     # [e,q,s]
+            # CH mode: potential form fcap = (Cn We)^-1 mu grad phi, entering
+            #   the strong r_mom and the Galerkin body as -fcap.
+            # CAC mode: the mu-grad-phi potential force is DROPPED (mu is not a
+            #   PDE unknown); surface tension is the Korteweg-equivalent form
+            #   f_st = -(Cn/We) div(grad phi (x) grad phi), whose weak form is
+            #   +(Cn/We) (grad phi (x) grad phi):grad w — first-derivatives
+            #   only, added GALERKIN-ONLY below (a strong Korteweg force needs
+            #   a Q1-unavailable weak 2nd derivative at GPs, so it is omitted
+            #   from r_mom / SUPG / PSPG — documented pragmatic ruling, spec §3,
+            #   Joshi & Jaiman 2020 lineage).  fcap is thus zeroed in CAC.
+            if cac:
+                fcap = np.zeros((ne, nqp, dim))
+            else:
+                fcap = cw_inv * mu_gp[..., None] * gphi     # [e,q,s]
             fgrav = (rho_gp[..., None] * grav_scale) * ghat[None, None, :]
             # MMS/SP-1 momentum source enters BOTH r_mom (strong, SUPG/PSPG
             # consistency) and the Galerkin body — same convention as the
@@ -434,6 +567,14 @@ class CHNSDiscrete:
             ugw = np.einsum("eqs,eqas->eqa", u_gp, dNp)      # [e,q,a]
             Rsupg = np.einsum("eq,eq,eqa,eqd->ead", dJxW, tau, ugw, r_mom)
             Ru = Rmom + Rvisc + Rpres + Rsupg               # [e,a,comp]
+            # CAC Korteweg surface tension (Galerkin only):
+            #   +(Cn/We) INT (grad phi)_d (grad phi . grad N_a)
+            if cac:
+                kort_scale = Cn / We
+                gphi_gNa = np.einsum("eqs,eqas->eqa", gphi, dNp)  # gphi.gradN_a
+                Rkort = kort_scale * np.einsum(
+                    "eq,eqa,eqd->ead", dJxW, gphi_gNa, gphi)      # [e,a,d]
+                Ru = Ru + Rkort
             for d in range(dim):
                 np.add.at(R, B["gdof"][:, d::blk].ravel(),
                           Ru[:, :, d].ravel())
@@ -451,15 +592,37 @@ class CHNSDiscrete:
             # machine-exact lumped-mass conservation.  "Non-skew" per the brief
             # = not the skew average; this is the divergence (conservative) form.
             ch_body = (phi_gp - phin_gp) / dt + ugradphi + phi_gp * divu
-            Rphi = (np.einsum("eq,qa,eq->ea", dJxW, N, ch_body)
-                    + (1.0 / Pe) * np.einsum("eq,eqas,eqs->ea",
-                                             dJxW, dNp, gmu))
+            if cac:
+                # CAC phi-row: transient + conservative advection identical,
+                # flux replaced by the Allen-Cahn relaxation.  Weak form
+                #   +gamma*Cn INT gNa.gphi   (from -gamma Cn lap phi, IBP)
+                #   +gamma INT N_a [F'(phi)/Cn + beta sqrt(F(phi))]
+                Fp = phi_gp ** 3 - phi_gp                   # F'(phi)
+                F = 0.25 * (phi_gp ** 2 - 1.0) ** 2         # F(phi) >= 0
+                sqrtF = np.sqrt(np.maximum(F, 0.0))
+                Rphi = (np.einsum("eq,qa,eq->ea", dJxW, N, ch_body)
+                        + gamma * Cn * np.einsum("eq,eqas,eqs->ea",
+                                                 dJxW, dNp, gphi)
+                        + gamma * np.einsum("eq,qa,eq->ea", dJxW, N,
+                                            Fp / Cn + beta * sqrtF))
+            else:
+                Rphi = (np.einsum("eq,qa,eq->ea", dJxW, N, ch_body)
+                        + (1.0 / Pe) * np.einsum("eq,eqas,eqs->ea",
+                                                 dJxW, dNp, gmu))
             np.add.at(R, B["gdof"][:, dim + 1::blk].ravel(), Rphi.ravel())
 
-            # CH mu: INT chi(mu - f'(phi)) - Cn^2 INT gchi . grad phi
-            fp = phi_gp ** 3 - phi_gp                       # f'(phi)
-            Rmu = (np.einsum("eq,qa,eq->ea", dJxW, N, mu_gp - fp)
-                   - Cn ** 2 * np.einsum("eq,eqas,eqs->ea", dJxW, dNp, gphi))
+            if cac:
+                # CAC: mu is not a PDE unknown.  Trivial-mu row (strong identity
+                # mu = 0), assembled as R^mu = INT N_a mu (lumped-consistent):
+                # the mass block N_a N_b is SPD, driving mu -> 0.  Documented as
+                # a wasted DOF (build-out optimisation: drop to dim+2 layout).
+                Rmu = np.einsum("eq,qa,eq->ea", dJxW, N, mu_gp)
+            else:
+                # CH mu: INT chi(mu - f'(phi)) - Cn^2 INT gchi . grad phi
+                fp = phi_gp ** 3 - phi_gp                   # f'(phi)
+                Rmu = (np.einsum("eq,qa,eq->ea", dJxW, N, mu_gp - fp)
+                       - Cn ** 2 * np.einsum("eq,eqas,eqs->ea", dJxW, dNp,
+                                             gphi))
             np.add.at(R, B["gdof"][:, dim + 2::blk].ravel(), Rmu.ravel())
 
             # --- MMS / SP-1 forcing: -INT N_a * S_f per field f ------------
@@ -562,13 +725,27 @@ class CHNSDiscrete:
                 # drho part (transient+conv) : INT N_a * drho N_b accel_d
                 m1 = np.einsum("eq,qa,eqb,eq->eab", dJxW, N, drho_Nb,
                                accel_d[:, :, d])
-                # -fcap part: body = -fcap ; d/dphi_b = -cw_inv mu dN_b,d
-                m2 = -np.einsum("eq,qa,eq,eqb->eab", dJxW, N, cw_inv * mu_gp,
+                # -fcap part: body = -fcap ; d/dphi_b = -cap_cw mu dN_b,d
+                # (cap_cw==0 in CAC; the Korteweg d/dphi block is added below)
+                m2 = -np.einsum("eq,qa,eq,eqb->eab", dJxW, N, cap_cw * mu_gp,
                                 dNp[:, :, :, d])
                 # -fgrav part: -(drho N_b) grav_scale ghat_d
                 m3 = -np.einsum("eq,qa,eqb->eab", dJxW * grav_scale * ghat[d],
                                 N, drho_Nb)
                 addblk(d, dim + 1, m1 + m2 + m3)
+            # CAC Korteweg d/dphi: Rkort[a,d] = kort_scale gphi_d (gphi.gNa);
+            #   d/dphi_b = kort_scale [ dN_b,d (gphi.gNa) + gphi_d (gNa.gNb) ]
+            if cac:
+                kort_scale = Cn / We
+                gphi_gNa = np.einsum("eqs,eqas->eqa", gphi, dNp)  # [e,q,a]
+                gNagNb = np.einsum("eqas,eqbs->eqab", dNp, dNp)   # [e,q,a,b]
+                for d in range(dim):
+                    mk = kort_scale * (
+                        np.einsum("eq,eqa,eqb->eab", dJxW, gphi_gNa,
+                                  dNp[:, :, :, d])
+                        + np.einsum("eq,eq,eqab->eab", dJxW, gphi[:, :, d],
+                                    gNagNb))
+                    addblk(d, dim + 1, mk)
             # viscous eta(phi): Rvisc = (1/Re) INT eta symgu:dN_a ; d/dphi_b
             #   = (1/Re) INT deta N_b symgu[:,:,d,s] dN_a,s
             for d in range(dim):
@@ -582,13 +759,13 @@ class CHNSDiscrete:
             #   Jgradu comp d = agg sum_s (grad mu)_s du_d/dx_s ;
             #   d/dmu_b = agg (grad N_b . grad? ) -> agg sum_s dN_b,s du_d/dx_s
             for d in range(dim):
-                # -fcap wrt mu
+                # -fcap wrt mu (cap_cw==0 in CAC)
                 mfc = -np.einsum("eq,qa,eq,qb->eab", dJxW, N,
-                                 cw_inv * gphi[:, :, d], N)
-                # Jgradu wrt mu: agg * (dN_b . row d of gu)
+                                 cap_cw * gphi[:, :, d], N)
+                # Jgradu wrt mu: agg_eff * (dN_b . row d of gu) (0 in CAC)
                 gu_d = gu[:, :, d, :]                        # [e,q,s]
-                mJ = self.agg * np.einsum("eq,qa,eqbs,eqs->eab",
-                                          dJxW, N, dNp, gu_d)
+                mJ = agg_eff * np.einsum("eq,qa,eqbs,eqs->eab",
+                                         dJxW, N, dNp, gu_d)
                 addblk(d, dim + 2, mfc + mJ)
 
             #### --- viscous already added above; --- SUPG derivatives ------
@@ -637,7 +814,7 @@ class CHNSDiscrete:
             dtau_Nb = np.einsum("eq,qb->eqb", dtau_dphi, N)   # [e,q,b]
             for d in range(dim):
                 dr_phi = (np.einsum("eqb,eq->eqb", drho_Nb, accel_d[:, :, d])
-                          - cw_inv * mu_gp[:, :, None] * dNp[:, :, :, d]
+                          - cap_cw * mu_gp[:, :, None] * dNp[:, :, :, d]
                           - grav_scale * ghat[d] * drho_Nb)
                 m_phi = np.einsum("eqa,eqb->eab", tau_ugw, dr_phi)
                 # tau-derivative correction (uses raw ugw, weight dJxW*r_mom_d)
@@ -646,9 +823,9 @@ class CHNSDiscrete:
                 addblk(d, dim + 1, m_phi + m_phi_tau)
             # d r_mom/dmu: -cw_inv N_b gphi_d + agg (dN_b.gu_d)
             for d in range(dim):
-                dr_mu = (-cw_inv * np.einsum("eq,qb->eqb", gphi[:, :, d], N)
-                         + self.agg * np.einsum("eqbs,eqs->eqb", dNp,
-                                                gu[:, :, d, :]))
+                dr_mu = (-cap_cw * np.einsum("eq,qb->eqb", gphi[:, :, d], N)
+                         + agg_eff * np.einsum("eqbs,eqs->eqb", dNp,
+                                               gu[:, :, d, :]))
                 m_mu = np.einsum("eqa,eqb->eab", tau_ugw, dr_mu)
                 addblk(d, dim + 2, m_mu)
 
@@ -684,47 +861,71 @@ class CHNSDiscrete:
             addblk(dim, dim, m_pp)
             # d/dphi: tau grad N_a . d r_mom/dphi
             for_phi = (np.einsum("eqb,eqd->eqbd", drho_Nb, accel_d)
-                       - cw_inv * np.einsum("eq,eqbd->eqbd", mu_gp, dNp)
+                       - cap_cw * np.einsum("eq,eqbd->eqbd", mu_gp, dNp)
                        - grav_scale * np.einsum("eqb,d->eqbd", drho_Nb, ghat))
             m_cphi = np.einsum("eqas,eqbs->eab", tau_gNa, for_phi)
             # tau depends on phi: dtau/dphi N_b (grad N_a . r_mom)
             m_cphi_tau = np.einsum("eqa,eqb->eab", gNa_rmom, dtau_Nb)
             addblk(dim, dim + 1, m_cphi + m_cphi_tau)
             # d/dmu: tau grad N_a . d r_mom/dmu
-            for_mu = (-cw_inv * np.einsum("eqd,qb->eqbd", gphi, N)
-                      + self.agg * np.einsum("eqbs,eqds->eqbd", dNp, gu))
+            for_mu = (-cap_cw * np.einsum("eqd,qb->eqbd", gphi, N)
+                      + agg_eff * np.einsum("eqbs,eqds->eqbd", dNp, gu))
             m_cmu = np.einsum("eqas,eqbs->eab", tau_gNa, for_mu)
             addblk(dim, dim + 2, m_cmu)
 
-            #### --- CH phi row (conservative advection) ---------------------
-            # Rphi = INT N_a[(phi-phin)/dt + u.grad phi + phi div u]
-            #        + (1/Pe) INT gNa.grad mu
-            # d/du_jc: from u.grad phi -> N_b dphi/dx_jc ; from phi div u ->
-            #          phi dN_b,jc  (d div u/du_jc,b = dN_b,jc)
+            #### --- CH / CAC phi row ----------------------------------------
+            # d/du_jc (both models — transient + conservative advection):
+            #   from u.grad phi -> N_b dphi/dx_jc ; from phi div u -> phi dN_b,jc
             for jc in range(dim):
                 m = (np.einsum("eq,qa,qb,eq->eab", dJxW, N, N, gphi[:, :, jc])
                      + np.einsum("eq,qa,eq,eqb->eab", dJxW, N, phi_gp,
                                  dNp[:, :, :, jc]))
                 addblk(dim + 1, jc, m)
-            # d/dphi: transient (1/dt)N_b + u.grad N_b + div u N_b
-            cphi = (N[None] / dt) + uGNb + divu[:, :, None] * N[None]  # [e,q,b]
-            m_phiphi = np.einsum("eq,qa,eqb->eab", dJxW, N, cphi)
-            addblk(dim + 1, dim + 1, m_phiphi)
-            # d/dmu: (1/Pe) INT gNa . grad N_b
-            m_phimu = (1.0 / Pe) * np.einsum("eq,eqas,eqbs->eab",
-                                             dJxW, dNp, dNp)
-            addblk(dim + 1, dim + 2, m_phimu)
+            if cac:
+                # CAC phi-row d/dphi (beta frozen -> no dbeta/dphi block):
+                #   transient/advection: (1/dt)N_b + u.gradN_b + divu N_b
+                #   +gamma Cn (gNa.gNb)             (from gamma Cn gNa.gphi)
+                #   +gamma N_a [F''(phi)/Cn + beta F'(phi)/(2 sqrt F)] N_b
+                # where d/dphi sqrt(F) = F'(phi)/(2 sqrt F); guard sqrt F floor.
+                Fp = phi_gp ** 3 - phi_gp
+                Fpp = 3.0 * phi_gp ** 2 - 1.0
+                F = 0.25 * (phi_gp ** 2 - 1.0) ** 2
+                sqrtF = np.sqrt(np.maximum(F, 0.0))
+                dsqrtF = np.where(sqrtF > 1e-12, Fp / (2.0 * sqrtF), 0.0)
+                cphi = ((N[None] / dt) + uGNb + divu[:, :, None] * N[None])
+                m_phiphi = (np.einsum("eq,qa,eqb->eab", dJxW, N, cphi)
+                            + gamma * Cn * np.einsum("eq,eqas,eqbs->eab",
+                                                     dJxW, dNp, dNp)
+                            + gamma * np.einsum(
+                                "eq,qa,eq,qb->eab", dJxW, N,
+                                Fpp / Cn + beta * dsqrtF, N))
+                addblk(dim + 1, dim + 1, m_phiphi)
+                # no phi-mu coupling in CAC (flux is Allen-Cahn, not CH)
+            else:
+                # d/dphi: transient (1/dt)N_b + u.grad N_b + div u N_b
+                cphi = ((N[None] / dt) + uGNb
+                        + divu[:, :, None] * N[None])       # [e,q,b]
+                m_phiphi = np.einsum("eq,qa,eqb->eab", dJxW, N, cphi)
+                addblk(dim + 1, dim + 1, m_phiphi)
+                # d/dmu: (1/Pe) INT gNa . grad N_b
+                m_phimu = (1.0 / Pe) * np.einsum("eq,eqas,eqbs->eab",
+                                                 dJxW, dNp, dNp)
+                addblk(dim + 1, dim + 2, m_phimu)
 
-            #### --- CH mu row -----------------------------------------------
-            # Rmu = INT N_a(mu - f'(phi)) - Cn^2 INT gNa.grad phi
-            # d/dphi: -INT N_a f''(phi) N_b - Cn^2 INT gNa.grad N_b
-            fpp = 3.0 * phi_gp ** 2 - 1.0                    # f''(phi)
-            m_muphi = (-np.einsum("eq,qa,eq,qb->eab", dJxW, N, fpp, N)
-                       - Cn ** 2 * np.einsum("eq,eqas,eqbs->eab",
-                                             dJxW, dNp, dNp))
-            addblk(dim + 2, dim + 1, m_muphi)
-            # d/dmu: INT N_a N_b
-            addblk(dim + 2, dim + 2, NNab)
+            #### --- CH mu row / CAC trivial-mu row --------------------------
+            if cac:
+                # trivial mu = 0 row: R^mu = INT N_a mu -> d/dmu = INT N_a N_b
+                addblk(dim + 2, dim + 2, NNab)
+            else:
+                # Rmu = INT N_a(mu - f'(phi)) - Cn^2 INT gNa.grad phi
+                # d/dphi: -INT N_a f''(phi) N_b - Cn^2 INT gNa.grad N_b
+                fpp = 3.0 * phi_gp ** 2 - 1.0                # f''(phi)
+                m_muphi = (-np.einsum("eq,qa,eq,qb->eab", dJxW, N, fpp, N)
+                           - Cn ** 2 * np.einsum("eq,eqas,eqbs->eab",
+                                                 dJxW, dNp, dNp))
+                addblk(dim + 2, dim + 1, m_muphi)
+                # d/dmu: INT N_a N_b
+                addblk(dim + 2, dim + 2, NNab)
 
             # ---- scatter Ae ----
             gdof = B["gdof"]
