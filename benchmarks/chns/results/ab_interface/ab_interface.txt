@@ -1,0 +1,12 @@
+A/B INTERFACE TABLE  (level 5, rho_ratio=10, Cn=2h, BDF1)
+======================================================================
+Axis                                                CH           CAC
+----------------------------------------------------------------------
+Bubble-rise robustness (diverge step)           OK 200            37
+Mass drift, no source (rel)                   0.00e+00      2.04e-13
+Mass drift, with source (rel)                 3.93e-09      7.07e-10
+Newton iters avg/max (bubble rise)               3.0/4         3.6/7
+Wall/step s (bubble rise)                        0.226         0.272
+Parasitic max|u| (static drop, 5 steps)      3.639e-04     1.331e-02
+Parasitic ratio CAC/CH                             1.0         36.6x
+======================================================================

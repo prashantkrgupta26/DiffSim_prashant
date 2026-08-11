@@ -1,0 +1,1398 @@
+r"""CHNSDiscrete — reference-grade numpy mirror of the coupled Cahn-Hilliard /
+Navier-Stokes (CHNS) BDF1 monolithic solve (SP-0 Task 5).
+
+This class is *ground truth*: a later Warp kernel is parity-checked against it,
+so the discretization contract below is BINDING — the kernel must reproduce
+every term exactly.  Correctness beats speed throughout; the element loops are
+plain vectorised numpy with an analytically-assembled Jacobian (FD-verified).
+
+================================================================================
+DOF LAYOUT
+================================================================================
+Node-major, block ``blk = dim + 3`` per node, ordered
+
+    (u_0, .., u_{dim-1},  p,  phi,  mu)
+
+so the global dof of (node a, field f) is ``a*blk + f`` with
+
+    f = 0 .. dim-1  -> velocity component
+    f = dim         -> pressure p
+    f = dim + 1     -> phase field phi
+    f = dim + 2     -> chemical potential mu
+
+The state vector ``x`` is length ``ndof = blk * nn``.
+
+================================================================================
+NON-DIMENSIONAL PARAMETERS (Khanwale form; from the CHNSCase)
+================================================================================
+Re, We, Cn, Pe, Fr, rho_ratio (= rho_h/rho_l), eta_ratio (= eta_h/eta_l).
+
+Density / viscosity normalisation (documented contract):
+    rho_h = 1,           rho_l = 1 / rho_ratio      (heavy phi=+1, light phi=-1)
+    eta_h = 1,           eta_l = 1 / eta_ratio
+Local rho(phi), eta(phi) come from ``physics.chns.mix_props`` with these
+endpoints, evaluated at ``phi^{n+1}`` (fully implicit).  mix_props linearly
+interpolates rho = a_rho*phi + b_rho with a=(hi-lo)/2, b=(hi+lo)/2 and floors
+each property at 1e-3*lo; the number of GP-clamps is surfaced per step.
+
+================================================================================
+DISCRETIZATION CONTRACT (BDF1, Q1 equal-order, PSPG + SUPG)
+================================================================================
+Time: BDF1.  History u_n, phi_n from the previously committed step.
+
+Momentum residual (test w, component i), CONVECTIVE (non-skew) form:
+    R^u_i = INT w [ rho (u-u_n)/dt + rho (u.grad)u + J.grad u ]              (Galerkin)
+          + INT (2 eta / Re) D(u):D(w)      with D = 1/2 (grad u + grad u^T)
+          - INT (div w) p
+          - INT w . f_cap
+          - INT w . f_grav
+          + INT tau_m (u.grad w) . r_mom_strong                             (SUPG)
+  where
+    f_cap  = (Cn*We)^{-1} mu grad phi                       (capillary_gp)
+    f_grav = rho g_hat / Fr^2,   g_hat = (0,-1) in 2-D (last axis in 3-D)
+    J      = -((rho_h - rho_l)/2) * (1/Pe) * M * grad mu    (AGG mass flux, M=1)
+    r_mom_strong = rho (u-u_n)/dt + rho (u.grad)u + J.grad u + grad p
+                   - f_cap - f_grav
+  The p1 Laplacian of u is identically zero, so the viscous strong term is
+  omitted from r_mom_strong (bit-identical to ns_bricks make_linear_ns_Ae).
+  Viscous term is integrated in the SYMMETRIC form (2 eta/Re) D(u):D(w).
+
+Continuity residual (test q):
+    R^p = INT q (div u)  +  INT tau_m grad q . r_mom_strong                 (PSPG)
+  Pressure nullspace for enclosed flow: pin p at node 0 (strong row).
+
+CH phi residual (test psi):
+    R^phi = INT psi [ (phi - phi_n)/dt + u.grad phi ]
+          + (1/Pe) INT grad psi . (M grad mu)               (M = 1 constant)
+
+CH mu residual (test chi):
+    R^mu = INT chi (mu - f'(phi)) - Cn^2 INT grad chi . grad phi
+    f'(phi) = phi^3 - phi          (double-well f = 1/4 (phi^2-1)^2)
+
+================================================================================
+CONSERVATIVE ALLEN-CAHN (CAC) MODE  (interface="cac", spec §3)
+================================================================================
+Selected by ``interface="cac"``.  Same (u, p, phi, mu) DOF layout (TRIVIAL-MU
+option: smallest diff, mu becomes a wasted DOF pinned to 0 by an identity row —
+a documented build-out optimisation would drop to a dim+2 layout).  gamma = 1/Pe
+is the CAC mobility (the SAME Onsager coefficient the CH phi-flux uses, so the
+two interfaces share the Pe*M mobility knob for the adjoint).
+
+phi-row (strong):
+    dphi/dt + div(u phi)
+        = gamma [ Cn lap(phi) - F'(phi)/Cn - beta(t) sqrt(F(phi)) ] + s_phi
+    F(phi) = (1/4)(phi^2-1)^2 >= 0,  F'(phi) = phi^3 - phi.
+phi-row (weak, test psi; -gamma Cn lap phi integrated by parts under no-flux):
+    R^phi = INT psi[(phi-phi_n)/dt + u.grad phi + phi div u]
+          + gamma Cn INT grad psi . grad phi
+          + gamma INT psi [ F'(phi)/Cn + beta sqrt(F(phi)) ]     ( - INT psi s_phi )
+
+Source-respecting Lagrange multiplier beta(t) (see ``_cac_beta``):
+    Integrating the phi-row over Omega with no-flux / no-slip and conservative
+    advection gives Int div(u phi)=0 and Int Cn lap(phi)=0; demanding
+    d/dt Int phi = Int s_phi (mass grows EXACTLY by the source) yields
+        beta(t) = -( Int F'(phi)/Cn dOmega ) / ( Int sqrt(F(phi)) dOmega ).
+    s_phi CANCELS by construction — the multiplier preserves exactly the
+    source-injected mass, nothing more.  (General form keeps the lap term in the
+    numerator: beta = Int[Cn lap phi - F'/Cn] / Int sqrt F; = the reduced form
+    under the no-flux gate.)  beta is evaluated IMPLICITLY at phi^{n+1} but
+    FROZEN per Newton iterate (Picard-on-beta): the local residual/Jacobian
+    treat beta as a constant (no rank-one dbeta/dphi block), which keeps the
+    sparse structure and is the standard AC practice.  The kernel freezes beta
+    identically (host-side scalar arg).
+
+mu-row (CAC): trivial identity  R^mu = INT chi mu  (drives mu -> 0).
+
+Momentum surface tension (CAC): the potential-form mu grad phi capillary AND
+the AGG mass flux J are DROPPED (spec §3).  Surface tension is the
+Korteweg-equivalent form
+    f_st = -(Cn/We) div( grad phi (x) grad phi ),
+weak form  +(Cn/We) (grad phi (x) grad phi) : grad w  (first-derivatives only,
+standard for AC-based CHNS, Joshi & Jaiman 2020 lineage).  A strong Korteweg
+force needs a Q1-unavailable weak 2nd derivative at GPs, so it is GALERKIN-ONLY
+(omitted from r_mom / SUPG / PSPG) — a documented pragmatic ruling.  CH mode's
+mu-grad-phi form is untouched.
+
+tau_m: physics.chns.tau_m_gp with LOCAL rho/eta per Gauss point (contrast-aware
+stabilization), house constants Ci=(4, 36), c2CI = 36*16*dim.
+
+Momentum convection: plain convective form rho*(u.grad)u — NOT the spec's skew-symmetric
+s=1/2 form (controller ruling: convective is the parity target for the spike phase; skew
+revisit deferred to Task 9 build-out). The Task 7 kernel must match the convective form.
+
+mix_props clamp Jacobian convention: drho/deta = interpolation slope where unclamped,
+exactly 0 where clamped (piecewise-constant at the clamp boundary) — kernel must match.
+
+History commit rule: after each converged step, u_n and phi_n <- converged state; p and mu
+carry no history (BDF1 on u,phi only).
+
+SUPG/PSPG choice (parity contract, per the escalation note): the SUPG/PSPG
+weighting acts on the FULL momentum strong residual r_mom_strong INCLUDING the
+pressure gradient, capillary and gravity forces — this mirrors make_linear_ns_Ae
+(where resu carries sigma*u + conv - nu*lap and the pressure-gradient / body
+forces enter through the same tau_m*agw weighting) generalised to the coupled
+system.  The Jacobian below differentiates SUPG/PSPG at the Newton (full) level
+w.r.t. the primary unknowns u, p, phi, mu.
+
+Newton: full coupled residual; Jacobian assembled analytically per element;
+scipy.sparse splu solve.  Guards: mix_props clamp counter surfaced per step;
+raise RuntimeError if clamped > 0.01*n_gp (spec §6) or Newton fails to converge.
+
+Boundary conditions: no-slip u=0 on all boundary nodes (strong rows); natural
+no-flux for phi/mu.  Sufficient for stationary-drop and closed-box bubble-rise.
+
+Gate scope: uniform mesh (constraints.T == identity), 2-D and 3-D generic.
+"""
+
+import numpy as np
+import scipy.sparse as sp
+from scipy.sparse.linalg import splu
+
+from ..physics.chns import mix_props, capillary_gp, tau_m_gp
+
+
+class CHNSDiscrete:
+    """Coupled BDF1 CHNS residual/Jacobian on a uniform Q1 mesh (numpy mirror).
+
+    Parameters
+    ----------
+    level, dim : int
+        Refinement level / spatial dimension (documentary; the mesh comes from
+        ``dm``).
+    case : CHNSCase
+        Supplies Re, We, Cn, Pe, Fr, rho_ratio, eta_ratio.
+    dt : float
+        Fixed BDF1 time step.
+    dm : DeviceMesh
+        Uniform Q1 mesh (constraints.T must be identity).  Required.
+    gravity : bool
+        If False, the gravity body force is zeroed (stationary-drop test).
+    Cn_override : {None, "2h", float}
+        Optional Cn override.  "2h" sets Cn = 2*h (parasitic-current bound for
+        the coarse static-drop gate); a float sets Cn directly.
+    newton_tol, newton_max : Newton controls.
+    """
+
+    def __init__(self, level, dim, case, dt, dm, gravity=True,
+                 Cn_override=None, newton_tol=1e-10, newton_max=30,
+                 src_fns=None, body_fn=None, tstep="bdf1", interface="ch"):
+        T = dm.constraints.T
+        assert T.shape[0] == T.shape[1] and (
+            abs(T - sp.eye(T.shape[0])).nnz == 0), \
+            "CHNSDiscrete assumes constraints.T == identity (uniform mesh)"
+        assert int(dim) == int(dm.dim), (
+            f"dim arg ({dim}) disagrees with dm.dim ({dm.dim})")
+        self.dm = dm
+        self.case = case
+        self.level = int(level)
+        self.dim = int(dm.dim)
+        self.dt = float(dt)
+        self.gravity = bool(gravity)
+        self.newton_tol = float(newton_tol)
+        self.newton_max = int(newton_max)
+        # MMS / SP-1 forcing: src_fns is a length-blk list of per-field source
+        # functions fn(xq[ngp,dim], t) -> [ngp], added to the RHS of each
+        # residual row (u_0..u_{dim-1}, p, phi, mu).  None entries -> no source.
+        # body_fn is a convenience alias: fn(xq, t) -> [ngp, dim] for the dim
+        # momentum rows (the NS body-force channel).  Both static per step;
+        # evaluated at t^{n+1} (fully-implicit convention).
+        self.src_fns = src_fns
+        self.body_fn = body_fn
+        if tstep not in ("bdf1", "bdf2"):
+            raise ValueError(f"tstep must be 'bdf1' or 'bdf2', got {tstep!r}")
+        self.tstep = tstep
+        # -------------------------------------------------------------------
+        # Interface model: "ch" (Cahn-Hilliard, the default 4-field brick) or
+        # "cac" (Conservative Allen-Cahn, source-respecting Lagrange
+        # multiplier).  See the class docstring section "CONSERVATIVE
+        # ALLEN-CAHN (CAC) MODE" for the full derivation.  gamma = 1/Pe is the
+        # CAC mobility (same Onsager coefficient the CH phi-flux uses, so the
+        # two interfaces share the Pe·M knob for the adjoint).
+        # -------------------------------------------------------------------
+        if interface not in ("ch", "cac"):
+            raise ValueError(
+                f"interface must be 'ch' or 'cac', got {interface!r}")
+        self.interface = interface
+        self.gamma = 1.0 / float(case.Pe)      # CAC mobility (== CH onsager)
+        # beta frozen per Newton iterate (Picard-on-beta): recomputed from the
+        # current iterate's phi at the top of every _assemble, then held
+        # constant while differentiating the local residual (the standard AC
+        # practice — keeps the sparse structure, no rank-one dbeta/dphi block).
+        self._beta_frozen = 0.0
+        self.u_nm1 = None                 # x^{n-1} (None => BDF1 bootstrap)
+        self.phi_nm1 = None
+        self.dt_prev = None
+
+        # --- non-dim parameters -------------------------------------------
+        self.Re = float(case.Re)
+        self.We = float(case.We)
+        self.Pe = float(case.Pe)
+        self.Fr = float(case.Fr)
+        self.rho_ratio = float(case.rho_ratio)
+        self.eta_ratio = float(case.eta_ratio)
+        # normalisation: heavy phase = 1, light phase = 1/ratio
+        self.rho_h, self.rho_l = 1.0, 1.0 / self.rho_ratio
+        self.eta_h, self.eta_l = 1.0, 1.0 / self.eta_ratio
+        # AGG flux prefactor: -((rho_h - rho_l)/2)*(1/Pe)*M, M=1
+        self.agg = -0.5 * (self.rho_h - self.rho_l) / self.Pe
+
+        self.blk = self.dim + 3
+        self.nn = dm.n_nodes
+        self.ndof = self.blk * self.nn
+
+        # --- element scaffolding (mirrors MultiCHDiscrete) -----------------
+        self.bins = []
+        hmin = np.inf
+        for pv, b in dm.bins.items():
+            tb = dm.tables_by_p[pv]
+            conn = dm.mesh.conn_of[pv].astype(np.int64)
+            h = np.asarray(dm.mesh.tree.h()[dm.mesh.bins[pv]], np.float64)
+            N = np.asarray(tb.N, np.float64)          # [nqp, nbf]
+            dN = np.asarray(tb.dN, np.float64)        # [nqp, nbf, dim]
+            w = np.asarray(tb.w, np.float64)          # [nqp]
+            ne, nbf = conn.shape
+            dscale = 2.0 / h                          # [ne] physical grad scale
+            jac = (h / 2.0) ** self.dim
+            dJxW = w[None, :] * jac[:, None]          # [ne, nqp]
+            gdof = (conn[:, :, None] * self.blk
+                    + np.arange(self.blk)[None, None, :]).reshape(
+                        ne, self.blk * nbf)
+            # physical GP coords xq[ne, nqp, dim] (for MMS source evaluation)
+            node_xy = dm.mesh.node_coords[conn]               # [ne, nbf, dim]
+            xq = np.einsum("qa,ead->eqd", N, node_xy)         # [ne, nqp, dim]
+            self.bins.append(dict(conn=conn, N=N, dN=dN, w=w, h=h, ne=ne,
+                                  nbf=nbf, nqp=N.shape[0], dscale=dscale,
+                                  dJxW=dJxW, gdof=gdof, xq=xq))
+            hmin = min(hmin, float(h.min()))
+        self.h = hmin
+
+        # --- Cn resolution --------------------------------------------------
+        if Cn_override is None:
+            self.Cn = float(case.Cn)
+        elif Cn_override == "2h":
+            self.Cn = 2.0 * self.h
+        else:
+            self.Cn = float(Cn_override)
+
+        # --- boundary (no-slip velocity) nodes -----------------------------
+        self.bnd = np.asarray(dm.mesh.boundary_nodes, bool)
+        self.coords = np.asarray(dm.mesh.node_coords, np.float64)
+
+        # --- state ----------------------------------------------------------
+        self.u = np.zeros((self.nn, self.dim))
+        self.p = np.zeros(self.nn)
+        self.phi = np.zeros(self.nn)
+        self.mu = np.zeros(self.nn)
+        self.u_n = np.zeros((self.nn, self.dim))
+        self.phi_n = np.zeros(self.nn)
+        self.t = 0.0
+        self._t_eval = float(self.dt)     # t^{n+1} for MMS source (updated per step)
+        self._lumped = None
+
+    # ------------------------------------------------------------------
+    # state <-> packed vector
+    # ------------------------------------------------------------------
+    def pack(self):
+        x = np.zeros(self.ndof)
+        blk, dim = self.blk, self.dim
+        for d in range(dim):
+            x[d::blk] = self.u[:, d]
+        x[dim::blk] = self.p
+        x[dim + 1::blk] = self.phi
+        x[dim + 2::blk] = self.mu
+        return x
+
+    def unpack(self, x):
+        blk, dim = self.blk, self.dim
+        u = np.stack([x[d::blk] for d in range(dim)], axis=1)
+        p = x[dim::blk]
+        phi = x[dim + 1::blk]
+        mu = x[dim + 2::blk]
+        return u, p, phi, mu
+
+    def set_history(self, u_n, phi_n):
+        self.u_n = np.asarray(u_n, np.float64).reshape(self.nn, self.dim).copy()
+        self.phi_n = np.asarray(phi_n, np.float64).copy()
+
+    def set_initial(self, phi0, u0=None):
+        self.phi = np.asarray(phi0, np.float64).copy()
+        self.mu = np.zeros(self.nn)
+        self.p = np.zeros(self.nn)
+        self.u = (np.zeros((self.nn, self.dim)) if u0 is None
+                  else np.asarray(u0, np.float64).reshape(self.nn, self.dim))
+        self.u_n = self.u.copy()
+        self.phi_n = self.phi.copy()
+        self.t = 0.0
+
+    # ------------------------------------------------------------------
+    # lumped mass integral (mass diagnostic)
+    # ------------------------------------------------------------------
+    def lumped_mass(self):
+        """Row-sum-lumped mass vector m so that ``m @ field`` = INT field."""
+        if self._lumped is not None:
+            return self._lumped
+        m = np.zeros(self.nn)
+        for B in self.bins:
+            # consistent mass row sums = INT N_a  (partition of unity)
+            Ma = np.einsum("eq,qa->ea", B["dJxW"], B["N"])
+            np.add.at(m, B["conn"].ravel(), Ma.ravel())
+        self._lumped = m
+        return m
+
+    # ------------------------------------------------------------------
+    # CAC source-respecting Lagrange multiplier beta(phi)  (frozen per iterate)
+    # ------------------------------------------------------------------
+    def _cac_beta(self, phi):
+        r"""beta(t) for the Conservative Allen-Cahn phi-row, computed from the
+        CURRENT iterate's phi by GP quadrature (a cheap scalar reduction).
+
+        Derivation (no-flux / no-slip closed box, conservative advection).
+        The CAC phi-row is
+            dphi/dt + div(u phi)
+                = gamma [ Cn lap(phi) - F'(phi)/Cn - beta sqrt(F(phi)) ] + s_phi
+        Integrate over Omega.  Int div(u phi) = 0 (conservative advection +
+        no-penetration), and Int Cn lap(phi) = Cn * boundary flux = 0 (no-flux).
+        Demanding d/dt Int phi = Int s_phi (mass grows EXACTLY by the source):
+            Int s_phi = gamma [ 0 - Int F'/Cn - beta Int sqrt(F) ] + Int s_phi
+            => 0 = -Int F'/Cn - beta Int sqrt(F)
+            => beta = -( Int F'(phi)/Cn ) / Int sqrt(F(phi)).
+        The source s_phi CANCELS by construction — beta is "source-respecting":
+        whatever mass the source injects is preserved, nothing more.  We keep
+        the lap term explicit in the numerator (it integrates to 0 here but the
+        general form is beta = Int[Cn lap(phi) - F'/Cn] / Int sqrt(F); the weak
+        Int Cn lap phi = -Int Cn |grad phi|^2 term would need a boundary
+        correction, so under the no-flux gate we use the reduced numerator).
+
+        Guards Int sqrt(F) away from 0 (flat phi == +-1 everywhere) with a
+        tiny floor; beta multiplies sqrt(F) which is then ~0, so the value is
+        immaterial there.
+        """
+        Cn = self.Cn
+        num = 0.0   # Int F'(phi)/Cn
+        den = 0.0   # Int sqrt(F(phi))
+        for B in self.bins:
+            phi_gp, _ = self._interp(phi, B)              # [e, q]
+            Fp = phi_gp ** 3 - phi_gp                      # F'(phi)
+            F = 0.25 * (phi_gp ** 2 - 1.0) ** 2            # F(phi) >= 0
+            sqrtF = np.sqrt(np.maximum(F, 0.0))
+            num += float(np.sum(B["dJxW"] * (Fp / Cn)))
+            den += float(np.sum(B["dJxW"] * sqrtF))
+        den = den if abs(den) > 1e-300 else 1e-300
+        return -num / den
+
+    # ------------------------------------------------------------------
+    # interpolation of a nodal field to GPs (value + physical gradient)
+    # ------------------------------------------------------------------
+    def _interp(self, field, B):
+        vals = field[B["conn"]]                        # [ne, nbf]
+        v = np.einsum("qa,ea->eq", B["N"], vals)       # [ne, nqp]
+        g = np.einsum("qad,ea,e->eqd", B["dN"], vals, B["dscale"])
+        return v, g
+
+    def _interp_vec(self, field, B):
+        # field [nn, dim] -> value [ne,nqp,dim], grad [ne,nqp,dim(comp),dim(sp)]
+        vals = field[B["conn"]]                        # [ne, nbf, dim]
+        v = np.einsum("qa,ead->eqd", B["N"], vals)
+        g = np.einsum("qas,ead,e->eqds", B["dN"], vals, B["dscale"])
+        return v, g
+
+    # ==================================================================
+    # residual + jacobian (assembled together for efficiency / consistency)
+    # ==================================================================
+    def _assemble(self, x, want_jac):
+        u, p, phi, mu = self.unpack(x)
+        blk, dim = self.blk, self.dim
+        cac = (self.interface == "cac")
+        gamma = self.gamma
+        # Freeze beta per Newton iterate (Picard-on-beta): both residual and
+        # jacobian within one Newton step call _assemble with the SAME x, so
+        # this recompute is naturally frozen-per-iterate, and the local
+        # residual below treats beta as a constant (no dbeta/dphi block).
+        # When self._freeze_beta is set (the FD-Jacobian gate), beta is held at
+        # the previously-frozen value so the numerically-differenced residual
+        # matches the frozen-beta analytic Jacobian exactly.
+        if cac and not getattr(self, "_freeze_beta", False):
+            self._beta_frozen = self._cac_beta(phi)
+        beta = self._beta_frozen
+        # A4b variable-step BDF2 effective time term: reproduce sigma*x - hist
+        # via an effective (dt, x^n) on the SAME BDF1 kernel — dt_eff = 1/sigma,
+        # xn_eff = hist/sigma (see steppers/chns.py:_bdf_time).  BDF1 default.
+        if self.tstep == "bdf2" and self.dt_prev is not None \
+                and self.u_nm1 is not None:
+            rr = self.dt / self.dt_prev
+            sig = (1.0 + 2.0 * rr) / (1.0 + rr) / self.dt
+            bv, cv = 1.0 + rr, rr * rr / (1.0 + rr)
+            dt = 1.0 / sig
+            u_n_eff = (bv * self.u_n - cv * self.u_nm1) / self.dt / sig
+            phi_n_eff = (bv * self.phi_n - cv * self.phi_nm1) / self.dt / sig
+        else:
+            dt = self.dt
+            u_n_eff, phi_n_eff = self.u_n, self.phi_n
+        Re, We, Cn, Pe, Fr = self.Re, self.We, self.Cn, self.Pe, self.Fr
+        cw_inv = 1.0 / (Cn * We)
+        # CAC drops the potential-form capillary (mu grad phi) AND the AGG mass
+        # flux (spec §3).  cap_cw / agg_eff zero those channels in CAC so the
+        # residual/Jacobian have no mu-coupling except the trivial mu=0 row.
+        cap_cw = 0.0 if cac else cw_inv
+        agg_eff = 0.0 if cac else self.agg
+        R = np.zeros(self.ndof)
+        rows, cols, vals = [], [], []
+        n_clamp = 0
+        n_gp = 0
+
+        # gravity unit vector g_hat = (0,...,-1) (last axis)
+        ghat = np.zeros(dim)
+        if self.gravity:
+            ghat[-1] = -1.0
+        grav_scale = 1.0 / Fr ** 2
+
+        for B in self.bins:
+            dJxW, N, dN, dscale = B["dJxW"], B["N"], B["dN"], B["dscale"]
+            ne, nbf, nqp = B["ne"], B["nbf"], B["nqp"]
+            h_e = B["h"]
+            n_gp += ne * nqp
+
+            u_gp, gu = self._interp_vec(u, B)          # [e,q,d], [e,q,d,s]
+            un_gp, _ = self._interp_vec(u_n_eff, B)
+            p_gp, gp = self._interp(p, B)
+            phi_gp, gphi = self._interp(phi, B)
+            phin_gp, _ = self._interp(phi_n_eff, B)
+            mu_gp, gmu = self._interp(mu, B)
+
+            # --- local rho, eta at GPs (implicit phi) ----------------------
+            rho_gp, eta_gp, nc = mix_props(
+                phi_gp.ravel(), self.rho_h, self.rho_l,
+                self.eta_h, self.eta_l)
+            n_clamp += nc
+            rho_gp = rho_gp.reshape(ne, nqp)
+            eta_gp = eta_gp.reshape(ne, nqp)
+            # d rho/d phi, d eta/d phi (linear interp; 0 where clamped)
+            a_rho = 0.5 * (self.rho_h - self.rho_l)
+            a_eta = 0.5 * (self.eta_h - self.eta_l)
+            rho_raw = a_rho * phi_gp + 0.5 * (self.rho_h + self.rho_l)
+            eta_raw = a_eta * phi_gp + 0.5 * (self.eta_h + self.eta_l)
+            drho = np.where(rho_raw >= 1e-3 * self.rho_l, a_rho, 0.0)
+            deta = np.where(eta_raw >= 1e-3 * self.eta_l, a_eta, 0.0)
+
+            # --- tau_m (per GP, local rho/eta) -----------------------------
+            tau = tau_m_gp(u_gp.reshape(-1, dim), rho_gp.ravel(),
+                           eta_gp.ravel(), float(h_e[0]), dt, Re
+                           ).reshape(ne, nqp)
+            # --- analytic tau derivatives (Newton-consistent; NOT frozen) --
+            # tau = 1/(denom*rho), denom = sqrt(A + Bu + C),
+            #   A = 4/dt^2, Bu = 4|u|^2/h^2, C = c2CI*nu^2/h^4, nu = eta/(rho Re)
+            h_ = float(h_e[0])
+            c2CI = 36.0 * 16.0 * dim
+            nu_loc = eta_gp / (rho_gp * Re)
+            A_t = 4.0 / dt ** 2
+            Bu_t = 4.0 * np.sum(u_gp ** 2, axis=-1) / h_ ** 2      # [e,q]
+            C_t = c2CI * nu_loc ** 2 / h_ ** 4
+            denom = np.sqrt(A_t + Bu_t + C_t)                      # [e,q]
+            # d denom / d rho, d eta (via C only)
+            dC_deta = 2.0 * c2CI * eta_gp / (h_ ** 4 * rho_gp ** 2 * Re ** 2)
+            dC_drho = -2.0 * c2CI * eta_gp ** 2 / (h_ ** 4 * rho_gp ** 3
+                                                   * Re ** 2)
+            ddenom_dphi = ((dC_deta * deta + dC_drho * drho)
+                           / (2.0 * denom))
+            # tau = 1/(denom rho): dtau/dphi = -tau*ddenom_dphi/denom
+            #                                  - tau*drho/rho
+            dtau_dphi = -tau * (ddenom_dphi / denom + drho / rho_gp)  # [e,q]
+            # dtau/du_k (via Bu): dBu/du_k = 8 u_k/h^2 ->
+            #   ddenom/du_k = (8 u_k/h^2)/(2 denom); dtau/du_k = -tau*ddenom/denom
+            dtau_du = (-tau[..., None]
+                       * (4.0 * u_gp / h_ ** 2)[...]
+                       / denom[..., None] ** 2)                    # [e,q,k]
+
+            # --- AGG flux J = agg * grad mu (agg_eff==0 drops it in CAC) ----
+            J_gp = agg_eff * gmu                        # [e,q,s]
+
+            # --- convective derivatives ------------------------------------
+            # (u.grad)u : [e,q,comp]  = sum_s u_s d u_comp/d x_s
+            ugradu = np.einsum("eqs,eqds->eqd", u_gp, gu)
+            # (J.grad)u : [e,q,comp]
+            Jgradu = np.einsum("eqs,eqds->eqd", J_gp, gu)
+            # u.grad phi : [e,q]
+            ugradphi = np.einsum("eqs,eqs->eq", u_gp, gphi)
+
+            # --- capillary + gravity body forces [e,q,comp] ----------------
+            # CH mode: potential form fcap = (Cn We)^-1 mu grad phi, entering
+            #   the strong r_mom and the Galerkin body as -fcap.
+            # CAC mode: the mu-grad-phi potential force is DROPPED (mu is not a
+            #   PDE unknown); surface tension is the Korteweg-equivalent form
+            #   f_st = -(Cn/We) div(grad phi (x) grad phi), whose weak form is
+            #   +(Cn/We) (grad phi (x) grad phi):grad w — first-derivatives
+            #   only, added GALERKIN-ONLY below (a strong Korteweg force needs
+            #   a Q1-unavailable weak 2nd derivative at GPs, so it is omitted
+            #   from r_mom / SUPG / PSPG — documented pragmatic ruling, spec §3,
+            #   Joshi & Jaiman 2020 lineage).  fcap is thus zeroed in CAC.
+            if cac:
+                fcap = np.zeros((ne, nqp, dim))
+            else:
+                fcap = cw_inv * mu_gp[..., None] * gphi     # [e,q,s]
+            fgrav = (rho_gp[..., None] * grav_scale) * ghat[None, None, :]
+            # MMS/SP-1 momentum source enters BOTH r_mom (strong, SUPG/PSPG
+            # consistency) and the Galerkin body — same convention as the
+            # kernel's fbody_gp.
+            fmms = np.zeros((ne, nqp, dim))
+            if self.body_fn is not None:
+                bf = np.asarray(self.body_fn(B["xq"].reshape(ne * nqp, dim),
+                                             self._t_eval), float)
+                fmms = bf.reshape(ne, nqp, dim)
+
+            # --- momentum strong residual (p1: no viscous lap) -------------
+            # r_mom = rho(u-u_n)/dt + rho ugradu + Jgradu + grad p - fcap - fgrav
+            r_mom = (rho_gp[..., None] * (u_gp - un_gp) / dt
+                     + rho_gp[..., None] * ugradu
+                     + Jgradu + gp - fcap - fgrav - fmms)  # [e,q,comp]
+
+            # ---------------- RESIDUAL ROWS --------------------------------
+            # momentum galerkin: INT N_a * [rho(u-un)/dt + rho ugradu + Jgradu]
+            mom_body = (rho_gp[..., None] * (u_gp - un_gp) / dt
+                        + rho_gp[..., None] * ugradu + Jgradu
+                        - fcap - fgrav - fmms)          # [e,q,comp]
+            # INT N_a * mom_body  -> [e,a,comp]
+            Rmom = np.einsum("eq,qa,eqd->ead", dJxW, N, mom_body)
+            # viscous (2 eta/Re) D(u):D(w):  eta/Re (grad u + grad u^T):grad w
+            # grad w for test a comp i is dN_a in direction; assemble per a,comp
+            # symgrad_u = grad u + grad u^T : [e,q,comp,s]
+            symgu = gu + np.transpose(gu, (0, 1, 3, 2))
+            # dN physical [e,q,a,s]
+            dNp = np.einsum("qas,e->eqas", dN, dscale)
+            # visc contribution to R for (a,comp d): INT (eta/Re) symgu[:,:,d,s] dN_a,s
+            Rvisc = (1.0 / Re) * np.einsum(
+                "eq,eq,eqds,eqas->ead", dJxW, eta_gp, symgu, dNp)
+            # pressure: -INT (div w) p ; div w for comp d is dN_a,d
+            Rpres = -np.einsum("eq,eq,eqad->ead", dJxW, p_gp, dNp)
+            # SUPG: INT tau (u.grad w) . r_mom ; u.grad w_a = sum_s u_s dN_a,s
+            ugw = np.einsum("eqs,eqas->eqa", u_gp, dNp)      # [e,q,a]
+            Rsupg = np.einsum("eq,eq,eqa,eqd->ead", dJxW, tau, ugw, r_mom)
+            Ru = Rmom + Rvisc + Rpres + Rsupg               # [e,a,comp]
+            # CAC Korteweg surface tension (Galerkin only):
+            #   +(Cn/We) INT (grad phi)_d (grad phi . grad N_a)
+            if cac:
+                kort_scale = Cn / We
+                gphi_gNa = np.einsum("eqs,eqas->eqa", gphi, dNp)  # gphi.gradN_a
+                Rkort = kort_scale * np.einsum(
+                    "eq,eqa,eqd->ead", dJxW, gphi_gNa, gphi)      # [e,a,d]
+                Ru = Ru + Rkort
+            for d in range(dim):
+                np.add.at(R, B["gdof"][:, d::blk].ravel(),
+                          Ru[:, :, d].ravel())
+
+            # continuity: INT q div u + PSPG INT tau grad q . r_mom
+            divu = np.einsum("eqdd->eq", gu)                # [e,q]
+            Rcont = np.einsum("eq,qa,eq->ea", dJxW, N, divu)
+            Rpspg = np.einsum("eq,eq,eqas,eqs->ea", dJxW, tau, dNp, r_mom)
+            Rp = Rcont + Rpspg
+            np.add.at(R, B["gdof"][:, dim::blk].ravel(), Rp.ravel())
+
+            # CH phi (CONSERVATIVE advection, spec §1 div(u phi) in strong
+            # Galerkin form u.grad phi + phi div u): summed over test functions
+            # (partition of unity) INT div(u phi) = 0 under no-flux BCs, giving
+            # machine-exact lumped-mass conservation.  "Non-skew" per the brief
+            # = not the skew average; this is the divergence (conservative) form.
+            ch_body = (phi_gp - phin_gp) / dt + ugradphi + phi_gp * divu
+            if cac:
+                # CAC phi-row: transient + conservative advection identical,
+                # flux replaced by the Allen-Cahn relaxation.  Weak form
+                #   +gamma*Cn INT gNa.gphi   (from -gamma Cn lap phi, IBP)
+                #   +gamma INT N_a [F'(phi)/Cn + beta sqrt(F(phi))]
+                Fp = phi_gp ** 3 - phi_gp                   # F'(phi)
+                F = 0.25 * (phi_gp ** 2 - 1.0) ** 2         # F(phi) >= 0
+                sqrtF = np.sqrt(np.maximum(F, 0.0))
+                Rphi = (np.einsum("eq,qa,eq->ea", dJxW, N, ch_body)
+                        + gamma * Cn * np.einsum("eq,eqas,eqs->ea",
+                                                 dJxW, dNp, gphi)
+                        + gamma * np.einsum("eq,qa,eq->ea", dJxW, N,
+                                            Fp / Cn + beta * sqrtF))
+            else:
+                Rphi = (np.einsum("eq,qa,eq->ea", dJxW, N, ch_body)
+                        + (1.0 / Pe) * np.einsum("eq,eqas,eqs->ea",
+                                                 dJxW, dNp, gmu))
+            np.add.at(R, B["gdof"][:, dim + 1::blk].ravel(), Rphi.ravel())
+
+            if cac:
+                # CAC: mu is not a PDE unknown.  Trivial-mu row (strong identity
+                # mu = 0), assembled as R^mu = INT N_a mu (lumped-consistent):
+                # the mass block N_a N_b is SPD, driving mu -> 0.  Documented as
+                # a wasted DOF (build-out optimisation: drop to dim+2 layout).
+                Rmu = np.einsum("eq,qa,eq->ea", dJxW, N, mu_gp)
+            else:
+                # CH mu: INT chi(mu - f'(phi)) - Cn^2 INT gchi . grad phi
+                fp = phi_gp ** 3 - phi_gp                   # f'(phi)
+                Rmu = (np.einsum("eq,qa,eq->ea", dJxW, N, mu_gp - fp)
+                       - Cn ** 2 * np.einsum("eq,eqas,eqs->ea", dJxW, dNp,
+                                             gphi))
+            np.add.at(R, B["gdof"][:, dim + 2::blk].ravel(), Rmu.ravel())
+
+            # --- MMS / SP-1 forcing: -INT N_a * S_f per field f ------------
+            # S does not depend on the unknowns -> RHS only (no Jacobian).
+            # The momentum body force (body_fn) is NOT applied here — it enters
+            # r_mom / mom_body above (SUPG/PSPG consistency).  This loop carries
+            # the p / phi / mu (and any explicit u-row) src_fns entries.
+            if self.src_fns is not None:
+                t_eval = self._t_eval
+                xq = B["xq"].reshape(ne * nqp, dim)          # [ngp, dim]
+                for f in range(blk):
+                    if f >= len(self.src_fns) or self.src_fns[f] is None:
+                        continue
+                    sf = np.asarray(self.src_fns[f](xq, t_eval), float)
+                    if not np.any(sf):
+                        continue
+                    sf = sf.reshape(ne, nqp)
+                    Rsrc = -np.einsum("eq,qa,eq->ea", dJxW, N, sf)
+                    np.add.at(R, B["gdof"][:, f::blk].ravel(), Rsrc.ravel())
+
+            if not want_jac:
+                continue
+
+            # ================= ELEMENT JACOBIAN =========================
+            Ae = np.zeros((ne, blk * nbf, blk * nbf))
+
+            # Precompute scalar shape products
+            # NNab = INT N_a N_b [e,a,b]
+            NNab = np.einsum("eq,qa,qb->eab", dJxW, N, N)
+            # For gradient couplings we build per-term einsums below.
+
+            # helper scatter: add contribution block for (row field fr, col
+            # field fc) given per-(e,a,b) matrix
+            def addblk(fr, fc, mat):
+                Ae[:, fr::blk, fc::blk] += mat
+
+            #### --- Momentum row derivatives -------------------------------
+            # d r_mom / d(unknowns) pieces reused by galerkin, SUPG, PSPG.
+            # We differentiate the *strong* residual r_mom and mom_body wrt
+            # nodal dofs, expressed at GPs, then contract with the appropriate
+            # test weightings.
+
+            # Shorthands
+            # dN_b physical: dNp[:,:,b,s]
+            # --- du_j (velocity col, component jc) -----------------------
+            # d(rho(u-un)/dt)/du = rho/dt * delta ; body comp d wrt u_jc:
+            #   transient: (rho/dt) N_b delta_{d,jc}
+            #   convection rho ugradu comp d = rho sum_s u_s du_d/dx_s
+            #     d/du_jc(node b): rho [ N_b du_d/dx_jc + delta_{d,jc} sum_s u_s dN_b,s ]
+            #   Jgradu comp d = sum_s J_s du_d/dx_s ; d/du_jc = delta_{d,jc} sum_s J_s dN_b,s
+            # We assemble momentum body Jacobian wrt u.
+            # term A: transient+conv-second (delta_{d,jc}) coefficient c1[e,q,b]
+            #   c1 = (rho/dt) N_b + rho (u.grad N_b) + (J.grad N_b)
+            uGNb = np.einsum("eqs,eqbs->eqb", u_gp, dNp)     # u.grad N_b
+            JGNb = np.einsum("eqs,eqbs->eqb", J_gp, dNp)     # J.grad N_b
+            c1 = (rho_gp[..., None] * (N[None] / dt)         # (rho/dt) N_b
+                  + rho_gp[..., None] * uGNb + JGNb)          # [e,q,b]
+            # galerkin transient+conv (diagonal in comp): INT N_a * c1 -> a,b
+            GAL_diag = np.einsum("eq,qa,eqb->eab", dJxW, N, c1)
+            for d in range(dim):
+                addblk(d, d, GAL_diag)
+            # conv-first term: rho N_b du_d/dx_jc (couples comp d to comp jc)
+            # coefficient m[e,q,b,d,jc] = rho N_b gu[e,q,d,jc]; contract INT N_a
+            for d in range(dim):
+                for jc in range(dim):
+                    # rho * N_b * gu_{d,jc}
+                    mm = np.einsum("eq,qb,eq->eqb", rho_gp, N, gu[:, :, d, jc])
+                    blk_ab = np.einsum("eq,qa,eqb->eab", dJxW, N, mm)
+                    addblk(d, jc, blk_ab)
+
+            # --- viscous (2 eta/Re) D(u):D(w), linear in u.  Row (a,d) col
+            # (b,jc):  (1/Re) INT eta [ delta_{d,jc} gNa.gNb + gNa_jc gNb_d ]
+            visc_gg = (1.0 / Re) * np.einsum(
+                "eq,eq,eqas,eqbs->eab", dJxW, eta_gp, dNp, dNp)  # gNa.gNb
+            for d in range(dim):
+                addblk(d, d, visc_gg)                            # delta_{d,jc}
+                for jc in range(dim):
+                    m_t = (1.0 / Re) * np.einsum(
+                        "eq,eq,eqa,eqb->eab", dJxW, eta_gp,
+                        dNp[:, :, :, jc], dNp[:, :, :, d])
+                    addblk(d, jc, m_t)
+
+            # --- momentum wrt p: galerkin body has no p; strong r_mom has
+            #   +grad p.  Only through SUPG (below).  Pressure term Rpres =
+            #   -INT (div w) p -> d/dp_b = -INT dN_a,d N_b
+            for d in range(dim):
+                blk_ab = -np.einsum("eq,eqa,qb->eab", dJxW, dNp[:, :, :, d], N)
+                addblk(d, dim, blk_ab)
+
+            # --- momentum wrt phi: rho depends on phi (drho), fcap on phi
+            #   (grad phi), fgrav on phi (rho).  Also viscous eta(phi).
+            # d(mom_body)/dphi_b comp d:
+            #   drho/dphi N_b * [(u-un)/dt + ugradu]_d      (transient+conv)
+            #   - d(fcap)/dphi : fcap = cw_inv mu grad phi ; wrt phi_b:
+            #       cw_inv mu dN_b,d  -> body has -fcap so derivative -cw_inv mu dN_b,d
+            #   - d(fgrav)/dphi: -(drho N_b) grav_scale ghat_d
+            drho_Nb = np.einsum("eq,qb->eqb", drho, N)       # drho * N_b
+            accel_d = ((u_gp - un_gp) / dt + ugradu)         # [e,q,d]
+            for d in range(dim):
+                # drho part (transient+conv) : INT N_a * drho N_b accel_d
+                m1 = np.einsum("eq,qa,eqb,eq->eab", dJxW, N, drho_Nb,
+                               accel_d[:, :, d])
+                # -fcap part: body = -fcap ; d/dphi_b = -cap_cw mu dN_b,d
+                # (cap_cw==0 in CAC; the Korteweg d/dphi block is added below)
+                m2 = -np.einsum("eq,qa,eq,eqb->eab", dJxW, N, cap_cw * mu_gp,
+                                dNp[:, :, :, d])
+                # -fgrav part: -(drho N_b) grav_scale ghat_d
+                m3 = -np.einsum("eq,qa,eqb->eab", dJxW * grav_scale * ghat[d],
+                                N, drho_Nb)
+                addblk(d, dim + 1, m1 + m2 + m3)
+            # CAC Korteweg d/dphi: Rkort[a,d] = kort_scale gphi_d (gphi.gNa);
+            #   d/dphi_b = kort_scale [ dN_b,d (gphi.gNa) + gphi_d (gNa.gNb) ]
+            if cac:
+                kort_scale = Cn / We
+                gphi_gNa = np.einsum("eqs,eqas->eqa", gphi, dNp)  # [e,q,a]
+                gNagNb = np.einsum("eqas,eqbs->eqab", dNp, dNp)   # [e,q,a,b]
+                for d in range(dim):
+                    mk = kort_scale * (
+                        np.einsum("eq,eqa,eqb->eab", dJxW, gphi_gNa,
+                                  dNp[:, :, :, d])
+                        + np.einsum("eq,eq,eqab->eab", dJxW, gphi[:, :, d],
+                                    gNagNb))
+                    addblk(d, dim + 1, mk)
+            # viscous eta(phi): Rvisc = (1/Re) INT eta symgu:dN_a ; d/dphi_b
+            #   = (1/Re) INT deta N_b symgu[:,:,d,s] dN_a,s
+            for d in range(dim):
+                mvis = (1.0 / Re) * np.einsum(
+                    "eq,eq,qb,eqs,eqas->eab", dJxW, deta, N,
+                    symgu[:, :, d, :], dNp)
+                addblk(d, dim + 1, mvis)
+
+            # --- momentum wrt mu: fcap = cw_inv mu grad phi ; body -fcap
+            #   d/dmu_b = -cw_inv N_b grad phi_d ; also J = agg grad mu ->
+            #   Jgradu comp d = agg sum_s (grad mu)_s du_d/dx_s ;
+            #   d/dmu_b = agg (grad N_b . grad? ) -> agg sum_s dN_b,s du_d/dx_s
+            for d in range(dim):
+                # -fcap wrt mu (cap_cw==0 in CAC)
+                mfc = -np.einsum("eq,qa,eq,qb->eab", dJxW, N,
+                                 cap_cw * gphi[:, :, d], N)
+                # Jgradu wrt mu: agg_eff * (dN_b . row d of gu) (0 in CAC)
+                gu_d = gu[:, :, d, :]                        # [e,q,s]
+                mJ = agg_eff * np.einsum("eq,qa,eqbs,eqs->eab",
+                                         dJxW, N, dNp, gu_d)
+                addblk(d, dim + 2, mfc + mJ)
+
+            #### --- viscous already added above; --- SUPG derivatives ------
+            # Rsupg = INT tau (u.grad w_a) . r_mom.
+            # tau is differentiated (Newton-consistent): dtau_du and dtau_dphi
+            # terms follow.  d/d(dof) therefore has three pieces:
+            #   (i) d(u.grad w_a)/du * r_mom   (SUPG test depends on u)
+            #   (ii) tau (u.grad w_a) . d r_mom/d(dof)
+            #   (iii) d tau/d(dof) * (u.grad w_a) . r_mom   (Newton-consistent)
+            # ugw[e,q,a] = u.grad w_a ; bake dJxW into the SUPG weight so all
+            # blocks contracted against tau_ugw carry the quadrature measure.
+            tau_ugw = (dJxW * tau)[:, :, None] * ugw         # [e,q,a]
+            # d r_mom/du_jc (component d row):
+            #   transient: rho/dt N_b delta ; conv-first rho N_b gu_{d,jc};
+            #   conv-second rho delta u.gradN_b ; Jgradu delta J.gradN_b
+            #   grad p: 0 ; fcap:0 ; fgrav:0
+            # -> same c1 (diag) + conv-first (off) as galerkin body strong part
+            #    r_mom diag coeff cr1 = rho/dt N_b + rho u.gradN_b + J.gradN_b
+            cr1 = c1                                          # identical
+            for d in range(dim):
+                # (ii) diagonal in comp d,jc=d
+                m_ii = np.einsum("eqa,eqb->eab", tau_ugw, cr1)
+                addblk(d, d, m_ii)
+                # (ii) conv-first off-diagonal comp d wrt u_jc
+                for jc in range(dim):
+                    mm = np.einsum("eq,qb->eqb", rho_gp, N) * gu[:, :, d, jc][:, :, None]
+                    m_off = np.einsum("eqa,eqb->eab", tau_ugw, mm)
+                    addblk(d, jc, m_off)
+                # (i) SUPG test depends on u_jc: d(u.grad w_a)/du_jc(node b)
+                #     = N_b dN_a,jc ; times tau * r_mom_d
+                # (iii) tau depends on u_jc: dtau/du_jc N_b weight ugw_a r_mom_d
+                for jc in range(dim):
+                    m_i = np.einsum("eq,eq,qb,eqa,eq->eab", dJxW, tau, N,
+                                    dNp[:, :, :, jc], r_mom[:, :, d])
+                    m_iii = np.einsum("eq,eqa,eq,eq,qb->eab", dJxW, ugw,
+                                      r_mom[:, :, d], dtau_du[:, :, jc], N)
+                    addblk(d, jc, m_i + m_iii)
+            # d r_mom/dp = grad p -> dN_b ; SUPG: tau ugw_a * dN_b,d
+            for d in range(dim):
+                m_p = np.einsum("eqa,eqb->eab", tau_ugw, dNp[:, :, :, d])
+                addblk(d, dim, m_p)
+            # d r_mom/dphi: drho*(u-un)/dt + drho ugradu (transient+conv strong)
+            #   - fcap(-cw_inv mu dN_b,d) - fgrav(-drho N_b grav ghat_d)
+            # SUPG also depends on phi through tau(rho(phi), eta(phi)):
+            #   d/dphi_b Rsupg[a,d] += INT dJxW ugw_a r_mom_d (dtau/dphi) N_b
+            dtau_Nb = np.einsum("eq,qb->eqb", dtau_dphi, N)   # [e,q,b]
+            for d in range(dim):
+                dr_phi = (np.einsum("eqb,eq->eqb", drho_Nb, accel_d[:, :, d])
+                          - cap_cw * mu_gp[:, :, None] * dNp[:, :, :, d]
+                          - grav_scale * ghat[d] * drho_Nb)
+                m_phi = np.einsum("eqa,eqb->eab", tau_ugw, dr_phi)
+                # tau-derivative correction (uses raw ugw, weight dJxW*r_mom_d)
+                m_phi_tau = np.einsum("eq,eqa,eq,eqb->eab", dJxW, ugw,
+                                      r_mom[:, :, d], dtau_Nb)
+                addblk(d, dim + 1, m_phi + m_phi_tau)
+            # d r_mom/dmu: -cw_inv N_b gphi_d + agg (dN_b.gu_d)
+            for d in range(dim):
+                dr_mu = (-cap_cw * np.einsum("eq,qb->eqb", gphi[:, :, d], N)
+                         + agg_eff * np.einsum("eqbs,eqs->eqb", dNp,
+                                               gu[:, :, d, :]))
+                m_mu = np.einsum("eqa,eqb->eab", tau_ugw, dr_mu)
+                addblk(d, dim + 2, m_mu)
+
+            #### --- Continuity row ------------------------------------------
+            # Rcont = INT N_a div u -> d/du_jc = INT N_a dN_b,jc
+            for jc in range(dim):
+                m = np.einsum("eq,qa,eqb->eab", dJxW, N, dNp[:, :, :, jc])
+                addblk(dim, jc, m)
+            # PSPG: Rpspg = INT tau grad N_a . r_mom (tau frozen)
+            #   d/du_jc: tau grad N_a . (d r_mom/du_jc) ; bake dJxW into weight
+            tau_gNa = (dJxW * tau)[:, :, None, None] * dNp   # [e,q,a,s]
+            # grad N_a . r_mom (per element-a), weighted by dJxW — reused by the
+            # tau-derivative PSPG corrections.
+            gNa_rmom = dJxW[:, :, None] * np.einsum(
+                "eqas,eqs->eqa", dNp, r_mom)                  # [e,q,a]
+            for jc in range(dim):
+                # diagonal-in-comp part of d r_mom/du: r_mom comp s row
+                #   = delta_{s,jc}(rho/dt N_b + rho u.gradN_b + J.gradN_b)
+                #     + rho N_b gu_{s,jc}
+                # contract tau grad N_a,s . that
+                # component jc only: tau grad N_a,jc * cr1
+                m_diag = np.einsum("eqa,eqb->eab", tau_gNa[:, :, :, jc], cr1)
+                # conv-first: sum_s tau gNa_s * rho N_b gu_{s,jc}
+                m_conv = np.einsum("eqas,eqb,eqs->eab", tau_gNa,
+                                   np.einsum("eq,qb->eqb", rho_gp, N),
+                                   gu[:, :, :, jc])
+                # tau depends on u_jc: dtau/du_jc N_b (grad N_a . r_mom)
+                m_tau = np.einsum("eqa,eq,qb->eab", gNa_rmom,
+                                  dtau_du[:, :, jc], N)
+                addblk(dim, jc, m_diag + m_conv + m_tau)
+            # d/dp: tau grad N_a . grad N_b
+            m_pp = np.einsum("eqas,eqbs->eab", tau_gNa, dNp)
+            addblk(dim, dim, m_pp)
+            # d/dphi: tau grad N_a . d r_mom/dphi
+            for_phi = (np.einsum("eqb,eqd->eqbd", drho_Nb, accel_d)
+                       - cap_cw * np.einsum("eq,eqbd->eqbd", mu_gp, dNp)
+                       - grav_scale * np.einsum("eqb,d->eqbd", drho_Nb, ghat))
+            m_cphi = np.einsum("eqas,eqbs->eab", tau_gNa, for_phi)
+            # tau depends on phi: dtau/dphi N_b (grad N_a . r_mom)
+            m_cphi_tau = np.einsum("eqa,eqb->eab", gNa_rmom, dtau_Nb)
+            addblk(dim, dim + 1, m_cphi + m_cphi_tau)
+            # d/dmu: tau grad N_a . d r_mom/dmu
+            for_mu = (-cap_cw * np.einsum("eqd,qb->eqbd", gphi, N)
+                      + agg_eff * np.einsum("eqbs,eqds->eqbd", dNp, gu))
+            m_cmu = np.einsum("eqas,eqbs->eab", tau_gNa, for_mu)
+            addblk(dim, dim + 2, m_cmu)
+
+            #### --- CH / CAC phi row ----------------------------------------
+            # d/du_jc (both models — transient + conservative advection):
+            #   from u.grad phi -> N_b dphi/dx_jc ; from phi div u -> phi dN_b,jc
+            for jc in range(dim):
+                m = (np.einsum("eq,qa,qb,eq->eab", dJxW, N, N, gphi[:, :, jc])
+                     + np.einsum("eq,qa,eq,eqb->eab", dJxW, N, phi_gp,
+                                 dNp[:, :, :, jc]))
+                addblk(dim + 1, jc, m)
+            if cac:
+                # CAC phi-row d/dphi (beta frozen -> no dbeta/dphi block):
+                #   transient/advection: (1/dt)N_b + u.gradN_b + divu N_b
+                #   +gamma Cn (gNa.gNb)             (from gamma Cn gNa.gphi)
+                #   +gamma N_a [F''(phi)/Cn + beta F'(phi)/(2 sqrt F)] N_b
+                # where d/dphi sqrt(F) = F'(phi)/(2 sqrt F); guard sqrt F floor.
+                Fp = phi_gp ** 3 - phi_gp
+                Fpp = 3.0 * phi_gp ** 2 - 1.0
+                F = 0.25 * (phi_gp ** 2 - 1.0) ** 2
+                sqrtF = np.sqrt(np.maximum(F, 0.0))
+                dsqrtF = np.where(sqrtF > 1e-12, Fp / (2.0 * sqrtF), 0.0)
+                cphi = ((N[None] / dt) + uGNb + divu[:, :, None] * N[None])
+                m_phiphi = (np.einsum("eq,qa,eqb->eab", dJxW, N, cphi)
+                            + gamma * Cn * np.einsum("eq,eqas,eqbs->eab",
+                                                     dJxW, dNp, dNp)
+                            + gamma * np.einsum(
+                                "eq,qa,eq,qb->eab", dJxW, N,
+                                Fpp / Cn + beta * dsqrtF, N))
+                addblk(dim + 1, dim + 1, m_phiphi)
+                # no phi-mu coupling in CAC (flux is Allen-Cahn, not CH)
+            else:
+                # d/dphi: transient (1/dt)N_b + u.grad N_b + div u N_b
+                cphi = ((N[None] / dt) + uGNb
+                        + divu[:, :, None] * N[None])       # [e,q,b]
+                m_phiphi = np.einsum("eq,qa,eqb->eab", dJxW, N, cphi)
+                addblk(dim + 1, dim + 1, m_phiphi)
+                # d/dmu: (1/Pe) INT gNa . grad N_b
+                m_phimu = (1.0 / Pe) * np.einsum("eq,eqas,eqbs->eab",
+                                                 dJxW, dNp, dNp)
+                addblk(dim + 1, dim + 2, m_phimu)
+
+            #### --- CH mu row / CAC trivial-mu row --------------------------
+            if cac:
+                # trivial mu = 0 row: R^mu = INT N_a mu -> d/dmu = INT N_a N_b
+                addblk(dim + 2, dim + 2, NNab)
+            else:
+                # Rmu = INT N_a(mu - f'(phi)) - Cn^2 INT gNa.grad phi
+                # d/dphi: -INT N_a f''(phi) N_b - Cn^2 INT gNa.grad N_b
+                fpp = 3.0 * phi_gp ** 2 - 1.0                # f''(phi)
+                m_muphi = (-np.einsum("eq,qa,eq,qb->eab", dJxW, N, fpp, N)
+                           - Cn ** 2 * np.einsum("eq,eqas,eqbs->eab",
+                                                 dJxW, dNp, dNp))
+                addblk(dim + 2, dim + 1, m_muphi)
+                # d/dmu: INT N_a N_b
+                addblk(dim + 2, dim + 2, NNab)
+
+            # ---- scatter Ae ----
+            gdof = B["gdof"]
+            rows.append(np.repeat(gdof, blk * nbf, axis=1).ravel())
+            cols.append(np.tile(gdof, (1, blk * nbf)).ravel())
+            vals.append(Ae.ravel())
+
+        J = None
+        if want_jac:
+            J = sp.coo_matrix(
+                (np.concatenate(vals),
+                 (np.concatenate(rows), np.concatenate(cols))),
+                shape=(self.ndof, self.ndof)).tocsr()
+        self._last_clamp = n_clamp
+        self._last_ngp = n_gp
+        return R, J
+
+    def residual(self, x):
+        R, _ = self._assemble(x, want_jac=False)
+        return self._apply_bc_res(x, R)
+
+    def jacobian(self, x):
+        _, J = self._assemble(x, want_jac=True)
+        return self._apply_bc_jac(J)
+
+    # ------------------------------------------------------------------
+    # boundary conditions: no-slip velocity (strong), pressure pin at node 0
+    # ------------------------------------------------------------------
+    def _bc_rows(self):
+        blk, dim = self.blk, self.dim
+        rows = []
+        for a in np.where(self.bnd)[0]:
+            for d in range(dim):
+                rows.append(a * blk + d)
+        rows.append(0 * blk + dim)          # pressure pin at node 0
+        return np.asarray(rows, np.int64)
+
+    def _apply_bc_res(self, x, R):
+        rows = self._bc_rows()
+        blk, dim = self.blk, self.dim
+        # velocity: enforce u=0 -> residual = x_dof (target 0)
+        # pressure pin: residual = p_node0 (target 0)
+        R[rows] = x[rows]
+        return R
+
+    def _apply_bc_jac(self, J):
+        rows = self._bc_rows()
+        J = J.tolil()
+        for r in rows:
+            J.rows[r] = [r]
+            J.data[r] = [1.0]
+        return J.tocsr()
+
+    # ------------------------------------------------------------------
+    # Newton step
+    # ------------------------------------------------------------------
+    def step(self, guards=True):
+        self._t_eval = self.t + self.dt      # MMS source evaluated at t^{n+1}
+        x = self.pack()
+        it = 0
+        rnorm = np.inf
+        for it in range(1, self.newton_max + 1):
+            R = self.residual(x)
+            rnorm = float(np.linalg.norm(R))
+            if rnorm < self.newton_tol:
+                break
+            J = self.jacobian(x)
+            dx = splu(J.tocsc()).solve(-R)
+            x = x + dx
+            if float(np.abs(dx).max()) < self.newton_tol:
+                # recompute residual for reporting
+                R = self.residual(x)
+                rnorm = float(np.linalg.norm(R))
+                break
+        else:
+            raise RuntimeError(
+                f"CHNS Newton failed to converge in {self.newton_max} iters: "
+                f"residual norm {rnorm:.3e}")
+
+        clamped = int(getattr(self, "_last_clamp", 0))
+        ngp = int(getattr(self, "_last_ngp", 1))
+        if guards and clamped > 0.01 * ngp:
+            raise RuntimeError(
+                f"mix_props clamp counter {clamped} > 1% of {ngp} GPs")
+
+        u, p, phi, mu = self.unpack(x)
+        # commit history: shift x^{n-1} <- x^n before x^n <- x^{n+1} (BDF2);
+        # BDF1 ignores x^{n-1}.
+        self.u_nm1 = self.u_n.copy()
+        self.phi_nm1 = self.phi_n.copy()
+        self.dt_prev = self.dt
+        self.u_n = u.copy()
+        self.phi_n = phi.copy()
+        self.u, self.p, self.phi, self.mu = u, p, phi, mu
+        self.t += self.dt
+        return dict(newton_iters=it, clamped=clamped, res_norm=rnorm)
+
+    def march(self, t_end):
+        out = []
+        while self.t < t_end - 1e-12:
+            out.append(self.step())
+        return out
+
+    # ==================================================================
+    # ADJOINT SUPPORT (Task 11): parametric residual + cross-step block
+    # ==================================================================
+    # These helpers back CHNSAdjoint.  They are CH-interface only (the SP-0
+    # adjoint exit gate is the CH mode; CAC adjoint is out of scope).  The
+    # forward Newton path above is untouched; the adjoint re-assembles J_n on
+    # the backward pass (memory-light) via self.jacobian(x_n) after restoring
+    # that step's history, and forms parameter cotangents dR/dp by COMPLEX-STEP
+    # through _residual_param (machine-exact, reuses the exact residual code
+    # path so the derivative is guaranteed consistent with the forward term).
+
+    _ADJ_PARAMS = ("rho_ratio", "eta_ratio", "We", "mobility", "Fr")
+
+    def _residual_param(self, x, u_n, phi_n, overrides=None, dtype=np.float64):
+        r"""Galerkin+SUPG+PSPG CH residual with scalar-parameter overrides,
+        dtype-generic (supports complex-step).  Mirrors the RESIDUAL rows of
+        _assemble exactly for interface=="ch"; BDF1 only (the adjoint gate is
+        BDF1).  ``overrides`` maps any of {rho_ratio, eta_ratio, We, mobility,
+        Fr} to a (possibly complex) value; ``mobility`` == 1/Pe (the Pe*M knob).
+        Boundary rows (no-slip u, pressure pin) are replaced by x_dof so the
+        parametric derivative through the BC rows is zero (BCs are param-free).
+        """
+        assert self.interface == "ch", "adjoint is CH-interface only"
+        ov = overrides or {}
+        blk, dim = self.blk, self.dim
+        dt = self.dt
+
+        rho_ratio = ov.get("rho_ratio", self.rho_ratio)
+        eta_ratio = ov.get("eta_ratio", self.eta_ratio)
+        We = ov.get("We", self.We)
+        mobility = ov.get("mobility", 1.0 / self.Pe)      # Pe*M knob, M=1
+        Fr = ov.get("Fr", self.Fr)
+        Re, Cn = self.Re, self.Cn
+
+        rho_h, eta_h = 1.0, 1.0
+        rho_l = 1.0 / rho_ratio
+        eta_l = 1.0 / eta_ratio
+        a_rho = 0.5 * (rho_h - rho_l)
+        b_rho = 0.5 * (rho_h + rho_l)
+        a_eta = 0.5 * (eta_h - eta_l)
+        b_eta = 0.5 * (eta_h + eta_l)
+        agg = -0.5 * (rho_h - rho_l) * mobility           # AGG prefactor
+        cw_inv = 1.0 / (Cn * We)
+        grav_scale = 1.0 / Fr ** 2
+
+        u, p, phi, mu = self.unpack(x)
+        u = u.astype(dtype); p = p.astype(dtype)
+        phi = phi.astype(dtype); mu = mu.astype(dtype)
+        u_n = np.asarray(u_n, dtype).reshape(self.nn, dim)
+        phi_n = np.asarray(phi_n, dtype)
+
+        ghat = np.zeros(dim)
+        if self.gravity:
+            ghat[-1] = -1.0
+        R = np.zeros(self.ndof, dtype=dtype)
+
+        # floors for clamp (real comparison on the real part; derivative 0 where
+        # clamped matches the mix_props convention)
+        rho_floor = 1e-3 * (1.0 / self.rho_ratio)
+        eta_floor = 1e-3 * (1.0 / self.eta_ratio)
+
+        for B in self.bins:
+            dJxW = B["dJxW"].astype(dtype)
+            N, dN, dscale = B["N"], B["dN"], B["dscale"]
+            ne, nbf, nqp = B["ne"], B["nbf"], B["nqp"]
+            h_e = B["h"]
+
+            u_gp, gu = self._interp_vec(u, B)
+            un_gp, _ = self._interp_vec(u_n, B)
+            p_gp, gp = self._interp(p, B)
+            phi_gp, gphi = self._interp(phi, B)
+            phin_gp, _ = self._interp(phi_n, B)
+            mu_gp, gmu = self._interp(mu, B)
+
+            rho_raw = a_rho * phi_gp + b_rho
+            eta_raw = a_eta * phi_gp + b_eta
+            rho_gp = np.where(np.real(rho_raw) >= rho_floor, rho_raw, rho_floor)
+            eta_gp = np.where(np.real(eta_raw) >= eta_floor, eta_raw, eta_floor)
+
+            # tau (per GP, local rho/eta) — same closed form as _assemble
+            h_ = float(h_e[0])
+            c2CI = 36.0 * 16.0 * dim
+            nu_loc = eta_gp / (rho_gp * Re)
+            A_t = 4.0 / dt ** 2
+            Bu_t = 4.0 * np.sum(u_gp ** 2, axis=-1) / h_ ** 2
+            C_t = c2CI * nu_loc ** 2 / h_ ** 4
+            denom = np.sqrt(A_t + Bu_t + C_t)
+            tau = 1.0 / (denom * rho_gp)
+
+            J_gp = agg * gmu
+            ugradu = np.einsum("eqs,eqds->eqd", u_gp, gu)
+            Jgradu = np.einsum("eqs,eqds->eqd", J_gp, gu)
+            ugradphi = np.einsum("eqs,eqs->eq", u_gp, gphi)
+
+            fcap = cw_inv * mu_gp[..., None] * gphi
+            fgrav = (rho_gp[..., None] * grav_scale) * ghat[None, None, :]
+            fmms = np.zeros((ne, nqp, dim), dtype=dtype)
+            if self.body_fn is not None:
+                bf = np.asarray(self.body_fn(B["xq"].reshape(ne * nqp, dim),
+                                             self._t_eval), float)
+                fmms = bf.reshape(ne, nqp, dim).astype(dtype)
+
+            r_mom = (rho_gp[..., None] * (u_gp - un_gp) / dt
+                     + rho_gp[..., None] * ugradu
+                     + Jgradu + gp - fcap - fgrav - fmms)
+
+            mom_body = (rho_gp[..., None] * (u_gp - un_gp) / dt
+                        + rho_gp[..., None] * ugradu + Jgradu
+                        - fcap - fgrav - fmms)
+            Rmom = np.einsum("eq,qa,eqd->ead", dJxW, N, mom_body)
+            symgu = gu + np.transpose(gu, (0, 1, 3, 2))
+            dNp = np.einsum("qas,e->eqas", dN, dscale)
+            Rvisc = (1.0 / Re) * np.einsum(
+                "eq,eq,eqds,eqas->ead", dJxW, eta_gp, symgu, dNp)
+            Rpres = -np.einsum("eq,eq,eqad->ead", dJxW, p_gp, dNp)
+            ugw = np.einsum("eqs,eqas->eqa", u_gp, dNp)
+            Rsupg = np.einsum("eq,eq,eqa,eqd->ead", dJxW, tau, ugw, r_mom)
+            Ru = Rmom + Rvisc + Rpres + Rsupg
+            for d in range(dim):
+                np.add.at(R, B["gdof"][:, d::blk].ravel(), Ru[:, :, d].ravel())
+
+            divu = np.einsum("eqdd->eq", gu)
+            Rcont = np.einsum("eq,qa,eq->ea", dJxW, N, divu)
+            Rpspg = np.einsum("eq,eq,eqas,eqs->ea", dJxW, tau, dNp, r_mom)
+            Rp = Rcont + Rpspg
+            np.add.at(R, B["gdof"][:, dim::blk].ravel(), Rp.ravel())
+
+            ch_body = (phi_gp - phin_gp) / dt + ugradphi + phi_gp * divu
+            Rphi = (np.einsum("eq,qa,eq->ea", dJxW, N, ch_body)
+                    + mobility * np.einsum("eq,eqas,eqs->ea", dJxW, dNp, gmu))
+            np.add.at(R, B["gdof"][:, dim + 1::blk].ravel(), Rphi.ravel())
+
+            fp = phi_gp ** 3 - phi_gp
+            Rmu = (np.einsum("eq,qa,eq->ea", dJxW, N, mu_gp - fp)
+                   - Cn ** 2 * np.einsum("eq,eqas,eqs->ea", dJxW, dNp, gphi))
+            np.add.at(R, B["gdof"][:, dim + 2::blk].ravel(), Rmu.ravel())
+
+        # boundary rows: residual = x_dof (param-independent)
+        rows = self._bc_rows()
+        R[rows] = x[rows].astype(dtype)
+        return R
+
+    def dR_dparam(self, x, u_n, phi_n, name):
+        r"""Explicit dR/dp (length-ndof) at fixed state x and BDF1 history,
+        by complex-step through _residual_param.  ``name`` in _ADJ_PARAMS."""
+        p0 = dict(rho_ratio=self.rho_ratio, eta_ratio=self.eta_ratio,
+                  We=self.We, mobility=1.0 / self.Pe, Fr=self.Fr)[name]
+        hstep = 1e-30
+        ov = {name: p0 + 1j * hstep}
+        Rc = self._residual_param(x, u_n, phi_n, overrides=ov,
+                                  dtype=np.complex128)
+        return np.imag(Rc) / hstep
+
+    def cross_step_matrix(self, x, u_n, phi_n):
+        r"""Analytic dR/d(x_n): the BDF1 history block.  u_n enters step n+1
+        only through rho*(u-u_n)/dt (Galerkin momentum + SUPG r_mom + PSPG
+        r_mom); phi_n enters only through (phi-phi_n)/dt (CH phi Galerkin row).
+        rho/eta/tau use phi^{n+1} only (NOT phi_n) — verified against
+        _assemble — so no other history dependence exists.  Returns a sparse
+        ndof x ndof matrix C with C[i,j] = dR_i/dx_n[j]."""
+        blk, dim = self.blk, self.dim
+        dt = self.dt
+        u, p, phi, mu = self.unpack(x)
+        rho_h, rho_l = 1.0, 1.0 / self.rho_ratio
+        a_rho, b_rho = 0.5 * (rho_h - rho_l), 0.5 * (rho_h + rho_l)
+        eta_h, eta_l = 1.0, 1.0 / self.eta_ratio
+        a_eta, b_eta = 0.5 * (eta_h - eta_l), 0.5 * (eta_h + eta_l)
+        Re, Cn = self.Re, self.Cn
+        rows, cols, vals = [], [], []
+        for B in self.bins:
+            dJxW, N, dN, dscale = B["dJxW"], B["N"], B["dN"], B["dscale"]
+            ne, nbf, nqp = B["ne"], B["nbf"], B["nqp"]
+            h_ = float(B["h"][0])
+            u_gp, gu = self._interp_vec(u, B)
+            phi_gp, _ = self._interp(phi, B)
+            rho_raw = a_rho * phi_gp + b_rho
+            eta_raw = a_eta * phi_gp + b_eta
+            rho_gp = np.maximum(rho_raw, 1e-3 * rho_l)
+            eta_gp = np.maximum(eta_raw, 1e-3 * eta_l)
+            c2CI = 36.0 * 16.0 * dim
+            nu_loc = eta_gp / (rho_gp * Re)
+            denom = np.sqrt(4.0 / dt ** 2
+                            + 4.0 * np.sum(u_gp ** 2, axis=-1) / h_ ** 2
+                            + c2CI * nu_loc ** 2 / h_ ** 4)
+            tau = 1.0 / (denom * rho_gp)
+            dNp = np.einsum("qas,e->eqas", dN, dscale)
+            ugw = np.einsum("eqs,eqas->eqa", u_gp, dNp)     # [e,q,a]
+            gdof = B["gdof"]
+            Ae = np.zeros((ne, blk * nbf, blk * nbf))
+
+            def addblk(fr, fc, mat):
+                Ae[:, fr::blk, fc::blk] += mat
+
+            # d(mom_body, SUPG r_mom, PSPG r_mom)/du_n[b,jc]: the u_n term is
+            # rho*(u-u_n)/dt, so its jc-component derivative wrt u_n[b] carries
+            # coefficient -rho/dt * N_b on component jc.
+            #   Galerkin momentum comp jc: INT N_a * (-rho/dt) N_b
+            #   SUPG      momentum comp jc: INT tau ugw_a * (-rho/dt) N_b
+            #   PSPG      continuity     : INT tau gNa_jc * (-rho/dt) N_b
+            coef = -(1.0 / dt) * rho_gp                     # [e,q]
+            gal = np.einsum("eq,qa,eq,qb->eab", dJxW, N, coef, N)
+            supg = np.einsum("eq,eq,eqa,eq,qb->eab", dJxW, tau, ugw, coef, N)
+            for jc in range(dim):
+                addblk(jc, jc, gal + supg)                  # momentum comp jc
+                pspg = np.einsum("eq,eq,eqa,eq,qb->eab", dJxW, tau,
+                                 dNp[:, :, :, jc], coef, N)
+                addblk(dim, jc, pspg)                       # continuity
+            # phi Galerkin: (phi - phi_n)/dt -> d/dphi_n[b] = -N_b/dt
+            phi_hist = np.einsum("eq,qa,qb->eab", dJxW * (-1.0 / dt), N, N)
+            addblk(dim + 1, dim + 1, phi_hist)
+
+            rows.append(np.repeat(gdof, blk * nbf, axis=1).ravel())
+            cols.append(np.tile(gdof, (1, blk * nbf)).ravel())
+            vals.append(Ae.ravel())
+        C = sp.coo_matrix((np.concatenate(vals),
+                           (np.concatenate(rows), np.concatenate(cols))),
+                          shape=(self.ndof, self.ndof)).tocsr()
+        # boundary rows of R are x_dof (no x_n dependence) -> zero those rows
+        bc = self._bc_rows()
+        C = C.tolil()
+        for r in bc:
+            C.rows[r] = []
+            C.data[r] = []
+        return C.tocsr()
+
+
+# ==========================================================================
+# Task 11: discrete-IFT adjoint through the coupled CHNS BDF1 march
+# ==========================================================================
+class CHNSAdjoint:
+    r"""Reverse-mode (discrete-IFT) adjoint of the CHNS mirror (CHNSDiscrete),
+    CH interface only (the SP-0 exit gate; CAC adjoint is SP-1+ work).
+
+    Forward pass marches ``mirror`` for ``n_steps`` from a set initial state,
+    storing each step's converged packed state x_n and its BDF1 history
+    (u_n, phi_n = the PREVIOUS committed state).  The backward pass RE-ASSEMBLES
+    J_n = jacobian(x_n) on demand (memory-light: no stored factorizations) after
+    restoring that step's history, and solves the per-step transposed system
+
+        J_n^T lam_n = dJ/dx_n  -  (dR_{n+1}/dx_n)^T lam_{n+1}
+
+    where the cross-step block dR_{n+1}/dx_n is the BDF1 history coupling
+    (mirror.cross_step_matrix): u_n, phi_n enter step n+1 ONLY through the time
+    terms rho*(u-u_n)/dt (momentum Galerkin + SUPG + PSPG) and (phi-phi_n)/dt
+    (CH phi row).  rho/eta/tau depend on phi^{n+1} only, so there is no other
+    history dependence.  Parameter cotangents:  dJ/dp = -sum_n lam_n^T dR_n/dp,
+    each dR_n/dp a complex-step re-assembly (mirror.dR_dparam).
+
+    Objectives (terminal, selectable):
+      "terminal_phi_mismatch":  J = 0.5 sum_i w_i (phi_i(T) - phi*_i)^2
+         with lumped weights w_i = INT N_i and a passed phi_target.
+      "centroid_y" (SMOOTH heavy-phase centroid):
+         J = sum_i w_i y_i (1+phi_i)/2  /  sum_i w_i (1+phi_i)/2.
+         This differs from the benchmark's masked metric (metrics.centroid_y,
+         a non-smooth phi>0 mask) BY DESIGN — the smooth form is differentiable
+         everywhere, which the adjoint requires; the masked metric has a
+         zero-measure-but-nondifferentiable boundary the discrete adjoint cannot
+         see.  Documented divergence, per the task brief.
+    """
+
+    def __init__(self, mirror, objective="terminal_phi_mismatch",
+                 phi_target=None, coords=None):
+        if mirror.interface != "ch":
+            raise ValueError("CHNSAdjoint supports interface='ch' only")
+        if mirror.tstep != "bdf1":
+            raise ValueError("CHNSAdjoint supports tstep='bdf1' only")
+        self.m = mirror
+        self.objective = objective
+        self.phi_target = (None if phi_target is None
+                           else np.asarray(phi_target, np.float64).copy())
+        self.coords = (mirror.coords if coords is None
+                       else np.asarray(coords, np.float64))
+        self.steps = []      # list of dict(x, u_n, phi_n) per committed step
+
+    # ------------------------------------------------------------------
+    def march(self, n_steps):
+        """March the mirror n_steps, recording (x_n, history) each step."""
+        self.steps = []
+        m = self.m
+        for _ in range(n_steps):
+            u_n = m.u_n.copy()
+            phi_n = m.phi_n.copy()
+            m.step()
+            self.steps.append(dict(x=m.pack(), u_n=u_n, phi_n=phi_n))
+        return self.steps
+
+    # ------------------------------------------------------------------
+    def objective_value(self):
+        """Scalar J at the terminal recorded state."""
+        xN = self.steps[-1]["x"]
+        _, _, phi, _ = self.m.unpack(xN)
+        return float(self._J_of_phi(phi))
+
+    def _J_of_phi(self, phi):
+        w = self.m.lumped_mass()
+        if self.objective == "terminal_phi_mismatch":
+            return 0.5 * float(np.sum(w * (phi - self.phi_target) ** 2))
+        elif self.objective == "centroid_y":
+            y = self.coords[:, 1]
+            heavy = 0.5 * (1.0 + phi)
+            num = float(np.sum(w * y * heavy))
+            den = float(np.sum(w * heavy))
+            return num / den
+        raise ValueError(f"unknown objective {self.objective!r}")
+
+    def _dJ_dphi(self, phi):
+        """dJ/dphi (length nn) at the terminal state."""
+        w = self.m.lumped_mass()
+        if self.objective == "terminal_phi_mismatch":
+            return w * (phi - self.phi_target)
+        elif self.objective == "centroid_y":
+            y = self.coords[:, 1]
+            heavy = 0.5 * (1.0 + phi)
+            num = float(np.sum(w * y * heavy))
+            den = float(np.sum(w * heavy))
+            J = num / den
+            # d/dphi_i: (w_i/2)(y_i)/den - (w_i/2) num/den^2 = (w_i/2)(y_i-J)/den
+            return 0.5 * w * (y - J) / den
+        raise ValueError(f"unknown objective {self.objective!r}")
+
+    def _seed(self, n_steps):
+        """dJ/dx_n for every step: only the terminal step (phi dofs) is nonzero."""
+        m = self.m
+        blk, dim = m.blk, m.dim
+        seeds = [np.zeros(m.ndof) for _ in range(n_steps)]
+        xN = self.steps[-1]["x"]
+        _, _, phi, _ = m.unpack(xN)
+        seeds[-1][dim + 1::blk] = self._dJ_dphi(phi)
+        return seeds
+
+    # ------------------------------------------------------------------
+    def gradients(self, params=("rho_ratio", "eta_ratio", "We",
+                                 "mobility", "Fr")):
+        """Return {param: dJ/dp} via the reverse sweep.  Requires march().
+
+        Note: this method mutates the mirror's history via ``set_history``
+        during the backward sweep (each step restores the recorded u_n/phi_n
+        so the Jacobian reproduces J_n exactly).  Call ``march`` again before
+        reusing the mirror for forward stepping — the history left after
+        ``gradients`` is the history of step 0, not the final state.
+        """
+        m = self.m
+        N = len(self.steps)
+        assert N > 0, "call march(n_steps) before gradients()"
+        seeds = self._seed(N)
+        grads = {p: 0.0 for p in params}
+        lam_next = None
+        rec_next = None
+        for n in range(N - 1, -1, -1):
+            rec = self.steps[n]
+            x_n = rec["x"]
+            # restore this step's BDF1 history so jacobian(x_n) reproduces J_n
+            m.set_history(rec["u_n"], rec["phi_n"])
+            J = m.jacobian(x_n)
+            rhs = seeds[n].copy()
+            if lam_next is not None:
+                # cross-step block dR_{n+1}/dx_n at step (n+1)'s state/history
+                C = m.cross_step_matrix(rec_next["x"], rec_next["u_n"],
+                                        rec_next["phi_n"])
+                rhs = rhs - C.T @ lam_next
+            lam = splu(J.T.tocsc()).solve(rhs)
+            for p in params:
+                dRdp = m.dR_dparam(x_n, rec["u_n"], rec["phi_n"], p)
+                grads[p] -= float(lam @ dRdp)
+            lam_next = lam
+            rec_next = rec
+        return grads
